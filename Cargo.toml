@@ -1,0 +1,24 @@
+[package]
+name = "musicbot-mk2"
+version = "0.6.1"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.9"
+chrono = { version = "0.4.45", features = ["serde"] }
+rand = "0.10.1"
+regex = "1.12.4"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache", "voice"] }
+sha2 = "0.11.0"
+songbird = { version = "0.6.0", features = ["serenity", "driver", "rustls"] }
+# songbird 는 symphonia 를 default-features=false 로 가져와 PCM 디코더가 빠진다.
+# ffmpeg raw 파이프(RawAdapter → CODEC_TYPE_PCM_F32LE)를 디코드하려면 "pcm" feature 필수 —
+# 없으면 모든 트랙이 "no compatible track found" 로 즉사한다 (2026-06-11 실측).
+symphonia = { version = "0.5.2", default-features = false, features = ["pcm"] }
+tokio = { version = "1.52.3", features = ["full"] }
+tower-cookies = "0.11.0"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"

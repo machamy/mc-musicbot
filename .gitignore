@@ -1,0 +1,18 @@
+/target
+
+# Runtime secrets and local state
+botsettings.json
+musicbot.runtime.json
+.musicbot-data/
+.env
+*.secret
+
+# Portable/runtime layout, if copied into the repo during local testing
+/bot/botsettings.json
+/bot/.musicbot-data/
+/tools/
+
+# Local logs and OS/editor noise
+*.log
+Thumbs.db
+.DS_Store
