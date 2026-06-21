@@ -55,27 +55,22 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 설치 후 `cargo --version`이 나오면 됩니다. (edition 2024 → Rust 1.85 이상 권장)
 
-### 2) ffmpeg + yt-dlp 설치
+### 2) ffmpeg 설치 (yt-dlp는 자동)
 
-봇은 이 둘로 오디오를 받아 디코딩합니다. `PATH`에 두거나, 봇 옆 `tools/` 폴더에 실행파일을 넣으면 됩니다.
+봇은 `ffmpeg`로 오디오를 디코딩합니다. `PATH`에 두거나 봇 옆 `tools/` 폴더에 넣으세요.
 
 ```sh
-# Windows (winget)
-winget install Gyan.FFmpeg
-winget install yt-dlp.yt-dlp
-
-# Windows (scoop)
-scoop install ffmpeg yt-dlp
-
+# Windows
+winget install Gyan.FFmpeg          # 또는: scoop install ffmpeg
 # Debian/Ubuntu
 sudo apt install ffmpeg
-python3 -m pip install -U yt-dlp     # apt 버전은 오래되기 쉬워 pip 권장
-
-# macOS (Homebrew)
-brew install ffmpeg yt-dlp
+# macOS
+brew install ffmpeg
 ```
 
-`ffmpeg -version` / `yt-dlp --version`이 나오는지 확인하세요.
+**`yt-dlp`는 직접 설치하지 않아도 됩니다.** 봇이 처음 켤 때 `yt-dlp`가 `PATH`/`tools/`에 없으면 **GitHub 최신 릴리스에서 `tools/`로 자동 다운로드**하고, 봇이 받은 yt-dlp는 **하루 1회 자동 업데이트**(`yt-dlp -U`)합니다. (YouTube 변경으로 인한 다운로드 실패를 예방 — 웹 설정에서 끌 수 있고, 직접 설치한 `PATH`/시스템 yt-dlp는 건드리지 않습니다.)
+
+> 미리 깔고 싶으면 `winget install yt-dlp.yt-dlp` / `pip install -U yt-dlp` / `brew install yt-dlp`도 됩니다.
 
 ### 3) 디스코드 봇 만들기 (토큰 + 인텐트 + 초대)
 

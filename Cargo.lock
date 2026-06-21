@@ -2009,12 +2009,13 @@ dependencies = [
 
 [[package]]
 name = "musicbot-mk2"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "axum",
  "chrono",
  "rand 0.10.1",
  "regex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

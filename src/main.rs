@@ -105,13 +105,16 @@ async fn main() {
         std::process::exit(2);
     }
 
-    let config = match config::Config::load() {
+    let mut config = match config::Config::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("설정 로드 실패: {e}");
             std::process::exit(1);
         }
     };
+
+    // 도구 확보 — yt-dlp 가 없으면 받아오고(없으면 config.yt_dlp_path 갱신), ffmpeg 는 없으면 안내.
+    media::tools::ensure_tools(&mut config).await;
 
     let app = app::App::new(config);
     {
@@ -127,6 +130,9 @@ async fn main() {
         "Bot",
         &format!("Starting MusicBot MK2 (build {}).", app.build_id),
     );
+
+    // 우리가 관리하는 yt-dlp 를 백그라운드로 주기 자동 업데이트 (설정으로 끌 수 있음).
+    media::tools::spawn_auto_update(app.clone());
 
     // songbird 인스턴스를 직접 만들어 보관 — 코디네이터가 게이트웨이 컨텍스트 없이 접근 가능.
     let manager = songbird::Songbird::serenity();

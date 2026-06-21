@@ -293,6 +293,9 @@ pub struct GlobalSettings {
     /// 켜면 다운로드 시 SponsorBlock 으로 인트로/아웃트로/비음악 구간을 잘라낸다
     /// (music_offtopic,intro,outro). 크라우드 데이터가 있는 영상에만 적용된다.
     pub sponsorblock_remove: bool,
+    /// 켜면 우리가 받은(toolsRoot 안의) yt-dlp 를 하루 1회 자동 업데이트(`yt-dlp -U`)한다.
+    /// YouTube 변경으로 다운로드가 깨지는 것을 예방. PATH/시스템 yt-dlp 는 건드리지 않는다.
+    pub auto_update_tools: bool,
 }
 
 impl Default for GlobalSettings {
@@ -316,6 +319,7 @@ impl Default for GlobalSettings {
             tweak_dedicated_send_thread: false,
             voice_bitrate_kbps: 96,
             sponsorblock_remove: false,
+            auto_update_tools: true,
         }
     }
 }

@@ -501,6 +501,7 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
 <label class="field">선호 브라우저 프로필 (쿠키 추출)</label><input type="text" name="preferred_browser_profile" value="{bp}"/>
 <label class="field">쿠키 파일 경로 (선택)</label><input type="text" name="cookie_file_path" value="{cf}"/>
 <label class="checkbox" title="yt-dlp --sponsorblock-remove music_offtopic,intro,outro — SponsorBlock 데이터가 있는 영상의 인트로/아웃트로/비음악 구간을 다운로드 시 잘라냅니다. 이미 캐시된 곡엔 적용 안 되고 새로 받는 곡부터 적용됩니다."><input type="checkbox" name="sponsorblock_remove" {sb}/> 인트로/아웃트로 제거 (SponsorBlock · 새로 받는 곡부터)</label>
+<label class="checkbox" title="봇이 받은(tools 폴더 안의) yt-dlp 를 하루 1회 자동으로 yt-dlp -U 합니다. YouTube 변경으로 다운로드가 깨지는 것을 예방합니다. 시스템/PATH 의 yt-dlp 는 건드리지 않습니다."><input type="checkbox" name="auto_update_tools" {au}/> yt-dlp 자동 업데이트 (하루 1회)</label>
 </div>
 <div class="card"><h2>끊김 최적화 (실험)</h2>
 <p class="sub">
@@ -528,6 +529,7 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
         bp = html_escape(&s.preferred_browser_profile),
         cf = html_escape(s.cookie_file_path.as_deref().unwrap_or("")),
         sb = chk(s.sponsorblock_remove),
+        au = chk(s.auto_update_tools),
         t1 = chk(s.tweak_ffmpeg_fast_start),
         t2 = chk(s.tweak_ffmpeg_direct_output),
         br = s.voice_bitrate_kbps,
@@ -549,6 +551,7 @@ pub struct SettingsForm {
     preferred_browser_profile: Option<String>,
     cookie_file_path: Option<String>,
     sponsorblock_remove: Option<String>,
+    auto_update_tools: Option<String>,
     tweak_ffmpeg_fast_start: Option<String>,
     tweak_ffmpeg_direct_output: Option<String>,
     voice_bitrate_kbps: Option<i32>,
@@ -588,6 +591,7 @@ pub async fn settings_post(
         .unwrap_or_else(|| "Default".into());
     s.cookie_file_path = f.cookie_file_path.filter(|v| !v.trim().is_empty());
     s.sponsorblock_remove = f.sponsorblock_remove.is_some();
+    s.auto_update_tools = f.auto_update_tools.is_some();
     s.tweak_ffmpeg_fast_start = f.tweak_ffmpeg_fast_start.is_some();
     s.tweak_ffmpeg_direct_output = f.tweak_ffmpeg_direct_output.is_some();
     s.voice_bitrate_kbps = f
