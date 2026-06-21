@@ -1,21 +1,63 @@
-MIT License
+mc-musicbot License (Source-Available, Personal & Noncommercial Use Only)
+Version 1.0
 
 Copyright (c) 2026 macham
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software is source-available, NOT open source. The source code is
+published so you can read it and run it yourself, but redistribution and
+commercial use are not permitted. Please read the terms below.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+------------------------------------------------------------------------
+1. Grant of Permission
+
+Subject to your full compliance with this License, the copyright holder
+grants you a worldwide, royalty-free, non-exclusive, non-transferable
+permission to:
+
+  (a) download, view, and study the source code of the software;
+  (b) build and run the software for your own personal, noncommercial
+      purposes (for example: running your own private Discord bot,
+      personal use, learning, experimentation, and hobby projects); and
+  (c) modify the source code for your own personal, noncommercial use.
+
+------------------------------------------------------------------------
+2. Restrictions
+
+You may NOT, without the prior written permission of the copyright holder:
+
+  (a) redistribute, publish, sublicense, lease, sell, or otherwise make
+      available the software or any modified or derivative version of it,
+      whether in source or binary (compiled) form, to any third party;
+  (b) use the software, in whole or in part, for any commercial purpose,
+      including offering it (or a service based on it) to others, whether
+      for a fee or free of charge; or
+  (c) remove or alter this License or the copyright notice.
+
+Forking or viewing this repository within the hosting platform's own
+interface (e.g. GitHub) is permitted only to the extent the platform's
+Terms of Service allow; this License grants no additional redistribution
+right.
+
+------------------------------------------------------------------------
+3. Reservation of Rights
+
+All rights not expressly granted in Section 1 are reserved by the
+copyright holder. No other license is granted or implied.
+
+------------------------------------------------------------------------
+4. Termination
+
+Any breach of this License automatically terminates the permissions
+granted to you. Upon termination you must stop using the software and
+destroy your copies.
+
+------------------------------------------------------------------------
+5. No Warranty / No Liability
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. TO THE MAXIMUM
+EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER SHALL NOT BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT,
+OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR OTHER DEALINGS IN THE SOFTWARE.
