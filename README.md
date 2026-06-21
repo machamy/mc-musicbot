@@ -1,4 +1,4 @@
-# MusicBot
+# mc-musicbot
 
 Rust로 만든 셀프호스팅 디스코드 음악봇입니다. [serenity](https://github.com/serenity-rs/serenity) + [songbird](https://github.com/serenity-rs/songbird) 기반이고, **웹 관리자 패널**이 봇과 하나의 프로세스로 함께 돌아갑니다.
 
@@ -94,7 +94,7 @@ cd mc-musicbot
 cargo build --release
 ```
 
-결과물: `target/release/musicbot-mk2` (Windows는 `musicbot-mk2.exe`).
+결과물: `target/release/mc-musicbot` (Windows는 `mc-musicbot.exe`).
 
 ### 5) 설정 파일 만들기
 
@@ -132,7 +132,7 @@ cp botsettings.sample.json botsettings.json
 직접 실행:
 
 ```sh
-./target/release/musicbot-mk2      # Windows: target\release\musicbot-mk2.exe
+./target/release/mc-musicbot      # Windows: target\release\mc-musicbot.exe
 ```
 
 또는 편의 스크립트로 — **그냥 시작** vs **업데이트 후 시작** 두 가지를 둡니다:

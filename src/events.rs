@@ -27,7 +27,7 @@ impl EventHandler for Handler {
         app.log.info(
             "Bot",
             &format!(
-                "Ready handler started (MK2 build {}). Registering commands...",
+                "Ready handler started (build {}). Registering commands...",
                 app.build_id
             ),
         );

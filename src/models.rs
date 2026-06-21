@@ -367,7 +367,7 @@ pub struct CacheEntry {
     /// 마지막으로 실제 재생된 시각(전역).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_played_utc: Option<String>,
-    /// 서버(길드)별 재생 통계. 키는 guild_id. C# 폴백은 이 필드를 보존하지 않음(주력=MK2).
+    /// 서버(길드)별 재생 통계. 키는 guild_id.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub per_guild: HashMap<u64, GuildPlayStat>,
 }

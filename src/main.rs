@@ -1,6 +1,6 @@
-//! MusicBot MK2 — C# DiscordMyMusicBot 의 풀 Rust 포팅.
+//! mc-musicbot — Rust(serenity + songbird) 디스코드 음악봇.
 //! 오디오 엔진: songbird (전용 스레드 페이싱 + DAVE E2EE 내장) — 끊김 방지의 구조적 해법.
-//! 데이터: 기존 .musicbot-data/musicbot.sqlite 를 그대로 공유 (드롭인 마이그레이션).
+//! 데이터: .musicbot-data/musicbot.sqlite (SQLite).
 
 mod app;
 mod blacklist;
@@ -81,7 +81,7 @@ mod win {
     }
     /// 단일 인스턴스 뮤텍스 — 이중 실행 방지 (C# 의 Global\ 뮤텍스와 동일 사상).
     pub fn acquire_single_instance() -> bool {
-        let name: Vec<u16> = "Global\\MusicBotMK2"
+        let name: Vec<u16> = "Global\\McMusicbot"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -101,7 +101,7 @@ async fn main() {
     }
     #[cfg(windows)]
     if !win::acquire_single_instance() {
-        eprintln!("MusicBot MK2 가 이미 실행 중입니다. 기존 창을 닫고 다시 실행하세요.");
+        eprintln!("mc-musicbot 이 이미 실행 중입니다. 기존 창을 닫고 다시 실행하세요.");
         std::process::exit(2);
     }
 
@@ -128,7 +128,7 @@ async fn main() {
     }
     app.log.info(
         "Bot",
-        &format!("Starting MusicBot MK2 (build {}).", app.build_id),
+        &format!("Starting mc-musicbot (build {}).", app.build_id),
     );
 
     // 우리가 관리하는 yt-dlp 를 백그라운드로 주기 자동 업데이트 (설정으로 끌 수 있음).

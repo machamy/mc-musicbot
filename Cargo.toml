@@ -1,5 +1,5 @@
 [package]
-name = "musicbot-mk2"
+name = "mc-musicbot"
 version = "0.7.0"
 edition = "2024"
 

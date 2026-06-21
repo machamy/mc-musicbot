@@ -6,4 +6,4 @@ echo "[update] Pulling latest source..."
 git pull --ff-only
 echo "[update] Building release binary..."
 cargo build --release
-exec target/release/musicbot-mk2
+exec target/release/mc-musicbot

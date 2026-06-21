@@ -48,7 +48,10 @@ impl LogService {
     fn today_path(&self) -> PathBuf {
         // 파일명 날짜도 로컬(한국시간) 기준 — 로그 항목 시각과 어긋나지 않게.
         self.dir
-            .join(format!("mk2-{}.jsonl", chrono::Local::now().format("%Y%m%d")))
+            .join(format!(
+                "mc-musicbot-{}.jsonl",
+                chrono::Local::now().format("%Y%m%d")
+            ))
     }
 
     pub fn write(&self, level: &str, category: &str, message: &str) {
@@ -105,7 +108,7 @@ impl LogService {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
                 if let Some(date_part) = name
-                    .strip_prefix("mk2-")
+                    .strip_prefix("mc-musicbot-")
                     .and_then(|s| s.strip_suffix(".jsonl"))
                 {
                     if let Ok(d) = chrono::NaiveDate::parse_from_str(date_part, "%Y%m%d") {

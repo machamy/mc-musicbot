@@ -47,7 +47,7 @@ async fn download_to(url: &str, dest: &Path) -> Result<(), String> {
         let _ = std::fs::create_dir_all(parent);
     }
     let bytes = reqwest::Client::builder()
-        .user_agent("musicbot-mk2")
+        .user_agent("mc-musicbot")
         .build()
         .map_err(|e| e.to_string())?
         .get(url)

@@ -119,7 +119,7 @@ pub async fn serve(app: Arc<App>) {
     let urls = std::env::var("MUSICBOT_WEB_URLS").unwrap_or_else(|_| "http://0.0.0.0:8693".into());
     let addr = urls.trim_start_matches("http://").to_string();
     app.log
-        .info("Web", &format!("Web admin listening on {addr} (MK2)."));
+        .info("Web", &format!("Web admin listening on {addr}."));
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
             // ConnectInfo<SocketAddr> 로 피어 IP 를 받아 /setup 의 localhost 게이트에 사용.
@@ -190,7 +190,7 @@ pub fn require_auth(state: &WebState, cookies: &Cookies) -> Option<Response> {
 // ───────── 공용 레이아웃 ─────────
 
 /// C# wwwroot/css/site.css 를 그대로 가져온 전역 스타일 (인라인화).
-/// MK2 추가분: .brand-badge 보라색 (엔진 구분용) + table 기본 스타일.
+/// .brand-badge + table 기본 스타일.
 const LAYOUT_CSS: &str = r#"<style>
 :root{--bg:#F8FAFC;--ink:#0F172A;--muted:#64748B;--card:#FFFFFF;--line:#E2E8F0;--accent:#2563EB;--sidebar:#111827;--sidebar-line:#1F2937;--ok-bg:#F0FDF4;--ok-ink:#15803D;--err-bg:#FEF2F2;--err-ink:#DC2626}
 *{box-sizing:border-box}
@@ -323,7 +323,7 @@ pub fn layout(state: &WebState, title: &str, active: &str, body: &str) -> Html<S
 <title>{title} · Discord 뮤직봇 관리</title>
 {css}</head><body><div class="app">
 <aside class="sidebar">
-  <div class="brand"><div class="brand-title">MusicBot</div><div class="brand-badge">MK2</div></div>
+  <div class="brand"><div class="brand-title">mc-musicbot</div></div>
   <div class="brand-sub">Discord 음악봇 운영 패널 · Rust 엔진</div>
   <nav>{nav}</nav>
   <form class="logout" method="post" action="/Logout"><button type="submit" class="btn btn-secondary" style="width:100%">로그아웃</button></form>

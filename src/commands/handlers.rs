@@ -1461,7 +1461,7 @@ pub async fn handle_button(app: Arc<App>, ctx: Context, comp: ComponentInteracti
         return;
     }
 
-    // 큐 페이지 버튼 — MK2 형식(mbq:prev:N) + C# 형식(mb:queue:prev:N / mb:queue:noop) 모두 인식.
+    // 큐 페이지 버튼 — mbq:prev:N / mb:queue:prev:N / mb:queue:noop 형식 모두 인식.
     // 엔진 전환 직후 C# 이 올려둔 옛 메시지의 버튼이 계속 동작하게 한다.
     let queue_nav = id
         .strip_prefix("mbq:")
@@ -1601,7 +1601,7 @@ pub async fn handle_button(app: Arc<App>, ctx: Context, comp: ComponentInteracti
             app.player.set_volume(guild_id, new_vol).await;
             app.coordinator.apply_volume(guild_id, new_vol).await;
         }
-        // C# 버튼 세트의 이전곡 — MK2 버튼엔 없지만 옛 메시지 호환으로 처리.
+        // 옛 버튼 세트의 이전곡 — 현재 버튼엔 없지만 호환 처리.
         "previous" => {
             app.player.previous(guild_id).await;
             app.coordinator.cancel_current(guild_id).await;

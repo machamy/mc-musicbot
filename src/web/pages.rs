@@ -117,7 +117,7 @@ pub async fn login_page(State(state): Ctx, Query(q): Query<LoginQuery>) -> Html<
 <title>로그인 · 뮤직봇 관리</title>
 {css}</head>
 <body><div class="login-wrap"><div class="login-card">
-<h2 style="margin-top:0">MusicBot 관리자<span class="brand-badge">MK2</span></h2>
+<h2 style="margin-top:0">mc-musicbot 관리자</h2>
 <p class="kv">계속하려면 비밀번호를 입력하세요.</p>
 {error_html}
 <form method="post" action="/login">
@@ -510,7 +510,7 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
 </p>
 <label class="checkbox" title="ffmpeg -probesize 32k -analyzeduration 0 -fflags +nobuffer — 곡 시작 지연 단축"><input type="checkbox" name="tweak_ffmpeg_fast_start" {t1}/> ① ffmpeg 빠른 시작 (probe/analyze 생략)</label>
 <label class="checkbox" title="ffmpeg -avioflags direct -flush_packets 1 — 파이프 즉시 flush"><input type="checkbox" name="tweak_ffmpeg_direct_output" {t2}/> ② ffmpeg 즉시 출력 (pipe flush)</label>
-<p class="kv">③ 작은 송신 버퍼 · ④ 낮은 패킷로스 힌트 · ⑤ 전용 송출 스레드 — songbird 엔진은 전용 스레드 페이싱이 기본이라 MK2 에서는 항상 적용된 것과 같아 토글이 없습니다.</p>
+<p class="kv">③ 작은 송신 버퍼 · ④ 낮은 패킷로스 힌트 · ⑤ 전용 송출 스레드 — songbird 엔진은 전용 스레드 페이싱이 기본이라 항상 적용된 것과 같아 토글이 없습니다.</p>
 <label class="field">송출 비트레이트 (kbps, 32–128 · 기본 96)</label><input type="number" name="voice_bitrate_kbps" min="32" max="128" value="{br}"/>
 </div>
 <div class="actions"><button class="btn btn-primary" type="submit">재생 설정 저장</button></div>
@@ -635,7 +635,7 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
     };
     let body = format!(
         r#"<h1 class="page-title">봇 설정</h1>
-<p class="page-sub">봇 본체가 읽는 botsettings.json입니다. MK2 에서는 읽기 전용 — 파일을 수정한 뒤 재시작하면 반영됩니다.</p>
+<p class="page-sub">봇 본체가 읽는 botsettings.json입니다. 읽기 전용 — 파일을 수정한 뒤 재시작하면 반영됩니다.</p>
 <div class="card"><h2>토큰 / 명령 등록</h2>
 <p class="kv">파일: {cfg}</p>
 <div class="diag-grid">
@@ -681,7 +681,7 @@ pub async fn sharedconfig_page(State(state): Ctx, cookies: Cookies) -> Response 
     let app = &state.app;
     let body = format!(
         r#"<h1 class="page-title">공용 설정</h1>
-<p class="page-sub">Bot · CLI · 웹/관리자가 공통으로 읽는 musicbot.runtime.json입니다. MK2 에서는 읽기 전용 — 파일을 수정한 뒤 재시작하면 반영됩니다.</p>
+<p class="page-sub">Bot · CLI · 웹/관리자가 공통으로 읽는 musicbot.runtime.json입니다. 읽기 전용 — 파일을 수정한 뒤 재시작하면 반영됩니다.</p>
 <div class="card"><h2>경로 / 소유자</h2>
 <p class="kv">파일: {file}</p>
 <div class="diag-grid">
@@ -1527,7 +1527,7 @@ pub async fn playlists_page(
     }
     let app = &state.app;
     let global = app.db.list_playlists(PlaylistScope::Global, None);
-    // C# Playlists 의 pl-row 구조: 이름 + ID/항목수 + 이름변경/삭제 폼. (MK2 추가: 항목 미리보기)
+    // 플레이리스트 행(pl-row): 이름 + ID/항목수 + 이름변경/삭제 폼 + 항목 미리보기.
     let render = |title: &str, lists: &[Playlist]| -> String {
         let items: String = lists
             .iter()

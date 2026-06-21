@@ -16,7 +16,7 @@ pub struct BotSettingsFile {
     pub tools_root: Option<String>,
     pub yt_dlp_path: Option<String>,
     pub ffmpeg_path: Option<String>,
-    /// Older MK2-only names are still accepted for local experiments.
+    /// Older alternate field names are still accepted for local experiments.
     pub bot_owner_user_id_override: Option<u64>,
     pub data_root_override: Option<String>,
     pub tools_root_override: Option<String>,
