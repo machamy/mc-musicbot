@@ -322,7 +322,6 @@ impl Coordinator {
             app: app.clone(),
             coordinator: self.clone(),
             guild_id,
-            generation,
         };
         let _ = handle.add_event(Event::Track(TrackEvent::End), end_handler);
         let err_handler = TrackErrorHandler {
@@ -554,32 +553,22 @@ struct TrackEndHandler {
     app: Arc<App>,
     coordinator: Arc<Coordinator>,
     guild_id: u64,
-    generation: u64,
 }
 
 #[serenity::async_trait]
 impl VoiceEventHandler for TrackEndHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        // 에러로 죽은 트랙은 Error 핸들러(이어재생)가 책임진다 — 여기서 advance 까지 하면
-        // 둘이 동시에 발동해 곡이 이중 전이되고 NowPlaying 도배가 난다 (2026-06-11 실측).
-        if let EventContext::Track(list) = ctx {
-            use songbird::tracks::PlayMode;
-            if list
-                .iter()
-                .any(|(s, _)| matches!(s.playing, PlayMode::Errored(_)))
-            {
-                return None;
-            }
-        }
-        // 이 핸들러를 등록한 세션(같은 세대)이 여전히 살아있을 때만 자연 종료로 처리한다.
-        // seek/replay 는 item_id 가 그대로라 옛 핸들의 stale End 가 item_id 로는 통과돼
-        // 곡을 한 칸 더 넘겨버렸다 — 세대 번호로 구분해 막는다. (스킵/교체도 새 세대라 자동 차단)
-        {
-            let sessions = self.coordinator.sessions.lock().await;
-            match sessions.get(&self.guild_id) {
-                Some(s) if s.generation == self.generation => {}
-                _ => return None,
-            }
+        use songbird::tracks::PlayMode;
+        let EventContext::Track(list) = ctx else {
+            return None;
+        };
+        // 곡이 "실제로 끝났을 때(End)"만 다음 곡으로 넘긴다. 곡 길이를 다 재생한 자연 종료는
+        // PlayMode::End 이고, seek/replay/skip/정지/교체로 인한 수동 중단은 PlayMode::Stop,
+        // 디코드/네트워크 실패는 PlayMode::Errored(이어재생 핸들러가 담당)다.
+        //   - Stop 을 무시 → seek/replay 시 멈춘 옛 핸들의 stale End 가 곡을 한 칸 더 넘기던 버그 방지.
+        //   - End 는 세션 식별과 무관하게 항상 처리 → 자연 종료가 안 넘어가 멈추던 회귀 방지(2026-06-21).
+        if !list.iter().any(|(s, _)| matches!(s.playing, PlayMode::End)) {
+            return None;
         }
         let state = self.app.player.advance(self.guild_id).await;
         self.app.log.info(
