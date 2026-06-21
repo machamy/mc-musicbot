@@ -125,11 +125,22 @@ cp botsettings.sample.json botsettings.json
 
 ### 6) 실행
 
+직접 실행:
+
 ```sh
-./target/release/musicbot-mk2
+./target/release/musicbot-mk2      # Windows: target\release\musicbot-mk2.exe
 ```
 
-콘솔에 `Registered N slash commands` / `Discord bot connected as ...`가 뜨면 성공입니다. Windows는 포터블 레이아웃에서 `scripts/START-MK2.cmd`로도 실행할 수 있습니다.
+또는 편의 스크립트로 — **그냥 시작** vs **업데이트 후 시작** 두 가지를 둡니다:
+
+| 목적 | Windows | Linux/macOS |
+|------|---------|-------------|
+| 그냥 시작 (업데이트 확인 X) | `scripts\run.cmd` | `scripts/run.sh` |
+| 최신 받아서 시작 (`git pull`→재빌드→시작) | `scripts\update-and-run.cmd` | `scripts/update-and-run.sh` |
+
+콘솔에 `Registered N slash commands` / `Discord bot connected as ...`가 뜨면 성공입니다.
+
+> **봇 업데이트 = 소스 갱신 후 재빌드**입니다. `update-and-run`이 `git pull` + `cargo build --release`를 해줍니다. (자동 정기 업데이트는 없음 — 셀프호스팅이라 직접 갱신합니다. 단, **`yt-dlp`는 봇이 자동으로 최신 유지**합니다.)
 
 ### 7) 웹 관리자 — 최초 비밀번호 설정
 
