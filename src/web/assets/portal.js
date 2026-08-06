@@ -834,8 +834,19 @@ function playlistCard(playlist) {
 
 /* ═══════════════════════ 중앙 스테이지 ═══════════════════════ */
 
+/** 재생 중인 곡이 없을 때 쓰는 자리표시 아트. 외부 요청 없이 인라인으로 그린다. */
+const ART_PLACEHOLDER =
+  'data:image/svg+xml;charset=utf-8,' +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240">' +
+      '<rect width="240" height="240" fill="none"/>' +
+      '<g fill="currentColor" opacity="0.22" transform="translate(88 78)">' +
+      '<path d="M60 0 22 9v46.5a19 19 0 1 0 8 15.5V21l30-7.2z"/>' +
+      '</g></svg>',
+  );
+
 function buildStage() {
-  el.nowArt = h('img', { class: 'now__art', alt: '앨범 아트', loading: 'eager' });
+  el.nowArt = h('img', { class: 'now__art', alt: '', loading: 'eager', src: ART_PLACEHOLDER });
   el.nowEyebrow = h('div', { class: 'now__eyebrow' });
   el.nowTitle = mqText('', 'now__title');
   el.nowBy = h('div', { class: 'now__by' });
@@ -981,7 +992,10 @@ function renderNow(state) {
   const connected = !!player.voiceChannelId;
 
   if (!current) {
-    el.nowArt.removeAttribute('src');
+    // src 를 지우면 브라우저가 alt 텍스트를 그대로 그려서 깨진 이미지처럼 보인다.
+    // 자리표시 SVG를 넣고 alt 는 비워 스크린리더에도 잡히지 않게 한다.
+    el.nowArt.setAttribute('src', ART_PLACEHOLDER);
+    el.nowArt.setAttribute('alt', '');
     el.nowArt.classList.add('now__art--idle');
     put(clear(el.nowEyebrow), h('span', { class: 'dot dot--offline' }), online ? '대기 중' : '봇 오프라인');
     el.nowTitle.firstElementChild.textContent = online ? '재생 중인 곡이 없다' : '봇이 꺼져 있다';
@@ -993,6 +1007,7 @@ function renderNow(state) {
     artColor('');
   } else {
     const art = artUrl(current.track);
+    el.nowArt.setAttribute('alt', '앨범 아트');
     el.nowArt.classList.remove('now__art--idle');
     if (el.nowArt.getAttribute('src') !== art) {
       el.nowArt.setAttribute('src', art);

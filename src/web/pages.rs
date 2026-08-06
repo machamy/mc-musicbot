@@ -688,6 +688,9 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
 <p class="kv">Discord Redirect URI: <code>{redirect_uri}</code></p>
 <p class="kv">요청 스코프: <code>identify guilds guilds.members.read</code></p>
 <p class="kv">저장 파일: <code>{oauth_path}</code> (Git/NAS 패키지 제외)</p>
+<label class="field" for="oauth-owner-ids">봇 주인 Discord 유저 ID (쉼표 구분)</label>
+<input id="oauth-owner-ids" type="text" name="owner_user_ids" inputmode="numeric" placeholder="예: 1234567890, 9876543210" value="{owner_user_ids}"/>
+<p class="kv">여기 등록된 사람은 리모컨에서 <strong>봇 주인</strong> 등급이 되어 배지·전용 컨트롤·운영 패널 링크를 받습니다. 저장 즉시 반영됩니다.</p>
 <label class="checkbox"><input type="checkbox" name="clear_secret"/> 저장된 Client Secret 제거</label>
 <div class="actions"><button class="btn btn-primary" type="submit">OAuth 설정 저장</button>
 <a class="btn btn-secondary" href="/music/login" target="_blank" rel="noopener">로그인 화면 열기</a></div>
@@ -723,6 +726,14 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
         client_id = html_escape(auth.client_id.as_deref().unwrap_or("")),
         secret_status = secret_status,
         public_base_url = html_escape(&auth.public_base_url),
+        owner_user_ids = html_escape(
+            &auth
+                .owner_user_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         redirect_uri = html_escape(&auth.redirect_uri()),
         oauth_path = html_escape(
             &crate::web::remote::RemoteAuthConfig::storage_path(&app.config.data_root)
@@ -738,6 +749,8 @@ pub struct OAuthSettingsForm {
     client_id: String,
     client_secret: Option<String>,
     public_base_url: String,
+    /// 봇 주인 Discord 유저 ID — 쉼표 구분. 리모컨의 `AccessTier::Owner` 판정 근거다.
+    owner_user_ids: Option<String>,
     clear_secret: Option<String>,
 }
 
@@ -807,13 +820,24 @@ pub async fn botsettings_oauth_post(
         .client_secret
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let owner_user_ids =
+        crate::web::remote::parse_owner_ids(form.owner_user_ids.as_deref().unwrap_or(""));
+    if owner_user_ids.len() > 20 {
+        return redirect_flash(
+            "/botsettings",
+            "봇 주인 ID는 최대 20개까지 등록할 수 있습니다.",
+            true,
+        );
+    }
     let current = state.remote_auth.read().unwrap().clone();
-    let next = current.updated(
-        client_id,
-        secret_update,
-        form.clear_secret.is_some(),
-        public_base_url,
-    );
+    let next = current
+        .updated(
+            client_id,
+            secret_update,
+            form.clear_secret.is_some(),
+            public_base_url,
+        )
+        .with_owner_user_ids(owner_user_ids.clone());
     if let Err(error) = next.save(&state.app.config.data_root) {
         state
             .app
@@ -822,7 +846,13 @@ pub async fn botsettings_oauth_post(
         return redirect_flash("/botsettings", &error, true);
     }
     let configured = next.configured();
+    let public_base_url = next.public_base_url.clone();
     *state.remote_auth.write().unwrap() = next;
+    // 봇 주인 판정은 App이 들고 있다 — 프로세스 재시작 없이 즉시 갱신한다.
+    if let Ok(mut owners) = state.app.owner_user_ids.write() {
+        *owners = owner_user_ids;
+    }
+    let _ = state.app.public_base_url.set(public_base_url);
     state.oauth_states.lock().unwrap().clear();
     state.remote_sessions.lock().unwrap().clear();
     state.app.log.info(

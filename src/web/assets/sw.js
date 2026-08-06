@@ -3,7 +3,8 @@
  * 반드시 `/music/sw.js` 로 서빙되어야 한다. 스코프가 스크립트 경로를 따라가므로
  * `/music/assets/sw.js` 에 두면 `/music/*` 를 못 잡는다. (사양서 §7.2 B13)
  *
- * 하는 일은 딱 하나: 정적 에셋(`/music/assets/*`)을 stale-while-revalidate 로 캐시한다.
+ * 하는 일은 딱 하나: 정적 에셋(`/music/assets/*`)을 오프라인 폴백용으로만 캐시한다.
+ * 평소에는 네트워크 우선이고, 서버가 ETag 로 재검증해 준다.
  * 하지 않는 일:
  *   - API 응답(`/music/api/*`)은 절대 캐시하지 않는다. 권한·정지 상태가 섞이면 사고다.
  *   - WebSocket(`/music/api/guilds/{id}/events`)은 fetch 이벤트로 오지도 않지만, 와도 통과시킨다.
@@ -74,7 +75,7 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.startsWith(API_PREFIX)) return;      // API·WS 는 절대 캐시하지 않는다
 
   if (url.pathname.startsWith(ASSET_PREFIX)) {
-    event.respondWith(staleWhileRevalidate(request));
+    event.respondWith(networkFirstAsset(request));
     return;
   }
 
@@ -85,25 +86,29 @@ self.addEventListener('fetch', (event) => {
 });
 
 /**
- * 정적 에셋: 캐시가 있으면 즉시 주고 뒤에서 갱신한다.
- * 에셋 URL 에는 `?v={build_id}` 가 붙으므로 같은 이름이라도 빌드가 다르면 다른 캐시 항목이 된다.
+ * 정적 에셋: 네트워크 우선, 실패하면 캐시.
+ *
+ * 예전에는 stale-while-revalidate 였는데, 그러면 "배포했는데 화면이 그대로"가 난다.
+ * 특히 `portal.js` 가 `./core.js` 를 정적 import 해서 그 요청에는 `?v=` 가 안 붙기 때문에
+ * 캐시 우선 전략에서는 core.js 가 영원히 낡은 채로 남는다.
+ *
+ * 서버가 ETag 로 재검증해 주므로 네트워크 우선이어도 대부분 304(본문 없음)라 비용이 거의 없다.
+ * 캐시는 오프라인 폴백 용도로만 남긴다.
  */
-async function staleWhileRevalidate(request) {
+async function networkFirstAsset(request) {
   const cache = await caches.open(CACHE_NAME);
-  const cached = await cache.match(request);
-
-  const network = fetch(request).then((response) => {
-    // opaque/에러 응답을 캐시에 넣으면 다음 로드가 통째로 깨진다.
+  try {
+    const response = await fetch(request);
+    // opaque/에러 응답을 캐시에 넣으면 다음 오프라인 로드가 통째로 깨진다.
     if (response && response.ok && response.type === 'basic') {
       cache.put(request, response.clone()).catch(() => {});
     }
     return response;
-  }).catch(() => null);
-
-  if (cached) return cached;
-  const fresh = await network;
-  if (fresh) return fresh;
-  return new Response('', { status: 504, statusText: 'offline' });
+  } catch {
+    const cached = await cache.match(request);
+    if (cached) return cached;
+    return new Response('', { status: 504, statusText: 'offline' });
+  }
 }
 
 /** 문서 요청: 네트워크가 죽었을 때만 오프라인 셸. 캐시된 HTML 을 되돌려주지 않는다(권한 화면이라 위험). */

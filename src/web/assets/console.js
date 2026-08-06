@@ -1471,18 +1471,16 @@ async function boot() {
   });
 
   // WS — 콘솔이 열려 있는 동안 정지/설정/접속 변화를 따라간다.
-  connect({
-    guildId: GUILD_ID,
-    csrf: M.csrf,
-    onEvent: (topic, data) => onRemoteEvent(topic, data),
+  // onEvent 는 core.js 가 처리하지 않은 토픽에만 오고, presence/settings/suspension/queue.set 은
+  // core.js 가 자체 머지한다. 콘솔은 그 토픽들도 봐야 하므로 모든 프레임을 주는 onAny 를 쓴다.
+  connect(GUILD_ID, {
+    onAny: (topic, data) => onRemoteEvent(topic, data),
   });
 
-  // 연결 끊김 표시는 core.js 스토어를 그대로 쓴다.
-  if (store && typeof store.subscribe === 'function') {
-    store.subscribe((next) => {
-      document.body.classList.toggle('is-offline', next && next.connected === false);
-    });
-  }
+  // 연결 끊김 표시는 core.js 스토어의 conn 값을 그대로 쓴다.
+  store.subscribe('conn', (next) => {
+    document.body.classList.toggle('is-offline', next.conn && next.conn !== 'live');
+  });
 }
 
 /** WS 이벤트 머지 — 전체 재조회는 하지 않는다 (성능 계약 §5.2 B). */

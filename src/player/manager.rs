@@ -4,10 +4,12 @@
 use crate::db::Db;
 use crate::logging::LogService;
 use crate::models::*;
-use crate::remote::RemoteStore;
-use crate::remote::ranking::{sort_queue, wait_score_targets};
+use crate::remote::ranking::{self, sort_queue, wait_score_targets};
+use crate::remote::{QueueSortMode, RemoteStore};
 use rand::seq::SliceRandom;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
@@ -19,6 +21,13 @@ pub struct PlayerManager {
     gate: Mutex<()>,
     previews: StdMutex<HashMap<u64, QueueItem>>,
     preview_inflight: StdMutex<HashSet<u64>>,
+    /// 길드별 대기열 정렬 모드 캐시. 정렬은 5초마다·모든 상태 변경마다 돌기 때문에
+    /// 매번 설정 JSON을 읽으면 유휴 상태에서도 쿼리가 계속 나간다(사양서 §5.2 H).
+    /// 웹이 모드를 바꾸면 `set_sort_mode`/`invalidate_sort_mode`로 갱신한다.
+    sort_modes: StdMutex<HashMap<u64, QueueSortMode>>,
+    /// 길드별 셔플 시드. 셔플은 별도 정렬 모드가 아니라 `Fifo` + 무작위 `original_order`이며
+    /// (사양서 §3.3), 그 무작위 순서를 시드 하나로 재현한다.
+    shuffle_seeds: StdMutex<HashMap<u64, u64>>,
 }
 
 /// `/재생` 응답의 ✖ 취소 버튼 결과 — 호출 측이 코디네이터를 어떻게 정리할지 결정한다.
@@ -40,6 +49,8 @@ impl PlayerManager {
             gate: Mutex::new(()),
             previews: StdMutex::new(HashMap::new()),
             preview_inflight: StdMutex::new(HashSet::new()),
+            sort_modes: StdMutex::new(HashMap::new()),
+            shuffle_seeds: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -181,31 +192,34 @@ impl PlayerManager {
         .await
     }
 
+    /// 다시 섞기. 시드를 새로 뽑으면 정렬이 그 시드대로 순서를 다시 만들어 준다.
     pub async fn shuffle(&self, guild_id: u64) -> GuildPlayerState {
+        self.reseed_shuffle(guild_id);
         self.mutate(
             guild_id,
             "Queue",
             &format!("Shuffled queue for guild {guild_id}."),
             |s| {
                 s.shuffle_enabled = true;
-                shuffle_upcoming(&mut s.upcoming);
             },
         )
         .await
     }
 
-    /// 셔플 모드 토글용. 켤 때만 대기열을 즉시 섞고, 끌 때는 플래그만 해제한다
-    /// (원래 순서는 복원하지 않음). 버튼이 셔플을 on/off 토글로 표시하므로 필요.
+    /// 셔플 모드 토글용. 켤 때 새 시드를 뽑고, 끌 때는 시드를 버려 등록 순서로 돌아간다.
+    /// 버튼이 셔플을 on/off 토글로 표시하므로 필요.
     pub async fn set_shuffle(&self, guild_id: u64, enabled: bool) -> GuildPlayerState {
+        if enabled {
+            self.reseed_shuffle(guild_id);
+        } else {
+            self.shuffle_seeds.lock().unwrap().remove(&guild_id);
+        }
         self.mutate(
             guild_id,
             "Queue",
             &format!("Shuffle {enabled} for guild {guild_id}."),
             |s| {
                 s.shuffle_enabled = enabled;
-                if enabled {
-                    shuffle_upcoming(&mut s.upcoming);
-                }
             },
         )
         .await
@@ -456,13 +470,13 @@ impl PlayerManager {
             &format!("Advanced playback for guild {guild_id}."),
             |s| {
                 if s.repeat_mode != RepeatMode::Track {
-                    let targets = wait_score_targets(&s.upcoming);
-                    let _ = self.remote.increment_wait_scores(&targets);
-                    self.sort_scored_queue(s);
                     if let Some(current) = &s.current_item {
+                        self.mark_played(guild_id, current);
                         let _ = self.remote.record_recent(guild_id, current, "completed");
                         let _ = self.remote.clear_item_runtime(&current.id);
                     }
+                    self.age_wait_scores(guild_id, s);
+                    self.sort_scored_queue(s);
                 }
                 advance_unsafe(s);
             },
@@ -477,13 +491,13 @@ impl PlayerManager {
             "Playback",
             &format!("Advanced playback for guild {guild_id}."),
             |s| {
-                let targets = wait_score_targets(&s.upcoming);
-                let _ = self.remote.increment_wait_scores(&targets);
-                self.sort_scored_queue(s);
                 if let Some(current) = &s.current_item {
+                    self.mark_played(guild_id, current);
                     let _ = self.remote.record_recent(guild_id, current, "skipped");
                     let _ = self.remote.clear_item_runtime(&current.id);
                 }
+                self.age_wait_scores(guild_id, s);
+                self.sort_scored_queue(s);
                 if let Some(cur) = s.current_item.take() {
                     if s.repeat_mode == RepeatMode::Queue {
                         s.cycle_history.push(clone_item(&cur));
@@ -744,6 +758,90 @@ impl PlayerManager {
         state
     }
 
+    /// 5초 주기 재정렬 태스크용(사양서 §3.3). 순서가 실제로 바뀐 길드만 저장하고 그 사실을 알린다.
+    /// 유휴 길드에서 쓰기 쿼리와 브로드캐스트가 발생하지 않아야 하므로(§5.2 H) 항상 저장하지 않는다.
+    pub async fn resort_if_changed(&self, guild_id: u64) -> bool {
+        let _g = self.gate.lock().await;
+        let eff = self.effective_settings(guild_id);
+        let mut state =
+            self.db
+                .load_guild_state(guild_id, eff.effective_volume, eff.autoplay_default);
+        if state.upcoming.len() < 2 {
+            return false; // 바꿀 순서가 없다 — 로드만 하고 끝낸다.
+        }
+        let before: Vec<String> = state.upcoming.iter().map(|i| i.id.clone()).collect();
+        self.prepare_scored_queue(&mut state);
+        let changed = state
+            .upcoming
+            .iter()
+            .map(|i| i.id.as_str())
+            .ne(before.iter().map(String::as_str));
+        if changed {
+            self.db.save_guild_state(&state);
+        }
+        changed
+    }
+
+    // ───────── 정렬 모드 ─────────
+
+    /// 길드의 정렬 모드. 캐시가 비었을 때만 설정 JSON을 읽는다.
+    pub fn sort_mode(&self, guild_id: u64) -> QueueSortMode {
+        if let Some(mode) = self.sort_modes.lock().unwrap().get(&guild_id) {
+            return *mode;
+        }
+        // 설정 조회는 remote 커넥션 뮤텍스를 잡으므로 캐시 락을 놓은 뒤에 읽는다.
+        let mode = self.remote.load_guild_settings(guild_id).sort_mode;
+        self.sort_modes.lock().unwrap().insert(guild_id, mode);
+        mode
+    }
+
+    /// 웹이 서버 관리 콘솔에서 모드를 저장한 직후 호출한다. 저장은 웹이 하고 여기선 캐시만 맞춘다.
+    pub fn set_sort_mode(&self, guild_id: u64, mode: QueueSortMode) {
+        self.sort_modes.lock().unwrap().insert(guild_id, mode);
+    }
+
+    /// 설정을 통째로 덮어써서 모드를 모를 때 쓰는 무효화. 다음 정렬에서 한 번만 DB를 읽는다.
+    pub fn invalidate_sort_mode(&self, guild_id: u64) {
+        self.sort_modes.lock().unwrap().remove(&guild_id);
+    }
+
+    /// 셔플 시드를 새로 뽑는다(= 다시 섞기).
+    fn reseed_shuffle(&self, guild_id: u64) {
+        self.shuffle_seeds
+            .lock()
+            .unwrap()
+            .insert(guild_id, rand::random::<u64>());
+    }
+
+    /// 셔플이 켜져 있는 동안 쓸 시드. 봇 재시작 등으로 비어 있으면 즉석에서 하나 뽑는다.
+    fn shuffle_seed(&self, guild_id: u64) -> u64 {
+        *self
+            .shuffle_seeds
+            .lock()
+            .unwrap()
+            .entry(guild_id)
+            .or_insert_with(rand::random::<u64>)
+    }
+
+    /// 점수제에서만 대기 점수를 올린다. 공평제는 대기 점수를 순서에 쓰지 않고(사양서 §3.1),
+    /// 시간제는 아예 점수를 보지 않으므로 곡 경계마다 쓰기 쿼리를 낼 이유가 없다.
+    fn age_wait_scores(&self, guild_id: u64, state: &GuildPlayerState) {
+        if self.sort_mode(guild_id) != QueueSortMode::Score {
+            return;
+        }
+        let targets = wait_score_targets(&state.upcoming);
+        let _ = self.remote.increment_wait_scores(&targets);
+    }
+
+    /// 곡 하나가 끝났음을 신청자에게 기록한다 — 대기 점수 0 초기화 + 마지막 재생 시각 갱신.
+    /// 공평제의 라운드는 이 시각으로 돌기 때문에, 빠지면 같은 사람 곡만 계속 나간다.
+    fn mark_played(&self, guild_id: u64, finished: &QueueItem) {
+        let Some(user_id) = finished.requested_by_user_id else {
+            return;
+        };
+        let _ = self.remote.mark_requester_played(guild_id, user_id);
+    }
+
     fn prepare_scored_queue(&self, state: &mut GuildPlayerState) {
         let mut items =
             Vec::with_capacity(state.upcoming.len() + usize::from(state.current_item.is_some()));
@@ -756,12 +854,38 @@ impl PlayerManager {
     }
 
     fn sort_scored_queue(&self, state: &mut GuildPlayerState) {
-        // 사용자가 명시적으로 셔플을 켠 동안에는 기존 셔플 순서를 존중한다.
+        // 셔플은 별도 모드가 아니라 `Fifo` + 무작위 `original_order`다(사양서 §3.3).
+        // 예전처럼 여기서 조기 반환하면 셔플을 켜는 순간 랭킹·수동 우선순위가 통째로 죽었다.
+        let mode = if state.shuffle_enabled {
+            QueueSortMode::Fifo
+        } else {
+            self.sort_mode(state.guild_id)
+        };
+        let mut scores = self.remote.queue_scores(state.guild_id);
         if state.shuffle_enabled {
-            return;
+            let seed = self.shuffle_seed(state.guild_id);
+            for (item_id, score) in scores.iter_mut() {
+                score.original_order = shuffled_order(seed, item_id);
+            }
         }
-        let scores = self.remote.queue_scores(state.guild_id);
-        sort_queue(&mut state.upcoming, &scores);
+
+        // 라운드는 정렬 입력이자 화면 표시값이다. 메모리에서 계산해 두고(쿼리 0회),
+        // 실제로 달라진 항목만 저장해 유휴 상태에서 쓰기 쿼리가 나가지 않게 한다.
+        let persisted: HashMap<String, i32> = scores
+            .iter()
+            .map(|(item_id, score)| (item_id.clone(), score.round))
+            .collect();
+        ranking::apply_rounds(&state.upcoming, &mut scores);
+        let stale: HashMap<String, i32> = scores
+            .iter()
+            .filter(|(item_id, score)| persisted.get(*item_id) != Some(&score.round))
+            .map(|(item_id, score)| (item_id.clone(), score.round))
+            .collect();
+        if !stale.is_empty() {
+            let _ = self.remote.save_queue_rounds(state.guild_id, &stale);
+        }
+
+        sort_queue(&mut state.upcoming, &scores, mode);
     }
 }
 
@@ -791,6 +915,16 @@ fn shuffle_upcoming(items: &mut Vec<QueueItem>) {
     items.shuffle(&mut rng);
 }
 
+/// 셔플 순서를 시드 하나로 재현한다. 같은 시드면 항상 같은 순서라 5초마다 재정렬해도
+/// 큐가 요동치지 않고, 뒤늦게 신청된 곡도 무작위 위치에 자연스럽게 끼어든다.
+fn shuffled_order(seed: u64, item_id: &str) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    item_id.hash(&mut hasher);
+    // 최상위 비트를 버려 항상 양수로 만든다(등록순 값과 같은 부호 영역에 둔다).
+    (hasher.finish() >> 1) as i64
+}
+
 fn advance_unsafe(state: &mut GuildPlayerState) {
     if state.current_item.is_some() && state.repeat_mode == RepeatMode::Track {
         return; // Track 반복: 같은 곡 재시작.
@@ -814,4 +948,169 @@ fn advance_unsafe(state: &mut GuildPlayerState) {
         state.upcoming.append(&mut next_cycle);
     }
     promote_if_idle(state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 실제 SQLite 두 개(레거시 Db + RemoteStore)를 같은 파일에 여는 운영 구성 그대로 만든다.
+    fn temp_player(tag: &str) -> (PlayerManager, Arc<RemoteStore>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("macham-player-{tag}-{}", uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("musicbot.sqlite");
+        let db = Arc::new(Db::open(&db_path).unwrap());
+        let remote = Arc::new(RemoteStore::open(&db_path).unwrap());
+        let log = Arc::new(LogService::new(root.join("logs")));
+        (PlayerManager::new(db, remote.clone(), log), remote, root)
+    }
+
+    fn cleanup(player: PlayerManager, remote: Arc<RemoteStore>, root: std::path::PathBuf) {
+        drop(player);
+        drop(remote);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 항목 id 를 곡 이름으로 고정해 단언문이 읽히게 한다.
+    fn user_item(content_id: &str, user_id: u64) -> QueueItem {
+        let mut item = QueueItem::new_user(
+            TrackRef {
+                provider: ProviderKind::YouTube,
+                content_id: content_id.into(),
+                source_url: format!("https://example.test/{content_id}"),
+                title: Some(content_id.into()),
+                artist: None,
+                duration: None,
+                variant_key: None,
+            },
+            format!("user-{user_id}"),
+            Some(user_id),
+        );
+        item.id = content_id.into();
+        item
+    }
+
+    fn queue_ids(state: &GuildPlayerState) -> Vec<&str> {
+        state.upcoming.iter().map(|item| item.id.as_str()).collect()
+    }
+
+    fn current_id(state: &GuildPlayerState) -> &str {
+        state
+            .current_item
+            .as_ref()
+            .map(|item| item.id.as_str())
+            .unwrap_or("")
+    }
+
+    /// 민수(1) 3곡 뒤에 지훈(2) 1곡. 공평제·점수제 테스트가 공유하는 시나리오.
+    async fn seed_two_requesters(player: &PlayerManager, guild_id: u64) {
+        for content_id in ["민수1", "민수2", "민수3"] {
+            player.enqueue(guild_id, user_item(content_id, 1), false).await;
+        }
+        player.enqueue(guild_id, user_item("지훈1", 2), false).await;
+    }
+
+    /// 공평제 라운드가 실제로 돈다 — 민수 곡이 하나 끝나면 아직 한 곡도 못 튼 지훈이 먼저 나간다.
+    /// `mark_requester_played` 가 빠지면 민수 곡만 끝까지 나가므로 이 테스트가 잡아낸다.
+    #[tokio::test]
+    async fn fair_mode_rotates_requesters_after_each_song() {
+        let (player, remote, root) = temp_player("fair");
+        let guild_id = 1;
+        player.set_sort_mode(guild_id, QueueSortMode::Fair);
+        seed_two_requesters(&player, guild_id).await;
+
+        let state = player.get_state(guild_id).await;
+        assert_eq!(current_id(&state), "민수1");
+        // 이미 1라운드가 적용된다: 민수의 2번째 곡(민수3)은 지훈의 1번째 곡 뒤로 밀린다.
+        // 아직 아무도 재생을 끝내지 않아 같은 라운드끼리는 등록순이다.
+        assert_eq!(queue_ids(&state), vec!["민수2", "지훈1", "민수3"]);
+
+        let state = player.advance(guild_id).await;
+        assert_eq!(
+            current_id(&state),
+            "지훈1",
+            "끝난 곡의 신청자를 기록하지 않으면 라운드가 영원히 안 돈다"
+        );
+        assert_eq!(queue_ids(&state), vec!["민수2", "민수3"]);
+
+        // 지훈도 한 곡 받았으니 다시 민수 차례.
+        let state = player.advance(guild_id).await;
+        assert_eq!(current_id(&state), "민수2");
+
+        // 공평제는 대기 점수를 순서에 쓰지 않으므로 곡 경계마다 점수를 올리지 않는다.
+        let scores = remote.queue_scores(guild_id);
+        assert!(scores.values().all(|score| score.wait_score == 0));
+        cleanup(player, remote, root);
+    }
+
+    /// "누구의 몇 번째 곡" 표시값이 정렬과 같은 계산에서 나와 응답 JSON까지 도달한다.
+    #[tokio::test]
+    async fn rounds_land_in_the_score_rows() {
+        let (player, remote, root) = temp_player("rounds");
+        let guild_id = 1;
+        player.set_sort_mode(guild_id, QueueSortMode::Fair);
+        seed_two_requesters(&player, guild_id).await;
+
+        let scores = remote.queue_scores(guild_id);
+        assert_eq!(scores["민수2"].round, 0);
+        assert_eq!(scores["민수3"].round, 1);
+        assert_eq!(scores["지훈1"].round, 0);
+        cleanup(player, remote, root);
+    }
+
+    /// 점수제는 기존 동작 유지 — 곡 경계마다 요청자별 맨 위 한 곡이 나이를 먹는다.
+    #[tokio::test]
+    async fn score_mode_still_ages_the_top_item_per_requester() {
+        let (player, remote, root) = temp_player("score");
+        let guild_id = 1;
+        player.set_sort_mode(guild_id, QueueSortMode::Score);
+        seed_two_requesters(&player, guild_id).await;
+
+        player.advance(guild_id).await;
+        let scores = remote.queue_scores(guild_id);
+        assert_eq!(scores["민수2"].wait_score, 1);
+        assert_eq!(scores["지훈1"].wait_score, 1);
+        assert_eq!(scores["민수3"].wait_score, 0, "요청자당 한 곡만 나이를 먹는다");
+        cleanup(player, remote, root);
+    }
+
+    /// 셔플을 켜도 랭킹이 죽지 않는다 — 예전에는 `sort_scored_queue` 가 조기 반환해
+    /// 수동 우선순위(관리자 강제 이동)까지 무시됐다.
+    #[tokio::test]
+    async fn shuffle_keeps_manual_priority_on_top_and_is_stable() {
+        let (player, remote, root) = temp_player("shuffle");
+        let guild_id = 1;
+        for content_id in ["a", "b", "c", "d", "e"] {
+            player.enqueue(guild_id, user_item(content_id, 1), false).await;
+        }
+        player.set_shuffle(guild_id, true).await;
+        player
+            .set_manual_priority(guild_id, "e", Some(1))
+            .await
+            .unwrap();
+
+        let state = player.get_state(guild_id).await;
+        assert_eq!(state.upcoming.first().map(|item| item.id.as_str()), Some("e"));
+        // 셔플 순서는 시드로 재현되므로 5초마다 재정렬해도 큐가 요동치지 않는다.
+        let again = player.get_state(guild_id).await;
+        assert_eq!(queue_ids(&state), queue_ids(&again));
+        cleanup(player, remote, root);
+    }
+
+    /// 정렬 모드 캐시가 비어 있으면 DB에서 한 번 읽고, 웹이 바꾸면 즉시 반영된다.
+    #[tokio::test]
+    async fn sort_mode_cache_reads_db_once_then_follows_the_web() {
+        let (player, remote, root) = temp_player("mode");
+        let guild_id = 1;
+        let mut settings = remote.load_guild_settings(guild_id);
+        settings.sort_mode = QueueSortMode::Fair;
+        remote.save_guild_settings(&settings).unwrap();
+
+        assert_eq!(player.sort_mode(guild_id), QueueSortMode::Fair);
+        player.set_sort_mode(guild_id, QueueSortMode::Fifo);
+        assert_eq!(player.sort_mode(guild_id), QueueSortMode::Fifo);
+        player.invalidate_sort_mode(guild_id);
+        assert_eq!(player.sort_mode(guild_id), QueueSortMode::Fair);
+        cleanup(player, remote, root);
+    }
 }

@@ -2,6 +2,7 @@
 //! 인증: 최초 접속 시 localhost 에서 비밀번호 설정 → SHA-256 해시를 data 디렉터리에 저장.
 //! `MUSICBOT_WEB_PASSWORD` 환경변수가 있으면 그 값으로 오버라이드(설정 파일보다 우선).
 
+pub mod assets;
 pub mod pages;
 pub mod remote;
 pub mod remote_page;
@@ -18,8 +19,9 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
 
@@ -103,6 +105,15 @@ pub struct WebState {
     pub remote_member_roles: Mutex<HashMap<(u64, u64), (Instant, Vec<u64>)>>,
     /// 주요 사용자 동작의 마지막 요청 시각. 연타와 자동화 오용을 완화한다.
     pub remote_action_rate: Mutex<HashMap<(u64, u64, &'static str), Instant>>,
+    /// 접속 레지스트리 — `(guild_id, user_id)` → 열려 있는 WebSocket 수. **DB를 쓰지 않는다.**
+    pub presence: Mutex<HashMap<(u64, u64), usize>>,
+    /// 길드별 presence 브로드캐스트 게이트 — `(마지막 송신, 예약됨)`. 최대 초당 1회로 코얼레싱한다.
+    pub presence_gate: Mutex<HashMap<u64, (Instant, bool)>>,
+    /// 재생 변화를 감시 중인 길드. 보는 사람이 있을 때만 길드당 하나가 돈다.
+    pub guild_watchers: Mutex<HashSet<u64>>,
+    /// S5: Discord/LRCLIB 호출에 재사용하는 공유 HTTP 클라이언트.
+    /// 요청마다 `Client::new()`를 하면 커넥션 풀과 TLS 세션이 매번 버려진다.
+    pub http_client: OnceLock<reqwest::Client>,
 }
 
 /// 비밀번호 해시 저장 파일 (data 디렉터리, gitignore 대상).
@@ -151,6 +162,16 @@ pub async fn serve(app: Arc<App>) {
         );
     }
     let (remote_events, _) = broadcast::channel(256);
+    let remote_auth = remote::RemoteAuthConfig::load(&app.config.data_root);
+
+    // `/리모컨` 슬래시 명령이 링크를 만들 때 읽는다. 미설정이면 명령이 안내만 한다.
+    let _ = app.public_base_url.set(remote_auth.public_base_url.clone());
+    // 봇 주인 판정(AccessTier::Owner)의 근거. 운영 패널에서 저장하면 즉시 갱신된다.
+    if let Ok(mut owners) = app.owner_user_ids.write() {
+        *owners = remote_auth.owner_user_ids.clone();
+    }
+    remote::mark_started();
+
     let state = Arc::new(WebState {
         app: app.clone(),
         password_hash: Mutex::new(initial_hash),
@@ -160,11 +181,26 @@ pub async fn serve(app: Arc<App>) {
         remote_sessions: Mutex::new(HashMap::new()),
         oauth_states: Mutex::new(HashMap::new()),
         remote_events,
-        remote_auth: RwLock::new(remote::RemoteAuthConfig::load(&app.config.data_root)),
+        remote_auth: RwLock::new(remote_auth),
         remote_chat_rate: Mutex::new(HashMap::new()),
         remote_member_roles: Mutex::new(HashMap::new()),
         remote_action_rate: Mutex::new(HashMap::new()),
+        presence: Mutex::new(HashMap::new()),
+        presence_gate: Mutex::new(HashMap::new()),
+        guild_watchers: Mutex::new(HashSet::new()),
+        http_client: OnceLock::new(),
     });
+
+    spawn_sweeper(state.clone());
+
+    // 5초 재정렬 루프가 순서를 바꾸면 그 결과를 WS로 밀어 준다.
+    // 이 훅을 안 걸면 대기열이 조용히 재정렬되기만 하고 화면은 안 움직인다.
+    {
+        let hook_state = state.clone();
+        let _ = app.on_queue_sorted.set(Box::new(move |guild_id| {
+            remote::spawn_queue_broadcast(&hook_state, guild_id);
+        }));
+    }
 
     let router = Router::new()
         .route("/", get(pages::index))
@@ -227,6 +263,47 @@ pub async fn serve(app: Arc<App>) {
             .log
             .error("Web", &format!("web bind failed ({addr}): {e}")),
     }
+}
+
+/// S8: `oauth_states`에 스위퍼가 없어 취소된 로그인 시도가 계속 쌓였다.
+/// 같은 태스크에서 만료 세션·역할 캐시·레이트리밋 흔적도 함께 걷어낸다.
+fn spawn_sweeper(state: Arc<WebState>) {
+    const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+    const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+    const ROLE_CACHE_KEEP: Duration = Duration::from_secs(6 * 60 * 60);
+    const RATE_KEEP: Duration = Duration::from_secs(10 * 60);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+            state
+                .oauth_states
+                .lock()
+                .unwrap()
+                .retain(|_, issued| issued.elapsed() < OAUTH_STATE_TTL);
+            state
+                .remote_member_roles
+                .lock()
+                .unwrap()
+                .retain(|_, (seen, _)| seen.elapsed() < ROLE_CACHE_KEEP);
+            state
+                .remote_action_rate
+                .lock()
+                .unwrap()
+                .retain(|_, seen| seen.elapsed() < RATE_KEEP);
+            state
+                .remote_chat_rate
+                .lock()
+                .unwrap()
+                .retain(|_, seen| seen.elapsed() < RATE_KEEP);
+            state.presence.lock().unwrap().retain(|_, count| *count > 0);
+            if let Err(error) = state.app.remote.prune_sessions() {
+                state
+                    .app
+                    .log
+                    .warn("Web", &format!("만료 세션 정리 실패: {error}"));
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -343,6 +420,8 @@ nav{display:flex;flex-direction:column;gap:10px;flex:1}
 .nav-item{display:flex;flex-direction:column;gap:4px;text-decoration:none;color:#fff;background:#1F2937;border:1px solid #334155;border-radius:10px;padding:12px 14px;transition:background .15s,border-color .15s}
 .nav-item:hover{background:#273449}
 .nav-item.active{background:#1D4ED8;border-color:#3B82F6}
+.nav-remote{background:#4C1D95;border-color:#7C3AED;margin-bottom:14px}
+.nav-remote:hover{background:#5B21B6}
 .nav-title{font-size:15px;font-weight:600}
 .nav-desc{font-size:12px;color:#CBD5E1}
 .logout{margin-top:16px}
@@ -462,6 +541,7 @@ pub fn layout(state: &WebState, title: &str, active: &str, body: &str) -> Html<S
 <aside class="sidebar">
   <div class="brand"><div class="brand-title">mc-musicbot</div></div>
   <div class="brand-sub">Discord 음악봇 운영 패널 · Rust 엔진</div>
+  <a class="nav-item nav-remote" href="/music" target="_blank" rel="noopener"><span class="nav-title">리모컨 열기 →</span><span class="nav-desc">사용자 화면(마참뮤직)으로 이동</span></a>
   <nav>{nav}</nav>
   <form class="logout" method="post" action="/Logout"><button type="submit" class="btn btn-secondary" style="width:100%">로그아웃</button></form>
   <div class="brand-build" title="현재 실행 중인 빌드 ID.">build {build}</div>

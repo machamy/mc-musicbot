@@ -1150,3 +1150,126 @@ body { overflow: hidden; }
 /* 연결 끊김이면 조작 영역 전체를 눌러 보이게 한다 */
 .portal[data-conn="down"] .stage,
 .portal[data-conn="down"] .rail { filter: grayscale(0.4); }
+
+/* ═══════════════════════ 게이트 화면 ═══════════════════════
+ * 로그인 · 서버 선택 · 접근 거부. remote_page.rs 의 plain() 셸이 쓰는 클래스들이다.
+ * 스크립트 없이 서버가 그대로 그리는 화면이라 여기서만 스타일을 잡는다.
+ */
+
+body.gate {
+  display: grid;
+  place-items: center;
+  min-height: 100dvh;
+  padding: var(--sp-6);
+  background:
+    radial-gradient(90% 70% at 50% -10%, var(--accent-soft), transparent 62%),
+    var(--surface-0);
+}
+
+.gate__wrap { width: 100%; display: grid; place-items: center; }
+
+.gate__card {
+  width: 100%;
+  max-width: 380px;
+  padding: var(--sp-8) var(--sp-6) var(--sp-6);
+  background: var(--surface-1);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-xl);
+  box-shadow: var(--shadow-3);
+  text-align: center;
+}
+.gate__card--wide { max-width: 520px; }
+
+.gate__logo {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto var(--sp-4);
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-lg);
+  background: linear-gradient(150deg, var(--accent), var(--accent-press));
+  box-shadow: 0 10px 28px var(--accent-glow);
+  color: var(--text-on-accent);
+  font-size: 26px;
+  line-height: 1;
+}
+
+.gate__card h1 {
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-2xl);
+  letter-spacing: -0.02em;
+}
+
+.gate__lead {
+  margin-bottom: var(--sp-5);
+  color: var(--text-3);
+  font-size: var(--fs-md);
+  line-height: var(--lh-base);
+}
+
+.gate__note {
+  margin-bottom: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-base);
+  text-align: left;
+}
+.gate__note strong { color: var(--text-1); }
+
+/* 서버 목록 */
+.gate__guilds { display: grid; gap: var(--sp-2); margin-bottom: var(--sp-4); }
+.gate__guild {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  background: var(--surface-2);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-md);
+  color: var(--text-1);
+  font-weight: var(--fw-medium);
+  text-align: left;
+  transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease),
+              transform var(--t-fast) var(--ease);
+}
+.gate__guild:hover {
+  background: var(--surface-3);
+  border-color: var(--accent-line);
+  text-decoration: none;
+  transform: translateY(-1px);
+}
+/* 아이콘은 <img class="ava"> 이거나 <span class="ava ava--fallback">🎵</span> 다.
+ * span 을 통째로 잡으면 아이콘 자리표시까지 늘어나므로 이름 span 만 잡는다. */
+.gate__guild .ava {
+  width: 34px; height: 34px;
+  flex: none;
+  border-radius: var(--r-sm);
+}
+.ava--fallback {
+  display: grid;
+  place-items: center;
+  background: var(--surface-4);
+  font-size: 16px;
+  line-height: 1;
+}
+.gate__guild > span:last-child {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 보조 동작(로컬 입장·로그아웃)은 본 동작과 시각적으로 떨어뜨린다 */
+.gate__dev { margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--line-1); }
+
+.gate__foot { margin-top: var(--sp-4); color: var(--text-4); font-size: var(--fs-xs); line-height: var(--lh-base); }
+
+@media (max-width: 460px) {
+  body.gate { padding: var(--sp-4); }
+  .gate__card { padding: var(--sp-6) var(--sp-4) var(--sp-5); }
+}

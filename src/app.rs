@@ -11,14 +11,19 @@ use crate::models::TrackRef;
 use crate::player::autoplay::AutoplayEngine;
 use crate::player::coordinator::Coordinator;
 use crate::player::manager::PlayerManager;
-use crate::remote::RemoteStore;
+use crate::remote::{RemoteStore, RetentionConfig};
 use serde::Serialize;
 use serenity::cache::Cache;
 use serenity::http::Http;
 use songbird::Songbird;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// 대기열 재정렬 주기 (사양서 §3.3 — 10초에서 단축).
+const QUEUE_SORT_INTERVAL: Duration = Duration::from_secs(5);
+/// 보존 정리 주기 (사양서 B16) — 기동 직후 1회 + 24시간마다.
+const RETENTION_PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// `/검색` 후보 묶음 — 셀렉트 메뉴 선택 시 인덱스로 되찾는다.
 /// custom_id 에 트랙 전체를 담을 수 없어(100자 제한) 토큰으로 서버에 보관한다.
@@ -75,6 +80,10 @@ pub struct App {
     pub intent_status: RwLock<IntentStatus>,
     /// 봇 주인 Discord 유저 ID 목록 (remote-oauth.json 의 ownerUserIds). 웹이 기동 시 채운다.
     pub owner_user_ids: RwLock<Vec<u64>>,
+    /// 5초 재정렬 태스크가 대기열 순서를 실제로 바꿨을 때 부르는 훅 (인자: guild_id).
+    /// 웹이 `web::serve()`에서 걸어 두면 `queue.set` 이벤트를 그때만 broadcast 할 수 있다.
+    /// 비어 있으면 정렬만 하고 아무도 깨우지 않는다.
+    pub on_queue_sorted: OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
     /// 길드별 마지막 명령 채널 (현재 재생 중 알림 대상).
     pub announce_channels: Mutex<HashMap<u64, u64>>,
     /// 길드별 직전 Now-Playing 메시지 (채널, 메시지) — 새 카드 전송 시 이전 카드 버튼 제거용.
@@ -118,7 +127,7 @@ impl App {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "dev".to_string());
 
-        Arc::new(App {
+        let app = Arc::new(App {
             config,
             db,
             log,
@@ -134,12 +143,25 @@ impl App {
             public_base_url: OnceLock::new(),
             intent_status: RwLock::new(IntentStatus::default()),
             owner_user_ids: RwLock::new(Vec::new()),
+            on_queue_sorted: OnceLock::new(),
             announce_channels: Mutex::new(HashMap::new()),
             last_np_message: Mutex::new(HashMap::new()),
             pending_leaves: Mutex::new(HashMap::new()),
             search_sessions: Mutex::new(HashMap::new()),
             build_id,
-        })
+        });
+        app.spawn_background_tasks();
+        app
+    }
+
+    /// 재생·웹과 무관하게 계속 도는 잡무들. 런타임 밖에서 App 을 만들면(테스트 등)
+    /// tokio::spawn 이 패닉하므로 런타임이 있을 때만 띄운다.
+    fn spawn_background_tasks(self: &Arc<App>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(queue_sort_loop(self.clone()));
+        tokio::spawn(retention_prune_loop(self.clone()));
     }
 
     /// 전역 설정 기준 최신 yt-dlp 래퍼 (브라우저 프로필/쿠키 변경 즉시 반영).
@@ -149,6 +171,48 @@ impl App {
             exe: self.config.yt_dlp_path.clone(),
             browser_profile: global.preferred_browser_profile,
             cookie_file: global.cookie_file_path,
+        }
+    }
+}
+
+/// 대기열 재정렬 루프. 순서가 실제로 바뀐 길드만 저장되고 훅이 불린다.
+/// 길드 하나를 처리할 때마다 양보해 재생 경로가 게이트를 오래 기다리지 않게 한다.
+async fn queue_sort_loop(app: Arc<App>) {
+    let mut ticker = tokio::time::interval(QUEUE_SORT_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        for guild_id in app.db.list_known_guild_ids() {
+            if app.player.resort_if_changed(guild_id).await
+                && let Some(hook) = app.on_queue_sorted.get()
+            {
+                hook(guild_id);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+/// 보존 정리 루프 (사양서 B16). 첫 tick 은 즉시 발화하므로 기동 시 1회가 자동으로 포함된다.
+/// 길드별 `chat_retention_days`·`audit_retention_days` 는 `prune_all` 이 직접 읽어 반영한다.
+/// 아무것도 안 지웠으면 로그를 남기지 않는다 — 하루 한 줄이라도 의미 없는 줄은 소음이다.
+async fn retention_prune_loop(app: Arc<App>) {
+    let mut ticker = tokio::time::interval(RETENTION_PRUNE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        match app.remote.prune_all(RetentionConfig::default()) {
+            Ok(report) if report.is_empty() => {}
+            Ok(report) => app.log.info(
+                "Remote",
+                &format!(
+                    "보존 정리 완료: 채팅 {}건, 최근재생 {}건, 활동로그 {}건, 가사실패 {}건, 만료세션 {}건 삭제.",
+                    report.chat, report.recent, report.audit, report.lyrics, report.sessions
+                ),
+            ),
+            Err(error) => app
+                .log
+                .warn("Remote", &format!("보존 정리 실패: {error}")),
         }
     }
 }

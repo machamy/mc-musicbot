@@ -219,6 +219,11 @@ img, svg, canvas { display: block; max-width: 100%; }
 }
 *::-webkit-scrollbar-thumb:hover { background: var(--line-3); background-clip: content-box; }
 
+/* hidden 속성이 항상 이기게 한다.
+ * 브라우저 기본 [hidden]{display:none} 은 클래스의 display 선언에 밀린다.
+ * (예: .warnbox{display:flex} 가 hidden 을 무력화해 경고가 늘 떠 있었다.) */
+[hidden] { display: none !important; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
@@ -270,6 +275,7 @@ img, svg, canvas { display: block; max-width: 100%; }
 .btn--sm { height: 27px; padding: 0 var(--sp-3); font-size: var(--fs-sm); }
 .btn--icon { width: 34px; padding: 0; }
 .btn--icon.btn--sm { width: 27px; }
+.btn--wide { width: 100%; height: 40px; font-size: var(--fs-base); }
 
 .field {
   width: 100%;

@@ -9,9 +9,11 @@
 //! 하위 디렉터리에 두면 `/music/*`를 제어하지 못한다.
 
 use axum::body::Body;
-use axum::extract::Path;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{Path, Query};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 // ── CSS ──
 const TOKENS_CSS: &str = include_str!("assets/tokens.css");
@@ -30,6 +32,37 @@ const FAVICON_SVG: &str = include_str!("assets/favicon.svg");
 const ICON_192: &[u8] = include_bytes!("assets/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("assets/icon-512.png");
 const ICON_180: &[u8] = include_bytes!("assets/icon-180.png");
+
+/// 에셋 전체 내용에서 뽑은 짧은 버전 문자열. 페이지 셸이 `?v=`에 쓴다.
+///
+/// `BUILD_ID.txt`는 포터블 배포본에만 있고 개발 중에는 비어 있다. 빈 `?v=`와
+/// `Cache-Control: immutable`이 겹치면 브라우저가 옛 에셋을 영원히 붙들어
+/// "배포했는데 화면이 그대로"가 된다. 내용에서 버전을 뽑으면 파일이 실제로
+/// 바뀔 때만 URL이 바뀌고, 안 바뀌면 캐시가 그대로 살아 있다.
+pub fn version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        for text in [
+            TOKENS_CSS,
+            PORTAL_CSS,
+            CONSOLE_CSS,
+            CORE_JS,
+            PORTAL_JS,
+            CONSOLE_JS,
+            SW_JS,
+            MANIFEST,
+            FAVICON_SVG,
+        ] {
+            hasher.update(text.as_bytes());
+        }
+        for bytes in [ICON_192, ICON_512, ICON_180] {
+            hasher.update(bytes);
+        }
+        hex_16(&hasher.finalize())
+    })
+}
 
 /// 에셋 본문과 MIME.
 enum Asset {
@@ -73,15 +106,40 @@ fn hex_16(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn respond(body: Vec<u8>, mime: &'static str, immutable: bool) -> Response {
+/// 응답 캐시 정책.
+///
+/// `immutable`은 **URL이 진짜로 내용 주소일 때만** 안전하다.
+/// `portal.js`가 `./core.js`를 정적 import 하기 때문에 그 요청에는 `?v=`가 붙지 않는다.
+/// 거기에 1년 immutable을 걸면 core.js가 영원히 갱신되지 않는다.
+/// 그래서 `?v=`가 현재 에셋 버전과 정확히 일치할 때만 immutable을 준다.
+fn cache_policy(query_version: Option<&str>) -> &'static str {
+    match query_version {
+        Some(value) if value == version() => "public, max-age=31536000, immutable",
+        // 그 외에는 매번 재검증. 본문 없는 304라 비용이 거의 없다.
+        _ => "no-cache",
+    }
+}
+
+fn respond(
+    body: Vec<u8>,
+    mime: &'static str,
+    cache: &'static str,
+    if_none_match: Option<&str>,
+) -> Response {
     let etag = etag_of(&body);
-    let cache = if immutable {
-        // build_id가 쿼리에 붙으므로 내용이 바뀌면 URL도 바뀐다.
-        "public, max-age=31536000, immutable"
-    } else {
-        // 서비스워커와 매니페스트는 갱신이 보여야 한다.
-        "no-cache"
-    };
+
+    // 재검증 요청이면 본문을 보내지 않는다.
+    if if_none_match.is_some_and(|value| value.split(',').any(|tag| tag.trim() == etag)) {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        let headers = response.headers_mut();
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+        if let Ok(value) = HeaderValue::from_str(&etag) {
+            headers.insert(header::ETAG, value);
+        }
+        return response;
+    }
+
     let mut response = Response::new(Body::from(body));
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
@@ -96,31 +154,43 @@ fn respond(body: Vec<u8>, mime: &'static str, immutable: bool) -> Response {
     response
 }
 
+fn header_str<'a>(headers: &'a HeaderMap, name: header::HeaderName) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
 /// `GET /music/assets/{name}`
-pub async fn serve_asset(Path(name): Path<String>) -> Response {
+pub async fn serve_asset(
+    Path(name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let cache = cache_policy(query.get("v").map(String::as_str));
+    let inm = header_str(&headers, header::IF_NONE_MATCH);
     // 경로 조작 방지 — 이름은 화이트리스트 조회로만 해석한다.
     match lookup(&name) {
-        Some(Asset::Text(body, mime)) => respond(body.as_bytes().to_vec(), mime, true),
-        Some(Asset::Bytes(body, mime)) => respond(body.to_vec(), mime, true),
+        Some(Asset::Text(body, mime)) => respond(body.as_bytes().to_vec(), mime, cache, inm),
+        Some(Asset::Bytes(body, mime)) => respond(body.to_vec(), mime, cache, inm),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 
 /// `GET /music/sw.js` — 스코프 때문에 반드시 `/music` 바로 아래에서 서빙한다.
-pub async fn serve_service_worker() -> Response {
+pub async fn serve_service_worker(headers: HeaderMap) -> Response {
     respond(
         SW_JS.as_bytes().to_vec(),
         "text/javascript; charset=utf-8",
-        false,
+        "no-cache",
+        header_str(&headers, header::IF_NONE_MATCH),
     )
 }
 
 /// `GET /music/manifest.webmanifest`
-pub async fn serve_manifest() -> Response {
+pub async fn serve_manifest(headers: HeaderMap) -> Response {
     respond(
         MANIFEST.as_bytes().to_vec(),
         "application/manifest+json; charset=utf-8",
-        false,
+        "no-cache",
+        header_str(&headers, header::IF_NONE_MATCH),
     )
 }
 

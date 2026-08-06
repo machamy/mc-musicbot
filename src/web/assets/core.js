@@ -904,6 +904,12 @@ const RECONNECT_MAX = 15000;
 const CHAT_CAP = 400;
 
 export function connect(guildId, handlers = {}) {
+  // connect(guildId, handlers) 와 connect({ guildId, ...handlers }) 둘 다 받는다.
+  // 후자로 부르면 guildId 자리에 객체가 들어와 URL이 [object Object]가 된다.
+  if (guildId && typeof guildId === 'object') {
+    handlers = guildId;
+    guildId = handlers.guildId;
+  }
   const id = guildId || ctx.guildId;
   let socket = null;
   let attempt = 0;
