@@ -12,11 +12,12 @@ use crate::player::autoplay::AutoplayEngine;
 use crate::player::coordinator::Coordinator;
 use crate::player::manager::PlayerManager;
 use crate::remote::RemoteStore;
+use serde::Serialize;
 use serenity::cache::Cache;
 use serenity::http::Http;
 use songbird::Songbird;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 /// `/검색` 후보 묶음 — 셀렉트 메뉴 선택 시 인덱스로 되찾는다.
@@ -24,6 +25,31 @@ use std::time::Instant;
 pub struct SearchSession {
     pub candidates: Vec<TrackRef>,
     pub created: Instant,
+}
+
+/// 특권 게이트웨이 인텐트 가용 여부 — 웹(멤버 목록·온라인 상태)이 표시를 축소할 근거.
+/// 개발자 포털에서 꺼져 있으면 serenity 연결이 거부되므로 main.rs 가 인텐트를 빼고
+/// 재접속하면서 여기에 사실을 기록한다.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentStatus {
+    /// Server Members Intent (GUILD_MEMBERS) — 길드 멤버 전체 목록.
+    pub members: bool,
+    /// Presence Intent (GUILD_PRESENCES) — 온라인/자리비움 상태.
+    pub presences: bool,
+    /// 축소된 이유 (정상이면 None).
+    pub degraded_reason: Option<String>,
+}
+
+impl Default for IntentStatus {
+    /// 기동 시엔 특권 인텐트를 요청한 상태로 본다 — 거부되면 재접속 루프가 즉시 false 로 낮춘다.
+    fn default() -> Self {
+        IntentStatus {
+            members: true,
+            presences: true,
+            degraded_reason: None,
+        }
+    }
 }
 
 pub struct App {
@@ -42,6 +68,13 @@ pub struct App {
     pub http: OnceLock<Arc<Http>>,
     /// OAuth 사용자의 현재 길드 역할·음성 채널을 서버 측에서 재검증할 Discord 캐시.
     pub discord_cache: OnceLock<Arc<Cache>>,
+    /// 웹 리모컨 공개 주소 (`RemoteAuthConfig.public_base_url`, 끝 슬래시 없음).
+    /// `web::serve()` 가 채우고 `/리모컨` 명령이 링크를 만들 때 읽는다. 미설정이면 안내만 한다.
+    pub public_base_url: OnceLock<String>,
+    /// 특권 인텐트 가용 여부 — 기동/재접속 시 main.rs 가 갱신한다.
+    pub intent_status: RwLock<IntentStatus>,
+    /// 봇 주인 Discord 유저 ID 목록 (remote-oauth.json 의 ownerUserIds). 웹이 기동 시 채운다.
+    pub owner_user_ids: RwLock<Vec<u64>>,
     /// 길드별 마지막 명령 채널 (현재 재생 중 알림 대상).
     pub announce_channels: Mutex<HashMap<u64, u64>>,
     /// 길드별 직전 Now-Playing 메시지 (채널, 메시지) — 새 카드 전송 시 이전 카드 버튼 제거용.
@@ -98,6 +131,9 @@ impl App {
             songbird: OnceLock::new(),
             http: OnceLock::new(),
             discord_cache: OnceLock::new(),
+            public_base_url: OnceLock::new(),
+            intent_status: RwLock::new(IntentStatus::default()),
+            owner_user_ids: RwLock::new(Vec::new()),
             announce_channels: Mutex::new(HashMap::new()),
             last_np_message: Mutex::new(HashMap::new()),
             pending_leaves: Mutex::new(HashMap::new()),

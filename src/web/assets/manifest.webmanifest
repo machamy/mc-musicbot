@@ -1,0 +1,42 @@
+{
+  "name": "마참뮤직",
+  "short_name": "마참뮤직",
+  "description": "Discord 음성 채널에서 같이 듣는 음악을 웹에서 조작하는 리모컨.",
+  "lang": "ko",
+  "dir": "ltr",
+  "id": "/music",
+  "start_url": "/music",
+  "scope": "/music",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#07090f",
+  "theme_color": "#0d111a",
+  "categories": ["music", "entertainment", "social"],
+  "icons": [
+    {
+      "src": "/music/assets/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/music/assets/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/music/assets/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/music/assets/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

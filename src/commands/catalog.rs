@@ -403,6 +403,21 @@ pub const ALL: &[CommandDef] = &[
         canonical: "leave",
     },
     CommandDef {
+        name: "remote",
+        description: "웹 리모컨 주소를 나만 보이게 알려 줍니다.",
+        canonical: "remote",
+    },
+    CommandDef {
+        name: "리모컨",
+        description: "웹 리모컨 주소를 나만 보이게 알려 줍니다.",
+        canonical: "remote",
+    },
+    CommandDef {
+        name: "ㄹㅁㅋ",
+        description: "리모컨 명령의 초성 별칭입니다.",
+        canonical: "remote",
+    },
+    CommandDef {
         name: "status",
         description: "봇 버전과 현재 재생/전역 설정을 보여 줍니다.",
         canonical: "status",
