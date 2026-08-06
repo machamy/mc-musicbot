@@ -39,6 +39,8 @@
 | 19b | 여러 곡 한번에 담을 때 사람 피드 도배 금지(합치기+펼치기) | §13.3 | ⬜ |
 | 20 | 다음 곡 미리 보여주기 (대기열/자동추천) | §14 | ⬜ |
 | 21 | 차트에서 곡 담기 (YT뮤직·SoundCloud·노래방, 2단계 UI) | §15 | ⬜ |
+| 21b | **우리 서버 차트 · 봇 전체 차트** — 많이 튼 곡 + 많이 사랑받은 곡, 자동재생 제외 | §15.2b | ⬜ |
+| 16c | 슈퍼 좋아요 쿨타임 · 하루 횟수 제한 | §10.6 | ⬜ |
 | 22 | 전부 담기 권한 `bulkEnqueue` (재생목록+차트) | §15.4 | ⬜ |
 | 23 | **[버그] 봇이 음성채널에 없는데 있다고 나옴** | §16 B1 | ⬜ |
 | 24 | **[버그] 내 메시지에 이모지·답장 안 됨** | §16 B2 | ⬜ |
@@ -52,6 +54,8 @@
 | 32 | **개인 통계** (담은 곡·재생·받은 반응·비율·상위 목록·30일 그래프) | §22 | ⬜ |
 | 33 | 통계 전용 DB 분리 (`musicbot-stats.sqlite`) + 비동기 쓰기 | §22.1~22.2 | ⬜ |
 | 34 | 마참 점수 (받은 추천 누적, 순서에는 영향 없음) | §22.4 | ⬜ |
+| 35 | **모든 숫자 설정에 무제한(0) 지원** + 서버 클램프 제거 | §23.1 | ⬜ |
+| 36 | **랙 없는 웹 UI · 가벼운 서버** (합격 기준) | §23.2 | ⬜ |
 
 **권한 10종** (§1의 `rule_role_ids` 키):
 `search` `vote` `chat` `playback` `skip` `seek` `volume` `queueEdit` `autoplay` `bulkEnqueue` + 관리자(`managerRoleIds`) — **11종**
@@ -651,6 +655,46 @@ pub enum VoteSkipBasis { Listeners, Viewers, Either, Both }
 - 즉시 스킵 권한이 있는 사람에게는 **`⏭ 바로 넘기기`** 로 보이고 툴팁에 `관리자라서 투표 없이 넘어가요`.
 - 활동 로그: `playback.skip` → `{누구}님이 곡을 넘겼어요` / 투표면 `{N}명이 동의해서 곡을 넘겼어요`
 
+### 10.6 슈퍼 좋아요 제한 — 쿨타임과 하루 횟수
+
+슈퍼 좋아요가 점수를 크게 움직이는데(기본 2점) 지금은 무제한이에요.
+한 사람이 자기 취향 곡마다 슈퍼를 박으면 대기열이 그 사람 것이 돼요.
+
+```rust
+#[serde(default)] pub super_like_cooldown_sec: u32,  // 0 = 없음 (기본 0) · 0~3600
+#[serde(default)] pub super_like_daily_limit: u32,   // 0 = 무제한 (기본 0) · 0~100
+```
+
+**기본은 둘 다 끔**이에요. 기존 서버 동작이 조용히 바뀌면 안 돼요. 필요한 서버만 켜요.
+
+**하루 기준은 서버 로컬 자정**이 아니라 **UTC 자정**으로 통일해요.
+서버마다 시간대를 따로 두면 "언제 초기화되지?"가 헷갈리고 코드도 지저분해져요.
+UI 에 `UTC 자정에 초기화돼요` 를 명시해요.
+
+```sql
+-- 마이그레이션 v12. 재시작해도 살아남아야 하니 메모리가 아니라 DB에 둔다
+CREATE TABLE remote_super_like_usage (
+  guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, day TEXT NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0,
+  last_utc TEXT NOT NULL,
+  PRIMARY KEY (guild_id, user_id, day));
+```
+
+**쿨타임은 메모리로 충분해요** — 짧고, 재시작 때 풀려도 손해가 없어요.
+
+**동작**
+- 슈퍼를 **취소**하면 사용 횟수를 **돌려줘요.** 실수로 누른 걸 하루 종일 못 쓰게 하면 가혹해요.
+  단 쿨타임은 안 돌려줘요(연타 방지가 목적이라).
+- 관리자·봇 주인도 **똑같이 적용**돼요. 여기서 예외를 두면 그게 특혜예요.
+- 서버가 거부할 때 이유를 정확히 말해요:
+  `슈퍼 좋아요는 3분 뒤에 다시 쓸 수 있어요` / `오늘 슈퍼 좋아요를 5번 다 썼어요 (UTC 자정에 초기화돼요)`
+
+**UI**
+- ⭐ 버튼 툴팁에 남은 횟수: `슈퍼 좋아요 · 오늘 3번 남았어요`
+- 쿨타임 중이면 버튼에 **남은 시간을 숫자로** 보여줘요 (`⭐ 2:14`). 회색으로만 두면 고장인 줄 알아요.
+- 다 썼으면 비활성 + 이유 툴팁. 숨기지 마요.
+- `/state/cold` 에 `superLike: {cooldownSec, dailyLimit, usedToday, availableAtUtc}`
+
 ---
 
 ## 11. 제안 게시판을 모달로
@@ -907,6 +951,7 @@ CREATE TABLE remote_chart_cache (
 
 | 분류 | 차트 |
 |---|---|
+| `ours` | **우리 서버 인기곡 · 마참뮤직 전체 인기곡** (§15.2b) |
 | `popular` | 전세계 인기 · 한국 인기 · 오늘 뜨는 곡 |
 | `region` | 미국 · 일본 · 영국 |
 | `genre` | K-Pop · J-Pop · 힙합 · R&B · 록 · 일렉트로닉 |
@@ -920,6 +965,71 @@ CREATE TABLE remote_chart_cache (
 **작동하지 않는 차트가 생기면 숨기지 말고 그대로 알려요.** 관리 콘솔의 차트 목록에
 `마지막 갱신 실패 · 2시간 전` 을 표시하고, 유저 UI 에서는 그 차트를 목록에서 빼요.
 빈 차트를 눌렀는데 아무 일도 안 일어나는 게 제일 나빠요.
+
+### 15.2b 우리가 만든 차트 — 서버 차트 · 전체 차트
+
+바깥에서 가져오는 차트 말고, **우리가 실제로 튼 것**으로 만드는 차트예요.
+재생 횟수를 세서 순위를 매겨요. 데이터는 통계 DB(§22.1)에 같이 둬요.
+
+| 차트 | 모수 | 분류 |
+|---|---|---|
+| **우리 서버 인기곡** | 이 길드에서 재생된 횟수 | `ours` |
+| **마참뮤직 전체 인기곡** | 봇이 들어간 모든 서버 합계 | `ours` |
+
+**자동재생으로 나간 곡은 세지 않아요.** 이게 핵심이에요.
+자동재생은 사람이 고른 게 아니라 알고리즘이 채운 거라, 같이 세면 차트가
+"자동재생이 많이 튼 곡" 이 돼버려요. 그래서 재생 횟수를 **두 갈래로 따로** 셉니다.
+
+```sql
+CREATE TABLE stat_track_plays (
+  guild_id  INTEGER NOT NULL,          -- 0 = 봇 전체 합계 행
+  cache_key TEXT    NOT NULL,
+  track_json TEXT   NOT NULL,
+  plays_user     INTEGER NOT NULL DEFAULT 0,   -- 사람이 신청해서 재생 ← 재생 차트는 이것만 본다
+  plays_autoplay INTEGER NOT NULL DEFAULT 0,   -- 자동재생으로 재생 ← 세되 차트에서는 무시
+  likes          INTEGER NOT NULL DEFAULT 0,   -- 받은 좋아요 누적
+  supers         INTEGER NOT NULL DEFAULT 0,   -- 받은 슈퍼 좋아요 누적
+  requesters     INTEGER NOT NULL DEFAULT 0,   -- 이 곡을 신청한 서로 다른 사람 수
+  last_utc TEXT NOT NULL,
+  PRIMARY KEY (guild_id, cache_key));
+CREATE INDEX idx_track_plays_rank ON stat_track_plays(guild_id, plays_user DESC);
+
+-- 기간별 차트용. 90일만 남긴다
+CREATE TABLE stat_track_daily (
+  guild_id INTEGER NOT NULL, cache_key TEXT NOT NULL, day TEXT NOT NULL,
+  plays_user INTEGER NOT NULL DEFAULT 0,
+  likes INTEGER NOT NULL DEFAULT 0, supers INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, cache_key, day));
+```
+
+**차트 종류 2가지** — 같은 모수에서 기준만 달라요.
+
+| 차트 | 기준 |
+|---|---|
+| **많이 튼 곡** | `plays_user` (자동재생 제외) |
+| **많이 사랑받은 곡** | `likes + supers × chart_super_weight` |
+
+```rust
+#[serde(default = "default_chart_super_weight")]
+pub chart_super_weight: u32,   // 기본 2 · 0~5. 0 이면 슈퍼 좋아요를 무시한다
+```
+
+`0` 으로 두면 슈퍼 좋아요를 아예 안 세고, `2` 면 두 배로 쳐요. 관리 콘솔에서 바꿔요.
+차트 화면에 **`👍284 + ⭐52×2 = 388`** 처럼 계산을 그대로 보여줘요. 순위가 왜 그런지 보여야 해요.
+
+**기간 선택**: `이번 주` / `이번 달` / `전체`. 기본은 `이번 달`.
+`전체` 는 `stat_track_plays` 를, 나머지는 `stat_track_daily` 를 합산해요.
+
+**순위 기준**: `plays_user` 우선, 동점이면 **서로 다른 신청자 수(`requesters`)** 가 많은 쪽이 위예요.
+한 사람이 같은 곡을 20번 튼 것보다 다섯 명이 네 번씩 튼 게 더 "인기곡"이에요.
+
+**전체 차트의 사생활** — 곡 제목과 횟수만 보여줘요. **어느 서버에서 나왔는지, 누가 신청했는지는 안 보여줘요.**
+다른 서버 사람들의 취향이 이름과 함께 드러나면 안 돼요.
+
+**UI**: §15.3 의 분류 카드에 **`⭐ 우리 차트`** 를 추가해요 (총 6장).
+그 안에 `우리 서버 인기곡` / `마참뮤직 전체 인기곡` 두 개가 있어요.
+각 곡에 `42회 재생 · 7명이 신청` 을 같이 보여주면 숫자가 살아 있어요.
+자동재생 횟수는 툴팁에만 `자동재생으로 12회 더 나갔어요` 로 덧붙여요 — 순위에는 안 쓰지만 궁금하니까요.
 
 ### 15.3 UI — 2단계로 들어가요
 
@@ -1431,7 +1541,53 @@ CREATE TABLE stat_daily (
 
 ---
 
-## 23. 공통 주의
+## 23. 전역 원칙 — 이건 모든 절에 적용돼요
+
+### 23.1 숫자 설정은 전부 "무제한"이 가능해요
+
+횟수·시간·곡수처럼 숫자로 정하는 설정은 **예외 없이 무제한을 고를 수 있어야 해요.**
+
+- 규약: **`0` = 무제한**. 코드 전체에서 이 하나로 통일해요.
+- 슬라이더는 **최댓값 다음 칸이 `∞`** 예요. 거기로 밀면 값이 `0` 이 되고 화면에는 `무제한` 이라고 떠요.
+  숫자 입력칸에는 `0` 또는 빈 값을 넣으면 무제한이에요.
+- 힌트 문구도 바뀌어요: `무제한 · 아무도 안 막아요`
+- **서버가 실제로 그렇게 동작해야 해요.** `max(1)` 같은 클램프가 남아 있으면 `0` 이 `1` 이 돼버려요.
+  지금 `remote.rs` 에 `max_queue_per_guild.max(1)` 처럼 쓰인 곳들이 있으니 전부 확인해요.
+
+무제한이 가능해야 하는 항목 (빠짐없이):
+`maxQueuePerUser` `maxQueuePerGuild` `maxTrackSeconds` `auditRetentionDays` `chatRetentionDays`
+`superLikeCooldownSec` `superLikeDailyLimit` `voteSkipMin` `autoplayArtistCooldown`
+`autoplayRecentDecayHours` `boomttaThreshold` `bulkEnqueueLimit` `autoplaySeedMax`
+
+**예외 둘** — 이것만은 무제한을 두지 않아요. 이유를 UI 에 적어요.
+- `minVolume`/`maxVolume`/`defaultVolume` — 0~200 범위가 있어야 의미가 있어요.
+- `voteSkipRatio` — 백분율이라 무제한이 말이 안 돼요.
+
+### 23.2 랙이 없어야 하고, 서버도 가벼워야 해요
+
+이건 기능이 아니라 **합격 기준**이에요. 기능이 다 돌아도 버벅이면 실패예요.
+
+**웹 UI**
+- 60fps 를 지켜요. 목록이 길어지면 **가상 스크롤**로 보이는 만큼만 그려요(§18.2).
+- 전체 재렌더 금지. 바뀐 노드만 갱신해요. 채팅 반응 하나에 채팅창이 통째로 다시 그려지면 안 돼요.
+- 무거운 계산은 **한 프레임 안에서 끝나게** 쪼개요. 드래그·리사이즈는 `requestAnimationFrame` 으로 묶어요.
+- 백그라운드 탭에서는 비주얼라이저·진행바 보간·마퀴·카운트다운을 **멈춰요**.
+- 이미지는 크기를 지정해 레이아웃이 튀지 않게 해요.
+
+**서버**
+- 유휴 상태에서 탭당 SQLite 쿼리 **0회/초** (기존 §5.2 H 유지).
+- 새 기능을 넣을 때 **폴링을 만들지 마요.** 변화가 있을 때만 WS 로 밀어요.
+- 통계·차트처럼 무거운 집계는 **캐시**를 먼저 설계해요 (차트 6시간, 통계 60초).
+- 통계 쓰기는 재생 경로를 막지 않아요 (§22.2 — 채널 + 배치).
+- 큰 payload 를 만들지 마요. 대기열 200곡, 투표자 12명, 채팅 50건 같은 상한을 지켜요.
+
+**검증**
+- 대기열 1000곡 · 채팅 500줄 · 접속 10명 상태에서 스크롤·전환이 버벅이지 않는지 봐요.
+- 아무 조작 없이 5분 두고 쿼리 카운터가 안 올라가는지 봐요.
+
+---
+
+## 24. 공통 주의
 
 - `data-testid` 24개는 **모든 배치에서** 살아 있어야 해요.
 - 새 기능이 실패해도 리모컨 기본 동작(재생·대기열·채팅)은 살아 있어야 해요.
