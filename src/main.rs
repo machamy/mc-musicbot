@@ -15,10 +15,21 @@ mod player;
 mod remote;
 mod web;
 
-use serenity::all::GatewayIntents;
+use serenity::all::{GatewayError, GatewayIntents};
 use songbird::SerenityInit;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+
+/// 개발자 포털에서 특권 인텐트가 꺼져 있어 게이트웨이가 IDENTIFY 를 거부한 경우인가.
+/// (undocumented 인텐트를 보낸 경우도 같은 처방 — 특권 인텐트를 빼고 다시 붙는다.)
+fn is_intent_rejection(error: &serenity::Error) -> bool {
+    matches!(
+        error,
+        serenity::Error::Gateway(
+            GatewayError::DisallowedGatewayIntents | GatewayError::InvalidGatewayIntents
+        )
+    )
+}
 
 /// songbird/serenity 내부 tracing 이벤트를 웹 로그 뷰어로 포워딩.
 /// 무음/DAVE 협상 문제는 우리 코드가 아니라 드라이버가 안다 — 이게 없으면
@@ -149,8 +160,19 @@ async fn main() {
 
     // 게이트웨이가 죽어도(토큰 오류/네트워크 단절) 웹 UI 는 살아 있어야 운영자가 로그를 본다.
     // 30초 간격으로 클라이언트를 재생성/재접속한다.
-    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
+    //
+    // 특권 인텐트(GUILD_MEMBERS/GUILD_PRESENCES)는 멤버 목록·온라인 상태 표시에 필요하지만,
+    // 개발자 포털에서 꺼져 있으면 게이트웨이가 IDENTIFY 를 거부해 봇이 아예 뜨지 않는다.
+    // 그래서 거부로 판단되면 특권 인텐트를 빼고 **즉시** 재접속하고, 그 사실을 상태에 남긴다.
+    let base_intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
+    let privileged_intents = GatewayIntents::GUILD_MEMBERS | GatewayIntents::GUILD_PRESENCES;
+    let mut privileged = true;
     loop {
+        let intents = if privileged {
+            base_intents | privileged_intents
+        } else {
+            base_intents
+        };
         let handler = events::Handler {
             app: app.clone(),
             ready_once: AtomicBool::new(false),
@@ -162,6 +184,21 @@ async fn main() {
         match client {
             Ok(mut client) => {
                 if let Err(e) = client.start().await {
+                    // 특권 인텐트 거부 — 한 번만 축소하고 대기 없이 다시 붙는다.
+                    if privileged && is_intent_rejection(&e) {
+                        privileged = false;
+                        let reason = "Discord가 특권 인텐트를 거부했습니다. 개발자 포털 → 내 봇 → Bot → Privileged Gateway Intents에서 Server Members / Presence Intent를 켠 뒤 봇을 재시작하세요.";
+                        if let Ok(mut status) = app.intent_status.write() {
+                            status.members = false;
+                            status.presences = false;
+                            status.degraded_reason = Some(reason.to_string());
+                        }
+                        app.log.warn(
+                            "Bot",
+                            &format!("{reason} (게이트웨이 응답: {e}) — 특권 인텐트 없이 즉시 재접속합니다."),
+                        );
+                        continue;
+                    }
                     app.log
                         .error("Bot", &format!("게이트웨이 종료: {e} — 30초 후 재접속."));
                 }

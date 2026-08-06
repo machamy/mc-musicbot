@@ -9,8 +9,9 @@ use crate::player::manager::CancelOutcome;
 use crate::player::side_effects;
 use serenity::all::{
     CommandInteraction, CommandOptionType, ComponentInteraction, ComponentInteractionDataKind,
-    Context, CreateCommand, CreateCommandOption, CreateInteractionResponse,
-    CreateInteractionResponseFollowup, CreateInteractionResponseMessage, GuildId, Permissions,
+    Context, CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter,
+    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
+    GuildId, Permissions,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -559,7 +560,13 @@ pub async fn handle_command(app: Arc<App>, ctx: Context, cmd: CommandInteraction
     }
 
     // 3초 내 defer (다운로드 등 긴 작업 대비).
-    if cmd.defer(&ctx.http).await.is_err() {
+    // `/리모컨` 은 응답 전체가 "나만 보임"이어야 하므로 대기 표시부터 ephemeral 로 연다.
+    let deferred = if canonical == "remote" {
+        cmd.defer_ephemeral(&ctx.http).await
+    } else {
+        cmd.defer(&ctx.http).await
+    };
+    if deferred.is_err() {
         return;
     }
 
@@ -837,6 +844,7 @@ async fn dispatch(
             Ok(())
         }
         "playlist" => handle_playlist(app, ctx, cmd, guild_id).await,
+        "remote" => handle_remote(app, ctx, cmd, guild_id).await,
         other => Err(format!("지원하지 않는 명령입니다: {other}")),
     }
 }
@@ -1263,6 +1271,90 @@ async fn handle_playlist(
         other => Err(format!(
             "playlist 하위 명령 '{other}'은(는) 지원하지 않습니다."
         )),
+    }
+}
+
+// ───────── remote (웹 리모컨 안내) ─────────
+
+/// 서버 관리자 판정 — 인터랙션이 실어 준 권한 비트(관리자/서버 관리) 또는 길드 소유자.
+/// 길드 설정의 "지정 역할"까지는 보지 않는다. 관리 콘솔 링크를 하나 더 붙일지만 정하는 용도다.
+fn is_guild_manager(ctx: &Context, cmd: &CommandInteraction, guild_id: u64) -> bool {
+    is_admin(cmd)
+        || ctx
+            .cache
+            .guild(GuildId::new(guild_id))
+            .map(|g| g.owner_id == cmd.user.id)
+            .unwrap_or(false)
+}
+
+/// `/리모컨` — 웹 리모컨 주소를 나만 보이는 응답으로 안내한다.
+/// 링크에는 어떤 접근 토큰도 넣지 않는다 — 접속자는 항상 Discord 로그인을 거친다.
+async fn handle_remote(
+    app: &Arc<App>,
+    ctx: &Context,
+    cmd: &CommandInteraction,
+    guild_id: u64,
+) -> Result<(), String> {
+    // 공개 주소는 web::serve() 가 기동 시 주입한다. 없으면 링크를 만들 수 없다.
+    let Some(base) = app.public_base_url.get() else {
+        respond_text(
+            ctx,
+            cmd,
+            "웹 리모컨 주소가 설정되지 않았습니다. 관리자에게 문의하세요.",
+            true,
+        )
+        .await;
+        return Ok(());
+    };
+    let base = base.trim_end_matches('/');
+
+    let guild_name = ctx
+        .cache
+        .guild(GuildId::new(guild_id))
+        .map(|g| g.name.to_string())
+        .unwrap_or_else(|| "이 서버".to_string());
+
+    let state = app.player.get_state(guild_id).await;
+    let now = match &state.current_item {
+        Some(item) => {
+            let title: String = item.track.display_title().chars().take(80).collect();
+            format!("{title}\n신청: {}", describe_requester_short(item))
+        }
+        None => "재생 중인 곡 없음".to_string(),
+    };
+
+    let portal = format!("{base}/music/guilds/{guild_id}");
+    let mut embed = CreateEmbed::new()
+        .colour(0x5865F2)
+        .title("🎛 마참뮤직 리모컨")
+        .description(format!("**{guild_name}**"))
+        .field("지금 재생 중", now, false)
+        .field("대기열", format!("{}곡", state.upcoming.len()), true)
+        .field("리모컨", format!("[열기 →]({portal})"), true);
+    if is_guild_manager(ctx, cmd, guild_id) {
+        embed = embed.field("서버 관리 콘솔", format!("[열기 →]({portal}/admin)"), false);
+    }
+    embed = embed.footer(CreateEmbedFooter::new(
+        "링크에는 접근 토큰이 없습니다. 열면 Discord 로그인을 거칩니다.",
+    ));
+
+    let _ = cmd
+        .create_followup(
+            &ctx.http,
+            CreateInteractionResponseFollowup::new()
+                .embed(embed)
+                .ephemeral(true),
+        )
+        .await;
+    Ok(())
+}
+
+/// 신청자 표기 — 자동추천 곡은 사람 이름 대신 "자동추천".
+fn describe_requester_short(item: &QueueItem) -> String {
+    if item.request_kind == PlaybackRequestKind::Autoplay {
+        "자동추천".to_string()
+    } else {
+        item.requested_by_display.clone()
     }
 }
 
