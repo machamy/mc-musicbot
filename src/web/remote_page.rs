@@ -15,6 +15,21 @@ use super::html_escape;
 use super::remote::{AccessTier, OAuthGuild, RemoteSession};
 use serde_json::{Value, json};
 
+/// `next` 경로를 쿼리스트링에 넣기 위한 최소 인코딩.
+/// 호출부에서 이미 `/music/` 로 시작하는 내부 경로만 통과시켰으므로
+/// 여기서는 쿼리 구분자로 오해될 문자만 막으면 된다.
+fn percent_encode_path(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 /// 테마 깜빡임 방지 — 스타일시트보다 먼저 실행돼야 한다.
 const THEME_BOOT: &str =
     r#"<script>try{document.documentElement.dataset.theme=localStorage.getItem('macham.theme')||'dark'}catch(e){}</script>"#;
@@ -100,14 +115,34 @@ fn guild_json(guild: &OAuthGuild) -> Value {
 }
 
 /// `GET /music/login`
-pub fn login(configured: bool, dev_login: bool, message: Option<&str>) -> String {
+///
+/// `next` 는 로그인 후 돌아갈 내부 경로다. 특정 서버의 리모컨을 열려다 막힌 경우
+/// 그 주소가 넘어오고, 로그인이 끝나면 서버 선택을 건너뛰고 바로 그 화면으로 간다.
+/// 호출부에서 이미 `/music/` 로 시작하는지 검증한 값만 들어온다.
+pub fn login(
+    configured: bool,
+    dev_login: bool,
+    message: Option<&str>,
+    next: Option<&str>,
+) -> String {
+    let next_query = next
+        .map(|path| format!("?next={}", percent_encode_path(path)))
+        .unwrap_or_default();
     let action = if configured {
-        r#"<a class="btn btn--primary btn--wide" data-testid="discord-login" href="/music/oauth/start">Discord로 계속하기</a>"#.to_string()
+        format!(
+            r#"<a class="btn btn--primary btn--wide" data-testid="discord-login" href="/music/oauth/start{next_query}">Discord로 계속하기</a>"#
+        )
     } else {
         r#"<div class="gate__note"><strong>OAuth 설정이 필요하다.</strong><br>운영 패널 → 봇 설정에서 Discord Client ID / Secret / 공개 URL을 넣어라.</div>"#.to_string()
     };
     let dev = if dev_login {
-        r#"<form method="post" action="/music/dev-login" class="gate__dev"><button class="btn btn--ghost btn--wide" data-testid="dev-login" type="submit">로컬 검증 계정으로 입장</button></form>"#
+        // dev 로그인은 폼 POST 라 next 를 hidden 으로 실어 보낸다.
+        let hidden = next
+            .map(|path| format!(r#"<input type="hidden" name="next" value="{}">"#, html_escape(path)))
+            .unwrap_or_default();
+        &format!(
+            r#"<form method="post" action="/music/dev-login" class="gate__dev">{hidden}<button class="btn btn--ghost btn--wide" data-testid="dev-login" type="submit">로컬 검증 계정으로 입장</button></form>"#
+        )
     } else {
         ""
     };

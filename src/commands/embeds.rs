@@ -258,8 +258,13 @@ pub fn playback_buttons_np(state: &GuildPlayerState) -> Vec<CreateActionRow> {
     buttons_with_prefix(state, "mbnp:")
 }
 
+/// 카드에 붙는 컨트롤. 버튼은 최소한만 남기고 나머지는 웹 리모컨으로 보낸다.
+///
+/// 예전에는 두 줄 10개(셔플·반복·볼륨±·자동추천·다시재생·대기열까지)였다.
+/// 채팅창을 잡아먹는 데다, 셔플·반복·볼륨·대기열은 리모컨에서 훨씬 잘 보이고 잘 눌린다.
+/// 여기에는 "지금 당장 눌러야 하는 것"만 남긴다.
 fn buttons_with_prefix(state: &GuildPlayerState, p: &str) -> Vec<CreateActionRow> {
-    let row1 = CreateActionRow::Buttons(vec![
+    let mut row = vec![
         CreateButton::new(format!("{p}playpause"))
             .style(serenity::all::ButtonStyle::Secondary)
             .label(if state.is_paused {
@@ -273,54 +278,13 @@ fn buttons_with_prefix(state: &GuildPlayerState, p: &str) -> Vec<CreateActionRow
         CreateButton::new(format!("{p}stop"))
             .style(serenity::all::ButtonStyle::Danger)
             .label("⏹ 정지"),
-        CreateButton::new(format!("{p}shuffle"))
-            .style(if state.shuffle_enabled {
-                serenity::all::ButtonStyle::Success
-            } else {
-                serenity::all::ButtonStyle::Secondary
-            })
-            .label(if state.shuffle_enabled {
-                "🔀 셔플 ✓"
-            } else {
-                "🔀 셔플"
-            }),
-        CreateButton::new(format!("{p}repeat"))
-            .style(match state.repeat_mode {
-                RepeatMode::Off => serenity::all::ButtonStyle::Secondary,
-                _ => serenity::all::ButtonStyle::Success,
-            })
-            .label(match state.repeat_mode {
-                RepeatMode::Off => "🔁 반복 없음",
-                RepeatMode::Track => "🔂 한곡 반복중",
-                RepeatMode::Queue => "🔁 전체 반복중",
-            }),
-    ]);
-    let row2 = CreateActionRow::Buttons(vec![
-        CreateButton::new(format!("{p}voldown"))
-            .style(serenity::all::ButtonStyle::Secondary)
-            .label("🔉 볼륨-"),
-        CreateButton::new(format!("{p}volup"))
-            .style(serenity::all::ButtonStyle::Secondary)
-            .label("🔊 볼륨+"),
-        CreateButton::new(format!("{p}autoplay"))
-            .style(if state.autoplay_enabled {
-                serenity::all::ButtonStyle::Success
-            } else {
-                serenity::all::ButtonStyle::Secondary
-            })
-            .label(if state.autoplay_enabled {
-                "✨ 자동추천 ✓"
-            } else {
-                "✨ 자동추천"
-            }),
-        CreateButton::new(format!("{p}replay"))
-            .style(serenity::all::ButtonStyle::Secondary)
-            .label("🔂 다시재생"),
-        CreateButton::new(format!("{p}queue"))
-            .style(serenity::all::ButtonStyle::Secondary)
-            .label("📋 대기열"),
-    ]);
-    vec![row1, row2]
+    ];
+    // 링크 버튼은 인터랙션을 만들지 않으므로 커스텀 ID 가 없다.
+    // 공개 주소가 아직 설정되지 않았으면 조용히 빼고 나머지만 보여준다.
+    if let Some(url) = crate::app::remote_url_for(state.guild_id) {
+        row.push(CreateButton::new_link(url).label("🎛 리모컨"));
+    }
+    vec![CreateActionRow::Buttons(row)]
 }
 
 /// `/상태` — 봇 버전 + 사용자에게 보여줄 만한 재생/전역 설정 요약(시크릿 제외).

@@ -82,7 +82,45 @@ const LS = {
   lyrics: 'macham.lyrics.open',
   sideTab: 'macham.side.tab',
   railTab: 'macham.rail.tab',
+  layout: 'macham.layout',
 };
+
+/* 화면 배치 2종. DOM은 완전히 같고 portal.css의 그리드 배치만 갈린다.
+ * cells는 프로필 메뉴의 미니 도식 — true인 칸이 '주 영역'이다. */
+const LAYOUTS = {
+  three: {
+    label: '3단',
+    desc: '검색·대기열을 항상 왼쪽에 띄운다.',
+    cells: [false, true, false],
+    drawerUnder: 1280,
+  },
+  two: {
+    label: '2단',
+    desc: '재생 화면을 넓게 쓰고 채팅을 오른쪽에 고정한다.',
+    cells: [true, false, false],
+    drawerUnder: 981,
+  },
+};
+
+/* ═══════════════════════ 화면 배치 ═══════════════════════
+ * 첫 페인트에 배치가 튀면 안 된다. 셸을 만들기 전, 모듈이 로드되는 이 시점에 바로 박는다.
+ * CSS는 <html data-layout="...">만 본다.
+ */
+
+let activeLayout = readLayout();
+document.documentElement.dataset.layout = activeLayout;
+
+function readLayout() {
+  let saved = null;
+  try { saved = localStorage.getItem(LS.layout); } catch { /* 시크릿 모드 */ }
+  return LAYOUTS[saved] ? saved : 'three';
+}
+
+/* 우측 사이드가 드로어로 빠지는 구간인가. 3단은 1280px 미만, 2단은 981px 미만. */
+function drawerActive() {
+  if (window.matchMedia('(max-width: 680px)').matches) return false;
+  return window.innerWidth < (LAYOUTS[activeLayout] || LAYOUTS.three).drawerUnder;
+}
 
 /* ═══════════════════════ 작은 헬퍼 ═══════════════════════ */
 
@@ -280,16 +318,30 @@ function buildShell() {
   el.rail = h('aside', { class: 'col rail' }, buildRail());
   el.stage = h('section', { class: 'col stage' }, buildStage());
   el.side = h('aside', { class: 'col side' }, buildSide());
+  el.grid = h('main', { class: 'portal__grid' }, el.rail, el.stage, el.side);
 
-  el.portal = h('div', { class: 'portal', 'data-testid': 'music-portal', dataset: { conn: 'connecting' } },
+  el.portal = h('div', {
+    class: 'portal', 'data-testid': 'music-portal',
+    dataset: { conn: 'connecting', layout: activeLayout },
+  },
     el.banners,
     buildHeader(),
-    h('main', { class: 'portal__grid' }, el.rail, el.stage, el.side),
+    el.grid,
     buildMobileTabs(),
     el.live);
 
   root.appendChild(el.portal);
   document.body.dataset.pane = 'stage';
+  watchBannerHeight();
+}
+
+/** 2단의 sticky 사이드 높이는 "뷰포트 − 헤더 − 배너"다.
+ *  배너는 접속이 끊기거나 정지당하면 생겼다 사라지므로 높이를 계속 알려준다. */
+function watchBannerHeight() {
+  const sync = () => el.portal.style.setProperty('--banner-h', `${el.banners.offsetHeight || 0}px`);
+  if (window.ResizeObserver) new ResizeObserver(sync).observe(el.banners);
+  else window.addEventListener('resize', sync);
+  sync();
 }
 
 /* ── 헤더 ── */
@@ -369,8 +421,62 @@ function buildProfileMenu() {
     },
   }, h('span', null, '↩'), h('span', null, '로그아웃'));
 
-  return h('div', { class: 'dd__menu', role: 'menu', hidden: true },
-    el.meHead, permBtn, el.consoleBtn, el.opsLink, h('div', { class: 'dd__sep' }), el.notifyBtn, logout);
+  return h('div', { class: 'dd__menu dd__menu--wide', role: 'menu', hidden: true },
+    el.meHead, permBtn, el.consoleBtn, el.opsLink,
+    h('div', { class: 'dd__sep' }),
+    buildLayoutPicker(),
+    h('div', { class: 'dd__sep' }),
+    el.notifyBtn, logout);
+}
+
+/* ── 화면 배치 고르기 ── */
+
+function buildLayoutPicker() {
+  el.layoutOpts = Object.entries(LAYOUTS).map(([id, def]) => h('button', {
+    class: 'lay__opt', type: 'button', role: 'menuitemradio',
+    'aria-checked': String(id === activeLayout),
+    dataset: { layout: id },
+    onClick: () => setLayout(id),
+  },
+    h('span', { class: `lay__glyph lay__glyph--${id}`, 'aria-hidden': 'true' },
+      ...def.cells.map((main) => h('i', { class: main ? 'is-main' : null }))),
+    h('strong', null, def.label),
+    h('small', null, def.desc)));
+
+  return frag(
+    h('div', { class: 'dd__label' }, '화면 배치'),
+    h('div', { class: 'lay', role: 'group', 'aria-label': '화면 배치' }, ...el.layoutOpts));
+}
+
+/** 새로고침 없이 즉시 바꾼다. DOM은 그대로 두고 그리드 배치만 갈아 끼운다. */
+function setLayout(id) {
+  const next = LAYOUTS[id] ? id : 'three';
+  if (next === activeLayout) return;
+  activeLayout = next;
+  try { localStorage.setItem(LS.layout, next); } catch { /* 시크릿 모드 */ }
+  applyLayout();
+  toast(`${LAYOUTS[next].label} 배치로 바꿨다.`, 'ok');
+}
+
+function applyLayout() {
+  const atEnd = nearChatEnd();
+
+  // 전환 순간에 드로어가 슬라이드해 들어오는 등의 잔상이 남지 않게 한 프레임 동안 전환을 끈다
+  el.portal.dataset.swap = '1';
+  document.documentElement.dataset.layout = activeLayout;
+  el.portal.dataset.layout = activeLayout;
+  openDrawer(false);
+
+  for (const node of el.layoutOpts || []) {
+    node.setAttribute('aria-checked', String(node.dataset.layout === activeLayout));
+  }
+
+  requestAnimationFrame(() => {
+    delete el.portal.dataset.swap;
+    if (atEnd) scrollChatToEnd(false);
+    marquee.scan();
+    scheduleViz();
+  });
 }
 
 async function askNotify() {
@@ -1314,7 +1420,7 @@ function openSide(id) {
   for (const [key, pane] of Object.entries(el.sidePanes)) pane.hidden = key !== id;
 
   if (window.matchMedia('(max-width: 680px)').matches) document.body.dataset.pane = 'side';
-  else if (window.matchMedia('(max-width: 1279px)').matches) openDrawer(true);
+  else if (drawerActive()) openDrawer(true);
 
   if (id === 'chat') markChatRead();
   if (id === 'suggest') loadSuggestions();

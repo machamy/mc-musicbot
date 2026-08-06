@@ -5,6 +5,11 @@
  *
  * 화면 골격: 100vh 앱 셸. 헤더는 고정, 세 열은 각자 내부 스크롤.
  * 세로가 짧은 화면에서도 채팅 입력창이 항상 보여야 한다(레퍼런스 v1.30.0).
+ *
+ * 배치는 2종이다. <html data-layout="three|two">로 갈린다(기본 three).
+ *   three — 좌 레일 / 중앙 스테이지 / 우 탭. 열이 각자 스크롤한다.        (이 파일의 기본 규칙)
+ *   two   — 좌측 한 컬럼(스테이지→레일) + 우측 390px sticky 사이드.       (맨 아래 2단 블록)
+ * DOM은 두 배치가 완전히 같다. 바뀌는 건 그리드 배치와 "누가 스크롤하는가"뿐이다.
  */
 
 /* ═══════════════════════ 셸 ═══════════════════════ */
@@ -16,6 +21,9 @@
 body { overflow: hidden; }
 
 .portal {
+  /* 배너가 있으면 그만큼 아래 내용이 밀린다. 2단의 sticky 사이드 높이 계산에 쓴다.
+   * 실제 값은 portal.js가 ResizeObserver로 채운다. */
+  --banner-h: 0px;
   display: flex;
   flex-direction: column;
   height: 100dvh;
@@ -196,6 +204,48 @@ body { overflow: hidden; }
 .dd__item--danger:hover { background: var(--danger-soft); color: var(--danger); }
 .dd__item span:first-child { width: 18px; text-align: center; flex: none; }
 .dd__sep { height: 1px; margin: var(--sp-2) var(--sp-1); background: var(--line-1); }
+
+.dd__label {
+  padding: var(--sp-1) var(--sp-3) var(--sp-2);
+  color: var(--text-4);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semi);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* ── 화면 배치 고르기 ── 도식은 실제 열 비율을 그대로 줄여 놓은 것이다 */
+.dd__menu--wide { min-width: 336px; }
+
+.lay { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); padding: 0 var(--sp-3) var(--sp-1); }
+
+.lay__opt {
+  display: grid;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-2);
+  background: var(--surface-1);
+  text-align: left;
+  transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+}
+.lay__opt:hover { background: var(--surface-3); border-color: var(--line-3); }
+.lay__opt[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.lay__opt strong { color: var(--text-1); font-size: var(--fs-md); font-weight: var(--fw-semi); }
+.lay__opt[aria-checked="true"] strong { color: var(--accent); }
+.lay__opt small { color: var(--text-3); font-size: var(--fs-xs); line-height: 1.35; }
+
+.lay__glyph { display: grid; gap: 2px; height: 30px; }
+.lay__glyph i { border-radius: 2px; background: var(--surface-4); }
+.lay__glyph i.is-main { background: var(--text-4); }
+.lay__opt[aria-checked="true"] .lay__glyph i { background: var(--accent-line); }
+.lay__opt[aria-checked="true"] .lay__glyph i.is-main { background: var(--accent); }
+
+.lay__glyph--three { grid-template-columns: 0.8fr 1.4fr 1fr; }
+.lay__glyph--two { grid-template-columns: 1.7fr 1fr; grid-template-rows: 1.3fr 1fr; }
+.lay__glyph--two i:nth-child(1) { grid-area: 1 / 1; }
+.lay__glyph--two i:nth-child(2) { grid-area: 2 / 1; }
+.lay__glyph--two i:nth-child(3) { grid-area: 1 / 2 / span 2; }
 
 /* 넘치는 제목은 오른쪽 끝을 흐리게 해서 "더 있다"는 걸 알린다. 호버하면 전광판이 돌면서 선명해진다. */
 .mq[data-over="1"] {
@@ -1136,6 +1186,115 @@ body { overflow: hidden; }
   .viz { height: 40px; }
   .lyrics__view { max-height: 150px; }
 }
+
+/* ═══════════════════════ 2단 레이아웃 ═══════════════════════
+ * <html data-layout="two">. 코덱스가 만들었던 배치(메인 + 390px 우측 채팅)를
+ * 지금 토큰·클래스 체계로 다시 짠 것이다.
+ *
+ * 3단은 열마다 스크롤하지만, 2단은 스크롤 주체가 .portal__grid 하나로 바뀐다.
+ * 스테이지(행1) → 레일(행2)이 같은 컬럼에서 한 흐름으로 이어지고,
+ * 우측 사이드만 sticky로 화면에 남는다. DOM 이동은 없다 — 그리드 배치만 바꾼다.
+ *
+ * 680px 이하는 두 배치가 같은 화면(단일 열 + 하단 탭바)이어야 하므로,
+ * 2단 규칙은 전부 681px부터만 산다. 아래 블록 밖으로 새어 나가면 안 된다.
+ */
+@media (min-width: 681px) {
+  :root[data-layout="two"] .portal { --side-w: 390px; }
+
+  :root[data-layout="two"] .portal__grid {
+    grid-template-columns: minmax(0, 1fr) var(--side-w);
+    grid-template-rows: auto auto;
+    align-items: start;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  :root[data-layout="two"] .stage { grid-column: 1; grid-row: 1; }
+  :root[data-layout="two"] .rail  { grid-column: 1; grid-row: 2; }
+
+  /* 열 안쪽의 내부 스크롤을 풀어 바깥 한 줄기로 잇는다 */
+  :root[data-layout="two"] .stage,
+  :root[data-layout="two"] .rail { overflow: visible; }
+  :root[data-layout="two"] .stage__scroll,
+  :root[data-layout="two"] .rail .scroll { overflow: visible; }
+  :root[data-layout="two"] .stage__scroll > * { flex: none; }
+
+  /* 컬럼이 넓어진 만큼 앨범아트를 키운다 */
+  :root[data-layout="two"] .now { grid-template-columns: minmax(200px, 300px) minmax(0, 1fr); }
+
+  /* 대기열이 짧아도 패널이 납작해지지 않게 바닥을 깔아 두고,
+   * 검색 결과 드롭다운이 패널 높이에 잘리지 않도록 클리핑을 푼다.
+   * (3단에서는 패널이 열 높이만큼 커서 잘릴 일이 없다) */
+  :root[data-layout="two"] .rail .pane { min-height: 300px; overflow: visible; }
+
+  /* 우측 사이드는 화면에 붙어 있고, 채팅 목록만 그 안에서 스크롤한다.
+   * 높이를 뷰포트에 맞춰야 "세로 짧은 화면에서도 입력창이 보인다"가 지켜진다.
+   * 1280px 미만에서 켜지는 드로어 규칙(.side{position:fixed;...})을 여기서 전부 되돌린다.
+   * 2단은 981px까지 사이드를 붙박이로 쓰기 때문이다. */
+  :root[data-layout="two"] .side {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    align-self: start;
+    position: sticky;
+    inset: 0 auto auto auto;
+    z-index: auto;
+    width: auto;
+    height: calc(100dvh - var(--header-h) - var(--banner-h) - var(--sp-3));
+    padding: 0;
+    background: none;
+    border-left: 0;
+    box-shadow: none;
+    transform: none;
+    transition: none;
+    overflow: hidden;
+  }
+}
+
+/* 2단 + 좁은 화면(980px 이하) — 우측 사이드를 드로어로 뺀다.
+ * 3단은 1280px 미만에서 빠지지만 2단은 사이드가 배치의 절반이라 더 오래 붙잡는다. */
+@media (min-width: 681px) and (max-width: 980px) {
+  :root[data-layout="two"] .portal__grid { grid-template-columns: minmax(0, 1fr); }
+  :root[data-layout="two"] .hdr__drawer { display: inline-flex; }
+  :root[data-layout="two"] .side {
+    position: fixed;
+    top: 0; right: 0; bottom: 0; left: auto;
+    z-index: var(--z-dropdown);
+    width: min(420px, 92vw);
+    height: auto;
+    /* align-self:start면 fixed 박스가 top/bottom으로 늘어나지 않고 내용 높이로 쪼그라든다.
+     * 그러면 채팅 입력창이 화면 아래로 밀려난다. 반드시 되돌려야 한다. */
+    align-self: stretch;
+    padding: var(--sp-3);
+    background: var(--surface-0);
+    border-left: 1px solid var(--line-2);
+    box-shadow: var(--shadow-pop);
+    transform: translateX(100%);
+    transition: transform var(--t-slow) var(--ease-out);
+  }
+  :root[data-layout="two"] .side[data-open="1"] { transform: none; }
+}
+
+/* 2단은 981px부터 사이드를 붙박이로 쓰므로 드로어 버튼이 필요 없다 */
+@media (min-width: 981px) {
+  :root[data-layout="two"] .hdr__drawer { display: none; }
+}
+
+@media (min-width: 681px) and (max-width: 1100px) {
+  :root[data-layout="two"] .now {
+    grid-template-columns: minmax(150px, 220px) minmax(0, 1fr);
+    gap: var(--sp-4);
+    padding: var(--sp-4);
+  }
+}
+
+@media (min-width: 681px) and (max-height: 720px) {
+  :root[data-layout="two"] .now { grid-template-columns: minmax(140px, 200px) minmax(0, 1fr); }
+}
+
+/* 배치를 바꾸는 순간에는 드로어 슬라이드 같은 전환이 끼어들면 안 된다 */
+.portal[data-swap="1"] .col,
+.portal[data-swap="1"] .side,
+.portal[data-swap="1"] .pane { transition: none; }
 
 /* ═══════════════════════ 스켈레톤/빈 상태 미세 조정 ═══════════════════════ */
 

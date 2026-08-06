@@ -1745,6 +1745,21 @@ fn html_page(body: String) -> Response {
     response
 }
 
+/// 로그인 후 돌아갈 내부 경로만 통과시킨다.
+///
+/// `//evil.com` 이나 `https://…` 같은 값이 그대로 리다이렉트에 쓰이면 오픈 리다이렉트가 된다.
+/// 그래서 `/music/` 로 시작하고 스킴·호스트가 없는 경로만 받는다.
+fn safe_next(value: Option<&str>) -> Option<String> {
+    let raw = value?.trim();
+    if !raw.starts_with("/music/") || raw.starts_with("//") || raw.contains("://") {
+        return None;
+    }
+    if raw.contains(['\\', '\n', '\r']) {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
 async fn login_page(
     State(state): State<Arc<WebState>>,
     Query(query): Query<HashMap<String, String>>,
@@ -1754,6 +1769,7 @@ async fn login_page(
         auth.configured(),
         auth.dev_login,
         query.get("error").map(String::as_str),
+        safe_next(query.get("next").map(String::as_str)).as_deref(),
     ))
 }
 
@@ -1767,6 +1783,10 @@ async fn portal_home(State(state): State<Arc<WebState>>, cookies: Cookies) -> Re
         .filter(|guild| session.is_developer || bot_in_guild(&state, guild.id))
         .cloned()
         .collect();
+    // 고를 게 하나뿐이면 고르라고 묻지 않는다. 바로 그 서버의 리모컨으로 보낸다.
+    if let [only] = guilds.as_slice() {
+        return Redirect::to(&format!("/music/guilds/{}", only.id)).into_response();
+    }
     html_page(remote_page::guild_selector(&session, &guilds))
 }
 
@@ -1782,7 +1802,8 @@ async fn guild_page(
             &state.app.build_id,
             ctx.tier,
         )),
-        Err(response) => page_error(response),
+        // 로그인만 안 된 경우에는 이 서버로 되돌아오도록 next 를 달아 준다.
+        Err(response) => page_error_returning_to(response, &format!("/music/guilds/{guild_id}")),
     }
 }
 
@@ -1826,9 +1847,21 @@ fn page_error(response: Response) -> Response {
     response
 }
 
+/// 로그인이 필요해서 막힌 경우에만 `next` 를 달아 로그인 화면으로 보낸다.
+/// 권한 부족(403)은 로그인해도 안 풀리므로 그대로 돌려준다.
+fn page_error_returning_to(response: Response, next: &str) -> Response {
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return Redirect::to(&format!("/music/login?next={}", percent_encode(next))).into_response();
+    }
+    response
+}
+
 // ───────────────────────── OAuth ─────────────────────────
 
-async fn oauth_start(State(state): State<Arc<WebState>>) -> Response {
+async fn oauth_start(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
     let auth = auth_config(&state);
     let Some(client_id) = auth.client_id.as_deref() else {
         return Redirect::to("/music/login?error=OAuth%20설정이%20필요합니다").into_response();
@@ -1840,8 +1873,14 @@ async fn oauth_start(State(state): State<Arc<WebState>>) -> Response {
     {
         let mut states = state.oauth_states.lock().unwrap();
         // S8: 발급할 때마다 만료분을 함께 걷어낸다(주기 스위퍼와 이중 방어).
-        states.retain(|_, issued| issued.elapsed() < OAUTH_STATE_TTL);
-        states.insert(oauth_state.clone(), Instant::now());
+        states.retain(|_, (issued, _)| issued.elapsed() < OAUTH_STATE_TTL);
+        states.insert(
+            oauth_state.clone(),
+            (
+                Instant::now(),
+                safe_next(query.get("next").map(String::as_str)),
+            ),
+        );
     }
     let url = format!(
         "https://discord.com/oauth2/authorize?response_type=code&client_id={}&scope={}&state={}&redirect_uri={}&prompt=consent",
@@ -1899,6 +1938,7 @@ async fn oauth_callback(
             auth.configured(),
             auth.dev_login,
             Some(&format!("Discord 로그인이 취소되었습니다: {error}")),
+            None,
         ));
     }
     let (Some(code), Some(returned_state)) = (query.code, query.state) else {
@@ -1906,7 +1946,10 @@ async fn oauth_callback(
             .into_response();
     };
     let issued = state.oauth_states.lock().unwrap().remove(&returned_state);
-    if !matches!(issued, Some(instant) if instant.elapsed() < OAUTH_STATE_TTL) {
+    let Some((issued_at, next_path)) = issued else {
+        return Redirect::to("/music/login?error=OAuth%20state가%20만료되었습니다").into_response();
+    };
+    if issued_at.elapsed() >= OAUTH_STATE_TTL {
         return Redirect::to("/music/login?error=OAuth%20state가%20만료되었습니다").into_response();
     }
     let (Some(client_id), Some(client_secret)) = (auth.client_id.clone(), auth.client_secret.clone())
@@ -2016,7 +2059,9 @@ async fn oauth_callback(
             is_developer: false,
         },
     );
-    Redirect::to("/music").into_response()
+    // 어느 서버의 리모컨을 열려다 로그인한 거면 그 서버로 바로 돌려보낸다.
+    // 그런 맥락이 없으면 /music 이 알아서 서버를 고르거나(여러 개) 바로 넘긴다(하나).
+    Redirect::to(next_path.as_deref().unwrap_or("/music")).into_response()
 }
 
 async fn discord_get<T: for<'de> Deserialize<'de>>(
@@ -2042,14 +2087,22 @@ async fn discord_get<T: for<'de> Deserialize<'de>>(
         .map_err(|error| format!("Discord API 응답 해석 실패: {error}"))
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct DevLoginForm {
+    #[serde(default)]
+    next: Option<String>,
+}
+
 async fn dev_login(
     State(state): State<Arc<WebState>>,
     cookies: Cookies,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Form(form): Form<DevLoginForm>,
 ) -> Response {
     if !auth_config(&state).dev_login || !address.ip().is_loopback() {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let next_path = safe_next(form.next.as_deref());
     let metadata = state.app.db.list_guild_metadata();
     let mut guilds: Vec<OAuthGuild> = metadata
         .into_iter()
@@ -2098,7 +2151,7 @@ async fn dev_login(
             is_developer: true,
         },
     );
-    Redirect::to("/music").into_response()
+    Redirect::to(next_path.as_deref().unwrap_or("/music")).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -5590,6 +5643,36 @@ async fn seed_dev_guild(state: &WebState, guild_id: u64, user_id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_next_only_accepts_internal_remote_paths() {
+        // 통과해야 하는 것 — 리모컨 안의 경로
+        assert_eq!(
+            safe_next(Some("/music/guilds/123")).as_deref(),
+            Some("/music/guilds/123")
+        );
+        assert_eq!(
+            safe_next(Some("/music/guilds/123/admin")).as_deref(),
+            Some("/music/guilds/123/admin")
+        );
+
+        // 막아야 하는 것 — 전부 오픈 리다이렉트로 이어진다
+        assert_eq!(safe_next(Some("//evil.example")), None);
+        assert_eq!(safe_next(Some("https://evil.example")), None);
+        assert_eq!(safe_next(Some("http://evil.example/music/x")), None);
+        assert_eq!(safe_next(Some("javascript:alert(1)")), None);
+        // 백슬래시를 `/` 로 정규화하는 브라우저가 있어 프로토콜 상대 URL이 될 수 있다
+        assert_eq!(safe_next(Some("/music/\\evil.example")), None);
+        assert_eq!(safe_next(Some("/music/a\r\nSet-Cookie: x=1")), None);
+
+        // 리모컨 밖은 받지 않는다 — 운영 패널로 튕겨 보내는 데 쓰이면 안 된다
+        assert_eq!(safe_next(Some("/botsettings")), None);
+        assert_eq!(safe_next(Some("/")), None);
+        assert_eq!(safe_next(Some("/music")), None);
+
+        assert_eq!(safe_next(None), None);
+        assert_eq!(safe_next(Some("   ")), None);
+    }
 
     fn settings_with(rule: PermissionRule) -> RemoteGuildSettings {
         let mut settings = RemoteGuildSettings::default();

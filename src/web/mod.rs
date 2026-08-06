@@ -94,7 +94,9 @@ pub struct WebState {
     /// 사용자용 마참뮤직 Discord OAuth 세션.
     pub remote_sessions: Mutex<HashMap<String, remote::RemoteSession>>,
     /// OAuth state 일회용 토큰과 발급 시각.
-    pub oauth_states: Mutex<HashMap<String, Instant>>,
+    /// OAuth state 토큰 → (발급 시각, 로그인 후 돌아갈 내부 경로).
+    /// `next` 는 `/music/...` 로 시작하는 값만 저장한다(오픈 리다이렉트 방지).
+    pub oauth_states: Mutex<HashMap<String, (Instant, Option<String>)>>,
     /// 길드별 상태 변경을 WebSocket 접속자에게 알리는 브로드캐스트 채널.
     pub remote_events: broadcast::Sender<remote::RemoteEvent>,
     /// 운영자 UI에서 저장하면 프로세스 재시작 없이 교체되는 OAuth 구성.
@@ -166,6 +168,8 @@ pub async fn serve(app: Arc<App>) {
 
     // `/리모컨` 슬래시 명령이 링크를 만들 때 읽는다. 미설정이면 명령이 안내만 한다.
     let _ = app.public_base_url.set(remote_auth.public_base_url.clone());
+    // 재생 카드의 "🎛 리모컨" 링크 버튼처럼 `&App` 이 없는 곳에서도 쓸 수 있게 전역에도 둔다.
+    crate::app::set_public_base_url(&remote_auth.public_base_url);
     // 봇 주인 판정(AccessTier::Owner)의 근거. 운영 패널에서 저장하면 즉시 갱신된다.
     if let Ok(mut owners) = app.owner_user_ids.write() {
         *owners = remote_auth.owner_user_ids.clone();
@@ -279,7 +283,7 @@ fn spawn_sweeper(state: Arc<WebState>) {
                 .oauth_states
                 .lock()
                 .unwrap()
-                .retain(|_, issued| issued.elapsed() < OAUTH_STATE_TTL);
+                .retain(|_, (issued, _)| issued.elapsed() < OAUTH_STATE_TTL);
             state
                 .remote_member_roles
                 .lock()

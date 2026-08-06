@@ -216,3 +216,25 @@ async fn retention_prune_loop(app: Arc<App>) {
         }
     }
 }
+
+/// 웹 리모컨 공개 주소의 프로세스 전역 사본.
+///
+/// `App.public_base_url` 과 같은 값이지만, Discord 임베드의 버튼 빌더처럼
+/// `&App` 핸들이 없는 곳에서 링크를 만들어야 해서 전역으로도 둔다.
+/// `web::serve()` 가 둘을 같이 채운다.
+static PUBLIC_BASE_URL: OnceLock<String> = OnceLock::new();
+
+/// `web::serve()` 전용. 끝 슬래시를 떼고 저장한다.
+pub fn set_public_base_url(url: &str) {
+    let trimmed = url.trim().trim_end_matches('/');
+    if !trimmed.is_empty() {
+        let _ = PUBLIC_BASE_URL.set(trimmed.to_string());
+    }
+}
+
+/// 이 길드의 웹 리모컨 주소. 공개 주소가 설정되지 않았으면 `None`.
+pub fn remote_url_for(guild_id: u64) -> Option<String> {
+    PUBLIC_BASE_URL
+        .get()
+        .map(|base| format!("{base}/music/guilds/{guild_id}"))
+}
