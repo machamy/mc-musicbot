@@ -3,12 +3,15 @@
 # Runtime secrets and local state
 botsettings.json
 musicbot.runtime.json
+remote.env.cmd
+.env.cmd
 .musicbot-data/
 .env
 *.secret
 
 # Portable/runtime layout, if copied into the repo during local testing
 /bot/botsettings.json
+/bot/remote.env.cmd
 /bot/.musicbot-data/
 /tools/
 

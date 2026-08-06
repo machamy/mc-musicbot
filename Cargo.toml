@@ -6,12 +6,12 @@ publish = false
 license-file = "LICENSE"
 
 [dependencies]
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 rand = "0.10.1"
 regex = "1.12.4"
 # yt-dlp 자동 다운로드용 HTTP 클라이언트 (serenity 가 이미 reqwest+rustls 를 끌어옴).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

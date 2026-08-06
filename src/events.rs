@@ -20,6 +20,7 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         let app = self.app.clone();
         let _ = app.http.set(ctx.http.clone());
+        let _ = app.discord_cache.set(ctx.cache.clone());
         if self.ready_once.swap(true, Ordering::SeqCst) {
             app.log.info("Bot", "Gateway resumed.");
             return;

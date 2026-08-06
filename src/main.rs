@@ -12,6 +12,7 @@ mod logging;
 mod media;
 mod models;
 mod player;
+mod remote;
 mod web;
 
 use serenity::all::GatewayIntents;

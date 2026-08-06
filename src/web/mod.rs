@@ -3,6 +3,8 @@
 //! `MUSICBOT_WEB_PASSWORD` 환경변수가 있으면 그 값으로 오버라이드(설정 파일보다 우선).
 
 pub mod pages;
+pub mod remote;
+pub mod remote_page;
 
 use crate::app::App;
 use axum::Router;
@@ -15,6 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::broadcast;
 use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
 
 /// 세션 유효 기간 — 12시간 쿠키.
@@ -25,6 +28,19 @@ pub struct WebState {
     /// 웹 비밀번호 SHA-256 해시. None 이면 미설정(최초 설정 필요) 상태.
     pub password_hash: Mutex<Option<[u8; 32]>>,
     pub sessions: Mutex<HashMap<String, Instant>>,
+    /// 사용자용 마참뮤직 Discord OAuth 세션.
+    pub remote_sessions: Mutex<HashMap<String, remote::RemoteSession>>,
+    /// OAuth state 일회용 토큰과 발급 시각.
+    pub oauth_states: Mutex<HashMap<String, Instant>>,
+    /// 길드별 상태 변경을 WebSocket 접속자에게 알리는 브로드캐스트 채널.
+    pub remote_events: broadcast::Sender<remote::RemoteEvent>,
+    pub remote_auth: remote::RemoteAuthConfig,
+    /// 길드·사용자별 마지막 채팅 전송 시각(간단한 도배 방지).
+    pub remote_chat_rate: Mutex<HashMap<(u64, u64), Instant>>,
+    /// Discord 멤버 역할 조회 캐시. 읽기 화면의 2초 동기화가 Discord API를 과호출하지 않게 한다.
+    pub remote_member_roles: Mutex<HashMap<(u64, u64), (Instant, Vec<u64>)>>,
+    /// 주요 사용자 동작의 마지막 요청 시각. 연타와 자동화 오용을 완화한다.
+    pub remote_action_rate: Mutex<HashMap<(u64, u64, &'static str), Instant>>,
 }
 
 /// 비밀번호 해시 저장 파일 (data 디렉터리, gitignore 대상).
@@ -72,10 +88,18 @@ pub async fn serve(app: Arc<App>) {
             "[web] 웹 비밀번호 미설정 — 호스트에서 http://localhost:8693 에 접속해 최초 비밀번호를 설정하세요."
         );
     }
+    let (remote_events, _) = broadcast::channel(256);
     let state = Arc::new(WebState {
         app: app.clone(),
         password_hash: Mutex::new(initial_hash),
         sessions: Mutex::new(HashMap::new()),
+        remote_sessions: Mutex::new(HashMap::new()),
+        oauth_states: Mutex::new(HashMap::new()),
+        remote_events,
+        remote_auth: remote::RemoteAuthConfig::from_env(),
+        remote_chat_rate: Mutex::new(HashMap::new()),
+        remote_member_roles: Mutex::new(HashMap::new()),
+        remote_action_rate: Mutex::new(HashMap::new()),
     });
 
     let router = Router::new()
@@ -113,6 +137,7 @@ pub async fn serve(app: Arc<App>) {
             get(pages::password_page).post(pages::password_post),
         )
         .route("/healthz", get(|| async { "ok" }))
+        .merge(remote::router())
         .layer(CookieManagerLayer::new())
         .with_state(state);
 
@@ -342,4 +367,3 @@ pub fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
-

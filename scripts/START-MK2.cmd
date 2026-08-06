@@ -18,6 +18,12 @@ if not exist "bot\botsettings.json" (
 REM Web admin bind address. On the FIRST launch, open http://localhost:8693
 REM and set the admin password (first-time setup is allowed from localhost only).
 set MUSICBOT_WEB_URLS=http://0.0.0.0:8693
+set MUSICBOT_PUBLIC_BASE_URL=https://musicbot.example.com
+REM Keep OAuth secrets outside the update manifest. Create bot\remote.env.cmd from
+REM bot\remote.env.sample.cmd on the host; updates preserve the local file.
+if exist "bot\remote.env.cmd" call "bot\remote.env.cmd"
+if "%MUSICBOT_DISCORD_CLIENT_ID%"=="" set MUSICBOT_DISCORD_CLIENT_ID=100000000000000001
+if "%MUSICBOT_DISCORD_CLIENT_SECRET%"=="" echo [!] Discord OAuth is not configured. Set MUSICBOT_DISCORD_CLIENT_SECRET in bot\remote.env.cmd.
 
 start "MusicBot" bot-mk2\mc-musicbot.exe
 

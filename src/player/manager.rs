@@ -4,6 +4,8 @@
 use crate::db::Db;
 use crate::logging::LogService;
 use crate::models::*;
+use crate::remote::RemoteStore;
+use crate::remote::ranking::{sort_queue, wait_score_targets};
 use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -12,6 +14,7 @@ use tokio::sync::Mutex;
 
 pub struct PlayerManager {
     db: Arc<Db>,
+    remote: Arc<RemoteStore>,
     log: Arc<LogService>,
     gate: Mutex<()>,
     previews: StdMutex<HashMap<u64, QueueItem>>,
@@ -29,9 +32,10 @@ pub enum CancelOutcome {
 }
 
 impl PlayerManager {
-    pub fn new(db: Arc<Db>, log: Arc<LogService>) -> PlayerManager {
+    pub fn new(db: Arc<Db>, remote: Arc<RemoteStore>, log: Arc<LogService>) -> PlayerManager {
         PlayerManager {
             db,
+            remote,
             log,
             gate: Mutex::new(()),
             previews: StdMutex::new(HashMap::new()),
@@ -42,8 +46,12 @@ impl PlayerManager {
     pub fn effective_settings(&self, guild_id: u64) -> EffectiveGuildSettings {
         let global = self.db.load_global_settings();
         let guild = self.db.load_guild_settings(guild_id);
+        let remote = self.remote.load_guild_settings(guild_id);
         EffectiveGuildSettings {
-            effective_volume: guild.volume_override.unwrap_or(global.master_volume),
+            effective_volume: guild
+                .volume_override
+                .unwrap_or(global.master_volume)
+                .clamp(remote.min_volume, remote.max_volume),
             normalize_enabled: guild
                 .normalize_enabled_override
                 .unwrap_or(global.normalize_enabled),
@@ -58,6 +66,7 @@ impl PlayerManager {
         let mut state =
             self.db
                 .load_guild_state(guild_id, eff.effective_volume, eff.autoplay_default);
+        self.prepare_scored_queue(&mut state);
         self.attach_preview(&mut state);
         state
     }
@@ -78,7 +87,9 @@ impl PlayerManager {
         let mut state =
             self.db
                 .load_guild_state(guild_id, eff.effective_volume, eff.autoplay_default);
+        self.prepare_scored_queue(&mut state);
         f(&mut state);
+        self.prepare_scored_queue(&mut state);
         self.db.save_guild_state(&state);
         self.log.info(category, log_msg);
         self.attach_preview(&mut state);
@@ -244,6 +255,7 @@ impl PlayerManager {
             ));
         }
         let removed = state.upcoming.remove(index);
+        let _ = self.remote.clear_item_runtime(&removed.id);
         self.db.save_guild_state(&state);
         self.log.info(
             "Queue",
@@ -266,6 +278,7 @@ impl PlayerManager {
 
         if let Some(pos) = state.upcoming.iter().position(|i| i.id == item_id) {
             let removed = state.upcoming.remove(pos);
+            let _ = self.remote.clear_item_runtime(&removed.id);
             self.db.save_guild_state(&state);
             let title = removed.track.display_title().to_string();
             self.log.info(
@@ -283,6 +296,7 @@ impl PlayerManager {
                 .map(|c| c.track.display_title().to_string())
                 .unwrap_or_default();
             if let Some(cur) = state.current_item.take() {
+                let _ = self.remote.clear_item_runtime(&cur.id);
                 if state.repeat_mode == RepeatMode::Queue {
                     state.cycle_history.push(clone_item(&cur));
                 }
@@ -441,6 +455,15 @@ impl PlayerManager {
             "Playback",
             &format!("Advanced playback for guild {guild_id}."),
             |s| {
+                if s.repeat_mode != RepeatMode::Track {
+                    let targets = wait_score_targets(&s.upcoming);
+                    let _ = self.remote.increment_wait_scores(&targets);
+                    self.sort_scored_queue(s);
+                    if let Some(current) = &s.current_item {
+                        let _ = self.remote.record_recent(guild_id, current, "completed");
+                        let _ = self.remote.clear_item_runtime(&current.id);
+                    }
+                }
                 advance_unsafe(s);
             },
         )
@@ -454,6 +477,13 @@ impl PlayerManager {
             "Playback",
             &format!("Advanced playback for guild {guild_id}."),
             |s| {
+                let targets = wait_score_targets(&s.upcoming);
+                let _ = self.remote.increment_wait_scores(&targets);
+                self.sort_scored_queue(s);
+                if let Some(current) = &s.current_item {
+                    let _ = self.remote.record_recent(guild_id, current, "skipped");
+                    let _ = self.remote.clear_item_runtime(&current.id);
+                }
                 if let Some(cur) = s.current_item.take() {
                     if s.repeat_mode == RepeatMode::Queue {
                         s.cycle_history.push(clone_item(&cur));
@@ -517,7 +547,8 @@ impl PlayerManager {
     }
 
     pub async fn set_volume(&self, guild_id: u64, volume: i32) -> GuildPlayerState {
-        let v = volume.clamp(0, 200);
+        let remote = self.remote.load_guild_settings(guild_id);
+        let v = volume.clamp(remote.min_volume, remote.max_volume);
         self.mutate(
             guild_id,
             "Playback",
@@ -685,6 +716,52 @@ impl PlayerManager {
             },
         )
         .await
+    }
+
+    /// 외부 웹이 관리자 강제 이동을 적용한다. 큰 우선순위일수록 먼저 재생된다.
+    pub async fn set_manual_priority(
+        &self,
+        guild_id: u64,
+        item_id: &str,
+        priority: Option<i32>,
+    ) -> Result<GuildPlayerState, String> {
+        self.remote
+            .set_manual_priority(guild_id, item_id, priority)
+            .map_err(|error| error.to_string())?;
+        Ok(self.refresh_scored_order(guild_id).await)
+    }
+
+    /// 투표/관리자 우선순위 변경 직후 정렬 결과를 영속 상태에도 반영한다.
+    pub async fn refresh_scored_order(&self, guild_id: u64) -> GuildPlayerState {
+        let _g = self.gate.lock().await;
+        let eff = self.effective_settings(guild_id);
+        let mut state =
+            self.db
+                .load_guild_state(guild_id, eff.effective_volume, eff.autoplay_default);
+        self.prepare_scored_queue(&mut state);
+        self.db.save_guild_state(&state);
+        self.attach_preview(&mut state);
+        state
+    }
+
+    fn prepare_scored_queue(&self, state: &mut GuildPlayerState) {
+        let mut items =
+            Vec::with_capacity(state.upcoming.len() + usize::from(state.current_item.is_some()));
+        if let Some(current) = &state.current_item {
+            items.push(current.clone());
+        }
+        items.extend(state.upcoming.iter().cloned());
+        let _ = self.remote.ensure_queue_items(state.guild_id, &items);
+        self.sort_scored_queue(state);
+    }
+
+    fn sort_scored_queue(&self, state: &mut GuildPlayerState) {
+        // 사용자가 명시적으로 셔플을 켠 동안에는 기존 셔플 순서를 존중한다.
+        if state.shuffle_enabled {
+            return;
+        }
+        let scores = self.remote.queue_scores(state.guild_id);
+        sort_queue(&mut state.upcoming, &scores);
     }
 }
 

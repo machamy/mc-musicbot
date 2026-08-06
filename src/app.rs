@@ -11,6 +11,8 @@ use crate::models::TrackRef;
 use crate::player::autoplay::AutoplayEngine;
 use crate::player::coordinator::Coordinator;
 use crate::player::manager::PlayerManager;
+use crate::remote::RemoteStore;
+use serenity::cache::Cache;
 use serenity::http::Http;
 use songbird::Songbird;
 use std::collections::HashMap;
@@ -33,9 +35,13 @@ pub struct App {
     pub player: Arc<PlayerManager>,
     pub autoplay: Arc<AutoplayEngine>,
     pub coordinator: Arc<Coordinator>,
+    /// 마참뮤직 점수 큐·개인 목록·채팅·감사 로그 저장소.
+    pub remote: Arc<RemoteStore>,
     /// serenity 클라이언트 기동 후 채워지는 핸들들.
     pub songbird: OnceLock<Arc<Songbird>>,
     pub http: OnceLock<Arc<Http>>,
+    /// OAuth 사용자의 현재 길드 역할·음성 채널을 서버 측에서 재검증할 Discord 캐시.
+    pub discord_cache: OnceLock<Arc<Cache>>,
     /// 길드별 마지막 명령 채널 (현재 재생 중 알림 대상).
     pub announce_channels: Mutex<HashMap<u64, u64>>,
     /// 길드별 직전 Now-Playing 메시지 (채널, 메시지) — 새 카드 전송 시 이전 카드 버튼 제거용.
@@ -57,7 +63,10 @@ impl App {
             db.clone(),
             log.clone(),
         ));
-        let player = Arc::new(PlayerManager::new(db.clone(), log.clone()));
+        let remote = Arc::new(
+            RemoteStore::open(&config.db_path()).expect("마참뮤직 SQLite 테이블 준비 실패"),
+        );
+        let player = Arc::new(PlayerManager::new(db.clone(), remote.clone(), log.clone()));
 
         let global = db.load_global_settings();
         let ytdlp = YtDlp {
@@ -85,8 +94,10 @@ impl App {
             player,
             autoplay,
             coordinator,
+            remote,
             songbird: OnceLock::new(),
             http: OnceLock::new(),
+            discord_cache: OnceLock::new(),
             announce_channels: Mutex::new(HashMap::new()),
             last_np_message: Mutex::new(HashMap::new()),
             pending_leaves: Mutex::new(HashMap::new()),
