@@ -100,6 +100,9 @@ const LS = {
  * 스와치 색은 tokens.css의 --surface-1 / --accent / --text-1 을 그대로 옮겨 적은 것이다.
  * 적용해 보기 전에는 그 테마의 토큰을 읽을 방법이 없어서 여기 한 벌 둔다.
  * tokens.css를 고치면 여기도 같이 고쳐야 색이 안 어긋난다. */
+/* 밝은 테마 목록 — color-scheme 을 light 로 줘야 스크롤바·폼 위젯이 같이 밝아진다. */
+const LIGHT_THEMES = new Set(['light', 'sepia']);
+
 const THEMES = {
   auto: { label: '시스템 따라가기', desc: '기기가 밝으면 라이트, 어두우면 다크로 따라가요', swatch: null },
   dark: { label: '다크', desc: '거의 검정 배경에 남보라 강조', swatch: ['#0d111a', '#8b5cf6', '#f2f5fa'] },
@@ -347,7 +350,12 @@ function resolveTheme(choice) {
 /** 화면에만 적용한다(미리보기). 저장은 하지 않는다. */
 function paintTheme(choice) {
   const value = resolveTheme(choice);
-  document.documentElement.dataset.theme = value;
+  const root = document.documentElement;
+  root.dataset.theme = value;
+  // Chromium 은 문서의 color-scheme 을 **첫 페인트 때 확정**하고, 이후 data-theme 이 바뀌어도
+  // CSS 의 color-scheme 선언을 다시 읽지 않는다. 그래서 스크롤바와 폼 기본 위젯만
+  // 반대 색으로 남는다. 인라인 스타일은 바로 먹으므로 여기서 같이 박아 준다.
+  root.style.colorScheme = LIGHT_THEMES.has(value) ? 'light' : 'dark';
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute('content', THEME_META[value] || THEME_META.dark);
   if (el.themeBtn) el.themeBtn.textContent = themeIcon(choice);
@@ -371,7 +379,11 @@ function commitTheme(choice) {
 
 /* 서버 셸의 FOUC 스크립트는 저장값을 그대로 박는다. `auto`만 여기서 한 번 풀어 준다.
  * el 이 아직 없는 시점이라 paintTheme 대신 최소한만 만진다. */
-if (themeChoice() === 'auto') document.documentElement.dataset.theme = systemTheme();
+if (themeChoice() === 'auto') {
+  const boot = systemTheme();
+  document.documentElement.dataset.theme = boot;
+  document.documentElement.style.colorScheme = LIGHT_THEMES.has(boot) ? 'light' : 'dark';
+}
 
 /* 시스템 따라가기를 골라 둔 사람은 OS 설정이 바뀌면 같이 바뀌어야 한다. */
 if (window.matchMedia) {

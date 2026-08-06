@@ -980,6 +980,22 @@ pub const AUDIT_MERGE_WINDOW_SECS: i64 = 60;
 /// `POST /control` 은 결과를 `"volume:150"` · `"autoplay:true"` 처럼 `키:값` 으로 남긴다.
 /// 사람 피드에 그대로 박으면 `서버 볼륨을 volume:150으로 바꿨어요` 가 나간다 —
 /// 문장을 만들 때 접두사를 벗겨서 값만 쓴다. 접두사가 없으면 값을 그대로 돌려준다.
+/// 재생목록 감사 대상은 `12:밤샘용` 처럼 `id:이름` 으로 남는다.
+/// 사람 피드에 id 가 새면 안 되므로 이름만 꺼낸다. 이름에 `:` 가 있어도 첫 번째만 자른다.
+fn playlist_name(item: Option<&str>) -> Option<&str> {
+    let raw = item?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.split_once(':') {
+        // 앞이 전부 숫자일 때만 id 로 본다. `팝:최애` 같은 이름을 잘라내면 안 된다.
+        Some((head, rest)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => {
+            Some(rest.trim())
+        }
+        _ => Some(raw),
+    }
+}
+
 fn audit_value<'a>(after: Option<&'a str>, prefix: &str) -> Option<&'a str> {
     let raw = after?.trim();
     Some(
@@ -1029,7 +1045,7 @@ pub fn audit_text(
             None => format!("어떤 곡이 싫어요 {count}개로 대기열에서 내려갔어요"),
         },
         "queue.clear" => format!("{actor}님이 대기열 {count}곡을 비웠어요"),
-        "playlist.enqueue" => match item {
+        "playlist.enqueue" => match playlist_name(item) {
             Some(name) => format!("{actor}님이 재생목록 **{name}** 에서 {count}곡을 담았어요"),
             None => format!("{actor}님이 재생목록에서 {count}곡을 담았어요"),
         },
@@ -1079,19 +1095,29 @@ pub fn audit_text(
                 format!("{actor}님이 자동 재생을 껐어요")
             }
         }
-        "playlist.create" => match item {
+        "playlist.create" => match playlist_name(item) {
             Some(name) => format!("{actor}님이 재생목록 **{name}** 을 만들었어요"),
             None => format!("{actor}님이 재생목록을 만들었어요"),
         },
-        "playlist.rename" => match (before, after) {
+        "playlist.rename" => match (playlist_name(before), playlist_name(after)) {
             (Some(old), Some(new)) => {
                 format!("{actor}님이 재생목록 이름을 **{old}** 에서 **{new}** 로 바꿨어요")
             }
             _ => format!("{actor}님이 재생목록 이름을 바꿨어요"),
         },
-        "playlist.delete" => match item {
+        "playlist.delete" => match playlist_name(item) {
             Some(name) => format!("{actor}님이 재생목록 **{name}** 을 지웠어요"),
             None => format!("{actor}님이 재생목록을 지웠어요"),
+        },
+        // 곡 추가/제거는 대상이 `id:재생목록이름` 이라 이름만 꺼내 쓴다.
+        // 이 두 개가 빠져 있어서 화면에 `playlist.addTrack 을 했어요 (1:aespa - Spicy)` 가 그대로 나갔다.
+        "playlist.addTrack" => match playlist_name(item) {
+            Some(name) => format!("{actor}님이 재생목록 **{name}** 에 곡을 담았어요"),
+            None => format!("{actor}님이 재생목록에 곡을 담았어요"),
+        },
+        "playlist.removeEntry" => match playlist_name(item) {
+            Some(name) => format!("{actor}님이 재생목록 **{name}** 에서 곡을 뺐어요"),
+            None => format!("{actor}님이 재생목록에서 곡을 뺐어요"),
         },
         "autoplay.seed.add" => match item {
             Some(title) => format!("{actor}님이 **{title}** 을 자동 재생 기준 곡으로 등록했어요"),
@@ -2088,6 +2114,36 @@ mod tests {
 
     /// `POST /control` 이 남기는 `키:값` 결과와 옛 액션명이 사람 피드에 그대로 새면 안 된다.
     /// (`민수님이 playback.autoplay 을 했어요` · `서버 볼륨을 volume:150으로 바꿨어요`)
+    #[test]
+    fn playlist_sentences_never_leak_the_id_or_the_action_name() {
+        // 화면에 `playlist.addTrack 을 했어요 (1:aespa - Spicy)` 가 그대로 나갔던 자리다.
+        for action in [
+            "playlist.create",
+            "playlist.addTrack",
+            "playlist.removeEntry",
+            "playlist.delete",
+            "playlist.enqueue",
+        ] {
+            let text = audit_text(action, "민수", Some("12:밤샘용"), None, None, 0);
+            assert!(
+                !text.contains("playlist."),
+                "{action} 문장에 액션명이 남았다: {text}"
+            );
+            assert!(!text.contains("12:"), "{action} 문장에 id 가 샜다: {text}");
+            assert!(
+                text.contains("밤샘용"),
+                "{action} 문장에 이름이 없다: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn playlist_names_that_contain_a_colon_survive() {
+        // `팝:최애` 처럼 이름에 콜론이 있으면 자르면 안 된다. 숫자 접두사일 때만 id 로 본다.
+        let text = audit_text("playlist.create", "민수", Some("팝:최애"), None, None, 0);
+        assert!(text.contains("팝:최애"), "{text}");
+    }
+
     #[test]
     fn machine_strings_never_reach_the_human_feed() {
         // 값 접두사를 벗긴다.

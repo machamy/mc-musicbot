@@ -114,7 +114,7 @@
   --focus-ring: 0 0 0 2px var(--surface-0), 0 0 0 4px var(--accent);
 }
 
-[data-theme="light"] {
+:root[data-theme="light"] {
   color-scheme: light;
 
   --surface-0: #f4f6fa;
@@ -175,7 +175,7 @@
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* ── 미드나잇 — 짙은 곤색. Tokyo Night 계열 ── */
-[data-theme="midnight"] {
+:root[data-theme="midnight"] {
   color-scheme: dark;
 
   --surface-0: #16161e;  --surface-1: #1a1b26;  --surface-2: #1f2130;
@@ -211,7 +211,7 @@
 }
 
 /* ── 그레이 — 채도를 뺀 중성 회색. GitHub Dimmed 계열. 눈이 제일 안 피곤하다 ── */
-[data-theme="slate"] {
+:root[data-theme="slate"] {
   color-scheme: dark;
 
   --surface-0: #1c2128;  --surface-1: #22272e;  --surface-2: #262c36;
@@ -249,7 +249,7 @@
 }
 
 /* ── 노르드 — 차가운 청회색. Nord 팔레트 ── */
-[data-theme="nord"] {
+:root[data-theme="nord"] {
   color-scheme: dark;
 
   --surface-0: #242933;  --surface-1: #2e3440;  --surface-2: #333b4a;
@@ -285,7 +285,7 @@
 }
 
 /* ── 베이지 — 따뜻한 종이색. 밝은 방에서 좋다. Solarized Light 계열 ── */
-[data-theme="sepia"] {
+:root[data-theme="sepia"] {
   color-scheme: light;
 
   --surface-0: #efe6d3;  --surface-1: #fdf6e3;  --surface-2: #fbf3de;
@@ -323,7 +323,7 @@
 /* ── 레트로 — 옛날 CRT 앰버 단색. 아마 제일 재밌고 제일 안 쓰일 테마다.
  * 단색이라 의미색을 구분하기 어렵다. 성공/위험은 색상을 확실히 벌려
  * 앰버 사이에서도 구분되게 했다. ── */
-[data-theme="retro"] {
+:root[data-theme="retro"] {
   color-scheme: dark;
 
   --surface-0: #0a0803;  --surface-1: #12100a;  --surface-2: #191509;
