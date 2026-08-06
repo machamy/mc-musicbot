@@ -3,8 +3,11 @@
 
 use crate::app::App;
 use crate::models::*;
+use crate::player::autoplay::{AutoplayContext, AutoplayTuning};
 use crate::player::coordinator::Coordinator;
 use crate::player::manager::PlayerManager;
+use crate::remote::AutoplayMode;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// preview 추천 진행중 플래그를 패닉/조기반환에도 반드시 해제하는 가드.
@@ -69,6 +72,161 @@ pub fn on_track_started(
     }
 }
 
+/// 자동추천 한 번에 필요한 입력 한 벌 (§8.2 · §8.5).
+/// DB 조회는 여기서 **한 번씩만** 한다 — 추천 경로에서 여러 번 왕복하면 곡 경계가 밀린다.
+struct AutoplayPlan {
+    /// 라운드로빈으로 돌 시드 목록. 비어 있으면 `fallback` 한 곡만 쓴다.
+    seeds: Vec<TrackRef>,
+    fallback: Option<TrackRef>,
+    /// 지금 재생 중·대기열에 있는 곡. 무조건 제외.
+    excluded: HashSet<String>,
+    /// `📻 이 곡 말고`로 뺐거나 재생에 실패한 곡 (§8.5-3).
+    blocked: HashSet<String>,
+    /// `cache_key → 마지막 재생 후 지난 시간`. **최근 목록에 있다고 영원히 빼지 않는다** (§8.5-2).
+    recent_ages: HashMap<String, f64>,
+    recent_artists: Vec<String>,
+    tuning: AutoplayTuning,
+}
+
+impl AutoplayPlan {
+    fn context(&self) -> AutoplayContext<'_> {
+        AutoplayContext {
+            excluded: &self.excluded,
+            blocked: &self.blocked,
+            recent_ages: &self.recent_ages,
+            recent_artists: &self.recent_artists,
+            tuning: self.tuning,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.seeds.is_empty() && self.fallback.is_none()
+    }
+}
+
+/// 길드 설정의 추천 방식(§8.2)대로 시드를 고르고, 정책 입력을 모아 온다.
+///
+/// **폴백 사슬**: `seed`(시드 없음) → `recent` → `genre` → 포기.
+/// 어떤 모드든 시드를 못 구하면 조용히 멈추지 말고 다음으로 내려간다 —
+/// 자동재생이 이유 없이 멈춘 것처럼 보이는 게 제일 나쁘다.
+fn build_autoplay_plan(app: &Arc<App>, guild_id: u64, state: &GuildPlayerState) -> AutoplayPlan {
+    let settings = app.remote.load_guild_settings(guild_id);
+
+    // 하드 제외는 지금 나오는 곡과 대기열뿐이다. 최근 재생은 감쇠로 다룬다.
+    let mut excluded: HashSet<String> = HashSet::new();
+    if let Some(current) = &state.current_item {
+        excluded.insert(current.track.cache_key());
+    }
+    for item in &state.upcoming {
+        excluded.insert(item.track.cache_key());
+    }
+    if let Some(preview) = &state.autoplay_preview {
+        excluded.insert(preview.track.cache_key());
+    }
+
+    let (recent_ages, recent_artists) = app.remote.recent_play_history(guild_id, 200);
+    let blocked = app.remote.blocked_autoplay_keys(guild_id);
+
+    let mut mode = settings.autoplay_mode;
+    let mut seeds;
+    loop {
+        seeds = seeds_for_mode(app, guild_id, &settings, state, mode);
+        if !seeds.is_empty() {
+            break;
+        }
+        match mode.fallback() {
+            Some(next) => {
+                app.log.info(
+                    "Autoplay",
+                    &format!(
+                        "{} 기준으로는 참고할 곡이 없어서 {} 기준으로 내려가요.",
+                        mode.label(),
+                        next.label()
+                    ),
+                );
+                mode = next;
+            }
+            None => break,
+        }
+    }
+
+    // 사슬 끝까지 갔는데도 비었으면 지금 나오는 곡이라도 쓴다 (지금까지의 동작).
+    let fallback = state
+        .current_item
+        .as_ref()
+        .map(|item| item.track.clone())
+        .or_else(|| state.recent_tracks.first().cloned());
+
+    AutoplayPlan {
+        seeds,
+        fallback,
+        excluded,
+        blocked,
+        recent_ages,
+        recent_artists,
+        tuning: AutoplayTuning {
+            policy: settings.autoplay_policy,
+            artist_cooldown: settings.autoplay_artist_cooldown,
+            recent_decay_hours: settings.autoplay_recent_decay_hours,
+        },
+    }
+}
+
+/// 모드별 시드 목록 (§8.2). 엔진이 이 목록을 길드별 커서로 라운드로빈한다.
+fn seeds_for_mode(
+    app: &Arc<App>,
+    guild_id: u64,
+    settings: &crate::remote::RemoteGuildSettings,
+    state: &GuildPlayerState,
+    mode: AutoplayMode,
+) -> Vec<TrackRef> {
+    match mode {
+        AutoplayMode::Seed => app
+            .remote
+            .list_autoplay_seeds(guild_id)
+            .into_iter()
+            .map(|seed| seed.track)
+            .collect(),
+        AutoplayMode::Recent => {
+            // 지금 나오는 곡을 맨 앞에 둔다 — 첫 회전은 지금까지와 똑같이 동작한다.
+            let mut seeds: Vec<TrackRef> = state
+                .current_item
+                .as_ref()
+                .map(|item| item.track.clone())
+                .into_iter()
+                .collect();
+            for track in &state.recent_tracks {
+                if seeds.len() >= settings.autoplay_recent_count.max(1) as usize {
+                    break;
+                }
+                if !seeds
+                    .iter()
+                    .any(|seed| seed.cache_key().eq_ignore_ascii_case(&track.cache_key()))
+                {
+                    seeds.push(track.clone());
+                }
+            }
+            seeds
+        }
+        AutoplayMode::Genre => {
+            // §15 의 차트 인프라를 그대로 쓴다. **캐시만 본다** — 재생 경로에서 yt-dlp 를 돌리면
+            // 곡 경계가 몇 초씩 밀린다. 캐시가 비어 있으면 폴백 사슬이 알아서 내려간다.
+            let mut seeds = Vec::new();
+            for key in &settings.autoplay_genres {
+                let Ok(chart_id) = key.parse::<i64>() else {
+                    continue;
+                };
+                let Some(snapshot) = app.remote.chart_cache(chart_id) else {
+                    continue;
+                };
+                // 장르를 여러 개 고르면 장르도 라운드로빈이 되도록 앞에서 몇 곡씩만 섞어 넣는다.
+                seeds.extend(snapshot.tracks.into_iter().take(5));
+            }
+            seeds
+        }
+    }
+}
+
 /// 큐가 빌 예정일 때 autoplay 미리보기를 풀어 둔다 (C# ResolveAutoplayPreviewAsync).
 pub async fn resolve_preview(app: Arc<App>, guild_id: u64) {
     let state = app.player.get_state(guild_id).await;
@@ -85,13 +243,18 @@ pub async fn resolve_preview(app: Arc<App>, guild_id: u64) {
         guild_id,
     };
     let result = async {
-        let seed = state
-            .current_item
-            .as_ref()
-            .map(|c| c.track.clone())
-            .or_else(|| state.recent_tracks.first().cloned())?;
-        let excluded = PlayerManager::excluded_keys(&state);
-        app.autoplay.recommend(guild_id, &seed, &excluded).await
+        let plan = build_autoplay_plan(&app, guild_id, &state);
+        if plan.is_empty() {
+            return None;
+        }
+        app.autoplay
+            .recommend_with_context(
+                guild_id,
+                plan.fallback.as_ref(),
+                &plan.seeds,
+                &plan.context(),
+            )
+            .await
     }
     .await;
     if let Some(track) = result {
@@ -173,24 +336,58 @@ pub async fn ensure_autoplay(
             return;
         }
     }
-    let seed = state
-        .current_item
-        .as_ref()
-        .map(|c| c.track.clone())
-        .or_else(|| state.recent_tracks.first().cloned());
-    let Some(seed) = seed else {
+    let plan = build_autoplay_plan(&app, guild_id, &state);
+    if plan.is_empty() {
         app.log.info(
             "Autoplay",
-            "추천 시드가 없어 건너뜀(현재 곡·최근 곡 모두 비어 있음).",
+            "참고할 곡이 없어서 이번 자동 재생은 건너뛰어요(기준 곡·최근 곡·장르 차트가 전부 비었어요).",
         );
         return;
-    };
-    let excluded = PlayerManager::excluded_keys(&state);
-    if let Some(track) = app.autoplay.recommend(guild_id, &seed, &excluded).await {
+    }
+    if let Some(track) = app
+        .autoplay
+        .recommend_with_context(
+            guild_id,
+            plan.fallback.as_ref(),
+            &plan.seeds,
+            &plan.context(),
+        )
+        .await
+    {
         app.player
             .seed_autoplay_item(guild_id, QueueItem::new_autoplay(track), allow_continuation)
             .await;
     }
+}
+
+/// `📻 이 곡 말고` (§14.3). 지금 잡혀 있는 다음 자동추천곡을 **7일간 다시 안 뽑히게** 하고
+/// 새로 하나 뽑는다. 권한은 호출부(`autoplay_rule`)가 이미 봤다고 본다.
+///
+/// 자동 재생 정책을 바꿨을 때도 이걸 부른다 — 안 그러면 바꾼 게 언제 먹는지 알 수 없다(§8.5).
+pub async fn reject_preview(app: Arc<App>, guild_id: u64, reason: &str) -> bool {
+    let Some(preview) = app.player.take_preview(guild_id) else {
+        return false;
+    };
+    let cache_key = preview.track.cache_key();
+    let _ = app
+        .remote
+        .block_autoplay_candidate(guild_id, &cache_key, Some(reason));
+    app.log.info(
+        "Autoplay",
+        &format!(
+            "'{}'는 다시 안 뽑아요 ({reason}). 다른 곡을 다시 골라요.",
+            preview.track.display_title()
+        ),
+    );
+    resolve_preview(app, guild_id).await;
+    true
+}
+
+/// 정책·기준 곡이 바뀌었을 때 다음 추천곡만 다시 뽑는다 (§8.5 UI).
+/// 이미 잡혀 있던 후보는 **차단하지 않는다** — 사용자가 싫다고 한 게 아니라 규칙이 바뀐 것뿐이다.
+pub async fn refresh_preview(app: Arc<App>, guild_id: u64) {
+    app.player.take_preview(guild_id);
+    resolve_preview(app, guild_id).await;
 }
 
 /// 이미 계산된 preview 만 소비한다. 네트워크 추천은 하지 않으므로 스킵 경로에서 즉시 호출 가능하다.

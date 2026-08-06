@@ -31,8 +31,19 @@ fn percent_encode_path(value: &str) -> String {
 }
 
 /// 테마 깜빡임 방지 — 스타일시트보다 먼저 실행돼야 한다.
-const THEME_BOOT: &str =
-    r#"<script>try{document.documentElement.dataset.theme=localStorage.getItem('macham.theme')||'dark'}catch(e){}</script>"#;
+///
+/// 저장값을 그대로 `data-theme` 에 넣는다. 테마가 7종으로 늘어도(V3 §17) 여기는 그대로다.
+/// **`auto` 만 예외**다 — 그건 값이 아니라 규칙이라 여기서 풀어 준다.
+/// 안 풀면 `data-theme="auto"` 가 박혀서 어느 토큰 블록에도 안 걸리고 화면이 기본색으로 뜬다.
+///
+/// `<meta name="theme-color">` 도 같이 맞춘다. 모바일 주소창만 반대 색이면 어색하다.
+const THEME_BOOT: &str = r#"<script>try{
+var t=localStorage.getItem('macham.theme')||'dark';
+if(t==='auto')t=matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
+document.documentElement.dataset.theme=t;
+var light=t==='light'||t==='sepia';
+document.documentElement.style.colorScheme=light?'light':'dark';
+}catch(e){}</script>"#;
 
 /// JSON 리터럴을 `<script>` 안에 넣을 때 `</script>` 조기 종료를 막는다.
 fn script_json(value: &Value) -> String {
@@ -61,7 +72,7 @@ fn shell(
         r##"<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
-<meta name="theme-color" content="#07090f">
+<meta name="theme-color" id="theme-color" content="#07090f">
 <title>{title} · 마참뮤직</title>
 {THEME_BOOT}
 <link rel="icon" href="/music/assets/favicon.svg?v={build}">
@@ -217,6 +228,8 @@ pub fn guild(
         "tier": tier.as_str(),
         "guild": guild_json(guild),
         "themeDefault": "dark",
+        // 테마 7종 + 시스템 따라가기 (V3 §17). 화면이 목록을 따로 들고 있으면 서버와 어긋난다.
+        "themes": ["auto", "dark", "light", "midnight", "slate", "sepia", "retro", "nord"],
     });
     shell(
         &guild.name,

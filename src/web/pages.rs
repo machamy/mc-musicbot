@@ -222,14 +222,14 @@ pub async fn setup_post(
     // 최초 설정은 호스트(localhost)에서만 — 원격에서 비밀번호를 선점하는 것을 방지.
     if !peer.ip().is_loopback() {
         return Html(setup_html(
-            Some("최초 비밀번호 설정은 봇이 실행 중인 PC(localhost)에서만 가능합니다."),
+            Some("최초 비밀번호는 봇이 돌고 있는 PC(localhost)에서만 정할 수 있어요."),
             &state.setup_csrf,
         ))
         .into_response();
     }
     if f.password.chars().count() < 4 {
         return Html(setup_html(
-            Some("비밀번호는 4자 이상이어야 합니다."),
+            Some("비밀번호는 4자 이상이어야 해요."),
             &state.setup_csrf,
         ))
         .into_response();
@@ -294,7 +294,7 @@ pub async fn password_post(
         return redirect_flash("/password", "현재 비밀번호가 올바르지 않습니다.", true);
     }
     if f.new_password.chars().count() < 4 {
-        return redirect_flash("/password", "새 비밀번호는 4자 이상이어야 합니다.", true);
+        return redirect_flash("/password", "새 비밀번호는 4자 이상이어야 해요.", true);
     }
     if f.new_password != f.confirm {
         return redirect_flash("/password", "새 비밀번호 확인이 일치하지 않습니다.", true);
@@ -795,7 +795,7 @@ pub async fn botsettings_oauth_post(
     {
         return redirect_flash(
             "/botsettings",
-            "Discord Client ID는 0이 아닌 숫자여야 합니다.",
+            "Discord Client ID는 0이 아닌 숫자여야 해요.",
             true,
         );
     }
@@ -827,7 +827,7 @@ pub async fn botsettings_oauth_post(
     {
         return redirect_flash(
             "/botsettings",
-            "공개 기본 URL은 경로·쿼리 없는 HTTPS 주소여야 합니다. localhost만 HTTP를 허용합니다.",
+            "공개 기본 URL은 경로·쿼리 없는 HTTPS 주소여야 해요. localhost만 HTTP로 둘 수 있어요.",
             true,
         );
     }
@@ -1959,7 +1959,7 @@ pub async fn playlists_post(
                 ),
             }
         }
-        _ => ("알 수 없는 동작입니다.".to_string(), true),
+        _ => ("알 수 없는 동작이에요.".to_string(), true),
     };
     redirect_flash("/playlists", &msg, is_err)
 }
@@ -2149,7 +2149,7 @@ pub async fn blacklist_post(
             }
             None => ("규칙 ID가 없습니다.".to_string(), true),
         },
-        _ => ("알 수 없는 동작입니다.".to_string(), true),
+        _ => ("알 수 없는 동작이에요.".to_string(), true),
     };
     redirect_flash(&back, &msg, is_err)
 }

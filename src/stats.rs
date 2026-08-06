@@ -13,7 +13,7 @@
 //! 통계 기능만 꺼진 채 계속 간다.
 
 use crate::logging::LogService;
-use crate::models::TrackRef;
+use crate::models::{PlaybackRequestKind, QueueItem, TrackRef};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Arc;
@@ -60,13 +60,20 @@ pub enum StatEvent {
     },
     /// 한 번에 담기를 한 번 썼다 (곡 수와 별개로 "횟수"를 센다).
     BulkUsed { guild_id: u64, user_id: u64 },
-    /// 곡이 재생됐다. `requester` 가 `None` 이면 자동재생이다.
+    /// 곡이 재생됐다.
     ///
     /// **자동재생은 차트에서 제외한다** — 사람이 고른 게 아니라 알고리즘이 채운 거라
-    /// 같이 세면 차트가 "자동재생이 많이 튼 곡"이 되어 버린다.
+    /// 같이 세면 차트가 "자동재생이 많이 튼 곡"이 되어 버린다(§15.2b).
+    ///
+    /// 판정은 **`autoplay` 하나로만** 한다. `requester.is_none()` 으로 대신하면
+    /// `/이전곡` 처럼 사람이 시켰는데 신청자 ID 가 없는 항목까지 자동재생으로 세어져
+    /// 차트가 조용히 오염된다. 만드는 건 [`StatEvent::played_from_item`] 에 맡긴다.
     Played {
         guild_id: u64,
+        /// 신청한 사람. 모르면 `None` 이고 그때는 사람 통계만 건너뛴다.
         requester: Option<u64>,
+        /// 자동재생이 채운 곡인가. 차트의 `plays_user`/`plays_autoplay` 를 가른다.
+        autoplay: bool,
         cache_key: String,
         track_json: String,
         outcome: PlayOutcome,
@@ -92,6 +99,38 @@ pub enum StatEvent {
 }
 
 impl StatEvent {
+    /// 큐 항목 하나가 끝났을 때의 재생 이벤트. **호출부는 반드시 이걸 쓴다.**
+    ///
+    /// 자동재생 판정은 `request_kind` 하나로 한다 — 신청자 ID 가 비었다는 이유로
+    /// 자동재생 취급하면 안 된다. `/이전곡`으로 되돌아간 곡은 사람이 시킨 곡인데도
+    /// 신청자 ID 가 없어서, 그걸 자동재생으로 세면 §15.2b 차트가 틀어진다.
+    pub fn played_from_item(guild_id: u64, item: &QueueItem, outcome: PlayOutcome) -> StatEvent {
+        let autoplay = item.request_kind == PlaybackRequestKind::Autoplay;
+        let (cache_key, track_json) = track_parts(&item.track);
+        StatEvent::Played {
+            guild_id,
+            // 자동재생 항목은 신청자가 있을 수 없다. 혹시 남아 있어도 사람 통계에 넣지 않는다.
+            requester: if autoplay {
+                None
+            } else {
+                item.requested_by_user_id
+            },
+            autoplay,
+            cache_key,
+            track_json,
+            outcome,
+        }
+    }
+
+    /// 붐따(§10.3)로 대기열에서 내려간 곡. 신청자에게만 기록이 남는다.
+    pub fn boomtta_from_item(guild_id: u64, item: &QueueItem) -> StatEvent {
+        StatEvent::Boomtta {
+            guild_id,
+            owner_id: item.requested_by_user_id,
+            cache_key: item.track.cache_key(),
+        }
+    }
+
     fn guild_id(&self) -> u64 {
         match self {
             StatEvent::Queued { guild_id, .. }
@@ -652,6 +691,7 @@ fn apply(tx: &rusqlite::Transaction<'_>, event: &StatEvent) -> rusqlite::Result<
         StatEvent::Played {
             guild_id,
             requester,
+            autoplay,
             cache_key,
             track_json,
             outcome,
@@ -678,10 +718,11 @@ fn apply(tx: &rusqlite::Transaction<'_>, event: &StatEvent) -> rusqlite::Result<
             }
 
             // 차트는 자동재생을 따로 센다 (§15.2b). 순위에는 plays_user 만 쓴다.
-            let column = if requester.is_some() {
-                "plays_user"
-            } else {
+            // 기준은 `autoplay` 플래그다 — 신청자 유무로 가르면 안 된다(위 주석 참고).
+            let column = if *autoplay {
                 "plays_autoplay"
+            } else {
+                "plays_user"
             };
             for scope in [*guild_id, ALL_GUILDS] {
                 touch_track(tx, scope, cache_key, track_json, &now)?;
@@ -692,7 +733,7 @@ fn apply(tx: &rusqlite::Transaction<'_>, event: &StatEvent) -> rusqlite::Result<
                     ),
                     params![scope as i64, cache_key, now],
                 )?;
-                if requester.is_some() {
+                if !*autoplay {
                     tx.execute(
                         "INSERT INTO stat_track_daily(guild_id, cache_key, day, plays_user)
                          VALUES(?1, ?2, ?3, 1)
@@ -930,13 +971,27 @@ mod tests {
         }
     }
 
+    /// 신청자가 없으면 자동재생인 흔한 경우. 둘이 갈리는 경우는 아래 전용 테스트가 본다.
     fn played(guild: u64, requester: Option<u64>, key: &str) -> StatEvent {
         StatEvent::Played {
             guild_id: guild,
             requester,
+            autoplay: requester.is_none(),
             cache_key: key.into(),
             track_json: format!("{{\"title\":\"{key}\"}}"),
             outcome: PlayOutcome::Completed,
+        }
+    }
+
+    fn track(content_id: &str) -> TrackRef {
+        TrackRef {
+            provider: crate::models::ProviderKind::YouTube,
+            content_id: content_id.into(),
+            source_url: format!("https://example.test/{content_id}"),
+            title: Some(content_id.into()),
+            artist: None,
+            duration: None,
+            variant_key: None,
         }
     }
 
@@ -1104,6 +1159,68 @@ mod tests {
         let all = stats.chart(all_guilds(), ChartKind::Plays, ChartWindow::All, 2, 10);
         assert_eq!(all[0].cache_key, "hit");
         assert_eq!(all[0].plays_user, 3);
+    }
+
+    /// 자동재생 판정은 `request_kind` 로만 한다. 신청자 ID 가 없다는 이유로 자동재생 취급하면
+    /// `/이전곡`으로 되돌아간 곡(사람이 시켰지만 신청자 ID 가 없다)이 차트에서 빠진다.
+    #[test]
+    fn autoplay_is_decided_by_request_kind_not_by_a_missing_requester() {
+        let auto = QueueItem::new_autoplay(track("auto"));
+        let StatEvent::Played {
+            requester, autoplay, ..
+        } = StatEvent::played_from_item(1, &auto, PlayOutcome::Completed)
+        else {
+            panic!("played_from_item 은 Played 를 만들어야 한다");
+        };
+        assert!(autoplay);
+        assert_eq!(requester, None);
+
+        // `/이전곡` 이 만드는 항목: 사람이 시켰는데 신청자 ID 가 없다.
+        let previous = QueueItem::new_user(track("prev"), "(이전 곡)".into(), None);
+        let StatEvent::Played {
+            requester, autoplay, ..
+        } = StatEvent::played_from_item(1, &previous, PlayOutcome::Completed)
+        else {
+            panic!("played_from_item 은 Played 를 만들어야 한다");
+        };
+        assert!(!autoplay, "신청자 ID 가 없다고 자동재생으로 보면 안 된다");
+        assert_eq!(requester, None);
+    }
+
+    /// 위 판정이 실제 차트 숫자까지 그대로 흘러간다.
+    #[test]
+    fn a_requesterless_human_play_still_counts_in_the_chart() {
+        let stats = open_temp();
+        let previous = QueueItem::new_user(track("prev"), "(이전 곡)".into(), None);
+        let auto = QueueItem::new_autoplay(track("auto"));
+        apply_now(
+            &stats,
+            &[
+                StatEvent::played_from_item(1, &previous, PlayOutcome::Completed),
+                StatEvent::played_from_item(1, &auto, PlayOutcome::Completed),
+            ],
+        );
+        let chart = stats.chart(1, ChartKind::Plays, ChartWindow::All, 2, 10);
+        assert_eq!(chart.len(), 1, "자동재생 곡은 재생 차트에 오르지 않는다");
+        assert_eq!(chart[0].cache_key, previous.track.cache_key());
+        assert_eq!(chart[0].plays_user, 1);
+        assert_eq!(chart[0].plays_autoplay, 0);
+    }
+
+    /// 스킵도 재생 횟수로는 센다 — 신청자에게는 `skipped` 로 따로 남는다.
+    #[test]
+    fn skipping_marks_the_requester_but_still_counts_a_play() {
+        let stats = open_temp();
+        let item = QueueItem::new_user(track("song"), "민수".into(), Some(10));
+        apply_now(
+            &stats,
+            &[StatEvent::played_from_item(1, &item, PlayOutcome::Skipped)],
+        );
+        let user = stats.user_stats(1, 10);
+        assert_eq!(user.played, 0);
+        assert_eq!(user.skipped, 1);
+        let chart = stats.chart(1, ChartKind::Plays, ChartWindow::All, 2, 10);
+        assert_eq!(chart[0].plays_user, 1);
     }
 
     #[test]

@@ -171,7 +171,7 @@ impl Coordinator {
                             app,
                             guild_id,
                             &format!(
-                                "⚠️ 재생 실패가 연속 {fails}회 발생해 멈춥니다. 잠시 후 /재생 으로 다시 시도해 주세요. (마지막 실패: {title})"
+                                "⚠️ 재생이 연속 {fails}번 실패해서 멈췄어요. 잠시 뒤에 `/재생` 으로 다시 시도해 주세요. (마지막 실패: {title})"
                             ),
                         )
                         .await;
@@ -180,7 +180,7 @@ impl Coordinator {
                     crate::player::side_effects::announce_text(
                         app,
                         guild_id,
-                        &format!("⚠️ 재생 실패, 다음 곡으로 넘어갑니다: {title}"),
+                        &format!("⚠️ 재생에 실패해서 다음 곡으로 넘어가요: {title}"),
                     )
                     .await;
                     // 망가진 곡을 강제로 지나친다(Track 반복이어도 같은 곡 재착석 방지).
@@ -448,7 +448,7 @@ impl Coordinator {
             crate::player::side_effects::announce_text(
                 app,
                 guild_id,
-                "⚠️ 음성 재연결을 3회 시도했지만 실패했어요. `/다시재생` 또는 `/재생` 으로 다시 시작해 주세요.",
+                "⚠️ 음성 재연결을 3번 시도했지만 안 됐어요. `/다시재생` 또는 `/재생` 으로 다시 시작해 주세요.",
             )
             .await;
             return;
@@ -544,7 +544,7 @@ fn spawn_ffmpeg(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    cmd.spawn().map_err(|e| format!("ffmpeg 실행 실패: {e}"))
+    cmd.spawn().map_err(|e| format!("ffmpeg 을(를) 실행하지 못했어요: {e}"))
 }
 
 // ───────── 이벤트 핸들러 ─────────

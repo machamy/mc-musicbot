@@ -116,6 +116,13 @@ pub struct WebState {
     /// S5: Discord/LRCLIB 호출에 재사용하는 공유 HTTP 클라이언트.
     /// 요청마다 `Client::new()`를 하면 커넥션 풀과 TLS 세션이 매번 버려진다.
     pub http_client: OnceLock<reqwest::Client>,
+    /// 투표 스킵 (V3 §10.5). 길드 하나에 진행 중인 투표 하나.
+    /// **DB를 쓰지 않는다** — 곡 하나 수명짜리 데이터라 재시작하면 사라지는 게 맞다.
+    pub skip_votes: Mutex<HashMap<u64, remote::SkipVoteState>>,
+    /// 통계·차트 응답 60초 캐시 (V3 §22.6 · §23.2).
+    /// 무거운 집계를 매 요청 돌리지 않으려는 것이지 실시간성을 포기한 게 아니다 —
+    /// 통계는 60초 늦어도 아무도 손해 보지 않는다.
+    pub stats_cache: Mutex<HashMap<String, (Instant, serde_json::Value)>>,
 }
 
 /// 비밀번호 해시 저장 파일 (data 디렉터리, gitignore 대상).
@@ -193,6 +200,8 @@ pub async fn serve(app: Arc<App>) {
         presence_gate: Mutex::new(HashMap::new()),
         guild_watchers: Mutex::new(HashSet::new()),
         http_client: OnceLock::new(),
+        skip_votes: Mutex::new(HashMap::new()),
+        stats_cache: Mutex::new(HashMap::new()),
     });
 
     spawn_sweeper(state.clone());
@@ -300,6 +309,17 @@ fn spawn_sweeper(state: Arc<WebState>) {
                 .unwrap()
                 .retain(|_, seen| seen.elapsed() < RATE_KEEP);
             state.presence.lock().unwrap().retain(|_, count| *count > 0);
+            // 끝난 투표와 지나간 캐시는 남겨 둘 이유가 없다 (V3 §10.5 · §22.6).
+            state
+                .skip_votes
+                .lock()
+                .unwrap()
+                .retain(|_, vote| !vote.is_expired());
+            state
+                .stats_cache
+                .lock()
+                .unwrap()
+                .retain(|_, (stored, _)| stored.elapsed() < Duration::from_secs(300));
             if let Err(error) = state.app.remote.prune_sessions() {
                 state
                     .app

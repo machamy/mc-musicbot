@@ -1,18 +1,27 @@
 //! 길드 재생 상태기계 — C# GuildPlayerManager 1:1 포팅.
 //! 반복/셔플/CycleHistory/자동추천 시드 규칙/최근기록(25개 상한) 의미론을 그대로 유지한다.
 
+use crate::app::QUEUE_SORT_INTERVAL;
 use crate::db::Db;
 use crate::logging::LogService;
 use crate::models::*;
 use crate::remote::ranking::{self, sort_queue, wait_score_targets};
-use crate::remote::{QueueSortMode, RemoteStore};
+use crate::remote::{QueueSortMode, RemoteGuildSettings, RemoteStore, VotePoints};
+use crate::stats::{PlayOutcome, StatEvent, Stats};
 use rand::seq::SliceRandom;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+/// 대기열이 이보다 길면 재정렬을 느리게 돌린다 (v3 §18.2).
+/// 그 정도 길이면 순서가 급하지 않고, 5초마다 전체를 정렬하면 그게 그대로 부하가 된다.
+pub const LONG_QUEUE_THRESHOLD: usize = 500;
+/// 긴 대기열의 재정렬 주기. 화면 카운트다운(§5)도 이 값을 따라와야 한다.
+pub const LONG_QUEUE_SORT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct PlayerManager {
     db: Arc<Db>,
@@ -21,13 +30,22 @@ pub struct PlayerManager {
     gate: Mutex<()>,
     previews: StdMutex<HashMap<u64, QueueItem>>,
     preview_inflight: StdMutex<HashSet<u64>>,
-    /// 길드별 대기열 정렬 모드 캐시. 정렬은 5초마다·모든 상태 변경마다 돌기 때문에
+    /// 길드별 리모컨 설정 캐시. 정렬은 5초마다·모든 상태 변경마다 돌기 때문에
     /// 매번 설정 JSON을 읽으면 유휴 상태에서도 쿼리가 계속 나간다(사양서 §5.2 H).
-    /// 웹이 모드를 바꾸면 `set_sort_mode`/`invalidate_sort_mode`로 갱신한다.
-    sort_modes: StdMutex<HashMap<u64, QueueSortMode>>,
+    ///
+    /// 정렬 모드만이 아니라 **투표 점수(v3 §10.1)도 여기서 나온다** — 점수를 읽으려고
+    /// DB를 또 치면 방금 없앤 문제가 그대로 되살아난다. 웹이 설정을 저장하면
+    /// `set_sort_mode`/`refresh_settings`/`invalidate_settings` 로 캐시를 맞춘다.
+    settings: StdMutex<HashMap<u64, Arc<RemoteGuildSettings>>>,
     /// 길드별 셔플 시드. 셔플은 별도 정렬 모드가 아니라 `Fifo` + 무작위 `original_order`이며
     /// (사양서 §3.3), 그 무작위 순서를 시드 하나로 재현한다.
     shuffle_seeds: StdMutex<HashMap<u64, u64>>,
+    /// 길드별 마지막으로 확인된 대기열 길이. 재정렬 주기 결정(v3 §18.2)에 쓰는데,
+    /// 그것 때문에 5초마다 길드마다 DB를 읽으면 §18.2 를 고치려다 §23.2 를 깨뜨린다.
+    queue_lens: StdMutex<HashMap<u64, usize>>,
+    /// 통계 기록기 (v3 §22). 통계 DB가 안 열렸거나 아직 안 붙었으면 `None` 이고
+    /// 그때는 **조용히 건너뛴다** — 통계 한 줄 때문에 음악이 멈추면 본말전도다.
+    stats: StdMutex<Option<Arc<Stats>>>,
 }
 
 /// `/재생` 응답의 ✖ 취소 버튼 결과 — 호출 측이 코디네이터를 어떻게 정리할지 결정한다.
@@ -49,8 +67,38 @@ impl PlayerManager {
             gate: Mutex::new(()),
             previews: StdMutex::new(HashMap::new()),
             preview_inflight: StdMutex::new(HashSet::new()),
-            sort_modes: StdMutex::new(HashMap::new()),
+            settings: StdMutex::new(HashMap::new()),
             shuffle_seeds: StdMutex::new(HashMap::new()),
+            queue_lens: StdMutex::new(HashMap::new()),
+            stats: StdMutex::new(None),
+        }
+    }
+
+    // ───────── 통계 (v3 §22) ─────────
+
+    /// 통계 기록기를 붙인다. 통계 DB가 안 열리면 아예 안 부르면 되고, 그러면 통계만 꺼진다.
+    /// `App::new` 가 `Stats::open` 성공 시 한 번 부른다.
+    pub fn attach_stats(&self, stats: Arc<Stats>) {
+        *self.stats.lock().unwrap() = Some(stats);
+    }
+
+    fn stats(&self) -> Option<Arc<Stats>> {
+        self.stats.lock().unwrap().clone()
+    }
+
+    /// 곡 하나가 끝났다는 사실을 통계에 남긴다. 채널에 던지기만 하고 즉시 돌아온다 —
+    /// 통계 쓰기가 재생 경로를 막으면 안 된다(§22.2).
+    fn record_play(&self, guild_id: u64, finished: &QueueItem, outcome: PlayOutcome) {
+        if let Some(stats) = self.stats() {
+            stats.record(StatEvent::played_from_item(guild_id, finished, outcome));
+        }
+    }
+
+    /// 붐따(§10.3)로 대기열에서 내려간 곡을 통계에 남긴다.
+    /// 붐따 실행 자체는 웹이 하므로, 웹은 곡을 내린 **뒤에** 이걸 한 번 부른다.
+    pub fn record_boomtta(&self, guild_id: u64, item: &QueueItem) {
+        if let Some(stats) = self.stats() {
+            stats.record(StatEvent::boomtta_from_item(guild_id, item));
         }
     }
 
@@ -238,13 +286,14 @@ impl PlayerManager {
                 .load_guild_state(guild_id, eff.effective_volume, eff.autoplay_default);
         if from >= state.upcoming.len() || to >= state.upcoming.len() {
             return Err(format!(
-                "순번이 대기열 범위를 벗어났습니다 (1~{}).",
+                "대기열에 없는 순번이에요. 1~{}번 중에서 골라 주세요.",
                 state.upcoming.len()
             ));
         }
         let item = state.upcoming.remove(from);
         state.upcoming.insert(to, item);
         self.db.save_guild_state(&state);
+        self.note_queue_len(&state);
         self.log.info(
             "Queue",
             &format!("Moved {from}->{to} for guild {guild_id}."),
@@ -264,13 +313,14 @@ impl PlayerManager {
                 .load_guild_state(guild_id, eff.effective_volume, eff.autoplay_default);
         if index >= state.upcoming.len() {
             return Err(format!(
-                "순번이 대기열 범위를 벗어났습니다 (1~{}).",
+                "대기열에 없는 순번이에요. 1~{}번 중에서 골라 주세요.",
                 state.upcoming.len()
             ));
         }
         let removed = state.upcoming.remove(index);
         let _ = self.remote.clear_item_runtime(&removed.id);
         self.db.save_guild_state(&state);
+        self.note_queue_len(&state);
         self.log.info(
             "Queue",
             &format!(
@@ -294,6 +344,7 @@ impl PlayerManager {
             let removed = state.upcoming.remove(pos);
             let _ = self.remote.clear_item_runtime(&removed.id);
             self.db.save_guild_state(&state);
+            self.note_queue_len(&state);
             let title = removed.track.display_title().to_string();
             self.log.info(
                 "Queue",
@@ -311,6 +362,8 @@ impl PlayerManager {
                 .unwrap_or_default();
             if let Some(cur) = state.current_item.take() {
                 let _ = self.remote.clear_item_runtime(&cur.id);
+                // 취소는 스킵과 같은 전이다 — 통계에도 스킵으로 남긴다.
+                self.record_play(guild_id, &cur, PlayOutcome::Skipped);
                 if state.repeat_mode == RepeatMode::Queue {
                     state.cycle_history.push(clone_item(&cur));
                 }
@@ -330,6 +383,7 @@ impl PlayerManager {
             }
             promote_if_idle(&mut state);
             self.db.save_guild_state(&state);
+            self.note_queue_len(&state);
             self.log.info(
                 "Queue",
                 &format!("Cancelled current {title} (skipped) for guild {guild_id}."),
@@ -389,12 +443,14 @@ impl PlayerManager {
                     .load_guild_state(guild_id, eff.effective_volume, eff.autoplay_default);
             if position < 1 || position > state.upcoming.len() {
                 return Err(format!(
-                    "순번이 대기열 범위를 벗어났습니다 (1~{}).",
+                    "대기열에 없는 순번이에요. 1~{}번 중에서 골라 주세요.",
                     state.upcoming.len()
                 ));
             }
             // 방금 재생하던 곡을 먼저 사이클에 보존(재생 순서 유지), 그 다음 건너뛴 곡들을 보존.
             if let Some(cur) = state.current_item.take() {
+                // 재생하던 곡만 스킵으로 센다. 건너뛴 대기열 곡들은 재생된 적이 없다.
+                self.record_play(guild_id, &cur, PlayOutcome::Skipped);
                 if state.repeat_mode == RepeatMode::Queue {
                     state.cycle_history.push(clone_item(&cur));
                 }
@@ -472,6 +528,7 @@ impl PlayerManager {
                 if s.repeat_mode != RepeatMode::Track {
                     if let Some(current) = &s.current_item {
                         self.mark_played(guild_id, current);
+                        self.record_play(guild_id, current, PlayOutcome::Completed);
                         let _ = self.remote.record_recent(guild_id, current, "completed");
                         let _ = self.remote.clear_item_runtime(&current.id);
                     }
@@ -493,6 +550,7 @@ impl PlayerManager {
             |s| {
                 if let Some(current) = &s.current_item {
                     self.mark_played(guild_id, current);
+                    self.record_play(guild_id, current, PlayOutcome::Skipped);
                     let _ = self.remote.record_recent(guild_id, current, "skipped");
                     let _ = self.remote.clear_item_runtime(&current.id);
                 }
@@ -766,6 +824,7 @@ impl PlayerManager {
         let mut state =
             self.db
                 .load_guild_state(guild_id, eff.effective_volume, eff.autoplay_default);
+        self.note_queue_len(&state);
         if state.upcoming.len() < 2 {
             return false; // 바꿀 순서가 없다 — 로드만 하고 끝낸다.
         }
@@ -782,27 +841,95 @@ impl PlayerManager {
         changed
     }
 
-    // ───────── 정렬 모드 ─────────
+    // ───────── 길드 설정 캐시 ─────────
 
-    /// 길드의 정렬 모드. 캐시가 비었을 때만 설정 JSON을 읽는다.
-    pub fn sort_mode(&self, guild_id: u64) -> QueueSortMode {
-        if let Some(mode) = self.sort_modes.lock().unwrap().get(&guild_id) {
-            return *mode;
+    /// 이 길드의 리모컨 설정. 캐시가 비었을 때만 설정 JSON을 읽는다.
+    ///
+    /// 정렬 모드와 투표 점수(§10.1)가 같은 캐시에서 나오므로, 점수 하나 읽자고
+    /// 정렬마다 DB를 다시 치는 일이 없다.
+    pub fn cached_settings(&self, guild_id: u64) -> Arc<RemoteGuildSettings> {
+        if let Some(cached) = self.settings.lock().unwrap().get(&guild_id) {
+            return cached.clone();
         }
         // 설정 조회는 remote 커넥션 뮤텍스를 잡으므로 캐시 락을 놓은 뒤에 읽는다.
-        let mode = self.remote.load_guild_settings(guild_id).sort_mode;
-        self.sort_modes.lock().unwrap().insert(guild_id, mode);
-        mode
+        let loaded = Arc::new(self.remote.load_guild_settings(guild_id));
+        self.settings
+            .lock()
+            .unwrap()
+            .insert(guild_id, loaded.clone());
+        loaded
+    }
+
+    /// 길드의 정렬 모드.
+    pub fn sort_mode(&self, guild_id: u64) -> QueueSortMode {
+        self.cached_settings(guild_id).sort_mode
     }
 
     /// 웹이 서버 관리 콘솔에서 모드를 저장한 직후 호출한다. 저장은 웹이 하고 여기선 캐시만 맞춘다.
     pub fn set_sort_mode(&self, guild_id: u64, mode: QueueSortMode) {
-        self.sort_modes.lock().unwrap().insert(guild_id, mode);
+        let mut updated = (*self.cached_settings(guild_id)).clone();
+        updated.sort_mode = mode;
+        self.settings
+            .lock()
+            .unwrap()
+            .insert(guild_id, Arc::new(updated));
     }
 
-    /// 설정을 통째로 덮어써서 모드를 모를 때 쓰는 무효화. 다음 정렬에서 한 번만 DB를 읽는다.
+    /// 웹이 설정을 통째로 저장했을 때. 방금 쓴 값을 그대로 넘겨 주면 DB를 다시 읽지 않는다.
+    pub fn refresh_settings(&self, settings: &RemoteGuildSettings) {
+        self.settings
+            .lock()
+            .unwrap()
+            .insert(settings.guild_id, Arc::new(settings.clone()));
+    }
+
+    /// 무엇이 바뀌었는지 모를 때 쓰는 무효화. 다음 조회에서 한 번만 DB를 읽는다.
+    pub fn invalidate_settings(&self, guild_id: u64) {
+        self.settings.lock().unwrap().remove(&guild_id);
+    }
+
+    /// 예전 이름. 이제 설정 전체를 버린다.
     pub fn invalidate_sort_mode(&self, guild_id: u64) {
-        self.sort_modes.lock().unwrap().remove(&guild_id);
+        self.invalidate_settings(guild_id);
+    }
+
+    // ───────── 대기열 길이와 재정렬 주기 (v3 §18.2) ─────────
+
+    /// 마지막으로 확인된 대기열 길이. **쿼리를 내지 않는다.**
+    /// 한 번도 상태를 읽은 적 없는 길드는 0이다(그런 길드는 정렬할 것도 없다).
+    pub fn queue_len(&self, guild_id: u64) -> usize {
+        self.queue_lens
+            .lock()
+            .unwrap()
+            .get(&guild_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 이 길드를 얼마 주기로 재정렬해야 하는가. 500곡을 넘으면 15초로 늘어난다.
+    /// 웹의 `nextSortAt`(§5 카운트다운)도 이 값을 써야 화면과 실제가 어긋나지 않는다.
+    pub fn sort_interval(&self, guild_id: u64) -> Duration {
+        if self.queue_len(guild_id) > LONG_QUEUE_THRESHOLD {
+            LONG_QUEUE_SORT_INTERVAL
+        } else {
+            QUEUE_SORT_INTERVAL
+        }
+    }
+
+    /// 5초 tick 하나를 세는 재정렬 루프용. 긴 대기열은 3틱에 한 번만 돌린다.
+    /// `tick` 은 루프가 켜진 뒤 몇 번째 tick 인지(0부터).
+    pub fn due_for_resort(&self, guild_id: u64, tick: u64) -> bool {
+        let base = QUEUE_SORT_INTERVAL.as_secs().max(1);
+        let every = (self.sort_interval(guild_id).as_secs() / base).max(1);
+        tick % every == 0
+    }
+
+    /// 상태를 읽거나 저장할 때마다 길이를 적어 둔다. 여기가 유일한 갱신 지점이다.
+    fn note_queue_len(&self, state: &GuildPlayerState) {
+        self.queue_lens
+            .lock()
+            .unwrap()
+            .insert(state.guild_id, state.upcoming.len());
     }
 
     /// 셔플 시드를 새로 뽑는다(= 다시 섞기).
@@ -851,16 +978,21 @@ impl PlayerManager {
         items.extend(state.upcoming.iter().cloned());
         let _ = self.remote.ensure_queue_items(state.guild_id, &items);
         self.sort_scored_queue(state);
+        self.note_queue_len(state);
     }
 
     fn sort_scored_queue(&self, state: &mut GuildPlayerState) {
+        // 정렬 모드와 투표 점수를 **한 번에** 캐시에서 꺼낸다. 점수(§10.1)를 읽자고
+        // 정렬마다 설정 JSON을 다시 파싱하면 유휴 상태의 쿼리 0회 기준(§23.2)이 깨진다.
+        let settings = self.cached_settings(state.guild_id);
         // 셔플은 별도 모드가 아니라 `Fifo` + 무작위 `original_order`다(사양서 §3.3).
         // 예전처럼 여기서 조기 반환하면 셔플을 켜는 순간 랭킹·수동 우선순위가 통째로 죽었다.
         let mode = if state.shuffle_enabled {
             QueueSortMode::Fifo
         } else {
-            self.sort_mode(state.guild_id)
+            settings.sort_mode
         };
+        let points = VotePoints::from_settings(&settings);
         let mut scores = self.remote.queue_scores(state.guild_id);
         if state.shuffle_enabled {
             let seed = self.shuffle_seed(state.guild_id);
@@ -885,7 +1017,7 @@ impl PlayerManager {
             let _ = self.remote.save_queue_rounds(state.guild_id, &stale);
         }
 
-        sort_queue(&mut state.upcoming, &scores, mode);
+        sort_queue(&mut state.upcoming, &scores, mode, &points);
     }
 }
 
@@ -1094,6 +1226,96 @@ mod tests {
         // 셔플 순서는 시드로 재현되므로 5초마다 재정렬해도 큐가 요동치지 않는다.
         let again = player.get_state(guild_id).await;
         assert_eq!(queue_ids(&state), queue_ids(&again));
+        cleanup(player, remote, root);
+    }
+
+    /// 자동재생으로 나간 곡은 우리 차트(v3 §15.2b)에 오르지 않는다.
+    ///
+    /// 판정이 시작되는 곳이 여기(`advance`)라서, 이벤트를 쏘는 지점부터 차트 숫자까지
+    /// 한 번은 끝까지 이어 봐야 한다. 여기가 틀리면 차트가 조용히
+    /// "자동재생이 많이 튼 곡" 목록이 되는데, 화면만 봐서는 절대 눈치챌 수 없다.
+    #[tokio::test]
+    async fn autoplay_playback_never_reaches_our_chart() {
+        use crate::stats::{ChartKind, ChartWindow};
+
+        let (player, remote, root) = temp_player("stats");
+        let log = Arc::new(LogService::new(root.join("logs")));
+        let stats = Stats::open(&root.join("musicbot-stats.sqlite"), log).expect("통계 DB 열기");
+        player.attach_stats(stats.clone());
+        let guild_id = 1;
+
+        let human = user_item("사람곡", 7);
+        let human_key = human.track.cache_key();
+        let mut auto = QueueItem::new_autoplay(human.track.clone());
+        // 자동재생도 사람이 신청한 곡과 **같은 곡**으로 둔다. 그래야 신청자 유무가 아니라
+        // request_kind 로 갈리는지가 드러난다.
+        auto.id = "자동곡".into();
+
+        player.enqueue(guild_id, human, false).await;
+        player.enqueue(guild_id, auto, false).await;
+        player.advance(guild_id).await; // 사람곡 종료
+        player.advance(guild_id).await; // 자동곡 종료
+
+        // 통계 쓰기는 배치라서 바로 보이지 않는다 — 재생 경로를 안 막는 대가다.
+        let row = wait_for_plays(&stats, guild_id, 2).await;
+        assert_eq!(row.cache_key, human_key);
+        assert_eq!(row.plays_user, 1, "사람이 신청한 재생만 순위에 든다");
+        assert_eq!(row.plays_autoplay, 1, "자동재생도 세긴 세되 순위에는 안 쓴다");
+
+        let chart = stats.chart(guild_id, ChartKind::Plays, ChartWindow::All, 2, 10);
+        assert_eq!(chart.len(), 1);
+        cleanup(player, remote, root);
+    }
+
+    /// 배치 쓰기가 `total` 건 반영될 때까지 기다린다. 고정 sleep 은 느리거나 불안정해서 폴링한다.
+    /// **합계**로 기다려야 갈림(사람/자동재생)이 틀렸을 때도 멈추지 않고 그 자리에서 단언이 깨진다.
+    async fn wait_for_plays(
+        stats: &Arc<Stats>,
+        guild_id: u64,
+        total: i64,
+    ) -> crate::stats::ChartRow {
+        use crate::stats::{ChartKind, ChartWindow};
+        for _ in 0..50 {
+            // 사랑받은 곡 기준으로 뽑으면 plays_user 가 0인 행도 보여서, 갈림이 틀린 경우도 잡힌다.
+            let chart = stats.chart(guild_id, ChartKind::Plays, ChartWindow::All, 2, 10);
+            if let Some(row) = chart.into_iter().next() {
+                if row.plays_user + row.plays_autoplay >= total {
+                    return row;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("통계 {total}건이 5초 안에 반영되지 않았다");
+    }
+
+    /// 대기열이 500곡을 넘으면 재정렬 주기가 15초로 늘어난다(v3 §18.2).
+    /// 주기 결정은 `app.rs` 가 하지만, 길이를 아는 건 여기뿐이라 판단 근거도 여기서 준다.
+    #[tokio::test]
+    async fn long_queues_get_a_slower_resort_interval() {
+        let (player, remote, root) = temp_player("interval");
+        // 아직 아무것도 안 본 길드는 정렬할 것도 없으니 기본 주기다.
+        assert_eq!(player.queue_len(1), 0);
+        assert_eq!(player.sort_interval(1), QUEUE_SORT_INTERVAL);
+        assert!(player.due_for_resort(1, 0) && player.due_for_resort(1, 1));
+
+        player.enqueue(1, user_item("한곡", 1), false).await;
+        assert_eq!(player.queue_len(1), 0, "현재 곡으로 올라갔으니 대기열은 비었다");
+        player.enqueue(1, user_item("두곡", 1), false).await;
+        assert_eq!(player.queue_len(1), 1);
+        assert_eq!(player.sort_interval(1), QUEUE_SORT_INTERVAL);
+
+        // 500곡을 실제로 넣으면 테스트가 느려지기만 하니 길이만 밀어 넣는다.
+        player
+            .queue_lens
+            .lock()
+            .unwrap()
+            .insert(1, LONG_QUEUE_THRESHOLD + 1);
+        assert_eq!(player.sort_interval(1), LONG_QUEUE_SORT_INTERVAL);
+        // 5초 tick 기준으로 3틱에 한 번만 돈다.
+        assert!(player.due_for_resort(1, 0));
+        assert!(!player.due_for_resort(1, 1));
+        assert!(!player.due_for_resort(1, 2));
+        assert!(player.due_for_resort(1, 3));
         cleanup(player, remote, root);
     }
 

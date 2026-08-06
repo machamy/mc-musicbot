@@ -2,34 +2,61 @@ use crate::models::TrackRef;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// 권한 규칙 키 8개. 관리 콘솔의 "권한" 섹션 순서이자 `rule_role_ids`의 키다.
+/// 권한 규칙 키 10종 (v3 §1 + §8.3 + §10.5 + §15.4). 관리 콘솔의 "권한" 섹션 순서이자
+/// `rule_role_ids`의 키다. 관리자(`manager_role_ids`)는 여기 없는 별개 축이라 총 11종이다.
 /// 여기 없는 키로 `roles_for`를 부르면 레거시 지정 역할로 폴백한다.
-pub const PERMISSION_KEYS: [&str; 8] = [
+pub const PERMISSION_KEYS: [&str; 10] = [
     "search",
     "vote",
     "chat",
     "playback",
+    "skip",
     "seek",
     "volume",
     "queueEdit",
-    "autoplaySeed",
+    "autoplay",
+    "bulkEnqueue",
 ];
 
-/// 길드당 자동 재생 시드곡 상한. 저장소가 강제한다.
+/// 이름이 바뀐 권한 키의 옛 이름. 저장된 `rule_role_ids`에 새 키가 아직 없으면
+/// 옛 키를 먼저 본다 — 관리자가 지정해 둔 역할이 개명 때문에 조용히 사라지면 안 된다.
+const PERMISSION_KEY_ALIASES: [(&str, &str); 1] = [("autoplay", "autoplaySeed")];
+
+/// 길드당 자동 재생 시드곡 기본 상한. 길드 설정(`autoplay_seed_max`)이 이기고,
+/// 그 값이 `0`이면 무제한이다(§23.1).
 pub const MAX_AUTOPLAY_SEEDS: usize = 10;
+
+/// 투표 점수 설정의 허용 범위 (§10.1).
+pub const VOTE_POINT_MIN: i32 = -10;
+pub const VOTE_POINT_MAX: i32 = 10;
+
+/// `0 = 무제한` 규약(§23.1)을 한 곳에서 푼다. 서버 코드가 `.max(1)` 같은 클램프를 쓰면
+/// `0`이 `1`로 둔갑해 "무제한"이 "가장 빡빡함"이 돼 버린다 — 그래서 전부 이 함수를 지난다.
+pub fn as_limit(value: i32) -> Option<i32> {
+    if value <= 0 { None } else { Some(value) }
+}
+
+/// `as_limit`의 부호 없는 버전.
+pub fn as_limit_u32(value: u32) -> Option<u32> {
+    if value == 0 { None } else { Some(value) }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum QueueVoteKind {
     Like,
     SuperLike,
+    /// 싫어요 (§10.2). 좋아요·슈퍼 좋아요와 상호 배타다.
+    Dislike,
 }
 
 impl QueueVoteKind {
-    pub fn points(self) -> i32 {
+    /// 이 투표 한 표가 곡 점수에 더하는 값. 하드코딩 배수는 없고 서버 설정을 그대로 쓴다(§10.1).
+    pub fn points(self, points: &VotePoints) -> i32 {
         match self {
-            Self::Like => 1,
-            Self::SuperLike => 2,
+            Self::Like => points.like,
+            Self::SuperLike => points.super_like,
+            Self::Dislike => points.dislike,
         }
     }
 
@@ -37,6 +64,7 @@ impl QueueVoteKind {
         match self {
             Self::Like => "Like",
             Self::SuperLike => "SuperLike",
+            Self::Dislike => "Dislike",
         }
     }
 
@@ -44,9 +72,86 @@ impl QueueVoteKind {
         match value {
             "Like" => Some(Self::Like),
             "SuperLike" => Some(Self::SuperLike),
+            "Dislike" => Some(Self::Dislike),
             _ => None,
         }
     }
+
+    /// `/vote` 요청·응답에 쓰는 소문자 키.
+    pub fn api_key(self) -> &'static str {
+        match self {
+            Self::Like => "like",
+            Self::SuperLike => "superLike",
+            Self::Dislike => "dislike",
+        }
+    }
+
+    /// 활동 로그 액션명 (§13.3).
+    pub fn audit_action(self) -> &'static str {
+        match self {
+            Self::Like => "vote.like",
+            Self::SuperLike => "vote.superlike",
+            Self::Dislike => "vote.dislike",
+        }
+    }
+}
+
+/// 서버가 정한 투표 점수표 (§10.1). `total_score`가 이 값으로만 계산한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotePoints {
+    pub like: i32,
+    pub dislike: i32,
+    pub super_like: i32,
+    /// 곡 하나가 지날 때마다 붙는 대기 가점.
+    pub wait: i32,
+}
+
+impl Default for VotePoints {
+    fn default() -> Self {
+        Self {
+            like: default_like_points(),
+            dislike: default_dislike_points(),
+            super_like: default_super_like_points(),
+            wait: default_wait_points(),
+        }
+    }
+}
+
+impl VotePoints {
+    /// 길드 설정에서 뽑아 온 점수표. 범위를 벗어난 값은 여기서 잘린다.
+    pub fn from_settings(settings: &RemoteGuildSettings) -> Self {
+        Self {
+            like: settings.like_points,
+            dislike: settings.dislike_points,
+            super_like: settings.super_like_points,
+            wait: settings.wait_points,
+        }
+        .clamped()
+    }
+
+    pub fn clamped(self) -> Self {
+        let clamp = |value: i32| value.clamp(VOTE_POINT_MIN, VOTE_POINT_MAX);
+        Self {
+            like: clamp(self.like),
+            dislike: clamp(self.dislike),
+            super_like: clamp(self.super_like),
+            wait: clamp(self.wait),
+        }
+    }
+}
+
+fn default_like_points() -> i32 {
+    1
+}
+fn default_dislike_points() -> i32 {
+    -1
+}
+fn default_super_like_points() -> i32 {
+    2
+}
+fn default_wait_points() -> i32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +228,9 @@ pub struct QueueScore {
     pub wait_score: i32,
     pub like_count: i32,
     pub super_like_count: i32,
+    /// 싫어요 수 (§10.2). 붐따 판정(§10.3)도 이 값을 본다.
+    #[serde(default)]
+    pub dislike_count: i32,
     pub manual_priority: Option<i32>,
     pub original_order: i64,
     /// 공평제에서 "그 사람의 몇 번째 곡"인지 (0-based). 정렬 시 계산해 채운다.
@@ -131,11 +239,56 @@ pub struct QueueScore {
     /// 이 곡을 신청한 사람이 마지막으로 곡을 재생한 시각. 없으면 아직 한 곡도 못 튼 사람.
     #[serde(default)]
     pub last_played_utc: Option<String>,
+    /// 좋아요를 누른 사람 (§10.4). **이름이 아니라 ID**이고 항목당 최대 `MAX_VOTER_IDS`명이다.
+    #[serde(default)]
+    pub like_by: Vec<u64>,
+    #[serde(default)]
+    pub super_by: Vec<u64>,
+    #[serde(default)]
+    pub dislike_by: Vec<u64>,
 }
 
+/// 한 항목이 내보내는 투표자 ID 상한 (§10.4). 대기열 50곡 × 투표자 전원을 실으면 payload가 터진다.
+pub const MAX_VOTER_IDS: usize = 12;
+
 impl QueueScore {
-    pub fn total_score(&self) -> i32 {
-        self.wait_score + self.like_count + self.super_like_count * 2
+    /// 서버가 정한 점수표로 계산한 총점. **하드코딩 배수는 없다** (§10.1).
+    pub fn total_score(&self, points: &VotePoints) -> i32 {
+        self.wait_score * points.wait
+            + self.like_count * points.like
+            + self.super_like_count * points.super_like
+            + self.dislike_count * points.dislike
+    }
+
+    /// 화면의 계산식(`👍3 + ⭐1×2 + 대기2 = 7`)을 서버가 만들어 준다.
+    /// 클라이언트가 배수를 다시 곱하면 설정을 바꿨을 때 화면이 거짓말을 한다(§10.4).
+    pub fn formula(&self, points: &VotePoints) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut push = |emoji: &str, count: i32, unit: i32| {
+            if count == 0 || unit == 0 {
+                return;
+            }
+            if unit == 1 {
+                parts.push(format!("{emoji}{count}"));
+            } else {
+                parts.push(format!("{emoji}{count}×{unit}"));
+            }
+        };
+        push("👍", self.like_count, points.like);
+        push("⭐", self.super_like_count, points.super_like);
+        push("👎", self.dislike_count, points.dislike);
+        push("대기", self.wait_score, points.wait);
+        if parts.is_empty() {
+            return format!("아직 점수가 없어요 = {}", self.total_score(points));
+        }
+        format!("{} = {}", parts.join(" + "), self.total_score(points))
+    }
+
+    /// 붐따 기준을 넘겼는지 (§10.3). 꺼져 있거나 기준이 `0`(무제한)이면 절대 안 걸린다.
+    pub fn boomtta_triggered(&self, settings: &RemoteGuildSettings) -> bool {
+        settings.boomtta_enabled
+            && as_limit_u32(settings.boomtta_threshold)
+                .is_some_and(|threshold| self.dislike_count >= threshold as i32)
     }
 }
 
@@ -180,8 +333,8 @@ pub enum SeedAddOutcome {
     Added,
     /// 같은 곡이 이미 기준 곡에 있다.
     Duplicate,
-    /// 상한(10곡)을 넘겼다.
-    LimitReached,
+    /// 상한을 넘겼다. 값은 그 서버의 상한(곡 수)이다.
+    LimitReached(u32),
 }
 
 impl SeedAddOutcome {
@@ -190,13 +343,424 @@ impl SeedAddOutcome {
     }
 
     /// 사용자에게 그대로 보여줄 안내 문구.
-    pub fn message(self) -> &'static str {
+    pub fn message(self) -> String {
         match self {
-            Self::Added => "기준 곡에 넣었어요.",
-            Self::Duplicate => "이미 기준 곡에 있는 곡이에요.",
-            Self::LimitReached => "시드곡은 10곡까지 넣을 수 있어요.",
+            Self::Added => "기준 곡에 넣었어요.".into(),
+            Self::Duplicate => "이미 기준 곡에 있는 곡이에요.".into(),
+            Self::LimitReached(max) => format!("시드곡은 {max}곡까지 넣을 수 있어요."),
         }
     }
+}
+
+/// 붐따가 걸렸을 때 그 곡을 어떻게 할지 (§10.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoomttaAction {
+    /// 맨 뒤로 보낸다 (기본). 곡이 사라지지 않아 되돌리기 쉽다.
+    #[default]
+    Bottom,
+    /// 대기열에서 아예 뺀다.
+    Remove,
+}
+
+impl BoomttaAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bottom => "bottom",
+            Self::Remove => "remove",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "bottom" => Some(Self::Bottom),
+            "remove" => Some(Self::Remove),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bottom => "맨 뒤로 보내요",
+            Self::Remove => "대기열에서 빼요",
+        }
+    }
+}
+
+/// 투표 스킵의 모수를 무엇으로 볼지 (§10.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoteSkipBasis {
+    /// 봇과 같은 음성 채널에 있는 사람 (기본).
+    #[default]
+    Listeners,
+    /// 리모컨을 보고 있는 사람.
+    Viewers,
+    /// 둘 중 하나라도 넘으면 통과.
+    Either,
+    /// 둘 다 넘어야 통과.
+    Both,
+}
+
+impl VoteSkipBasis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Listeners => "listeners",
+            Self::Viewers => "viewers",
+            Self::Either => "either",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "listeners" => Some(Self::Listeners),
+            "viewers" => Some(Self::Viewers),
+            "either" => Some(Self::Either),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Listeners => "봇과 같은 음성 채널에 있는 사람만 세요.",
+            Self::Viewers => "리모컨을 보고 있는 사람을 세요.",
+            Self::Either => "듣는 사람이나 보는 사람 중 한쪽만 넘어도 넘어가요.",
+            Self::Both => "듣는 사람과 보는 사람이 둘 다 넘어야 넘어가요.",
+        }
+    }
+
+    /// 필요 표 수 = `ceil(모수 × ratio / 100)`, 단 최소 `min_votes`명.
+    /// 모수가 그보다 적으면 모수가 곧 필요 표 수다 — 혼자 듣는데 2명을 요구하면 영원히 안 넘어간다.
+    pub fn votes_needed(population: u32, ratio: u32, min_votes: u32) -> u32 {
+        if population == 0 {
+            return 0;
+        }
+        let ratio = ratio.clamp(10, 100);
+        let by_ratio = population.saturating_mul(ratio).div_ceil(100).max(1);
+        by_ratio.max(min_votes).min(population)
+    }
+}
+
+/// 자동 재생이 **시드를 어디서 고르는지** (§8). 기본은 지금 동작인 `Recent`다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoplayMode {
+    /// 직접 등록한 기준 곡 1~10곡을 라운드로빈.
+    Seed,
+    /// 최근에 튼 N곡 중 무작위 (기본, 지금 동작).
+    #[default]
+    Recent,
+    /// 고른 장르 차트에서 무작위.
+    Genre,
+}
+
+impl AutoplayMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Seed => "seed",
+            Self::Recent => "recent",
+            Self::Genre => "genre",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "seed" => Some(Self::Seed),
+            "recent" => Some(Self::Recent),
+            "genre" => Some(Self::Genre),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Seed => "기준 곡",
+            Self::Recent => "최근에 튼 곡",
+            Self::Genre => "장르",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Seed => "직접 고른 기준 곡을 돌아가며 참고해요.",
+            Self::Recent => "최근에 튼 곡 중 하나를 골라 참고해요.",
+            Self::Genre => "고른 장르 차트에서 한 곡을 골라 참고해요.",
+        }
+    }
+
+    /// 폴백 사슬 (§8.2). 후보를 못 구하면 조용히 멈추지 말고 다음 모드로 내려간다.
+    pub fn fallback(self) -> Option<Self> {
+        match self {
+            Self::Seed => Some(Self::Recent),
+            Self::Recent => Some(Self::Genre),
+            Self::Genre => None,
+        }
+    }
+}
+
+/// 라디오 후보 **목록에서 어떤 곡을 집는지** (§8.5). 시드 선택(`AutoplayMode`)과는 다른 축이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoplayPolicy {
+    /// 후보 상위 3곡 중 무작위.
+    Similar,
+    /// 후보 상위 10곡 중 가중 무작위 (기본).
+    #[default]
+    Balanced,
+    /// 후보 전체에서 균등 무작위.
+    Explore,
+    /// 길이가 무난한 후보 위주로 무작위.
+    Popular,
+}
+
+impl AutoplayPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Similar => "similar",
+            Self::Balanced => "balanced",
+            Self::Explore => "explore",
+            Self::Popular => "popular",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "similar" => Some(Self::Similar),
+            "balanced" => Some(Self::Balanced),
+            "explore" => Some(Self::Explore),
+            "popular" => Some(Self::Popular),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Similar => "비슷하게",
+            Self::Balanced => "적당히",
+            Self::Explore => "새롭게",
+            Self::Popular => "무난하게",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Similar => "기준 곡과 가장 비슷한 곡 중에서 골라요. 분위기가 유지돼요.",
+            Self::Balanced => "비슷한 곡 위주로 고르되 매번 다른 곡이 나와요.",
+            Self::Explore => "후보 전체에서 골라요. 예상 못 한 곡이 나와요.",
+            Self::Popular => "길이가 무난한 곡 위주로 골라요.",
+        }
+    }
+
+    /// 후보가 부족해 시드를 갈아탈 때마다 한 단계 느슨해진다 (§8.5-4).
+    pub fn loosened(self) -> Self {
+        match self {
+            Self::Similar => Self::Balanced,
+            Self::Balanced | Self::Explore | Self::Popular => Self::Explore,
+        }
+    }
+
+    /// 이 정책이 들여다볼 후보 상위 개수. `None`이면 전체를 본다.
+    pub fn window(self) -> Option<usize> {
+        match self {
+            Self::Similar => Some(3),
+            Self::Balanced => Some(10),
+            Self::Explore => None,
+            Self::Popular => None,
+        }
+    }
+}
+
+// ───────── 차트 (§15) ─────────
+
+/// 차트 캐시 수명(시간). 차트 하나 펼치는 데 yt-dlp 가 몇 초씩 걸려서
+/// 여러 사람이 같은 차트를 눌러도 이 시간 안에는 한 번만 돈다.
+pub const CHART_CACHE_TTL_HOURS: i64 = 6;
+
+/// 차트 분류 (§15.2 · §15.3). 유저 UI 1단계의 카드 6장이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChartCategory {
+    /// 우리가 실제로 튼 것으로 만드는 차트 (§15.2b). 통계 DB 에서 나온다.
+    Ours,
+    Popular,
+    Region,
+    Genre,
+    Karaoke,
+    Soundcloud,
+}
+
+impl ChartCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ours => "ours",
+            Self::Popular => "popular",
+            Self::Region => "region",
+            Self::Genre => "genre",
+            Self::Karaoke => "karaoke",
+            Self::Soundcloud => "soundcloud",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ours" => Some(Self::Ours),
+            "popular" => Some(Self::Popular),
+            "region" => Some(Self::Region),
+            "genre" => Some(Self::Genre),
+            "karaoke" => Some(Self::Karaoke),
+            "soundcloud" => Some(Self::Soundcloud),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ours => "우리 차트",
+            Self::Popular => "인기",
+            Self::Region => "나라별",
+            Self::Genre => "장르",
+            Self::Karaoke => "노래방",
+            Self::Soundcloud => "SoundCloud",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Ours => "⭐",
+            Self::Popular => "🔥",
+            Self::Region => "🌏",
+            Self::Genre => "🎸",
+            Self::Karaoke => "🎤",
+            Self::Soundcloud => "☁",
+        }
+    }
+
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Self::Ours => "우리가 많이 튼 곡",
+            Self::Popular => "지금 많이 듣는 곡",
+            Self::Region => "미국·일본·영국",
+            Self::Genre => "K-Pop·힙합·록·R&B",
+            Self::Karaoke => "TJ·금영 장르별",
+            Self::Soundcloud => "SoundCloud 인기곡",
+        }
+    }
+
+    pub const ALL: [Self; 6] = [
+        Self::Ours,
+        Self::Popular,
+        Self::Region,
+        Self::Genre,
+        Self::Karaoke,
+        Self::Soundcloud,
+    ];
+}
+
+/// 차트 한 장의 정의. **코드가 아니라 데이터**라 유튜브가 재생목록 ID 를 바꿔도
+/// 관리 콘솔에서 주소만 갈아 끼우면 된다 (§15.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartDef {
+    pub id: i64,
+    /// `None`이면 모든 서버 공용(기본 제공분).
+    pub guild_id: Option<u64>,
+    pub category: ChartCategory,
+    pub name: String,
+    pub provider: String,
+    pub url: String,
+    pub sort_order: i64,
+    pub enabled: bool,
+    /// 기본 제공분은 지울 수 없고 끄기만 된다 (§15.5). 되돌릴 수 없는 삭제는 위험하다.
+    pub builtin: bool,
+    pub last_fetched_utc: Option<String>,
+    pub last_failure_utc: Option<String>,
+    pub last_failure_reason: Option<String>,
+    /// 캐시에 들어 있는 곡 수. 0이면 아직 한 번도 안 펼쳤거나 실패했다.
+    pub track_count: usize,
+}
+
+impl ChartDef {
+    /// 바깥에서 가져오지 않고 통계 DB 에서 만드는 차트인지 (§15.2b).
+    pub fn is_internal(&self) -> bool {
+        self.url.starts_with(INTERNAL_CHART_PREFIX)
+    }
+
+    /// 마지막 갱신이 성공했는지. 실패한 차트는 유저 UI 목록에서 빼고
+    /// 관리 콘솔에는 실패로 표시한다 — 빈 차트를 눌렀는데 아무 일도 안 일어나는 게 제일 나쁘다.
+    pub fn ok(&self) -> bool {
+        self.is_internal() || self.track_count > 0 || self.last_failure_utc.is_none()
+    }
+}
+
+/// 통계 DB 로 만드는 차트의 주소 접두사. `internal:guild-plays` 같은 값이 들어간다.
+pub const INTERNAL_CHART_PREFIX: &str = "internal:";
+
+/// 캐시에서 꺼낸 차트 곡 목록.
+#[derive(Debug, Clone)]
+pub struct ChartSnapshot {
+    pub tracks: Vec<TrackRef>,
+    pub fetched_utc: String,
+    /// TTL(6시간)이 지났는지. 지났어도 일단 보여 주고 뒤에서 다시 받는 편이 화면이 덜 비어 보인다.
+    pub stale: bool,
+}
+
+// ───────── 슈퍼 좋아요 제한 (§10.6) ─────────
+
+/// 슈퍼 좋아요를 지금 쓸 수 있는지. 거부할 때 **이유를 정확히** 말한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuperLikeVerdict {
+    Allowed {
+        used_today: u32,
+        /// 오늘 남은 횟수. `None`이면 무제한.
+        remaining: Option<u32>,
+    },
+    Cooldown {
+        remaining_sec: u32,
+    },
+    DailyLimitReached {
+        limit: u32,
+    },
+}
+
+impl SuperLikeVerdict {
+    pub fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed { .. })
+    }
+
+    /// 거부 사유 문장. 통과했으면 `None`.
+    pub fn message(self) -> Option<String> {
+        match self {
+            Self::Allowed { .. } => None,
+            Self::Cooldown { remaining_sec } => {
+                let minutes = remaining_sec / 60;
+                let seconds = remaining_sec % 60;
+                let when = if minutes > 0 {
+                    format!("{minutes}분 {seconds}초")
+                } else {
+                    format!("{seconds}초")
+                };
+                Some(format!("슈퍼 좋아요는 {when} 뒤에 다시 쓸 수 있어요."))
+            }
+            Self::DailyLimitReached { limit } => Some(format!(
+                "오늘 슈퍼 좋아요를 {limit}번 다 썼어요 (UTC 자정에 초기화돼요)."
+            )),
+        }
+    }
+}
+
+/// `/state/cold` 의 `superLike` (§10.6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuperLikeStatus {
+    pub cooldown_sec: u32,
+    pub daily_limit: u32,
+    pub used_today: u32,
+    /// 오늘 남은 횟수. `None`이면 무제한.
+    pub remaining: Option<u32>,
+    /// 쿨타임이 끝나는 시각. 지금 쓸 수 있으면 `None`.
+    pub available_at_utc: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +845,259 @@ pub struct ChatReport {
     pub resolved_utc: Option<String>,
 }
 
+/// 활동 로그 분류 6종 (§13.3~13.4). 유저 UI 의 필터 칩이자 보존 기간의 단위다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditKind {
+    /// 곡을 담고 빼고 올린 일.
+    #[default]
+    Song,
+    /// 좋아요·슈퍼 좋아요·싫어요.
+    Vote,
+    /// 재생·일시정지·스킵·이동·볼륨·자동 재생 토글.
+    Playback,
+    /// 재생목록과 자동 재생 기준 곡.
+    Playlist,
+    /// 메시지 삭제·정지·차단 목록.
+    Moderation,
+    /// 서버 설정 변경.
+    Admin,
+}
+
+impl AuditKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Song => "song",
+            Self::Vote => "vote",
+            Self::Playback => "playback",
+            Self::Playlist => "playlist",
+            Self::Moderation => "moderation",
+            Self::Admin => "admin",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "song" => Some(Self::Song),
+            "vote" => Some(Self::Vote),
+            "playback" => Some(Self::Playback),
+            "playlist" => Some(Self::Playlist),
+            "moderation" => Some(Self::Moderation),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+
+    /// 필터 칩 문구 (§13.4).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Song => "🎵 곡",
+            Self::Vote => "👍 투표",
+            Self::Playback => "▶ 재생",
+            Self::Playlist => "📃 재생목록",
+            Self::Moderation => "🛡 관리",
+            Self::Admin => "🛡 관리",
+        }
+    }
+
+    /// 유저 UI 로그 탭의 기본 필터 (§13.4) — 곡과 재생목록만 켠다.
+    /// 투표는 사람이 많으면 초당 여러 줄이 쌓여 다른 게 안 보인다.
+    pub fn default_filter() -> [Self; 2] {
+        [Self::Song, Self::Playlist]
+    }
+
+    pub const ALL: [Self; 6] = [
+        Self::Song,
+        Self::Vote,
+        Self::Playback,
+        Self::Playlist,
+        Self::Moderation,
+        Self::Admin,
+    ];
+
+    /// 분류별 보존 기간 (§13.6). 투표·재생은 양이 확 늘어나므로 3일만 남긴다.
+    /// `0`(무제한)이면 그대로 무제한이다 — 짧은 쪽으로 덮어쓰지 않는다.
+    pub fn retention_days(self, configured_days: i32) -> i32 {
+        match self {
+            Self::Vote | Self::Playback if configured_days != 0 => configured_days.min(3),
+            _ => configured_days,
+        }
+    }
+}
+
+/// 액션명 → 분류 (§13.3). 모르는 액션은 관리자 화면에만 나오도록 `Admin`으로 떨어뜨린다 —
+/// 사람 피드의 기본 필터에 안 잡히므로 조용히 새어 나가지 않는다.
+pub fn audit_kind_for(action: &str) -> AuditKind {
+    match action {
+        _ if action.starts_with("queue.") => AuditKind::Song,
+        "playlist.enqueue" | "chart.enqueue" => AuditKind::Song,
+        _ if action.starts_with("vote.") => AuditKind::Vote,
+        _ if action.starts_with("playback.") || action.starts_with("autoplay.toggle") => {
+            AuditKind::Playback
+        }
+        _ if action.starts_with("playlist.") || action.starts_with("autoplay.") => {
+            AuditKind::Playlist
+        }
+        _ if action.starts_with("chat.")
+            || action.starts_with("user.")
+            || action.starts_with("blacklist.")
+            || action.starts_with("suggestion.") =>
+        {
+            AuditKind::Moderation
+        }
+        _ => AuditKind::Admin,
+    }
+}
+
+/// 곡 제목은 40자에서 자른다 (§13.3). 전체는 툴팁이 보여준다.
+pub const AUDIT_TITLE_CHARS: usize = 40;
+
+pub fn truncate_title(title: &str) -> String {
+    let trimmed: String = title.chars().take(AUDIT_TITLE_CHARS).collect();
+    if trimmed.chars().count() < title.chars().count() {
+        format!("{trimmed}…")
+    } else {
+        trimmed
+    }
+}
+
+/// 합쳐진 로그 한 줄이 될 수 있는 액션 (§13.3). 같은 사람·같은 종류가 60초 안에 반복되면
+/// 새 줄을 만들지 않고 기존 줄의 숫자만 올린다.
+pub fn is_mergeable_action(action: &str) -> bool {
+    matches!(
+        action,
+        "queue.add" | "queue.remove" | "vote.like" | "vote.superlike" | "vote.dislike"
+    )
+}
+
+/// 로그 합치기 창(초). 이 안에 같은 사람이 같은 일을 또 하면 기존 줄을 갱신한다.
+pub const AUDIT_MERGE_WINDOW_SECS: i64 = 60;
+
+/// **사람이 읽는 문장을 서버가 완성한다** (§13.5). 클라이언트가 액션명을 문장으로 바꾸는
+/// 로직을 갖지 않게 하려는 것이라, 여기 없는 액션도 반드시 말이 되는 문장을 돌려준다.
+///
+/// - `actor` 는 누가 했는지, `target` 은 곡·항목 이름, `count` 는 합쳐진 개수(1이면 단수 문장).
+pub fn audit_text(
+    action: &str,
+    actor: &str,
+    target: Option<&str>,
+    before: Option<&str>,
+    after: Option<&str>,
+    count: u32,
+) -> String {
+    let item = target.map(truncate_title);
+    let item = item.as_deref();
+    let many = count > 1;
+    match action {
+        "queue.add" => match (item, many) {
+            (_, true) => format!("{actor}님이 곡 {count}개를 담았어요"),
+            (Some(title), false) => format!("{actor}님이 **{title}** 을 담았어요"),
+            (None, false) => format!("{actor}님이 곡을 담았어요"),
+        },
+        "queue.remove" => match (item, many) {
+            (_, true) => format!("{actor}님이 곡 {count}개를 뺐어요"),
+            (Some(title), false) => format!("{actor}님이 **{title}** 을 뺐어요"),
+            (None, false) => format!("{actor}님이 곡을 뺐어요"),
+        },
+        "queue.pin" => match item {
+            Some(title) => format!("{actor}님이 **{title}** 을 맨 앞으로 올렸어요"),
+            None => format!("{actor}님이 곡을 맨 앞으로 올렸어요"),
+        },
+        "queue.boomtta" => match item {
+            Some(title) => format!("**{title}** 이 싫어요 {count}개로 대기열에서 내려갔어요"),
+            None => format!("어떤 곡이 싫어요 {count}개로 대기열에서 내려갔어요"),
+        },
+        "queue.clear" => format!("{actor}님이 대기열 {count}곡을 비웠어요"),
+        "playlist.enqueue" => match item {
+            Some(name) => format!("{actor}님이 재생목록 **{name}** 에서 {count}곡을 담았어요"),
+            None => format!("{actor}님이 재생목록에서 {count}곡을 담았어요"),
+        },
+        "chart.enqueue" => match item {
+            Some(name) => format!("{actor}님이 차트 **{name}** 에서 {count}곡을 담았어요"),
+            None => format!("{actor}님이 차트에서 {count}곡을 담았어요"),
+        },
+        "vote.like" | "vote.superlike" | "vote.dislike" => {
+            let what = match action {
+                "vote.like" => "좋아요",
+                "vote.superlike" => "슈퍼 좋아요",
+                _ => "싫어요",
+            };
+            match (item, many) {
+                (_, true) => format!("{actor}님이 곡 {count}개에 {what}를 눌렀어요"),
+                (Some(title), false) => format!("{actor}님이 **{title}** 에 {what}를 눌렀어요"),
+                (None, false) => format!("{actor}님이 {what}를 눌렀어요"),
+            }
+        }
+        "playback.pause" => format!("{actor}님이 일시정지했어요"),
+        "playback.resume" => format!("{actor}님이 다시 재생했어요"),
+        "playback.skip" => format!("{actor}님이 곡을 넘겼어요"),
+        "playback.skip.vote" => format!("{count}명이 동의해서 곡을 넘겼어요"),
+        "playback.seek" => format!("{actor}님이 재생 위치를 옮겼어요"),
+        "playback.volume" => match after {
+            Some(value) => format!("{actor}님이 서버 볼륨을 {value}으로 바꿨어요"),
+            None => format!("{actor}님이 서버 볼륨을 바꿨어요"),
+        },
+        "autoplay.toggle" => match after {
+            Some("on") | Some("true") | Some("1") => format!("{actor}님이 자동 재생을 켰어요"),
+            _ => format!("{actor}님이 자동 재생을 껐어요"),
+        },
+        "playlist.create" => match item {
+            Some(name) => format!("{actor}님이 재생목록 **{name}** 을 만들었어요"),
+            None => format!("{actor}님이 재생목록을 만들었어요"),
+        },
+        "playlist.rename" => match (before, after) {
+            (Some(old), Some(new)) => {
+                format!("{actor}님이 재생목록 이름을 **{old}** 에서 **{new}** 로 바꿨어요")
+            }
+            _ => format!("{actor}님이 재생목록 이름을 바꿨어요"),
+        },
+        "playlist.delete" => match item {
+            Some(name) => format!("{actor}님이 재생목록 **{name}** 을 지웠어요"),
+            None => format!("{actor}님이 재생목록을 지웠어요"),
+        },
+        "autoplay.seed.add" => match item {
+            Some(title) => format!("{actor}님이 **{title}** 을 자동 재생 기준 곡으로 등록했어요"),
+            None => format!("{actor}님이 자동 재생 기준 곡을 등록했어요"),
+        },
+        "autoplay.seed.remove" => match item {
+            Some(title) => format!("{actor}님이 자동 재생 기준 곡에서 **{title}** 을 뺐어요"),
+            None => format!("{actor}님이 자동 재생 기준 곡을 뺐어요"),
+        },
+        "autoplay.seed.reorder" => format!("{actor}님이 자동 재생 기준 곡 순서를 바꿨어요"),
+        "chat.delete" => format!("{actor}님이 메시지를 지웠어요"),
+        "user.suspend" => match item {
+            Some(who) => format!("{actor}님이 {who}님을 정지했어요"),
+            None => format!("{actor}님이 누군가를 정지했어요"),
+        },
+        "user.unsuspend" => match item {
+            Some(who) => format!("{actor}님이 {who}님의 정지를 풀었어요"),
+            None => format!("{actor}님이 정지를 풀었어요"),
+        },
+        "blacklist.add" => match item {
+            Some(pattern) => format!("{actor}님이 **{pattern}** 을 차단 목록에 넣었어요"),
+            None => format!("{actor}님이 차단 목록에 규칙을 넣었어요"),
+        },
+        "blacklist.remove" => match item {
+            Some(pattern) => format!("{actor}님이 차단 목록에서 **{pattern}** 을 뺐어요"),
+            None => format!("{actor}님이 차단 목록에서 규칙을 뺐어요"),
+        },
+        _ if action.starts_with("settings.") => {
+            let what = item.unwrap_or_else(|| action.trim_start_matches("settings.").into());
+            match (before, after) {
+                (Some(old), Some(new)) => {
+                    format!("{actor}님이 {what} 을 {old} → {new} 로 바꿨어요")
+                }
+                (None, Some(new)) => format!("{actor}님이 {what} 을 {new} 로 바꿨어요"),
+                _ => format!("{actor}님이 {what} 을 바꿨어요"),
+            }
+        }
+        other => match item {
+            Some(title) => format!("{actor}님이 {other} 을 했어요 (**{title}**)"),
+            None => format!("{actor}님이 {other} 을 했어요"),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditEntry {
@@ -289,12 +1106,66 @@ pub struct AuditEntry {
     pub user_id: u64,
     pub display_name: String,
     pub action: String,
+    /// 분류. 저장 시 `audit_kind_for`로 정해져 컬럼에 박혀 있다.
+    #[serde(default)]
+    pub kind: AuditKind,
+    /// 서버가 완성한 사람 문장 (§13.5).
+    #[serde(default)]
+    pub text: String,
     pub target: Option<String>,
     pub before_value: Option<String>,
     pub after_value: Option<String>,
     pub success: bool,
     pub failure_reason: Option<String>,
     pub created_utc: String,
+    /// 합쳐진 줄이면 2 이상 (§13.3). 1이면 평범한 한 줄이다.
+    #[serde(default)]
+    pub merged_count: u32,
+    /// 합쳐진 줄을 펼쳤을 때 보여줄 항목들. 숫자만 보여주면 "뭘 넣은 거지?"가 남는다.
+    #[serde(default)]
+    pub merged_items: Vec<String>,
+}
+
+/// 유저 UI 로 나가는 투영 (§13.2·§13.5). **전후값 JSON과 실패 사유는 아예 싣지 않는다** —
+/// 사람이 볼 화면에 기계용 덩어리가 나가면 그 탭은 못 읽는 화면이 된다.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditFeedItem {
+    pub id: i64,
+    pub kind: AuditKind,
+    pub actor_id: u64,
+    pub actor_name: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_title: Option<String>,
+    pub created_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_count: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub merged_items: Vec<String>,
+}
+
+impl AuditEntry {
+    /// 사람 피드용 투영. 관리 콘솔은 `AuditEntry` 자체를 쓴다.
+    pub fn feed_item(&self) -> AuditFeedItem {
+        AuditFeedItem {
+            id: self.id,
+            kind: self.kind,
+            actor_id: self.user_id,
+            actor_name: self.display_name.clone(),
+            text: self.text.clone(),
+            track_title: self.target.clone(),
+            created_utc: self.created_utc.clone(),
+            merged_count: (self.merged_count > 1).then_some(self.merged_count),
+            merged_items: self.merged_items.clone(),
+        }
+    }
+
+    /// 자동 재생이 넣은 곡은 사람 피드에 안 남긴다 (§13.3).
+    /// 사람이 한 일이 아니고, 계속 쌓이면 피드가 자동재생 로그가 된다.
+    pub fn is_human_visible(&self) -> bool {
+        self.user_id != 0 && self.success
+    }
 }
 
 /// 앱 개선 제안의 처리 상태. 관리자만 바꾼다.
@@ -498,9 +1369,18 @@ pub struct RemoteGuildSettings {
     pub seek_rule: PermissionRule,
     pub volume_rule: PermissionRule,
     pub queue_edit_rule: PermissionRule,
-    /// 기준 곡(자동 재생 시드) 등록·삭제 권한. 기본은 관리자만.
-    #[serde(default = "default_autoplay_seed_rule")]
-    pub autoplay_seed_rule: PermissionRule,
+    /// 곡 넘기기 권한 (§10.5). 재생/일시정지와 성격이 달라 `playback_rule`에서 갈라냈다.
+    /// **기본이 `GuildMember`** — 리모컨만 보는 사람도 곡을 넘길 수 있어야 한다.
+    #[serde(default = "default_open_rule")]
+    pub skip_rule: PermissionRule,
+    /// 자동 재생 권한 (§8.3). 추천 방식 전환·기준 곡 등록/삭제/정렬·최근 N곡 수·장르 선택·
+    /// `📻 이 곡 말고`·자동 재생 On/Off 를 전부 관장한다. **기본이 `GuildMember`** 다.
+    /// (v2 의 `autoplaySeedRule` 이 이 이름으로 바뀌었고 alias 로 옛 값을 그대로 읽는다.)
+    #[serde(default = "default_open_rule", alias = "autoplaySeedRule")]
+    pub autoplay_rule: PermissionRule,
+    /// 한 번에 담기 권한 (§15.4). 재생목록 전체 담기 + 차트 전체 담기를 함께 관장한다.
+    #[serde(default = "default_open_rule")]
+    pub bulk_enqueue_rule: PermissionRule,
     /// 레거시 통짜 지정 역할. **직접 읽지 말고** `roles_for`/`manager_roles`를 쓴다.
     /// 새 값이 없을 때만 폴백으로 쓰이고, 저장 시점에 분리된 값으로 대체된다.
     pub configured_role_ids: Vec<u64>,
@@ -528,14 +1408,114 @@ pub struct RemoteGuildSettings {
     /// 장식용 비주얼라이저 표시 여부.
     #[serde(default = "default_true")]
     pub visualizer_enabled: bool,
+
+    // ───────── 투표 점수 (§10.1) ─────────
+    /// 좋아요 한 표의 점수. 허용 범위 −10~10.
+    #[serde(default = "default_like_points")]
+    pub like_points: i32,
+    #[serde(default = "default_dislike_points")]
+    pub dislike_points: i32,
+    #[serde(default = "default_super_like_points")]
+    pub super_like_points: i32,
+    /// 곡 하나가 지날 때마다 붙는 대기 가점.
+    #[serde(default = "default_wait_points")]
+    pub wait_points: i32,
+
+    // ───────── 붐따 (§10.3) ─────────
+    /// 꺼져 있으면(기본) 싫어요는 점수에만 영향을 준다. 곡이 사라지지 않는다.
+    #[serde(default)]
+    pub boomtta_enabled: bool,
+    /// 이 수만큼 싫어요가 모이면 실행한다. `0`이면 무제한(=절대 안 걸림).
+    #[serde(default = "default_boomtta_threshold")]
+    pub boomtta_threshold: u32,
+    #[serde(default)]
+    pub boomtta_action: BoomttaAction,
+
+    // ───────── 투표 스킵 (§10.5) ─────────
+    #[serde(default)]
+    pub vote_skip_enabled: bool,
+    #[serde(default)]
+    pub vote_skip_basis: VoteSkipBasis,
+    /// 필요 비율(%). 백분율이라 무제한이 없다(§23.1 예외) — 10~100.
+    #[serde(default = "default_vote_skip_ratio")]
+    pub vote_skip_ratio: u32,
+    /// 최소 필요 인원. `0`이면 비율만 본다.
+    #[serde(default = "default_vote_skip_min")]
+    pub vote_skip_min: u32,
+
+    // ───────── 슈퍼 좋아요 제한 (§10.6) ─────────
+    /// 연타 방지 쿨타임(초). `0`이면 없음(기본).
+    #[serde(default)]
+    pub super_like_cooldown_sec: u32,
+    /// 하루(UTC 자정 기준) 사용 횟수. `0`이면 무제한(기본).
+    #[serde(default)]
+    pub super_like_daily_limit: u32,
+
+    // ───────── 자동 재생 (§8.4 · §8.5) ─────────
+    #[serde(default)]
+    pub autoplay_mode: AutoplayMode,
+    /// `recent` 모드가 참고할 최근 곡 수 (1~20).
+    #[serde(default = "default_autoplay_recent")]
+    pub autoplay_recent_count: u32,
+    /// `genre` 모드가 쓸 장르 차트 키.
+    #[serde(default)]
+    pub autoplay_genres: Vec<String>,
+    #[serde(default)]
+    pub autoplay_policy: AutoplayPolicy,
+    /// 최근 이 곡 수 안에 나온 아티스트는 후보에서 뺀다. `0`이면 끔.
+    #[serde(default = "default_artist_cooldown")]
+    pub autoplay_artist_cooldown: u32,
+    /// 최근 재생 이력의 회피가 완전히 풀리는 시간(시간). `0`이면 감쇠 없이 그냥 제외한다.
+    #[serde(default = "default_recent_decay_hours")]
+    pub autoplay_recent_decay_hours: u32,
+    /// 기준 곡 상한. `0`이면 무제한(§23.1).
+    #[serde(default = "default_autoplay_seed_max")]
+    pub autoplay_seed_max: u32,
+
+    // ───────── 한 번에 담기 · 차트 (§15 · §18.2) ─────────
+    /// 한 번의 클릭으로 들어올 수 있는 최대 곡 수. `0`이면 무제한.
+    #[serde(default = "default_bulk_enqueue_limit")]
+    pub bulk_enqueue_limit: u32,
+    /// 사랑받은 곡 차트에서 슈퍼 좋아요를 몇 배로 칠지 (0~5). `0`이면 슈퍼를 무시한다.
+    #[serde(default = "default_chart_super_weight")]
+    pub chart_super_weight: u32,
 }
 
 fn default_chat_retention_days() -> u32 {
     30
 }
 
-fn default_autoplay_seed_rule() -> PermissionRule {
-    PermissionRule::Administrator
+/// 새 권한들의 기본값. 사용자가 "일반사용자도 할수있고"라고 명시했다(§8.3·§10.5·§15.4).
+fn default_open_rule() -> PermissionRule {
+    PermissionRule::GuildMember
+}
+
+fn default_boomtta_threshold() -> u32 {
+    3
+}
+fn default_vote_skip_ratio() -> u32 {
+    50
+}
+fn default_vote_skip_min() -> u32 {
+    2
+}
+fn default_autoplay_recent() -> u32 {
+    5
+}
+fn default_artist_cooldown() -> u32 {
+    3
+}
+fn default_recent_decay_hours() -> u32 {
+    24
+}
+fn default_autoplay_seed_max() -> u32 {
+    MAX_AUTOPLAY_SEEDS as u32
+}
+fn default_bulk_enqueue_limit() -> u32 {
+    200
+}
+fn default_chart_super_weight() -> u32 {
+    2
 }
 
 fn default_true() -> bool {
@@ -548,10 +1528,18 @@ impl RemoteGuildSettings {
     /// "비어 있으면"은 **키 자체가 없을 때**를 말한다. 빈 배열이 저장돼 있으면
     /// 관리자가 일부러 비운 것이므로 폴백하지 않는다 — 안 그러면 지운 역할이 되살아난다.
     pub fn roles_for(&self, key: &str) -> &[u64] {
-        match self.rule_role_ids.get(key) {
-            Some(ids) => ids,
-            None => &self.configured_role_ids,
+        if let Some(ids) = self.rule_role_ids.get(key) {
+            return ids;
         }
+        // 키가 개명됐으면 옛 이름에 저장된 값을 먼저 본다 (예: autoplay ← autoplaySeed).
+        for (new_key, legacy_key) in PERMISSION_KEY_ALIASES {
+            if new_key == key {
+                if let Some(ids) = self.rule_role_ids.get(legacy_key) {
+                    return ids;
+                }
+            }
+        }
+        &self.configured_role_ids
     }
 
     /// 관리자 지정 역할. 비어 있으면 레거시 폴백.
@@ -574,9 +1562,84 @@ impl RemoteGuildSettings {
             "seek" => self.seek_rule,
             "volume" => self.volume_rule,
             "queueEdit" => self.queue_edit_rule,
-            "autoplaySeed" => self.autoplay_seed_rule,
+            "skip" => self.skip_rule,
+            // 옛 이름도 계속 받아 준다 — 저장된 설정 JSON 과 관리 콘솔의 과거 요청이 살아 있다.
+            "autoplay" | "autoplaySeed" => self.autoplay_rule,
+            "bulkEnqueue" => self.bulk_enqueue_rule,
             _ => return None,
         })
+    }
+
+    /// 권한 키의 설명 문구. 관리 콘솔과 "왜 안 되는지"(§23.3) 툴팁이 같은 문장을 쓴다.
+    pub fn permission_description(key: &str) -> &'static str {
+        match key {
+            "search" => "곡을 찾아 대기열에 담는 동작이에요.",
+            "vote" => "곡에 좋아요·슈퍼 좋아요·싫어요를 누르는 동작이에요.",
+            "chat" => "리모컨 채팅에 글을 쓰는 동작이에요.",
+            "playback" => "재생·일시정지처럼 지금 나오는 곡을 조작하는 동작이에요.",
+            "skip" => "지금 나오는 곡을 다음으로 넘기는 동작이에요.",
+            "seek" => "재생 위치를 앞뒤로 옮기는 동작이에요.",
+            "volume" => "모두에게 들리는 서버 볼륨을 바꾸는 동작이에요.",
+            "queueEdit" => "대기열 순서를 바꾸거나 곡을 빼는 동작이에요.",
+            "autoplay" | "autoplaySeed" => {
+                "자동 재생이 무엇을 기준으로 곡을 고를지 정하는 동작이에요."
+            }
+            "bulkEnqueue" => "재생목록이나 차트를 한 번에 전부 담는 동작이에요.",
+            _ => "이 동작을 누가 할 수 있는지 정해요.",
+        }
+    }
+
+    /// 이 서버의 투표 점수표.
+    pub fn vote_points(&self) -> VotePoints {
+        VotePoints::from_settings(self)
+    }
+
+    /// 기준 곡 상한. `0`이면 무제한이라 `None`이다 (§23.1).
+    pub fn seed_limit(&self) -> Option<u32> {
+        as_limit_u32(self.autoplay_seed_max)
+    }
+
+    /// **`0 = 무제한` 규약을 여기서 강제한다** (§23.1). 저장 직전에 한 번 부르면
+    /// 어떤 라우트를 거쳐 들어와도 서버가 실제로 그 규약대로 동작한다.
+    /// `.max(1)` 같은 클램프가 남아 있으면 `0`이 `1`이 돼 "무제한"이 "가장 빡빡함"이 된다.
+    pub fn sanitize(&mut self) {
+        // 볼륨은 §23.1 예외 — 0~200 범위가 있어야 의미가 있다.
+        self.min_volume = self.min_volume.clamp(0, 200);
+        self.max_volume = self.max_volume.clamp(0, 200);
+        if self.max_volume < self.min_volume {
+            self.max_volume = self.min_volume;
+        }
+        self.default_volume = self.default_volume.clamp(self.min_volume, self.max_volume);
+
+        // 0 = 무제한. 음수만 0으로 올리고, 위쪽은 v3 §18.1 의 새 상한을 쓴다.
+        self.max_queue_per_user = self.max_queue_per_user.clamp(0, 1_000);
+        self.max_queue_per_guild = self.max_queue_per_guild.clamp(0, 10_000);
+        self.max_track_seconds = self.max_track_seconds.max(0);
+        self.audit_retention_days = self.audit_retention_days.clamp(0, 3650);
+        self.chat_retention_days = self.chat_retention_days.min(3650);
+
+        let points = self.vote_points();
+        self.like_points = points.like;
+        self.dislike_points = points.dislike;
+        self.super_like_points = points.super_like;
+        self.wait_points = points.wait;
+
+        self.boomtta_threshold = self.boomtta_threshold.min(1_000);
+        // 비율은 백분율이라 무제한이 말이 안 된다(§23.1 예외).
+        self.vote_skip_ratio = self.vote_skip_ratio.clamp(10, 100);
+        self.vote_skip_min = self.vote_skip_min.min(20);
+        self.super_like_cooldown_sec = self.super_like_cooldown_sec.min(3_600);
+        self.super_like_daily_limit = self.super_like_daily_limit.min(100);
+
+        self.autoplay_recent_count = self.autoplay_recent_count.clamp(1, 20);
+        self.autoplay_artist_cooldown = self.autoplay_artist_cooldown.min(20);
+        self.autoplay_recent_decay_hours = self.autoplay_recent_decay_hours.min(168);
+        self.autoplay_seed_max = self.autoplay_seed_max.min(100);
+        self.autoplay_genres.retain(|genre| !genre.trim().is_empty());
+        self.autoplay_genres.truncate(20);
+
+        self.bulk_enqueue_limit = self.bulk_enqueue_limit.min(10_000);
+        self.chart_super_weight = self.chart_super_weight.min(5);
     }
 
     /// 레거시 값을 8개 키에 펼쳐 넣는다. 관리 콘솔이 처음 저장할 때 한 번 부르면
@@ -609,7 +1672,9 @@ impl Default for RemoteGuildSettings {
             seek_rule: PermissionRule::GuildMember,
             volume_rule: PermissionRule::SameVoiceChannel,
             queue_edit_rule: PermissionRule::SameVoiceChannel,
-            autoplay_seed_rule: default_autoplay_seed_rule(),
+            skip_rule: default_open_rule(),
+            autoplay_rule: default_open_rule(),
+            bulk_enqueue_rule: default_open_rule(),
             configured_role_ids: Vec::new(),
             rule_role_ids: BTreeMap::new(),
             manager_role_ids: Vec::new(),
@@ -622,6 +1687,28 @@ impl Default for RemoteGuildSettings {
             chat_retention_days: default_chat_retention_days(),
             suggestion_enabled: true,
             visualizer_enabled: true,
+            like_points: default_like_points(),
+            dislike_points: default_dislike_points(),
+            super_like_points: default_super_like_points(),
+            wait_points: default_wait_points(),
+            boomtta_enabled: false,
+            boomtta_threshold: default_boomtta_threshold(),
+            boomtta_action: BoomttaAction::Bottom,
+            vote_skip_enabled: false,
+            vote_skip_basis: VoteSkipBasis::Listeners,
+            vote_skip_ratio: default_vote_skip_ratio(),
+            vote_skip_min: default_vote_skip_min(),
+            super_like_cooldown_sec: 0,
+            super_like_daily_limit: 0,
+            autoplay_mode: AutoplayMode::Recent,
+            autoplay_recent_count: default_autoplay_recent(),
+            autoplay_genres: Vec::new(),
+            autoplay_policy: AutoplayPolicy::Balanced,
+            autoplay_artist_cooldown: default_artist_cooldown(),
+            autoplay_recent_decay_hours: default_recent_decay_hours(),
+            autoplay_seed_max: default_autoplay_seed_max(),
+            bulk_enqueue_limit: default_bulk_enqueue_limit(),
+            chart_super_weight: default_chart_super_weight(),
         }
     }
 }
@@ -659,8 +1746,28 @@ mod tests {
         }
         // 관리자 지정 역할도 같은 방식으로 폴백한다.
         assert_eq!(settings.manager_roles(), &[123, 456]);
-        // 새 규칙은 기본이 관리자다.
-        assert_eq!(settings.autoplay_seed_rule, PermissionRule::Administrator);
+        // v3 의 새 권한 3종은 기본이 "모든 사람"이다.
+        assert_eq!(settings.skip_rule, PermissionRule::GuildMember);
+        assert_eq!(settings.autoplay_rule, PermissionRule::GuildMember);
+        assert_eq!(settings.bulk_enqueue_rule, PermissionRule::GuildMember);
+    }
+
+    /// v2 를 쓰던 서버의 `autoplaySeedRule` 과 그 지정 역할이 개명 때문에 사라지면 안 된다.
+    #[test]
+    fn renamed_autoplay_key_still_reads_the_old_setting() {
+        let json = r#"{"autoplaySeedRule":"administrator",
+                       "ruleRoleIds":{"autoplaySeed":[42]}}"#;
+        let settings: RemoteGuildSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.autoplay_rule, PermissionRule::Administrator);
+        assert_eq!(settings.roles_for("autoplay"), &[42]);
+        assert_eq!(
+            settings.rule_for("autoplaySeed"),
+            Some(PermissionRule::Administrator)
+        );
+        // 새 키로 저장된 값이 있으면 그쪽이 이긴다.
+        let mut settings = settings;
+        settings.rule_role_ids.insert("autoplay".into(), vec![7]);
+        assert_eq!(settings.roles_for("autoplay"), &[7]);
     }
 
     /// 관리자가 일부러 비운 키는 레거시 값으로 되살아나면 안 된다.
@@ -727,9 +1834,273 @@ mod tests {
     fn seed_add_outcome_messages_are_specific() {
         assert!(SeedAddOutcome::Added.is_added());
         assert_eq!(
-            SeedAddOutcome::LimitReached.message(),
+            SeedAddOutcome::LimitReached(10).message(),
             "시드곡은 10곡까지 넣을 수 있어요."
         );
         assert!(!SeedAddOutcome::Duplicate.is_added());
+    }
+
+    fn score_of(wait: i32, likes: i32, supers: i32, dislikes: i32) -> QueueScore {
+        QueueScore {
+            wait_score: wait,
+            like_count: likes,
+            super_like_count: supers,
+            dislike_count: dislikes,
+            ..Default::default()
+        }
+    }
+
+    /// `*2` 하드코딩이 사라지고 설정값만 쓰는지 (§10.1).
+    #[test]
+    fn total_score_uses_the_configured_points_only() {
+        let score = score_of(2, 3, 1, 0);
+        // 기본 점수표는 지금 동작 그대로: 대기2 + 👍3 + ⭐1×2 = 7
+        assert_eq!(score.total_score(&VotePoints::default()), 7);
+
+        // 좋아요를 2점으로 올리면 화면도 서버도 같이 움직여야 한다.
+        let doubled = VotePoints {
+            like: 2,
+            ..VotePoints::default()
+        };
+        assert_eq!(score.total_score(&doubled), 2 + 6 + 2);
+
+        // 싫어요는 음수 점수로 들어간다.
+        let disliked = score_of(0, 0, 0, 3);
+        assert_eq!(disliked.total_score(&VotePoints::default()), -3);
+
+        // 슈퍼를 0점으로 두면 아예 안 세진다 — `*2` 가 남아 있으면 여기서 터진다.
+        let ignored = VotePoints {
+            super_like: 0,
+            ..VotePoints::default()
+        };
+        assert_eq!(score_of(0, 0, 5, 0).total_score(&ignored), 0);
+    }
+
+    #[test]
+    fn vote_points_are_clamped_to_the_allowed_range() {
+        let wild = VotePoints {
+            like: 999,
+            dislike: -999,
+            super_like: 11,
+            wait: -11,
+        }
+        .clamped();
+        assert_eq!(wild.like, VOTE_POINT_MAX);
+        assert_eq!(wild.dislike, VOTE_POINT_MIN);
+        assert_eq!(wild.super_like, 10);
+        assert_eq!(wild.wait, -10);
+    }
+
+    /// 화면의 계산식은 설정값을 반영해야 한다. 안 그러면 화면이 거짓말을 한다(§10.4).
+    #[test]
+    fn formula_reflects_the_settings() {
+        let score = score_of(2, 3, 1, 0);
+        assert_eq!(score.formula(&VotePoints::default()), "👍3 + ⭐1×2 + 대기2 = 7");
+        let none = score_of(0, 0, 0, 0);
+        assert!(none.formula(&VotePoints::default()).starts_with("아직 점수가 없어요"));
+    }
+
+    /// 붐따는 기본으로 꺼져 있고, 기준이 0(무제한)이면 절대 안 걸린다 (§10.3 · §23.1).
+    #[test]
+    fn boomtta_stays_off_until_it_is_turned_on() {
+        let mut settings = RemoteGuildSettings::default();
+        let score = score_of(0, 0, 0, 5);
+        assert!(!score.boomtta_triggered(&settings), "기본은 꺼져 있어야 한다");
+
+        settings.boomtta_enabled = true;
+        assert!(score.boomtta_triggered(&settings));
+        assert!(!score_of(0, 0, 0, 2).boomtta_triggered(&settings));
+
+        settings.boomtta_threshold = 0;
+        assert!(!score.boomtta_triggered(&settings), "0은 무제한이라 안 걸린다");
+    }
+
+    /// 모수가 1명이면 그 사람 혼자 눌러도 넘어간다 — 혼자 듣는데 투표를 시키면 괴롭힘이다.
+    #[test]
+    fn vote_skip_threshold_never_exceeds_the_population() {
+        assert_eq!(VoteSkipBasis::votes_needed(0, 50, 2), 0);
+        assert_eq!(VoteSkipBasis::votes_needed(1, 50, 2), 1);
+        assert_eq!(VoteSkipBasis::votes_needed(3, 50, 2), 2);
+        assert_eq!(VoteSkipBasis::votes_needed(4, 50, 2), 2);
+        assert_eq!(VoteSkipBasis::votes_needed(5, 50, 2), 3);
+        assert_eq!(VoteSkipBasis::votes_needed(10, 100, 2), 10);
+        // 최소 인원이 모수보다 크면 모수가 이긴다.
+        assert_eq!(VoteSkipBasis::votes_needed(2, 10, 20), 2);
+    }
+
+    /// `0 = 무제한` 규약이 저장 직전에 실제로 강제되는지 (§23.1).
+    #[test]
+    fn sanitize_keeps_zero_as_unlimited_and_clamps_the_rest() {
+        let mut settings = RemoteGuildSettings {
+            max_queue_per_user: 0,
+            max_queue_per_guild: 99_999,
+            audit_retention_days: 0,
+            super_like_daily_limit: 0,
+            vote_skip_ratio: 3,
+            like_points: 42,
+            autoplay_recent_count: 0,
+            autoplay_seed_max: 0,
+            default_volume: 500,
+            ..Default::default()
+        };
+        settings.sanitize();
+
+        // 0 은 살아남는다 — .max(1) 이 남아 있으면 여기서 터진다.
+        assert_eq!(settings.max_queue_per_user, 0);
+        assert_eq!(settings.audit_retention_days, 0);
+        assert_eq!(settings.super_like_daily_limit, 0);
+        assert_eq!(settings.autoplay_seed_max, 0);
+        assert!(settings.seed_limit().is_none());
+        assert!(as_limit(settings.max_queue_per_user).is_none());
+        assert_eq!(as_limit(5), Some(5));
+
+        // 나머지는 범위 안으로.
+        assert_eq!(settings.max_queue_per_guild, 10_000);
+        assert_eq!(settings.vote_skip_ratio, 10);
+        assert_eq!(settings.like_points, VOTE_POINT_MAX);
+        assert_eq!(settings.autoplay_recent_count, 1);
+        assert_eq!(settings.default_volume, settings.max_volume);
+    }
+
+    #[test]
+    fn audit_kinds_match_the_action_table() {
+        assert_eq!(audit_kind_for("queue.add"), AuditKind::Song);
+        assert_eq!(audit_kind_for("queue.boomtta"), AuditKind::Song);
+        assert_eq!(audit_kind_for("playlist.enqueue"), AuditKind::Song);
+        assert_eq!(audit_kind_for("chart.enqueue"), AuditKind::Song);
+        assert_eq!(audit_kind_for("vote.superlike"), AuditKind::Vote);
+        assert_eq!(audit_kind_for("playback.skip"), AuditKind::Playback);
+        assert_eq!(audit_kind_for("autoplay.toggle"), AuditKind::Playback);
+        assert_eq!(audit_kind_for("autoplay.seed.add"), AuditKind::Playlist);
+        assert_eq!(audit_kind_for("playlist.create"), AuditKind::Playlist);
+        assert_eq!(audit_kind_for("chat.delete"), AuditKind::Moderation);
+        assert_eq!(audit_kind_for("user.suspend"), AuditKind::Moderation);
+        assert_eq!(audit_kind_for("blacklist.add"), AuditKind::Moderation);
+        assert_eq!(audit_kind_for("settings.update"), AuditKind::Admin);
+        // 기본 필터는 조용해야 로그창이 쓸모 있다 (§13.4).
+        assert_eq!(AuditKind::default_filter(), [AuditKind::Song, AuditKind::Playlist]);
+    }
+
+    /// 투표·재생은 3일, 나머지는 설정값 그대로. 무제한(0)은 짧은 쪽으로 덮이지 않는다 (§13.6).
+    #[test]
+    fn vote_and_playback_logs_are_kept_for_three_days() {
+        assert_eq!(AuditKind::Vote.retention_days(14), 3);
+        assert_eq!(AuditKind::Playback.retention_days(14), 3);
+        assert_eq!(AuditKind::Vote.retention_days(2), 2);
+        assert_eq!(AuditKind::Song.retention_days(14), 14);
+        assert_eq!(AuditKind::Vote.retention_days(0), 0);
+    }
+
+    /// 문장은 서버가 완성한다 — 클라이언트가 액션명을 문장으로 바꾸지 않는다 (§13.5).
+    #[test]
+    fn audit_sentences_are_written_by_the_server_in_haeyo() {
+        assert_eq!(
+            audit_text("queue.add", "민수", Some("I AM"), None, None, 1),
+            "민수님이 **I AM** 을 담았어요"
+        );
+        assert_eq!(
+            audit_text("queue.add", "민수", Some("I AM"), None, None, 7),
+            "민수님이 곡 7개를 담았어요"
+        );
+        assert_eq!(
+            audit_text("playlist.enqueue", "민수", Some("밤샘용"), None, None, 50),
+            "민수님이 재생목록 **밤샘용** 에서 50곡을 담았어요"
+        );
+        assert_eq!(
+            audit_text("chart.enqueue", "민수", Some("한국 인기곡"), None, None, 100),
+            "민수님이 차트 **한국 인기곡** 에서 100곡을 담았어요"
+        );
+        assert_eq!(
+            audit_text("playback.volume", "지훈", None, Some("200"), Some("150"), 1),
+            "지훈님이 서버 볼륨을 150으로 바꿨어요"
+        );
+        assert_eq!(
+            audit_text("queue.boomtta", "", Some("Spicy"), None, None, 3),
+            "**Spicy** 이 싫어요 3개로 대기열에서 내려갔어요"
+        );
+        // 모르는 액션도 문장이 되어야 한다.
+        assert!(audit_text("something.new", "민수", None, None, None, 1).contains("민수님이"));
+        // 곡 제목은 40자에서 자른다.
+        let long = "가".repeat(60);
+        let text = audit_text("queue.add", "민수", Some(&long), None, None, 1);
+        assert!(text.contains('…'));
+        assert!(text.chars().count() < long.chars().count() + 20);
+    }
+
+    /// 정책은 시드를 갈아탈 때마다 한 단계씩 느슨해진다 (§8.5-4).
+    #[test]
+    fn policies_loosen_and_never_tighten() {
+        assert_eq!(AutoplayPolicy::Similar.loosened(), AutoplayPolicy::Balanced);
+        assert_eq!(AutoplayPolicy::Balanced.loosened(), AutoplayPolicy::Explore);
+        assert_eq!(AutoplayPolicy::Explore.loosened(), AutoplayPolicy::Explore);
+        assert_eq!(AutoplayPolicy::default(), AutoplayPolicy::Balanced);
+        assert_eq!(AutoplayPolicy::Similar.window(), Some(3));
+        assert_eq!(AutoplayPolicy::Balanced.window(), Some(10));
+        assert!(AutoplayPolicy::Explore.window().is_none());
+    }
+
+    /// 폴백 사슬: seed → recent → genre → 포기 (§8.2).
+    #[test]
+    fn autoplay_modes_fall_back_in_order() {
+        assert_eq!(AutoplayMode::default(), AutoplayMode::Recent);
+        assert_eq!(AutoplayMode::Seed.fallback(), Some(AutoplayMode::Recent));
+        assert_eq!(AutoplayMode::Recent.fallback(), Some(AutoplayMode::Genre));
+        assert!(AutoplayMode::Genre.fallback().is_none());
+        for mode in [AutoplayMode::Seed, AutoplayMode::Recent, AutoplayMode::Genre] {
+            assert_eq!(AutoplayMode::parse(mode.as_str()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn super_like_denials_say_exactly_why() {
+        assert!(
+            SuperLikeVerdict::Allowed {
+                used_today: 1,
+                remaining: Some(4)
+            }
+            .is_allowed()
+        );
+        assert_eq!(
+            SuperLikeVerdict::Cooldown { remaining_sec: 180 }
+                .message()
+                .unwrap(),
+            "슈퍼 좋아요는 3분 0초 뒤에 다시 쓸 수 있어요."
+        );
+        assert_eq!(
+            SuperLikeVerdict::DailyLimitReached { limit: 5 }
+                .message()
+                .unwrap(),
+            "오늘 슈퍼 좋아요를 5번 다 썼어요 (UTC 자정에 초기화돼요)."
+        );
+    }
+
+    /// 싫어요가 붙어도 좋아요/슈퍼와 문자열 표현이 겹치지 않아야 DB 왕복이 깨지지 않는다.
+    #[test]
+    fn vote_kinds_round_trip_including_dislike() {
+        for kind in [
+            QueueVoteKind::Like,
+            QueueVoteKind::SuperLike,
+            QueueVoteKind::Dislike,
+        ] {
+            assert_eq!(QueueVoteKind::parse(kind.as_str()), Some(kind));
+        }
+        let points = VotePoints::default();
+        assert_eq!(QueueVoteKind::Dislike.points(&points), -1);
+        assert_eq!(QueueVoteKind::SuperLike.points(&points), 2);
+        assert_eq!(QueueVoteKind::Dislike.audit_action(), "vote.dislike");
+        assert_eq!(QueueVoteKind::SuperLike.api_key(), "superLike");
+    }
+
+    #[test]
+    fn permission_keys_cover_every_rule_and_stay_at_ten() {
+        assert_eq!(PERMISSION_KEYS.len(), 10);
+        let settings = RemoteGuildSettings::default();
+        for key in PERMISSION_KEYS {
+            assert!(settings.rule_for(key).is_some(), "키 {key} 규칙 누락");
+            assert!(
+                !RemoteGuildSettings::permission_description(key).is_empty(),
+                "키 {key} 설명 누락"
+            );
+        }
     }
 }

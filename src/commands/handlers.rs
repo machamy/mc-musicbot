@@ -7,12 +7,15 @@ use crate::media::resolver::{self, Resolved};
 use crate::models::*;
 use crate::player::manager::CancelOutcome;
 use crate::player::side_effects;
+use crate::remote::{PermissionRule, RemoteGuildSettings};
+use crate::web::remote::{MemberContext, permission_allowed};
 use serenity::all::{
     CommandInteraction, CommandOptionType, ComponentInteraction, ComponentInteractionDataKind,
     Context, CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
     GuildId, Permissions,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -339,7 +342,7 @@ async fn ensure_playback_allowed(
 ) -> Result<(), String> {
     let guild_id = cmd
         .guild_id
-        .ok_or("이 명령은 서버 안에서만 사용할 수 있습니다.")?
+        .ok_or("이 명령은 서버 안에서만 쓸 수 있어요.")?
         .get();
     let requester_vc = requester_voice_channel(ctx, guild_id, cmd.user.id.get());
     let admin = is_admin(cmd);
@@ -354,7 +357,7 @@ async fn ensure_playback_allowed(
         }
         // 봇이 아무 방에도 없을 때만 명령자 방으로 최초 합류.
         let Some(rvc) = requester_vc else {
-            return Err("먼저 음성 채널에 들어간 뒤 재생 명령을 사용하세요.".into());
+            return Err("먼저 음성 채널에 들어간 뒤에 재생 명령을 써 주세요.".into());
         };
         app.log.info(
             "Voice",
@@ -370,8 +373,202 @@ async fn ensure_playback_allowed(
     if same_channel || admin {
         Ok(())
     } else {
-        Err("재생을 제어하려면 봇과 같은 음성 채널에 있거나 관리자 권한이 필요합니다.".into())
+        Err("재생을 조작하려면 봇과 같은 음성 채널에 있어야 해요. 서버 관리자는 어디서든 할 수 있어요.".into())
     }
+}
+
+// ───────── 리모컨과 같은 권한 판정 (v3 §8.3 · §23.3 · §24.3) ─────────
+
+/// 자동 재생 권한 키. 리모컨과 **같은 키·같은 판정 함수**를 쓴다 —
+/// "웹에서는 되는데 명령으로는 안 돼요" 만큼 설명하기 어려운 게 없다.
+const AUTOPLAY_KEY: &str = "autoplay";
+
+/// 리모컨 판정 함수(`web::remote::permission_allowed`)에 넣을 멤버 정보를 만든다.
+///
+/// `same_voice_channel` 은 **songbird 의 라이브 연결**로만 판단한다.
+/// 저장된 `voice_channel_id` 를 쓰면 봇이 이미 나갔는데도 "같은 채널"이 되는
+/// v3 §16 B1 함정이 명령 쪽에 그대로 재현된다.
+async fn member_context(
+    app: &Arc<App>,
+    ctx: &Context,
+    guild_id: u64,
+    user_id: u64,
+    admin: bool,
+    role_ids: Vec<u64>,
+) -> MemberContext {
+    let bot_live = bot_live_voice_channel(app, guild_id).await;
+    let requester_vc = requester_voice_channel(ctx, guild_id, user_id);
+    MemberContext {
+        is_admin: admin,
+        same_voice_channel: bot_live.is_some() && bot_live == requester_vc,
+        role_ids,
+    }
+}
+
+fn role_ids_of(member: Option<&serenity::all::Member>) -> Vec<u64> {
+    member
+        .map(|m| m.roles.iter().map(|role| role.get()).collect())
+        .unwrap_or_default()
+}
+
+/// 이 서버의 자동 재생 규칙. `autoplay_rule` 이 아직 없는 설정 파일이면
+/// v3 §8.3 의 기본값(모든 멤버)으로 본다 — 기본이 조여지면 안 된다.
+fn autoplay_rule(settings: &RemoteGuildSettings) -> PermissionRule {
+    settings
+        .rule_for(AUTOPLAY_KEY)
+        .unwrap_or(PermissionRule::GuildMember)
+}
+
+/// 막혔을 때 **왜** 안 되는지 + **누가** 되는지 (v3 §23.3).
+/// `권한 없음` 은 답이 아니라서, 조건과 통과 대상을 같이 말한다.
+///
+/// `console` 은 **관리자에게만** 붙이는 관리 콘솔 링크다. 일반 멤버에게 못 들어가는
+/// 링크를 보여 주는 건 놀리는 것이라 그때는 `None` 을 넣는다(§23.3-4).
+fn denied_reason(
+    ctx: &Context,
+    guild_id: u64,
+    what: &str,
+    key: &str,
+    rule: PermissionRule,
+    settings: &RemoteGuildSettings,
+    members_known: bool,
+    console: Option<String>,
+) -> String {
+    match rule {
+        // 관리자도 못 지나가는 유일한 규칙이라, 여기서만 "어디서 바꾸는지"가 쓸모 있다.
+        PermissionRule::Disabled => {
+            let where_to = console
+                .map(|url| format!(" 관리 콘솔에서 다시 켤 수 있어요 → {url}"))
+                .unwrap_or_default();
+            format!("{what}은(는) 이 서버에서 꺼 뒀어요.{where_to}")
+        }
+        PermissionRule::SameVoiceChannel => {
+            format!("{what}은(는) 봇과 같은 음성 채널에 있어야 바꿀 수 있어요.")
+        }
+        PermissionRule::Administrator => {
+            let who = manager_count(ctx, guild_id, members_known)
+                .map(|n| format!(" 지금은 서버 관리자 {n}명이 쓸 수 있어요."))
+                .unwrap_or_default();
+            format!("{what}은(는) 서버 관리자만 바꿀 수 있어요.{who}")
+        }
+        PermissionRule::ConfiguredRole => {
+            let (names, holders) = configured_role_info(ctx, guild_id, settings.roles_for(key), members_known);
+            if names.is_empty() {
+                return format!(
+                    "{what}에 쓸 역할이 아직 지정되지 않았어요. 서버 관리자가 관리 콘솔에서 정해야 해요."
+                );
+            }
+            // 사람 이름은 나열하지 않는다 — 그러면 그 사람들이 부탁 받는 창구가 된다(§23.3).
+            let who = holders
+                .map(|n| format!(" ({n}명)"))
+                .unwrap_or_default();
+            format!(
+                "{what}은(는) {} 역할이 있어야 바꿀 수 있어요.{who}",
+                names.join(" · ")
+            )
+        }
+        PermissionRule::GuildMember => format!("{what}을(를) 지금은 바꿀 수 없어요."),
+    }
+}
+
+/// 지정 역할 이름과, 그 역할을 가진 사람 수. 멤버 목록을 못 받는 서버면 인원수는 `None`.
+fn configured_role_info(
+    ctx: &Context,
+    guild_id: u64,
+    role_ids: &[u64],
+    members_known: bool,
+) -> (Vec<String>, Option<usize>) {
+    let Some(guild) = ctx.cache.guild(GuildId::new(guild_id)) else {
+        return (Vec::new(), None);
+    };
+    let wanted: HashSet<u64> = role_ids.iter().copied().collect();
+    let names: Vec<String> = guild
+        .roles
+        .iter()
+        .filter(|(id, _)| wanted.contains(&id.get()))
+        .map(|(_, role)| format!("@{}", role.name))
+        .collect();
+    if !members_known || guild.members.is_empty() {
+        return (names, None);
+    }
+    let holders = guild
+        .members
+        .values()
+        .filter(|m| !m.user.bot && m.roles.iter().any(|role| wanted.contains(&role.get())))
+        .count();
+    (names, Some(holders))
+}
+
+/// 이 서버에서 관리자로 통과하는 사람 수. 멤버 목록이 없으면 `None` — 모르면 모른다고 한다.
+fn manager_count(ctx: &Context, guild_id: u64, members_known: bool) -> Option<usize> {
+    if !members_known {
+        return None;
+    }
+    let guild = ctx.cache.guild(GuildId::new(guild_id))?;
+    if guild.members.is_empty() {
+        return None;
+    }
+    let admin_roles: HashSet<u64> = guild
+        .roles
+        .iter()
+        .filter(|(_, role)| {
+            role.permissions.contains(Permissions::ADMINISTRATOR)
+                || role.permissions.contains(Permissions::MANAGE_GUILD)
+        })
+        .map(|(id, _)| id.get())
+        .collect();
+    let owner = guild.owner_id;
+    Some(
+        guild
+            .members
+            .values()
+            .filter(|m| {
+                !m.user.bot
+                    && (m.user.id == owner
+                        || m.roles.iter().any(|role| admin_roles.contains(&role.get())))
+            })
+            .count(),
+    )
+}
+
+/// 자동 재생을 바꿀 수 있는지. 기본이 `GuildMember` 라 **누구나** 켜고 끌 수 있고
+/// (v3 §24.3), 관리자가 조여 뒀으면 그때만 막힌다.
+async fn ensure_autoplay_allowed(
+    app: &Arc<App>,
+    ctx: &Context,
+    guild_id: u64,
+    user_id: u64,
+    admin: bool,
+    role_ids: Vec<u64>,
+) -> Result<(), String> {
+    let settings = app.player.cached_settings(guild_id);
+    let rule = autoplay_rule(&settings);
+    let member = member_context(app, ctx, guild_id, user_id, admin, role_ids).await;
+    if permission_allowed(AUTOPLAY_KEY, rule, &settings, &member) {
+        return Ok(());
+    }
+    let members_known = app
+        .intent_status
+        .read()
+        .map(|status| status.members)
+        .unwrap_or(false);
+    let console = if admin {
+        app.public_base_url
+            .get()
+            .map(|base| format!("{}/music/guilds/{guild_id}/admin", base.trim_end_matches('/')))
+    } else {
+        None
+    };
+    Err(denied_reason(
+        ctx,
+        guild_id,
+        "자동 재생",
+        AUTOPLAY_KEY,
+        rule,
+        &settings,
+        members_known,
+        console,
+    ))
 }
 
 // ───────── 옵션 헬퍼 ─────────
@@ -490,7 +687,7 @@ async fn resolve_input(app: &Arc<App>, input: &str) -> Result<ResolveOutcome, St
             .next()
             .map(ResolveOutcome::Single)
             .ok_or_else(|| {
-                "검색 결과를 찾지 못했습니다. 다른 검색어를 쓰거나 직접 URL을 입력해주세요."
+                "찾은 곡이 없어요. 다른 검색어를 쓰거나 주소를 직접 넣어 주세요."
                     .to_string()
             });
     }
@@ -514,7 +711,7 @@ async fn resolve_input(app: &Arc<App>, input: &str) -> Result<ResolveOutcome, St
             let tracks = ytdlp.expand_collection(&c.source_url, c.provider).await;
             if tracks.is_empty() {
                 Err(
-                    "재생할 수 있는 곡을 찾지 못했습니다. 링크 접근 권한과 인증 설정을 확인하세요."
+                    "재생할 수 있는 곡이 없어요. 링크 접근 권한과 인증 설정을 확인해 주세요."
                         .into(),
                 )
             } else {
@@ -536,7 +733,7 @@ pub async fn handle_command(app: Arc<App>, ctx: Context, cmd: CommandInteraction
                     &ctx.http,
                     CreateInteractionResponse::Message(
                         CreateInteractionResponseMessage::new()
-                            .content("서버 안에서만 사용할 수 있습니다.")
+                            .content("서버 안에서만 쓸 수 있어요.")
                             .ephemeral(true),
                     ),
                 )
@@ -590,20 +787,20 @@ async fn dispatch(
     match canonical {
         "play" => {
             ensure_playback_allowed(app, ctx, cmd, true).await?;
-            let input = opt_str(cmd, "input").ok_or("input 이 필요합니다.")?;
+            let input = opt_str(cmd, "input").ok_or("무엇을 재생할지 같이 알려 주세요.")?;
             handle_play(app, ctx, cmd, guild_id, &input, false).await
         }
         "playnow" => {
             ensure_playback_allowed(app, ctx, cmd, true).await?;
-            let input = opt_str(cmd, "input").ok_or("input 이 필요합니다.")?;
+            let input = opt_str(cmd, "input").ok_or("무엇을 재생할지 같이 알려 주세요.")?;
             handle_play(app, ctx, cmd, guild_id, &input, true).await
         }
         "search" => {
-            let query = opt_str(cmd, "query").ok_or("query 가 필요합니다.")?;
+            let query = opt_str(cmd, "query").ok_or("검색어를 같이 알려 주세요.")?;
             handle_search(app, ctx, cmd, &query, ProviderKind::YouTube).await
         }
         "scsearch" => {
-            let query = opt_str(cmd, "query").ok_or("query 가 필요합니다.")?;
+            let query = opt_str(cmd, "query").ok_or("검색어를 같이 알려 주세요.")?;
             handle_search(app, ctx, cmd, &query, ProviderKind::SoundCloud).await
         }
         "queue" => {
@@ -626,7 +823,7 @@ async fn dispatch(
         "nowplaying" => {
             let state = app.player.get_state(guild_id).await;
             match &state.current_item {
-                None => respond_text(ctx, cmd, "> 현재 재생 중인 곡이 없습니다.", false).await,
+                None => respond_text(ctx, cmd, "> 지금 재생 중인 곡이 없어요.", false).await,
                 Some(item) => {
                     let position = app.coordinator.current_position(guild_id).await;
                     let embed = embeds::now_playing_embed(&state, item, position);
@@ -657,11 +854,21 @@ async fn dispatch(
                 RepeatMode::Track => "한곡 반복",
                 RepeatMode::Queue => "전체 반복",
             };
-            respond_text(ctx, cmd, &format!("🔁 반복 모드: **{label}**"), false).await;
+            respond_text(ctx, cmd, &format!("🔁 반복: **{label}**"), false).await;
             Ok(())
         }
         "autoplay" => {
-            ensure_playback_allowed(app, ctx, cmd, false).await?;
+            // 자동 재생은 재생 제어가 아니라 **자동 재생 권한**을 본다(v3 §24.3).
+            // 기본이 모든 멤버라, 리모컨만 보는 사람도 켜고 끌 수 있다.
+            ensure_autoplay_allowed(
+                app,
+                ctx,
+                guild_id,
+                cmd.user.id.get(),
+                is_admin(cmd),
+                role_ids_of(cmd.member.as_deref()),
+            )
+            .await?;
             let enabled = opt_bool(cmd, "enabled").unwrap_or(true);
             app.player.set_autoplay(guild_id, enabled).await;
             if enabled {
@@ -677,7 +884,7 @@ async fn dispatch(
             respond_text(
                 ctx,
                 cmd,
-                &format!("자동추천: **{}**", if enabled { "켜짐" } else { "꺼짐" }),
+                &format!("✨ 자동 재생: **{}**", if enabled { "켜짐" } else { "꺼짐" }),
                 false,
             )
             .await;
@@ -687,7 +894,7 @@ async fn dispatch(
             ensure_playback_allowed(app, ctx, cmd, false).await?;
             app.player.pause(guild_id).await;
             app.coordinator.apply_pause(guild_id, true).await;
-            respond_text(ctx, cmd, "⏸ 일시정지", false).await;
+            respond_text(ctx, cmd, "⏸ 잠깐 멈췄어요.", false).await;
             Ok(())
         }
         "resume" => {
@@ -695,7 +902,7 @@ async fn dispatch(
             app.player.resume(guild_id).await;
             app.coordinator.apply_pause(guild_id, false).await;
             app.coordinator.sync_guild(app, guild_id).await;
-            respond_text(ctx, cmd, "▶ 재생 재개", false).await;
+            respond_text(ctx, cmd, "▶ 다시 재생해요.", false).await;
             Ok(())
         }
         "skip" => {
@@ -712,7 +919,7 @@ async fn dispatch(
             respond_text(
                 ctx,
                 cmd,
-                "⏹ 정지하고 대기열을 비웠습니다. (음성 채널엔 남아 있어요 — 내보내려면 `/나가기`)",
+                "⏹ 정지하고 대기열을 비웠어요. (음성 채널엔 남아 있어요 — 내보내려면 `/나가기`)",
                 false,
             )
             .await;
@@ -723,7 +930,7 @@ async fn dispatch(
             app.player.stop(guild_id).await;
             app.player.disconnect_voice(guild_id).await;
             app.coordinator.leave_voice(app, guild_id).await;
-            respond_text(ctx, cmd, "👋 음성 채널에서 나갔습니다.", false).await;
+            respond_text(ctx, cmd, "👋 음성 채널에서 나갔어요.", false).await;
             Ok(())
         }
         "clear" => {
@@ -756,20 +963,20 @@ async fn dispatch(
         }
         "seek" => {
             ensure_playback_allowed(app, ctx, cmd, false).await?;
-            let time = opt_str(cmd, "time").ok_or("time 이 필요합니다.")?;
+            let time = opt_str(cmd, "time").ok_or("이동할 시간을 같이 알려 주세요.")?;
             let target =
-                parse_time(&time).ok_or("시간 형식을 해석하지 못했습니다 (예: 1:23 또는 83).")?;
+                parse_time(&time).ok_or("시간 형식을 못 읽었어요 (예: 1:23 또는 83).")?;
             let state = app.player.get_state(guild_id).await;
             let current = state
                 .current_item
                 .as_ref()
-                .ok_or("재생 중인 곡이 없습니다.")?;
+                .ok_or("지금 재생 중인 곡이 없어요.")?;
             let total = current
                 .track
                 .duration
-                .ok_or("이 곡은 길이를 알 수 없어(예: 라이브) 특정 시간으로 이동할 수 없습니다.")?;
+                .ok_or("이 곡은 길이를 알 수 없어서(예: 라이브) 특정 시간으로 못 옮겨요.")?;
             if target.as_secs_f64() >= total.as_secs_f64() {
-                return Err(format!("곡 길이({})를 넘는 시간입니다.", total.display()));
+                return Err(format!("곡 길이({})보다 뒤예요.", total.display()));
             }
             app.player
                 .set_current_start_offset(guild_id, CsTimeSpan(target))
@@ -779,7 +986,7 @@ async fn dispatch(
             respond_text(
                 ctx,
                 cmd,
-                &format!("⏩ {} 로 이동", CsTimeSpan(target).display()),
+                &format!("⏩ {} 로 옮겼어요.", CsTimeSpan(target).display()),
                 false,
             )
             .await;
@@ -822,7 +1029,7 @@ async fn dispatch(
             let level = opt_int(cmd, "level").unwrap_or(100).clamp(0, 200) as i32;
             app.player.set_volume(guild_id, level).await;
             app.coordinator.apply_volume(guild_id, level).await;
-            respond_text(ctx, cmd, &format!("🔊 볼륨: **{level}%**"), false).await;
+            respond_text(ctx, cmd, &format!("🔊 서버 볼륨: **{level}%** (모두에게 적용돼요)"), false).await;
             Ok(())
         }
         "normalize" => {
@@ -835,7 +1042,7 @@ async fn dispatch(
                 ctx,
                 cmd,
                 &format!(
-                    "볼륨 평준화: **{}** (다음 곡부터 반영)",
+                    "🎚 볼륨 평준화: **{}** (다음 곡부터 적용돼요)",
                     if enabled { "켜짐" } else { "꺼짐" }
                 ),
                 false,
@@ -845,7 +1052,7 @@ async fn dispatch(
         }
         "playlist" => handle_playlist(app, ctx, cmd, guild_id).await,
         "remote" => handle_remote(app, ctx, cmd, guild_id).await,
-        other => Err(format!("지원하지 않는 명령입니다: {other}")),
+        other => Err(format!("이건 없는 명령이에요: {other}")),
     }
 }
 
@@ -873,7 +1080,7 @@ async fn handle_play(
                     ctx,
                     cmd,
                     &format!(
-                        "차단된 곡입니다: {}",
+                        "차단된 곡이에요: {}",
                         crate::blacklist::Blacklist::describe_rule(&rule)
                     ),
                     true,
@@ -889,14 +1096,14 @@ async fn handle_play(
                 app.coordinator.cancel_current(guild_id).await;
                 app.coordinator.sync_guild(app, guild_id).await;
                 let mode = if state.repeat_mode == RepeatMode::Off {
-                    "큐 비움"
+                    "대기열을 비웠어요"
                 } else {
-                    "반복 큐 뒤로 보냄"
+                    "반복 대기열 뒤로 보냈어요"
                 };
                 respond_with_cancel(
                     ctx,
                     cmd,
-                    &format!("⏯ 바로 재생: '{title}' ({mode})"),
+                    &format!("⏯ 바로 재생해요: '{title}' ({mode})"),
                     &item_id,
                 )
                 .await;
@@ -906,7 +1113,7 @@ async fn handle_play(
                 respond_with_cancel(
                     ctx,
                     cmd,
-                    &format!("'{title}' 곡을 재생 대기열에 추가했습니다."),
+                    &format!("'{title}' 을(를) 대기열에 담았어요."),
                     &item_id,
                 )
                 .await;
@@ -927,7 +1134,7 @@ async fn handle_play(
                 respond_text(
                     ctx,
                     cmd,
-                    &format!("컬렉션의 모든 곡({blocked}개)이 차단되어 추가하지 않았습니다."),
+                    &format!("전부 차단된 곡({blocked}개)이라 하나도 못 담았어요."),
                     true,
                 )
                 .await;
@@ -942,11 +1149,11 @@ async fn handle_play(
                 app.coordinator.cancel_current(guild_id).await;
                 app.coordinator.sync_guild(app, guild_id).await;
                 let mode = if state.repeat_mode == RepeatMode::Off {
-                    "큐 비움"
+                    "대기열을 비웠어요"
                 } else {
-                    "반복 큐 뒤로 보냄"
+                    "반복 대기열 뒤로 보냈어요"
                 };
-                respond_text(ctx, cmd, &format!("⏯ 바로 재생: '{title}' ({mode})"), false).await;
+                respond_text(ctx, cmd, &format!("⏯ 바로 재생해요: '{title}' ({mode})"), false).await;
                 return Ok(());
             }
             let count = allowed.len();
@@ -957,14 +1164,14 @@ async fn handle_play(
             }
             app.coordinator.sync_guild(app, guild_id).await;
             let suffix = if blocked > 0 {
-                format!(" (차단 {blocked}개 제외)")
+                format!(" (차단된 {blocked}곡은 빼고요)")
             } else {
                 String::new()
             };
             respond_text(
                 ctx,
                 cmd,
-                &format!("'{first_title}' 곡 포함 {count}개를 추가했습니다.{suffix}"),
+                &format!("'{first_title}' 을(를) 포함해 {count}곡을 담았어요.{suffix}"),
                 false,
             )
             .await;
@@ -999,7 +1206,7 @@ async fn handle_search(
 
     if candidates.is_empty() {
         return Err(
-            "검색 결과가 없습니다. 다른 검색어를 쓰거나 직접 URL을 입력해 주세요.".to_string(),
+            "찾은 곡이 없어요. 다른 검색어를 쓰거나 주소를 직접 넣어 주세요.".to_string(),
         );
     }
 
@@ -1037,7 +1244,7 @@ async fn handle_playlist(
     cmd: &CommandInteraction,
     guild_id: u64,
 ) -> Result<(), String> {
-    let sub = cmd.data.options.first().ok_or("하위 명령이 필요합니다.")?;
+    let sub = cmd.data.options.first().ok_or("무엇을 할지 하위 명령을 골라 주세요.")?;
     let sub_name = sub.name.clone();
     let sub_opts = match &sub.value {
         serenity::all::CommandDataOptionValue::SubCommand(opts) => opts.clone(),
@@ -1068,13 +1275,13 @@ async fn handle_playlist(
             let global_lists = app.db.list_playlists(PlaylistScope::Global, None);
             let mut lines = Vec::new();
             for p in &guild_lists {
-                lines.push(format!("• [길드] **{}** — {}곡", p.name, p.entries.len()));
+                lines.push(format!("• [서버] **{}** — {}곡", p.name, p.entries.len()));
             }
             for p in &global_lists {
                 lines.push(format!("• [전역] **{}** — {}곡", p.name, p.entries.len()));
             }
             let text = if lines.is_empty() {
-                "저장된 플레이리스트가 없습니다.".to_string()
+                "저장해 둔 재생목록이 없어요.".to_string()
             } else {
                 lines.join("\n")
             };
@@ -1082,9 +1289,9 @@ async fn handle_playlist(
             Ok(())
         }
         "create" => {
-            let name = get_str("name").ok_or("이름이 필요합니다.")?;
+            let name = get_str("name").ok_or("재생목록 이름을 같이 알려 주세요.")?;
             if find_by_name(&name).is_some() {
-                return Err(format!("'{name}' 이름의 플레이리스트가 이미 있습니다."));
+                return Err(format!("'{name}' 이름의 재생목록이 이미 있어요."));
             }
             let scope = if get_str("scope").as_deref() == Some("global") {
                 PlaylistScope::Global
@@ -1100,46 +1307,46 @@ async fn handle_playlist(
             respond_text(
                 ctx,
                 cmd,
-                &format!("플레이리스트 '{name}' 을(를) 만들었습니다."),
+                &format!("재생목록 '{name}' 을(를) 만들었어요."),
                 false,
             )
             .await;
             Ok(())
         }
         "delete" => {
-            let name = get_str("name").ok_or("이름이 필요합니다.")?;
+            let name = get_str("name").ok_or("재생목록 이름을 같이 알려 주세요.")?;
             let pl =
-                find_by_name(&name).ok_or(format!("'{name}' 플레이리스트를 찾지 못했습니다."))?;
+                find_by_name(&name).ok_or(format!("'{name}' 재생목록을 못 찾았어요."))?;
             app.db.delete_playlist(pl.id);
             respond_text(
                 ctx,
                 cmd,
-                &format!("플레이리스트 '{name}' 을(를) 삭제했습니다."),
+                &format!("재생목록 '{name}' 을(를) 지웠어요."),
                 false,
             )
             .await;
             Ok(())
         }
         "rename" => {
-            let name = get_str("name").ok_or("이름이 필요합니다.")?;
-            let new_name = get_str("newname").ok_or("새 이름이 필요합니다.")?;
+            let name = get_str("name").ok_or("재생목록 이름을 같이 알려 주세요.")?;
+            let new_name = get_str("newname").ok_or("새 이름을 같이 알려 주세요.")?;
             let pl =
-                find_by_name(&name).ok_or(format!("'{name}' 플레이리스트를 찾지 못했습니다."))?;
+                find_by_name(&name).ok_or(format!("'{name}' 재생목록을 못 찾았어요."))?;
             app.db.rename_playlist(pl.id, &new_name);
             respond_text(
                 ctx,
                 cmd,
-                &format!("'{name}' → '{new_name}' 으로 이름을 바꿨습니다."),
+                &format!("'{name}' 을(를) '{new_name}' 으로 바꿨어요."),
                 false,
             )
             .await;
             Ok(())
         }
         "add" => {
-            let name = get_str("name").ok_or("이름이 필요합니다.")?;
-            let input = get_str("input").ok_or("곡 입력이 필요합니다.")?;
+            let name = get_str("name").ok_or("재생목록 이름을 같이 알려 주세요.")?;
+            let input = get_str("input").ok_or("어떤 곡인지 같이 알려 주세요.")?;
             let pl =
-                find_by_name(&name).ok_or(format!("'{name}' 플레이리스트를 찾지 못했습니다."))?;
+                find_by_name(&name).ok_or(format!("'{name}' 재생목록을 못 찾았어요."))?;
             match resolve_input(app, &input).await? {
                 ResolveOutcome::Single(track) => {
                     let title = track.display_title().to_string();
@@ -1155,7 +1362,7 @@ async fn handle_playlist(
                     respond_text(
                         ctx,
                         cmd,
-                        &format!("'{title}' 을(를) '{name}' 에 추가했습니다."),
+                        &format!("'{title}' 을(를) '{name}' 에 담았어요."),
                         false,
                     )
                     .await;
@@ -1176,7 +1383,7 @@ async fn handle_playlist(
                     respond_text(
                         ctx,
                         cmd,
-                        &format!("{count}곡을 '{name}' 에 추가했습니다."),
+                        &format!("{count}곡을 '{name}' 에 담았어요."),
                         false,
                     )
                     .await;
@@ -1185,27 +1392,27 @@ async fn handle_playlist(
             Ok(())
         }
         "remove" => {
-            let name = get_str("name").ok_or("이름이 필요합니다.")?;
+            let name = get_str("name").ok_or("재생목록 이름을 같이 알려 주세요.")?;
             let index = get_int("index").unwrap_or(1).max(1) as usize - 1;
             let pl =
-                find_by_name(&name).ok_or(format!("'{name}' 플레이리스트를 찾지 못했습니다."))?;
+                find_by_name(&name).ok_or(format!("'{name}' 재생목록을 못 찾았어요."))?;
             if app.db.remove_playlist_entry(pl.id, index) {
                 respond_text(
                     ctx,
                     cmd,
-                    &format!("'{name}' 의 {}번 항목을 제거했습니다.", index + 1),
+                    &format!("'{name}' 의 {}번째 곡을 뺐어요.", index + 1),
                     false,
                 )
                 .await;
                 Ok(())
             } else {
-                Err("해당 순번 항목을 찾지 못했습니다.".into())
+                Err("그 순번에는 곡이 없어요.".into())
             }
         }
         "show" => {
-            let name = get_str("name").ok_or("이름이 필요합니다.")?;
+            let name = get_str("name").ok_or("재생목록 이름을 같이 알려 주세요.")?;
             let pl =
-                find_by_name(&name).ok_or(format!("'{name}' 플레이리스트를 찾지 못했습니다."))?;
+                find_by_name(&name).ok_or(format!("'{name}' 재생목록을 못 찾았어요."))?;
             let lines: Vec<String> = pl
                 .entries
                 .iter()
@@ -1235,9 +1442,9 @@ async fn handle_playlist(
         }
         "load" => {
             ensure_playback_allowed(app, ctx, cmd, true).await?;
-            let name = get_str("name").ok_or("이름이 필요합니다.")?;
+            let name = get_str("name").ok_or("재생목록 이름을 같이 알려 주세요.")?;
             let pl =
-                find_by_name(&name).ok_or(format!("'{name}' 플레이리스트를 찾지 못했습니다."))?;
+                find_by_name(&name).ok_or(format!("'{name}' 재생목록을 못 찾았어요."))?;
             let requester = cmd
                 .member
                 .as_ref()
@@ -1262,14 +1469,14 @@ async fn handle_playlist(
             respond_text(
                 ctx,
                 cmd,
-                &format!("'{}' 에서 {added}곡을 대기열에 추가했습니다.", pl.name),
+                &format!("'{}' 에서 {added}곡을 대기열에 담았어요.", pl.name),
                 false,
             )
             .await;
             Ok(())
         }
         other => Err(format!(
-            "playlist 하위 명령 '{other}'은(는) 지원하지 않습니다."
+            "재생목록 하위 명령 '{other}' 은(는) 없어요."
         )),
     }
 }
@@ -1300,7 +1507,7 @@ async fn handle_remote(
         respond_text(
             ctx,
             cmd,
-            "웹 리모컨 주소가 설정되지 않았습니다. 관리자에게 문의하세요.",
+            "웹 리모컨 주소가 아직 설정되지 않았어요. 서버 관리자에게 말해 주세요.",
             true,
         )
         .await;
@@ -1320,7 +1527,13 @@ async fn handle_remote(
             let title: String = item.track.display_title().chars().take(80).collect();
             format!("{title}\n신청: {}", describe_requester_short(item))
         }
-        None => "재생 중인 곡 없음".to_string(),
+        None => "지금은 없어요".to_string(),
+    };
+
+    // v3 §4: 봇이 음성 채널에 없으면 "듣는 중 N명"이 아니라 그 사실을 그대로 말한다.
+    let listening = match listening_summary(app, ctx, guild_id).await {
+        Some((channel, count)) => format!("🎧 {count}명 · #{channel}"),
+        None => "봇이 음성 채널에 없어요".to_string(),
     };
 
     let portal = format!("{base}/music/guilds/{guild_id}");
@@ -1329,13 +1542,14 @@ async fn handle_remote(
         .title("🎛 마참뮤직 리모컨")
         .description(format!("**{guild_name}**"))
         .field("지금 재생 중", now, false)
+        .field("듣는 중", listening, true)
         .field("대기열", format!("{}곡", state.upcoming.len()), true)
         .field("리모컨", format!("[열기 →]({portal})"), true);
     if is_guild_manager(ctx, cmd, guild_id) {
         embed = embed.field("서버 관리 콘솔", format!("[열기 →]({portal}/admin)"), false);
     }
     embed = embed.footer(CreateEmbedFooter::new(
-        "링크에는 접근 토큰이 없습니다. 열면 Discord 로그인을 거칩니다.",
+        "링크에 접근 토큰은 없어요. 열면 Discord 로그인을 거쳐요.",
     ));
 
     let _ = cmd
@@ -1347,6 +1561,38 @@ async fn handle_remote(
         )
         .await;
     Ok(())
+}
+
+/// 봇이 **실제로** 들어가 있는 음성 채널과, 거기서 같이 듣고 있는 사람 수 (봇 제외).
+///
+/// v3 §4: 봇이 음성 채널에 없으면 "듣는 중"이라는 말 자체가 성립하지 않으므로 `None` 이다.
+/// 채널 판단은 §16 B1 대로 songbird 라이브 연결만 믿는다 — 저장값은 봇이 튕겨 나가도 남는다.
+async fn listening_summary(
+    app: &Arc<App>,
+    ctx: &Context,
+    guild_id: u64,
+) -> Option<(String, usize)> {
+    let channel_id = bot_live_voice_channel(app, guild_id).await?;
+    let guild = ctx.cache.guild(GuildId::new(guild_id))?;
+    let listeners = guild
+        .voice_states
+        .values()
+        .filter(|voice| voice.channel_id.map(|c| c.get()) == Some(channel_id))
+        .filter(|voice| {
+            // 봇 자신은 청취자가 아니다. 멤버 정보가 없으면 사람으로 본다(과소 집계보다 낫다).
+            voice
+                .member
+                .as_ref()
+                .map(|member| !member.user.bot)
+                .unwrap_or(true)
+        })
+        .count();
+    let name = guild
+        .channels
+        .get(&serenity::all::ChannelId::new(channel_id))
+        .map(|channel| channel.name.clone())
+        .unwrap_or_else(|| "음성 채널".to_string());
+    Some((name, listeners))
 }
 
 /// 신청자 표기 — 자동추천 곡은 사람 이름 대신 "자동추천".
@@ -1417,12 +1663,12 @@ async fn handle_search_select(
         })
     };
     let Some(track) = chosen else {
-        comp_reject(ctx, comp, "검색 세션이 만료되었어요. 다시 검색해 주세요.").await;
+        comp_reject(ctx, comp, "검색 결과가 만료됐어요. 다시 찾아 주세요.").await;
         return;
     };
 
     let Some(rvc) = requester_voice_channel(ctx, guild_id, comp.user.id.get()) else {
-        comp_reject(ctx, comp, "먼저 음성 채널에 들어간 뒤 곡을 선택해 주세요.").await;
+        comp_reject(ctx, comp, "먼저 음성 채널에 들어간 뒤에 곡을 골라 주세요.").await;
         return;
     };
 
@@ -1431,7 +1677,7 @@ async fn handle_search_select(
             ctx,
             comp,
             &format!(
-                "차단된 곡입니다: {}",
+                "차단된 곡이에요: {}",
                 crate::blacklist::Blacklist::describe_rule(&rule)
             ),
         )
@@ -1463,7 +1709,7 @@ async fn handle_search_select(
             &ctx.http,
             CreateInteractionResponse::UpdateMessage(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("✅ '{title}' 을(를) 대기열에 추가했습니다."))
+                    .content(format!("✅ '{title}' 을(를) 대기열에 담았어요."))
                     .embeds(Vec::new())
                     .components(embeds::cancel_button(&item_id)),
             ),
@@ -1497,7 +1743,7 @@ pub async fn handle_button(app: Arc<App>, ctx: Context, comp: ComponentInteracti
                 &ctx.http,
                 CreateInteractionResponse::UpdateMessage(
                     CreateInteractionResponseMessage::new()
-                        .content("검색을 취소했습니다.")
+                        .content("검색을 닫았어요.")
                         .embeds(Vec::new())
                         .components(Vec::new()),
                 ),
@@ -1513,7 +1759,7 @@ pub async fn handle_button(app: Arc<App>, ctx: Context, comp: ComponentInteracti
             comp_reject(
                 &ctx,
                 &comp,
-                "봇과 같은 음성 채널에 있어야 취소할 수 있습니다.",
+                "봇과 같은 음성 채널에 있어야 취소할 수 있어요.",
             )
             .await;
             return;
@@ -1521,13 +1767,13 @@ pub async fn handle_button(app: Arc<App>, ctx: Context, comp: ComponentInteracti
         let outcome = app.player.cancel_by_id(guild_id, &item_id).await;
         let (text, skipped) = match outcome {
             CancelOutcome::RemovedUpcoming(t) => {
-                (format!("✖ '{t}' 을(를) 대기열에서 취소했습니다."), false)
+                (format!("✖ '{t}' 을(를) 대기열에서 뺐어요."), false)
             }
             CancelOutcome::SkippedCurrent(t) => {
-                (format!("✖ 재생 중이던 '{t}' 을(를) 취소했습니다."), true)
+                (format!("✖ 재생 중이던 '{t}' 을(를) 껐어요."), true)
             }
             CancelOutcome::NotFound => (
-                "이미 재생되었거나 취소할 수 없는 곡입니다.".to_string(),
+                "이미 재생됐거나 취소할 수 없는 곡이에요.".to_string(),
                 false,
             ),
         };
@@ -1629,13 +1875,30 @@ pub async fn handle_button(app: Arc<App>, ctx: Context, comp: ComponentInteracti
         .unwrap_or(false);
     let state_before = app.player.get_state(guild_id).await;
     let effective = bot_live.or(state_before.voice_channel_id);
-    if !(admin || (requester_vc.is_some() && requester_vc == effective)) {
+    // 🎲 자동 재생만 규칙이 다르다 — 재생 제어가 아니라 자동 재생 권한을 본다(v3 §24.3).
+    let denial = if action == "autoplay" {
+        ensure_autoplay_allowed(
+            &app,
+            &ctx,
+            guild_id,
+            comp.user.id.get(),
+            admin,
+            role_ids_of(comp.member.as_ref()),
+        )
+        .await
+        .err()
+    } else if admin || (requester_vc.is_some() && requester_vc == effective) {
+        None
+    } else {
+        Some("봇과 같은 음성 채널에 있어야 조작할 수 있어요.".to_string())
+    };
+    if let Some(reason) = denial {
         let _ = comp
             .create_response(
                 &ctx.http,
                 CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
-                        .content("봇과 같은 음성 채널에 있어야 조작할 수 있습니다.")
+                        .content(reason)
                         .ephemeral(true),
                 ),
             )

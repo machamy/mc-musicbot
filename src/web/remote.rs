@@ -12,9 +12,15 @@ use crate::models::{
 use crate::remote::ranking;
 use crate::remote::store::is_valid_pref;
 use crate::remote::{
-    AutoplaySeed, ChatTrackTag, LyricsCacheHit, LyricsDocument, LyricsLine, MAX_AUTOPLAY_SEEDS,
-    PERMISSION_KEYS, PermissionRule, QueueScore, QueueSortMode, QueueVoteKind, RemoteGuildSettings,
-    SeedAddOutcome, StoredSession, SuggestionStatus, Suspension, SuspensionScope, UserTrackKind,
+    AuditKind, AutoplaySeed, ChatTrackTag, LyricsCacheHit, LyricsDocument, LyricsLine,
+    MAX_AUTOPLAY_SEEDS, MAX_VOTER_IDS, PERMISSION_KEYS, PermissionRule, QueueScore, QueueSortMode,
+    QueueVoteKind, RemoteGuildSettings, SeedAddOutcome, StoredSession, SuggestionStatus,
+    SuperLikeStatus, Suspension, SuspensionScope, UserTrackKind, VotePoints, VoteSkipBasis,
+    as_limit, as_limit_u32,
+};
+use crate::remote::{
+    AutoplayMode, AutoplayPolicy, BoomttaAction, ChartCategory, ChartDef, ChartSnapshot,
+    INTERNAL_CHART_PREFIX, VOTE_POINT_MAX, VOTE_POINT_MIN,
 };
 use std::collections::BTreeMap;
 use axum::Json;
@@ -524,7 +530,35 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/api/guilds/{guild_id}/mention-candidates",
             get(api_mention_candidates),
         )
-        .route("/music/api/guilds/{guild_id}/queue", post(api_enqueue))
+        // 대기열 뒤쪽 (V3 §18.2). `/state/hot` 은 앞 200곡만 싣는다.
+        .route(
+            "/music/api/guilds/{guild_id}/queue",
+            get(api_queue_page).post(api_enqueue),
+        )
+        // 통계 (V3 §22.6) · 사람 카드 (V3 §24.2)
+        .route("/music/api/guilds/{guild_id}/stats/me", get(api_stats_me))
+        .route(
+            "/music/api/guilds/{guild_id}/stats/user/{user_id}",
+            get(api_stats_user),
+        )
+        .route(
+            "/music/api/guilds/{guild_id}/stats/server",
+            get(api_stats_server),
+        )
+        // 차트 (V3 §15.5)
+        .route("/music/api/guilds/{guild_id}/charts", get(api_charts))
+        .route(
+            "/music/api/guilds/{guild_id}/charts/{chart_id}",
+            get(api_chart_detail),
+        )
+        .route(
+            "/music/api/guilds/{guild_id}/charts/{chart_id}/enqueue",
+            post(api_chart_enqueue),
+        )
+        .route(
+            "/music/api/guilds/{guild_id}/charts/{chart_id}/refresh",
+            post(api_chart_refresh),
+        )
         .route(
             "/music/api/guilds/{guild_id}/queue/action",
             post(api_queue_action),
@@ -571,6 +605,11 @@ pub fn router() -> Router<Arc<WebState>> {
         )
         .route("/music/api/guilds/{guild_id}/settings", post(api_settings))
         .route("/music/api/guilds/{guild_id}/events", get(api_events))
+        // 자동 재생 (V3 §8.6) — 방식·정책은 일반 유저도 바꿀 수 있다.
+        .route(
+            "/music/api/guilds/{guild_id}/autoplay",
+            get(api_autoplay_get).put(api_autoplay_put),
+        )
         // 자동 재생 기준 곡 (V3 §8)
         .route(
             "/music/api/guilds/{guild_id}/autoplay/seeds",
@@ -637,6 +676,19 @@ pub fn router() -> Router<Arc<WebState>> {
         .route(
             "/music/api/guilds/{guild_id}/admin/diagnostics",
             get(admin_diagnostics),
+        )
+        // 서버 차단 목록 (V3 §19.2) — 자기 길드 항목만 만질 수 있다.
+        .route(
+            "/music/api/guilds/{guild_id}/admin/blacklist",
+            get(admin_blacklist_get).post(admin_blacklist_add),
+        )
+        .route(
+            "/music/api/guilds/{guild_id}/admin/blacklist/remove",
+            post(admin_blacklist_remove),
+        )
+        .route(
+            "/music/api/guilds/{guild_id}/admin/blacklist/test",
+            post(admin_blacklist_test),
         )
 }
 
@@ -776,15 +828,15 @@ fn now_utc() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// `app::queue_sort_loop`의 재정렬 주기(초). 값 자체는 `app.rs`가 갖고 있다.
-const QUEUE_SORT_PERIOD_SECONDS: i64 = crate::app::QUEUE_SORT_INTERVAL.as_secs() as i64;
-
 /// 대기열 갱신 카운트다운(V3 §5)의 기준 시각 두 개 — `(sortedAt, nextSortAt)`.
 ///
-/// `nextSortAt`은 5초 루프가 **마지막으로 돈 시각 + 주기**다. 클라이언트 타이머만 쓰면
+/// `nextSortAt`은 정렬 루프가 **마지막으로 돈 시각 + 주기**다. 클라이언트 타이머만 쓰면
 /// 탭이 백그라운드에 갔다 오는 순간 어긋나므로 기준 시각은 서버가 준다.
 /// 루프가 아직 한 번도 안 돌았으면(기동 직후) "지금부터 한 주기"로 근사한다.
-fn sort_clock(state: &WebState) -> (String, String) {
+///
+/// **주기는 대기열 길이를 따라간다** — 500곡을 넘으면 5초가 아니라 15초다 (§18.2 (3)).
+/// 화면이 5초를 세는데 서버가 15초마다 돌면 카운트다운이 세 번 헛돈다.
+fn sort_clock(state: &WebState, queue_len: usize) -> (String, String, i64) {
     let now = chrono::Utc::now();
     let last = state
         .app
@@ -793,13 +845,14 @@ fn sort_clock(state: &WebState) -> (String, String) {
         .ok()
         .and_then(|slot| *slot)
         .unwrap_or(now);
-    let period = chrono::Duration::seconds(QUEUE_SORT_PERIOD_SECONDS);
+    let seconds = crate::app::queue_sort_interval_for_len(queue_len).as_secs() as i64;
+    let period = chrono::Duration::seconds(seconds.max(1));
     let mut next = last + period;
     // 루프가 밀렸으면(길드가 많거나 tick을 건너뛰었으면) 이미 지난 시각을 주지 않는다.
     while next <= now {
         next += period;
     }
-    (now.to_rfc3339(), next.to_rfc3339())
+    (now.to_rfc3339(), next.to_rfc3339(), seconds)
 }
 
 fn parse_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -856,7 +909,7 @@ fn audit_ok(
     target: Option<&str>,
     after: Option<&str>,
 ) {
-    let _ = state.app.remote.add_audit(
+    let id = state.app.remote.add_audit(
         guild_id,
         session.user_id,
         &session.display_name,
@@ -867,7 +920,22 @@ fn audit_ok(
         true,
         None,
     );
-    emit_bare(state, guild_id, "audit");
+    // **한 줄만 실어 보낸다** (V3 §13.5). 예전처럼 빈 신호만 주면 로그 탭이 열려 있는
+    // 모든 탭이 통째로 재조회해서, 사람이 많을수록 조용해야 할 화면이 제일 시끄러워진다.
+    let payload = id
+        .ok()
+        .and_then(|id| {
+            state
+                .app
+                .remote
+                .list_audit(guild_id, 1, None)
+                .into_iter()
+                .find(|entry| entry.id == id)
+        })
+        .filter(|entry| entry.is_human_visible())
+        .and_then(|entry| serde_json::to_value(entry.feed_item()).ok())
+        .unwrap_or(Value::Null);
+    emit(state, guild_id, "audit", json!({ "entry": payload }));
 }
 
 // ───────────────────────── 세션 ─────────────────────────
@@ -1178,9 +1246,12 @@ fn stale_roles(state: &Arc<WebState>, guild_id: u64, user_id: u64) -> Option<Vec
 }
 
 /// 이 사람이 봇과 같은 음성 채널에 있는지.
-async fn same_voice_channel(state: &WebState, guild_id: u64, user_id: u64) -> bool {
-    let player = state.app.player.get_state(guild_id).await;
-    let Some(bot_channel) = player.voice_channel_id else {
+///
+/// **V3 §16 B1**: 봇이 *지금* 어디 있는지는 저장값(`player.voice_channel_id`)이 아니라
+/// Discord 캐시가 결정한다. 저장값을 쓰면 봇이 비정상 경로로 빠져나간 뒤에도
+/// "같은 채널에 있다"가 되어 권한이 열린 채로 남는다.
+fn same_voice_channel(state: &WebState, guild_id: u64, user_id: u64) -> bool {
+    let Some(bot_channel) = bot_voice_status(state, guild_id).channel_id else {
         return false;
     };
     state
@@ -1268,6 +1339,18 @@ fn rule_label(rule: PermissionRule) -> &'static str {
         PermissionRule::ConfiguredRole => "지정 역할",
         PermissionRule::Administrator => "관리자",
         PermissionRule::Disabled => "사용 안 함",
+    }
+}
+
+/// 이름이 바뀐 권한 키를 지금 이름으로 바꿔 준다 (V3 §1).
+///
+/// 옛 관리 콘솔이 아직 `autoplaySeed` 를 보낼 수 있다. 400으로 튕기면
+/// 저장 버튼이 이유 없이 안 먹는 화면이 되므로 조용히 받아 준다.
+fn canonical_permission_key(key: &str) -> &str {
+    match key {
+        "autoplaySeed" => "autoplay",
+        "playlistEnqueue" => "bulkEnqueue",
+        other => other,
     }
 }
 
@@ -1370,7 +1453,7 @@ async fn resolve_tier(
         );
     }
 
-    let same_voice = same_voice_channel(state, guild_id, session.user_id).await;
+    let same_voice = same_voice_channel(state, guild_id, session.user_id);
     let lookup = fetch_member_roles(state, session, guild_id, fresh).await;
 
     let (role_ids, demote) = match lookup {
@@ -1504,11 +1587,17 @@ fn schedule_presence(state: &Arc<WebState>, guild_id: u64) {
     });
 }
 
-/// 봇이 지금 어디에 있는지. Discord 캐시 + 메모리만 본다 — **DB를 쓰지 않는다**(V3 §4).
+/// 봇이 지금 어디에 있는지. Discord 캐시만 본다 — **DB도 저장값도 안 본다**(V3 §4·§16 B1).
 ///
-/// `voice_channel_id`(플레이어가 기억하는 값)와 캐시의 실제 음성 상태가 어긋날 수 있어서,
-/// 캐시에 봇의 voice_state가 있으면 그쪽을 진짜로 친다. 화면에 "듣는 중"이 뜨는데
-/// 실제로는 아무도 같은 방에 없는 상황이 §4가 지적한 바로 그 버그다.
+/// **여기가 B1의 진원지였다.** 예전 코드는 캐시가 "음성에 없음"(`None`)을 정확히 줘도
+/// `.or(player_channel)` 로 저장값을 덮어써서, 봇이 재시작·연결 끊김·Discord 강제 퇴장으로
+/// 빠져나간 뒤에도 화면에는 계속 들어가 있다고 나왔다.
+///
+/// 저장된 `player.voice_channel_id` 는 **"다음에 어디로 들어갈까"에만** 쓴다.
+/// "지금 어디 있나"의 근거로 쓰는 곳은 하나도 없어야 한다.
+///
+/// 기동 직후 캐시에 길드가 아직 없는 몇 초는 `in_guild: false` 가 받아 준다 —
+/// 잠깐 "확인 중"인 게, 없는 걸 있다고 하는 것보다 낫다.
 #[derive(Debug, Clone, Default)]
 struct BotVoiceStatus {
     in_guild: bool,
@@ -1516,7 +1605,22 @@ struct BotVoiceStatus {
     channel_name: Option<String>,
 }
 
-fn bot_voice_status(state: &WebState, guild_id: u64, player_channel: Option<u64>) -> BotVoiceStatus {
+impl BotVoiceStatus {
+    fn in_voice(&self) -> bool {
+        self.channel_id.is_some()
+    }
+}
+
+/// B1 회귀를 코드로 못 박아 두는 자리.
+///
+/// 캐시가 진실이고 저장값은 **어떤 경우에도** 결과에 섞이지 않는다.
+/// 인자로 받기만 하고 쓰지 않는 게 의도다 — 다시 `.or(stored)` 를 넣으려는 손을 막는다.
+fn authoritative_voice_channel(cache_says: Option<u64>, stored: Option<u64>) -> Option<u64> {
+    let _ = stored;
+    cache_says
+}
+
+fn bot_voice_status(state: &WebState, guild_id: u64) -> BotVoiceStatus {
     let Some(cache) = state.app.discord_cache.get() else {
         return BotVoiceStatus::default();
     };
@@ -1524,12 +1628,14 @@ fn bot_voice_status(state: &WebState, guild_id: u64, player_channel: Option<u64>
         return BotVoiceStatus::default();
     };
     let bot_id = cache.current_user().id;
-    let channel_id = guild
-        .voice_states
-        .get(&bot_id)
-        .and_then(|voice| voice.channel_id)
-        .map(|channel| channel.get())
-        .or(player_channel);
+    let channel_id = authoritative_voice_channel(
+        guild
+            .voice_states
+            .get(&bot_id)
+            .and_then(|voice| voice.channel_id)
+            .map(|channel| channel.get()),
+        None,
+    );
     let channel_name = channel_id.and_then(|channel| {
         guild
             .channels
@@ -1575,8 +1681,7 @@ async fn build_presence(state: &Arc<WebState>, guild_id: u64) -> Value {
         .into_iter()
         .map(|id| id.to_string())
         .collect();
-    let player = state.app.player.get_state(guild_id).await;
-    let bot = bot_voice_status(state, guild_id, player.voice_channel_id);
+    let bot = bot_voice_status(state, guild_id);
     let presences_intent = state
         .app
         .intent_status
@@ -1628,7 +1733,7 @@ async fn build_presence(state: &Arc<WebState>, guild_id: u64) -> Value {
         "viewingCount": viewing.len(),
         "bot": {
             "inGuild": bot.in_guild,
-            "inVoice": bot.channel_id.is_some(),
+            "inVoice": bot.in_voice(),
             "voiceChannelId": bot.channel_id.map(|id| id.to_string()),
             "voiceChannelName": bot.channel_name,
             "listenerCount": listening.len(),
@@ -1783,6 +1888,247 @@ fn ensure_guild_watcher(state: &Arc<WebState>, guild_id: u64) {
 
 /// 모든 트랙 객체에 `durationSeconds` 숫자를 넣는다 —
 /// `duration`은 C# TimeSpan 문자열이라 프런트가 신뢰할 수 없다(계약 §0).
+// ───────────────────────── 무제한(0) · 투표 · 스킵 ─────────────────────────
+
+/// 한 프레임에 싣는 대기열 최대 곡수 (V3 §18.2).
+/// 뒤쪽은 `GET .../queue?offset=&limit=` 로 가져간다. 보통 사람은 앞 20곡만 보므로
+/// 평소에는 추가 요청이 아예 안 일어난다.
+const QUEUE_PAGE_MAX: usize = 200;
+/// 통계·차트 응답 캐시 수명 (V3 §22.6). 통계는 60초 늦어도 아무도 손해 보지 않는다.
+const STATS_CACHE_TTL: Duration = Duration::from_secs(60);
+/// 투표 스킵이 아무도 안 누르면 저절로 닫히는 시간 (V3 §10.5).
+const SKIP_VOTE_TTL: Duration = Duration::from_secs(90);
+/// 우리 차트 한 장에 싣는 곡수 (V3 §15.2b).
+const OURS_CHART_LIMIT: usize = 50;
+
+/// **§23.1 규약: `0` 은 무제한이다.**
+///
+/// 예전 코드는 `max_queue_per_guild.max(1)` 처럼 클램프를 걸어서 `0` 이 조용히 `1` 이 됐다.
+/// 그러면 화면에는 "무제한"이라고 뜨는데 서버는 한 곡만 받는 최악의 조합이 된다.
+fn limit_blocks(limit: i32, would_be: usize) -> bool {
+    as_limit(limit).is_some_and(|limit| would_be > limit as usize)
+}
+
+/// 숫자 설정 검증. **`0` 은 언제나 통과한다** — 무제한이라는 뜻이기 때문이다 (§23.1).
+fn unlimited_or(value: i32, min: i32, max: i32) -> bool {
+    value == 0 || (min..=max).contains(&value)
+}
+
+/// 길이 상한. `0` 이면 아무 곡이나 담을 수 있다 (§23.1).
+fn track_too_long(max_seconds: i32, track: &TrackRef) -> bool {
+    as_limit(max_seconds).is_some_and(|max| {
+        track
+            .duration
+            .is_some_and(|duration| duration.as_secs_f64() > max as f64)
+    })
+}
+
+/// 봇과 같은 음성 채널에 있는 사람들 (봇 제외). 투표 스킵의 `listeners` 모수다.
+/// 봇이 음성에 없으면 언제나 빈 집합이다 (V3 §4).
+fn listener_ids(state: &WebState, guild_id: u64) -> HashSet<u64> {
+    let Some(channel) = bot_voice_status(state, guild_id).channel_id else {
+        return HashSet::new();
+    };
+    let Some(cache) = state.app.discord_cache.get() else {
+        return HashSet::new();
+    };
+    let Some(guild) = cache.guild(GuildId::new(guild_id)) else {
+        return HashSet::new();
+    };
+    let bot_id = cache.current_user().id;
+    guild
+        .voice_states
+        .iter()
+        .filter(|(user_id, voice)| {
+            **user_id != bot_id
+                && voice.channel_id.map(|id| id.get()) == Some(channel)
+                && !guild
+                    .members
+                    .get(user_id)
+                    .map(|member| member.user.bot)
+                    .unwrap_or(false)
+        })
+        .map(|(user_id, _)| user_id.get())
+        .collect()
+}
+
+/// 투표 스킵 정족수 판정 (V3 §10.5). **순수 함수** — 테스트가 여기를 못 박는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SkipQuorum {
+    have: usize,
+    need: usize,
+    passed: bool,
+}
+
+/// `have`/`need` 는 화면에 그대로 찍히는 숫자다.
+/// `either` 는 둘 중 **더 가까운 쪽**을, `both` 는 **더 먼 쪽**을 보여 준다 —
+/// 사람이 보는 "몇 표 남았나"가 실제 통과 조건과 어긋나면 안 되기 때문이다.
+/// 모수가 0인 쪽은 `both` 에서 만족한 것으로 친다(아무도 없는 조건 때문에 영영 안 넘어가면 곤란하다).
+fn skip_quorum(
+    listeners: &HashSet<u64>,
+    viewers: &HashSet<u64>,
+    voters: &HashSet<u64>,
+    basis: VoteSkipBasis,
+    ratio: u32,
+    min_votes: u32,
+) -> SkipQuorum {
+    let have_listeners = voters.intersection(listeners).count();
+    let have_viewers = voters.intersection(viewers).count();
+    let need_listeners =
+        VoteSkipBasis::votes_needed(listeners.len() as u32, ratio, min_votes) as usize;
+    let need_viewers = VoteSkipBasis::votes_needed(viewers.len() as u32, ratio, min_votes) as usize;
+    let listeners_ok = listeners.is_empty() || have_listeners >= need_listeners;
+    let viewers_ok = viewers.is_empty() || have_viewers >= need_viewers;
+
+    match basis {
+        VoteSkipBasis::Listeners => SkipQuorum {
+            have: have_listeners,
+            need: need_listeners,
+            passed: need_listeners > 0 && have_listeners >= need_listeners,
+        },
+        VoteSkipBasis::Viewers => SkipQuorum {
+            have: have_viewers,
+            need: need_viewers,
+            passed: need_viewers > 0 && have_viewers >= need_viewers,
+        },
+        VoteSkipBasis::Either => {
+            let left = need_listeners.saturating_sub(have_listeners);
+            let right = need_viewers.saturating_sub(have_viewers);
+            let take_listeners = need_listeners > 0 && (need_viewers == 0 || left <= right);
+            SkipQuorum {
+                have: if take_listeners { have_listeners } else { have_viewers },
+                need: if take_listeners { need_listeners } else { need_viewers },
+                passed: (need_listeners > 0 && have_listeners >= need_listeners)
+                    || (need_viewers > 0 && have_viewers >= need_viewers),
+            }
+        }
+        VoteSkipBasis::Both => {
+            let take_listeners = need_listeners.saturating_sub(have_listeners)
+                >= need_viewers.saturating_sub(have_viewers);
+            SkipQuorum {
+                have: if take_listeners { have_listeners } else { have_viewers },
+                need: if take_listeners { need_listeners } else { need_viewers },
+                passed: listeners_ok && viewers_ok && (need_listeners > 0 || need_viewers > 0),
+            }
+        }
+    }
+}
+
+/// 진행 중인 투표 스킵 하나. **메모리에만** 산다 (V3 §10.5) — 곡 하나 수명짜리 데이터다.
+#[derive(Debug, Clone)]
+pub struct SkipVoteState {
+    /// 어느 곡에 대한 투표인지. 곡이 바뀌면 표가 넘어가면 안 되므로 이걸로 리셋한다.
+    item_id: String,
+    voters: HashSet<u64>,
+    opened: Instant,
+}
+
+impl SkipVoteState {
+    fn new(item_id: String) -> Self {
+        Self {
+            item_id,
+            voters: HashSet::new(),
+            opened: Instant::now(),
+        }
+    }
+
+    /// 90초가 지났으면 실패한 투표다. 화면에 계속 붙어 있으면 지저분하다.
+    pub fn is_expired(&self) -> bool {
+        self.opened.elapsed() >= SKIP_VOTE_TTL
+    }
+
+    fn expires_utc(&self) -> String {
+        let left = SKIP_VOTE_TTL.saturating_sub(self.opened.elapsed());
+        (chrono::Utc::now() + chrono::Duration::milliseconds(left.as_millis() as i64)).to_rfc3339()
+    }
+}
+
+/// `/state/hot` 의 `skipVote`. 진행 중인 투표가 없으면 `null` 이다.
+///
+/// **곡이 바뀌면 리셋된다** — 저장된 `item_id` 가 지금 곡과 다르면 없는 것으로 본다.
+/// 90초가 지난 투표도 마찬가지다.
+fn skip_vote_json(
+    state: &WebState,
+    ctx: &AuthContext,
+    player: &crate::models::GuildPlayerState,
+) -> Value {
+    let guild_id = ctx.guild_id();
+    if !ctx.settings.vote_skip_enabled {
+        return Value::Null;
+    }
+    let Some(current_id) = player.current_item.as_ref().map(|item| item.id.clone()) else {
+        return Value::Null;
+    };
+    let votes = state.skip_votes.lock().unwrap();
+    let Some(vote) = votes.get(&guild_id) else {
+        return Value::Null;
+    };
+    if vote.item_id != current_id || vote.is_expired() {
+        return Value::Null;
+    }
+    let listeners = listener_ids(state, guild_id);
+    let viewers: HashSet<u64> = viewers_of(state, guild_id).into_iter().collect();
+    let quorum = skip_quorum(
+        &listeners,
+        &viewers,
+        &vote.voters,
+        ctx.settings.vote_skip_basis,
+        ctx.settings.vote_skip_ratio,
+        ctx.settings.vote_skip_min,
+    );
+    json!({
+        "have": quorum.have,
+        "need": quorum.need,
+        "mine": vote.voters.contains(&ctx.user_id()),
+        "basis": ctx.settings.vote_skip_basis.as_str(),
+        "basisLabel": ctx.settings.vote_skip_basis.description(),
+        "expiresUtc": vote.expires_utc(),
+    })
+}
+
+// ───────── 슈퍼 좋아요 제한 (V3 §10.6) ─────────
+//
+// 판정·소비·환불·현황은 전부 저장소(`remote_super_like_usage`)가 한다.
+// **하루 횟수는 재시작해도 살아남아야** 해서 메모리가 아니라 DB다.
+// 쿨타임만 저장소 안의 메모리다 — 짧고, 풀려도 손해가 없다.
+
+/// `/state/cold` 와 투표 응답에 싣는 현황. 회색으로만 두면 고장인 줄 아니까
+/// 남은 횟수와 쿨타임 끝나는 시각을 숫자로 그대로 준다.
+fn super_like_status(
+    state: &WebState,
+    guild_id: u64,
+    user_id: u64,
+    settings: &RemoteGuildSettings,
+) -> SuperLikeStatus {
+    state.app.remote.super_like_status(
+        guild_id,
+        user_id,
+        settings.super_like_cooldown_sec,
+        settings.super_like_daily_limit,
+    )
+}
+
+/// `/vote` 의 `kind` 문자열 → 투표 종류. `null`·`""`·`"none"` 은 취소다.
+fn parse_vote_kind(value: &str) -> Option<QueueVoteKind> {
+    match value {
+        "like" => Some(QueueVoteKind::Like),
+        "superLike" | "superlike" => Some(QueueVoteKind::SuperLike),
+        "dislike" => Some(QueueVoteKind::Dislike),
+        _ => None,
+    }
+}
+
+/// 투표자 ID 목록을 문자열 배열로. **최대 12명**까지만 (V3 §10.4) —
+/// 대기열 50곡 × 투표자 전원을 실으면 payload 가 터진다. 나머지는 개수로 `+5명` 처럼 보여 준다.
+fn voter_ids_json(ids: &[u64]) -> Value {
+    json!(
+        ids.iter()
+            .take(MAX_VOTER_IDS)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+    )
+}
+
 fn track_json(track: &TrackRef) -> Value {
     json!({
         "title": track.title.clone().unwrap_or_else(|| track.content_id.clone()),
@@ -1819,6 +2165,7 @@ fn queue_item_json(
     score: &QueueScore,
     viewer_user_id: u64,
     my_vote: Option<QueueVoteKind>,
+    points: &VotePoints,
 ) -> Value {
     json!({
         "id": item.id,
@@ -1826,17 +2173,23 @@ fn queue_item_json(
         "requestedByDisplay": item.requested_by_display,
         "requestedByUserId": item.requested_by_user_id.map(|id| id.to_string()),
         "isMine": item.requested_by_user_id == Some(viewer_user_id),
-        "myVote": my_vote.map(|kind| match kind {
-            QueueVoteKind::Like => "like",
-            QueueVoteKind::SuperLike => "superLike",
-        }),
+        "myVote": my_vote.map(QueueVoteKind::api_key),
         "round": score.round,
         "score": {
             "waitScore": score.wait_score,
             "likeCount": score.like_count,
             "superLikeCount": score.super_like_count,
+            "dislikeCount": score.dislike_count,
             "manualPriority": score.manual_priority,
-            "totalScore": score.total_score(),
+            // 설정된 점수로 계산한다 (V3 §10.1). 화면의 계산식이 이 숫자와 같아야 한다.
+            "totalScore": score.total_score(points),
+            // 계산식도 서버가 만들어 준다 — 클라이언트가 배수를 다시 곱하면
+            // 점수 설정을 바꿨을 때 화면이 거짓말을 한다 (V3 §10.4).
+            "formula": score.formula(points),
+            // 누가 눌렀는지 (V3 §10.4). 이름이 아니라 ID다 — 클라이언트가 `members` 로 붙인다.
+            "likeBy": voter_ids_json(&score.like_by),
+            "superBy": voter_ids_json(&score.super_by),
+            "dislikeBy": voter_ids_json(&score.dislike_by),
         }
     })
 }
@@ -1871,8 +2224,41 @@ fn playback_payload(
         "effectiveVolume": player.effective_volume,
         "repeatMode": repeat_key(player.repeat_mode),
         "shuffleEnabled": player.shuffle_enabled,
-        "voiceChannelId": player.voice_channel_id.map(|id| id.to_string()),
+        "autoplayEnabled": player.autoplay_enabled,
+        // V3 §16 B1 — 저장값이 아니라 캐시가 진실이다.
+        "voiceChannelId": bot_voice_status(state, player.guild_id)
+            .channel_id
+            .map(|id| id.to_string()),
+        "voiceConnected": bot_voice_status(state, player.guild_id).in_voice(),
         "botOnline": bot_in_guild(state, player.guild_id),
+        // 곡이 바뀌면 다음 곡도 같이 바뀐다 — 같은 프레임에 실어야 화면이 한 번만 움직인다 (V3 §14).
+        "next": next_up_json(player),
+    })
+}
+
+/// 다음에 나올 곡 (V3 §14). **새 계산이 전혀 없다** — 둘 다 이미 메모리에 있다.
+///
+/// 대기열에 곡이 있으면 그게 다음이고, 비었으면 자동 재생이 미리 뽑아 둔 후보다.
+/// 자동 추천은 "대기열이 비면 나올 곡"이라 확정이 아니다. 화면이 단정하지 않도록
+/// `source` 를 같이 내려 준다.
+fn next_up_json(player: &crate::models::GuildPlayerState) -> Value {
+    if let Some(item) = player.upcoming.first() {
+        return json!({ "source": "queue", "item": next_item_json(item) });
+    }
+    match player.autoplay_preview.as_ref() {
+        Some(item) if player.autoplay_enabled => {
+            json!({ "source": "autoplay", "item": next_item_json(item) })
+        }
+        _ => json!({ "source": Value::Null, "item": Value::Null }),
+    }
+}
+
+fn next_item_json(item: &QueueItem) -> Value {
+    json!({
+        "id": item.id,
+        "track": track_json(&item.track),
+        "requestedByDisplay": item.requested_by_display,
+        "requestedByUserId": item.requested_by_user_id.map(|id| id.to_string()),
     })
 }
 
@@ -1895,29 +2281,37 @@ async fn broadcast_queue(state: &Arc<WebState>, guild_id: u64) {
     let settings = state.app.remote.load_guild_settings(guild_id);
     let mut scores = state.app.remote.queue_scores(guild_id);
     ranking::apply_rounds(&player.upcoming, &mut scores);
+    let points = settings.vote_points();
     // 이 프레임은 모든 구독자가 같이 받는다 — 개인화 필드(isMine/myVote)는 넣지 않는다.
+    //
+    // **앞 200곡만 싣는다** (V3 §18.2). 5000곡짜리 대기열을 5초마다 접속자 전원에게
+    // 통째로 밀면 프레임 하나가 수 MB 다. 뒤쪽은 `GET .../queue?offset=` 로 가져간다.
     let items: Vec<Value> = player
         .upcoming
         .iter()
+        .take(QUEUE_PAGE_MAX)
         .map(|item| {
             let score = scores.get(&item.id).cloned().unwrap_or_default();
-            let mut value = queue_item_json(item, &score, 0, None);
+            let mut value = queue_item_json(item, &score, 0, None, &points);
             value["isMine"] = Value::Null;
             value["myVote"] = Value::Null;
             value
         })
         .collect();
-    let (sorted_at, next_sort_at) = sort_clock(state);
+    let (sorted_at, next_sort_at, sort_period) = sort_clock(state, player.upcoming.len());
     emit(
         state,
         guild_id,
         "queue.set",
         json!({
             "items": items,
+            "queueTotal": player.upcoming.len(),
+            "queueTruncated": player.upcoming.len() > QUEUE_PAGE_MAX,
             "mode": settings.sort_mode.as_str(),
             "sortedAt": sorted_at,
             // 카운트다운 기준(V3 §5). 클라 타이머만 쓰면 백그라운드 탭에서 어긋난다.
             "nextSortAt": next_sort_at,
+            "sortPeriodSeconds": sort_period,
         }),
     );
 }
@@ -2057,10 +2451,10 @@ async fn oauth_start(
 ) -> Response {
     let auth = auth_config(&state);
     let Some(client_id) = auth.client_id.as_deref() else {
-        return Redirect::to("/music/login?error=OAuth%20설정이%20필요합니다").into_response();
+        return Redirect::to("/music/login?error=OAuth%20설정이%20필요해요").into_response();
     };
     if !auth.has_client_secret() {
-        return Redirect::to("/music/login?error=OAuth%20설정이%20필요합니다").into_response();
+        return Redirect::to("/music/login?error=OAuth%20설정이%20필요해요").into_response();
     }
     let oauth_state = crate::models::uuid_like();
     {
@@ -2147,7 +2541,7 @@ async fn oauth_callback(
     }
     let (Some(client_id), Some(client_secret)) = (auth.client_id.clone(), auth.client_secret.clone())
     else {
-        return Redirect::to("/music/login?error=OAuth%20설정이%20필요합니다").into_response();
+        return Redirect::to("/music/login?error=OAuth%20설정이%20필요해요").into_response();
     };
     let client = http_client(&state);
     let token = match client
@@ -2522,16 +2916,21 @@ async fn api_state_hot(
 
     let mut scores = state.app.remote.queue_scores(guild_id);
     ranking::apply_rounds(&player.upcoming, &mut scores);
+    let points = ctx.settings.vote_points();
+    // 앞 200곡만 싣는다 (V3 §18.2). 나머지는 `queueTotal` 로 개수만 알리고
+    // 필요할 때 `GET .../queue?offset=` 으로 가져간다.
     let queue: Vec<Value> = player
         .upcoming
         .iter()
+        .take(QUEUE_PAGE_MAX)
         .map(|item| {
             let score = scores.get(&item.id).cloned().unwrap_or_default();
             let my_vote = state.app.remote.user_vote(&item.id, ctx.user_id());
-            queue_item_json(item, &score, ctx.user_id(), my_vote)
+            queue_item_json(item, &score, ctx.user_id(), my_vote, &points)
         })
         .collect();
-    let (sorted_at, next_sort_at) = sort_clock(&state);
+    let (sorted_at, next_sort_at, sort_period) = sort_clock(&state, player.upcoming.len());
+    let bot = bot_voice_status(&state, guild_id);
 
     json_ok(json!({
         "player": {
@@ -2539,7 +2938,10 @@ async fn api_state_hot(
             "effectiveVolume": player.effective_volume,
             "repeatMode": repeat_key(player.repeat_mode),
             "shuffleEnabled": player.shuffle_enabled,
-            "voiceChannelId": player.voice_channel_id.map(|id| id.to_string()),
+            "autoplayEnabled": player.autoplay_enabled,
+            // V3 §16 B1 — 캐시가 진실이다. 저장값은 "다음에 어디로 들어갈까"에만 쓴다.
+            "voiceChannelId": bot.channel_id.map(|id| id.to_string()),
+            "voiceConnected": bot.in_voice(),
             "botOnline": ctx.session.is_developer || bot_in_guild(&state, guild_id),
             "minVolume": ctx.settings.min_volume,
             "maxVolume": ctx.settings.max_volume,
@@ -2550,7 +2952,16 @@ async fn api_state_hot(
         "queueMode": ctx.settings.sort_mode.as_str(),
         "sortedAt": sorted_at,
         "nextSortAt": next_sort_at,
+        // 500곡을 넘으면 15초로 늘어난다 (§18.2). 화면이 이 값을 세야 카운트다운이 안 헛돈다.
+        "sortPeriodSeconds": sort_period,
         "queue": queue,
+        "queueTotal": player.upcoming.len(),
+        "queueTruncated": player.upcoming.len() > QUEUE_PAGE_MAX,
+        "votePoints": points,
+        // 다음 곡 (V3 §14) — 이미 메모리에 있는 값을 그대로 싣는다.
+        "next": next_up_json(&player),
+        // 투표 스킵 현황 (V3 §10.5). 진행 중이 아니면 null 이다.
+        "skipVote": skip_vote_json(&state, &ctx, &player),
         "presence": build_presence(&state, guild_id).await,
     }))
 }
@@ -2575,26 +2986,22 @@ async fn api_state_cold(
         .map(OAuthGuild::to_json)
         .collect();
 
+    // 서버 재생목록 + **내 개인 재생목록** (V3 §12). 개인 것은 길드에 안 묶여서
+    // 어느 서버에서 열어도 같이 보인다.
     let playlists: Vec<Value> = state
         .app
         .db
         .list_playlists(PlaylistScope::Guild, Some(guild_id))
         .into_iter()
-        .map(|playlist| {
-            json!({
-                "id": playlist.id,
-                "name": playlist.name,
-                "ownerUserId": playlist.owner_user_id.to_string(),
-                "isMine": playlist.owner_user_id == session.user_id,
-                "entryCount": playlist.entries.len(),
-                "entries": playlist
-                    .entries
-                    .iter()
-                    .filter_map(|entry| entry.track.as_ref())
-                    .map(|track| json!({ "track": track_json(track) }))
-                    .collect::<Vec<_>>(),
-            })
-        })
+        .map(|playlist| playlist_json(&playlist, session.user_id))
+        .chain(
+            state
+                .app
+                .db
+                .list_user_playlists(session.user_id)
+                .into_iter()
+                .map(|playlist| playlist_json(&playlist, session.user_id)),
+        )
         .collect();
 
     let liked: Vec<Value> = state
@@ -2652,7 +3059,27 @@ async fn api_state_cold(
             "minVolume": settings.min_volume,
             "maxVolume": settings.max_volume,
             "sortMode": settings.sort_mode.as_str(),
+            // 화면이 계산식을 그리려면 점수표를 알아야 한다 (V3 §10.1).
+            "votePoints": settings.vote_points(),
+            // `0` 은 무제한이다 — 화면이 `∞` 로 그린다 (V3 §23.1).
+            "maxQueuePerUser": settings.max_queue_per_user,
+            "maxQueuePerGuild": settings.max_queue_per_guild,
+            "maxTrackSeconds": settings.max_track_seconds,
+            "bulkEnqueueLimit": settings.bulk_enqueue_limit,
+            "chartSuperWeight": settings.chart_super_weight,
+            // 붐따 (V3 §10.3) — 꺼져 있으면 싫어요는 점수에만 영향을 준다.
+            "boomttaEnabled": settings.boomtta_enabled,
+            "boomttaThreshold": settings.boomtta_threshold,
+            "boomttaAction": settings.boomtta_action.as_str(),
+            // 투표 스킵 (V3 §10.5).
+            "voteSkipEnabled": settings.vote_skip_enabled,
+            "voteSkipBasis": settings.vote_skip_basis.as_str(),
+            "voteSkipBasisLabel": settings.vote_skip_basis.description(),
+            "voteSkipRatio": settings.vote_skip_ratio,
+            "voteSkipMin": settings.vote_skip_min,
         },
+        // 슈퍼 좋아요 남은 횟수·쿨타임 (V3 §10.6). 회색으로만 두면 고장인 줄 안다.
+        "superLike": super_like_status(&state, guild_id, session.user_id, settings),
         "permissions": permissions_json(&state, &ctx),
         "search": search_json(&state),
         // 진입 시 왕복을 하나 줄이려고 개인 설정도 같이 싣는다 (V3 §2).
@@ -2671,6 +3098,34 @@ async fn api_state_cold(
 /// 운영 패널에 YouTube API 키가 있으면 브라우저가 YouTube Data API를 직접 부른다
 /// (봇 호스트의 `yt-dlp`가 느리거나 막혀도 검색이 살아 있다). 키가 없으면 지금처럼 서버가 찾는다.
 /// 키는 브라우저로 그대로 나가는 값이라 리퍼러 제한이 전제다 — 운영 패널에 그렇게 적어 뒀다.
+/// 재생목록 한 장. 개인(`User`)과 서버(`Guild`)를 **아이콘과 색으로 확실히 구분**할 수 있게
+/// `scope` 를 같이 준다 — 실수로 서버 것을 지우면 곤란하다 (V3 §12.2).
+fn playlist_json(playlist: &crate::models::Playlist, viewer: u64) -> Value {
+    let total_seconds: f64 = playlist
+        .entries
+        .iter()
+        .filter_map(|entry| entry.track.as_ref())
+        .filter_map(|track| track.duration)
+        .map(|duration| duration.as_secs_f64())
+        .sum();
+    json!({
+        "id": playlist.id,
+        "name": playlist.name,
+        "scope": playlist.scope.as_str(),
+        "ownerUserId": playlist.owner_user_id.to_string(),
+        "isMine": playlist.owner_user_id == viewer,
+        "entryCount": playlist.entries.len(),
+        // `12곡 · 48분` 처럼 총 길이까지 보여주면 고를 때 편하다 (§12.2).
+        "totalSeconds": total_seconds,
+        "entries": playlist
+            .entries
+            .iter()
+            .filter_map(|entry| entry.track.as_ref())
+            .map(|track| json!({ "track": track_json(track) }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn search_json(state: &WebState) -> Value {
     match auth_config(state).youtube_api_key() {
         Some(key) => json!({ "mode": "browser", "youtubeApiKey": key }),
@@ -2688,24 +3143,38 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
     // (화면 키, 라벨, 규칙, 추가 게이트, 지정 역할을 찾을 권한 키)
     // 마지막 항목이 §1의 핵심이다. `playlistEdit`처럼 다른 권한의 규칙을 빌려 쓰는 줄은
     // 역할도 그 권한(`queueEdit`)의 것을 봐야 화면과 실제 판정이 어긋나지 않는다.
+    //
+    // **권한 11종** (V3 §0): 위 10개 + 관리자(`manager_role_ids`). 아래 줄 중 앞 10개가 그것이고,
+    // 나머지는 그 10개의 규칙을 빌려 쓰거나 관리자 고정인 화면용 파생 키다.
     let rows: Vec<(&str, &str, PermissionRule, bool, &str)> = vec![
         ("search", "곡 검색·신청", settings.search_rule, true, "search"),
-        ("vote", "좋아요·슈퍼 좋아요", settings.vote_rule, true, "vote"),
-        ("playback", "재생 / 일시정지 / 스킵", settings.playback_rule, true, "playback"),
+        ("vote", "좋아요·슈퍼 좋아요·싫어요", settings.vote_rule, true, "vote"),
+        ("playback", "재생 / 일시정지", settings.playback_rule, true, "playback"),
+        ("skip", "곡 넘기기", settings.skip_rule, true, "skip"),
         ("seek", "재생 위치 이동", settings.seek_rule, true, "seek"),
-        ("volume", "볼륨 조절", settings.volume_rule, true, "volume"),
+        ("volume", "서버 볼륨 조절", settings.volume_rule, true, "volume"),
         ("queueEdit", "대기열 편집", settings.queue_edit_rule, true, "queueEdit"),
         ("chat", "채팅 쓰기·반응·답장", settings.chat_rule, settings.chat_enabled, "chat"),
-        ("autoplaySeed", "자동 재생 기준 곡 등록", settings.autoplay_seed_rule, true, "autoplaySeed"),
+        ("autoplay", "자동 재생 켜고 끄기·기준 곡", settings.autoplay_rule, true, "autoplay"),
+        ("bulkEnqueue", "재생목록·차트 전부 담기", settings.bulk_enqueue_rule, true, "bulkEnqueue"),
+        // ── 아래는 위 규칙을 빌려 쓰는 화면용 파생 키 ──
+        ("autoplaySeed", "자동 재생 기준 곡 등록", settings.autoplay_rule, true, "autoplay"),
+        ("playlistEnqueue", "재생목록 전부 담기", settings.bulk_enqueue_rule, true, "bulkEnqueue"),
         ("playlistEdit", "재생목록 편집", settings.queue_edit_rule, true, "queueEdit"),
         ("library", "보관함·재생목록", PermissionRule::GuildMember, true, "library"),
         ("suggest", "제안 작성·공감", PermissionRule::GuildMember, settings.suggestion_enabled, "suggest"),
+        ("stats", "기록 보기", PermissionRule::GuildMember, true, "stats"),
         ("chatDelete", "남의 채팅 삭제", PermissionRule::Administrator, true, "chatDelete"),
         ("suggestStatus", "제안 상태 변경", PermissionRule::Administrator, true, "suggestStatus"),
         ("suspend", "유저 정지·해제", PermissionRule::Administrator, true, "suspend"),
         ("sortMode", "정렬 모드 변경", PermissionRule::Administrator, true, "sortMode"),
+        ("blacklist", "차단 목록 관리", PermissionRule::Administrator, true, "blacklist"),
         ("console", "서버 관리 콘솔", PermissionRule::Administrator, true, "console"),
     ];
+
+    // "누가 되는지"는 서버가 센다 (V3 §23.3). 클라이언트가 역할과 인원을 다시 세면
+    // 틀리기 쉽고 느리다. 캐시 한 번만 읽고 모든 줄이 그걸 나눠 쓴다.
+    let audience = PermissionAudience::of(state, ctx.guild_id(), settings);
 
     let mut can = serde_json::Map::new();
     let mut entries: Vec<Value> = Vec::with_capacity(rows.len() + 1);
@@ -2713,6 +3182,12 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
         let base = rule_base_allowed(role_key, rule, settings, member);
         let allowed = !viewer && gate && permission_allowed(role_key, rule, settings, member);
         let via_admin = allowed && !base;
+        let role_names_for_rule = if rule == PermissionRule::ConfiguredRole {
+            role_names(state, ctx.guild_id(), settings.roles_for(role_key))
+        } else {
+            Vec::new()
+        };
+        // 왜 안 되는지 — 조건을 그대로 말한다. `권한 없음`은 답이 아니다 (§23.3).
         let reason = if viewer {
             Some(
                 ctx.viewer_reason
@@ -2720,28 +3195,55 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
                     .unwrap_or_else(|| "읽기 전용이라 아무것도 조작할 수 없어요.".into()),
             )
         } else if !gate {
-            Some("관리자가 이 기능을 꺼 뒀어요.".into())
-        } else if !allowed && rule == PermissionRule::Disabled {
-            Some("사용 안 함으로 설정돼 있어서 아무도 쓸 수 없어요.".into())
-        } else {
+            Some("이 기능은 서버에서 꺼 뒀어요.".into())
+        } else if allowed {
             None
+        } else {
+            Some(match rule {
+                PermissionRule::Disabled => "이 기능은 서버에서 꺼 뒀어요.".to_string(),
+                PermissionRule::SameVoiceChannel => {
+                    "봇과 같은 음성 채널에 있어야 눌러요.".to_string()
+                }
+                PermissionRule::Administrator => "서버 관리자만 할 수 있어요.".to_string(),
+                PermissionRule::ConfiguredRole if role_names_for_rule.is_empty() => {
+                    "지정된 역할이 없어서 서버 관리자만 할 수 있어요.".to_string()
+                }
+                PermissionRule::ConfiguredRole => format!(
+                    "{} 역할이 있어야 눌러요.",
+                    role_names_for_rule
+                        .iter()
+                        .map(|name| format!("@{name}"))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                ),
+                PermissionRule::GuildMember => "이 서버의 멤버만 할 수 있어요.".to_string(),
+            })
+        };
+        let allowed_count = audience.for_rule(rule, role_key, settings);
+        // 통과하는 대상의 역할 이름. 지정 역할이면 그 역할들, 관리자 규칙이면 관리자 지정 역할.
+        let allowed_role_names = match rule {
+            PermissionRule::ConfiguredRole => role_names_for_rule.clone(),
+            PermissionRule::Administrator | PermissionRule::SameVoiceChannel => {
+                role_names(state, ctx.guild_id(), settings.manager_role_ids.as_slice())
+            }
+            _ => Vec::new(),
         };
         can.insert(key.to_string(), Value::Bool(allowed));
         entries.push(json!({
             "key": key,
             "label": label,
+            "description": RemoteGuildSettings::permission_description(role_key),
             "allowed": allowed,
             "rule": rule_key(rule),
             "ruleLabel": rule_label(rule),
             "viaAdmin": via_admin,
             "reason": reason,
             // 왜 되는지/안 되는지 설명하려면 역할 이름이 있어야 말이 된다 (V3 §1).
-            // 지정 역할 규칙이 아닌 줄은 빈 배열이다.
-            "roleNames": if rule == PermissionRule::ConfiguredRole {
-                json!(role_names(state, ctx.guild_id(), settings.roles_for(role_key)))
-            } else {
-                json!([])
-            },
+            "roleNames": role_names_for_rule,
+            // 누가 되는지 (V3 §23.3). **사람 이름은 안 나열한다** — 역할 이름 + 인원수면 충분하고,
+            // 이름을 다 까면 그 사람들이 부탁 받는 창구가 된다.
+            "allowedCount": allowed_count,
+            "allowedRoleNames": allowed_role_names,
         }));
     }
 
@@ -2751,15 +3253,121 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
     entries.push(json!({
         "key": "ops",
         "label": "운영 패널",
+        "description": "봇 전체를 관리하는 화면이에요.",
         "allowed": ops,
         "rule": "owner",
         "ruleLabel": "봇 주인 전용",
         "viaAdmin": false,
         "reason": if ops { Value::Null } else { Value::String("여기는 봇 주인만 들어갈 수 있어요.".into()) },
         "roleNames": json!([]),
+        "allowedCount": Value::Null,
+        "allowedRoleNames": json!([]),
     }));
 
     json!({ "can": Value::Object(can), "entries": entries })
+}
+
+/// "지금 이 권한을 누가 쓸 수 있나"를 한 번만 세어 두고 모든 줄이 나눠 쓴다 (V3 §23.3).
+///
+/// 길드 멤버 캐시를 권한마다 다시 훑으면 20줄 × 수천 명이 된다. 그래서 한 번만 훑으며
+/// (관리자 수, 역할별 인원, 음성에 같이 있는 사람 수, 전체 멤버 수)를 모아 둔다.
+/// 멤버 인텐트가 꺼져 있거나 캐시가 비어 있으면 `None` 을 돌려준다 —
+/// **0명이라고 단정하지 않는다.** 모르는 걸 0으로 쓰면 화면이 거짓말을 한다.
+struct PermissionAudience {
+    known: bool,
+    members: usize,
+    admins: usize,
+    same_voice: usize,
+    by_role: HashMap<u64, usize>,
+}
+
+impl PermissionAudience {
+    fn of(state: &WebState, guild_id: u64, settings: &RemoteGuildSettings) -> Self {
+        let mut audience = Self {
+            known: false,
+            members: 0,
+            admins: 0,
+            same_voice: 0,
+            by_role: HashMap::new(),
+        };
+        let bot_channel = bot_voice_status(state, guild_id).channel_id;
+        let Some(cache) = state.app.discord_cache.get() else {
+            return audience;
+        };
+        let Some(guild) = cache.guild(GuildId::new(guild_id)) else {
+            return audience;
+        };
+        audience.known = true;
+        for (user_id, member) in guild.members.iter() {
+            if member.user.bot {
+                continue;
+            }
+            audience.members += 1;
+            let admin = guild.owner_id == *user_id
+                || is_owner_user(state, user_id.get())
+                || member
+                    .roles
+                    .iter()
+                    .any(|role| settings.manager_roles().contains(&role.get()))
+                || member.roles.iter().any(|role| {
+                    guild
+                        .roles
+                        .get(role)
+                        .map(|role| {
+                            role.permissions.contains(Permissions::ADMINISTRATOR)
+                                || role.permissions.contains(Permissions::MANAGE_GUILD)
+                        })
+                        .unwrap_or(false)
+                });
+            if admin {
+                audience.admins += 1;
+            }
+            if bot_channel.is_some()
+                && guild
+                    .voice_states
+                    .get(user_id)
+                    .and_then(|voice| voice.channel_id)
+                    .map(|id| id.get())
+                    == bot_channel
+            {
+                audience.same_voice += 1;
+            }
+            for role in member.roles.iter() {
+                *audience.by_role.entry(role.get()).or_insert(0) += 1;
+            }
+        }
+        audience
+    }
+
+    /// 이 규칙을 통과하는 인원. 캐시가 없어 모르면 `null` 이다 — **0으로 단정하지 않는다.**
+    fn for_rule(
+        &self,
+        rule: PermissionRule,
+        role_key: &str,
+        settings: &RemoteGuildSettings,
+    ) -> Value {
+        if !self.known {
+            return Value::Null;
+        }
+        let count = match rule {
+            // 사용 안 함은 관리자와 봇 주인까지 전부 막는다.
+            PermissionRule::Disabled => 0,
+            PermissionRule::GuildMember => self.members,
+            PermissionRule::Administrator => self.admins,
+            PermissionRule::SameVoiceChannel => self.same_voice.max(self.admins),
+            PermissionRule::ConfiguredRole => {
+                // 역할이 여럿이면 겹치는 사람이 이중으로 세어질 수 있다. 상한을 멤버 수로 눌러
+                // "12명 중 15명이 쓸 수 있어요" 같은 말이 안 되게 한다.
+                let by_roles: usize = settings
+                    .roles_for(role_key)
+                    .iter()
+                    .map(|role| self.by_role.get(role).copied().unwrap_or(0))
+                    .sum();
+                (by_roles + self.admins).min(self.members)
+            }
+        };
+        json!(count)
+    }
 }
 
 /// 역할 ID를 사람이 읽는 이름으로. 캐시에 없는 역할(지워졌거나 아직 못 받은)은
@@ -2803,9 +3411,11 @@ async fn api_state(
     let sampled_at = now_utc();
     let mut scores = state.app.remote.queue_scores(guild_id);
     ranking::apply_rounds(&player.upcoming, &mut scores);
+    let points = ctx.settings.vote_points();
     let queue: Vec<Value> = player
         .upcoming
         .iter()
+        .take(QUEUE_PAGE_MAX)
         .map(|item| {
             let score = scores.get(&item.id).cloned().unwrap_or_default();
             queue_item_json(
@@ -2813,9 +3423,11 @@ async fn api_state(
                 &score,
                 ctx.user_id(),
                 state.app.remote.user_vote(&item.id, ctx.user_id()),
+                &points,
             )
         })
         .collect();
+    let bot = bot_voice_status(&state, guild_id);
     json_ok(json!({
         "guild": ctx.guild.to_json(),
         "user": {
@@ -2825,7 +3437,8 @@ async fn api_state(
         },
         "tier": ctx.tier.as_str(),
         "player": {
-            "voiceChannelId": player.voice_channel_id.map(|id| id.to_string()),
+            // V3 §16 B1 — 저장값이 아니라 Discord 캐시가 진실이다.
+            "voiceChannelId": bot.channel_id.map(|id| id.to_string()),
             "isPaused": player.is_paused,
             "effectiveVolume": player.effective_volume,
             "repeatMode": repeat_key(player.repeat_mode),
@@ -2834,12 +3447,14 @@ async fn api_state(
         },
         "connection": {
             "botOnline": ctx.session.is_developer || bot_in_guild(&state, guild_id),
-            "voiceConnected": player.voice_channel_id.is_some(),
+            "voiceConnected": bot.in_voice(),
         },
         "current": player.current_item.as_ref().map(current_json),
         "positionSeconds": position,
         "sampledAtUtc": sampled_at,
         "queue": queue,
+        "queueTotal": player.upcoming.len(),
+        "next": next_up_json(&player),
         "settings": ctx.settings,
         "permissions": permissions_json(&state, &ctx),
         "serverTimeUtc": sampled_at,
@@ -2913,28 +3528,76 @@ async fn api_chat_list(
     json_ok(json!({ "messages": rows, "nextBefore": next_before }))
 }
 
+/// `GET .../audit?before=&kinds=song,playlist` — **사람이 읽는 피드** (V3 §13.5).
+///
+/// `text` 는 서버가 완성해서 내려준다. 클라이언트가 액션명을 문장으로 바꾸는 로직을
+/// 갖게 두면 서버가 액션을 하나 추가할 때마다 화면이 조용히 깨진다.
+/// 전후값 JSON 과 실패 사유는 **아예 싣지 않는다** — 그건 관리 콘솔(`/admin/audit`)의 몫이다.
 async fn api_audit(
     State(state): State<Arc<WebState>>,
     cookies: Cookies,
     Path(guild_id): Path<u64>,
-    Query(query): Query<BeforeQuery>,
+    Query(query): Query<AuditFeedQuery>,
 ) -> Response {
     let ctx = match authorize(&state, &cookies, guild_id, None).await {
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
     if ctx.tier.is_viewer() {
-        return json_ok(json!({ "entries": [] }));
+        return json_ok(json!({ "entries": [], "kinds": audit_kind_options() }));
     }
     let limit = query.limit.unwrap_or(100).clamp(1, 300);
-    let entries: Vec<Value> = state
+    let kinds = parse_audit_kinds(query.kinds.as_deref());
+    let rows = state
         .app
         .remote
-        .list_audit(guild_id, limit, query.before)
+        .list_audit_kinds(guild_id, limit, query.before, &kinds);
+    // 자동 재생이 넣은 곡과 실패한 시도는 사람 피드에 안 남긴다 (§13.3).
+    let entries: Vec<Value> = rows
         .iter()
-        .map(audit_json)
+        .filter(|entry| entry.is_human_visible())
+        .map(|entry| serde_json::to_value(entry.feed_item()).unwrap_or(Value::Null))
         .collect();
-    json_ok(json!({ "entries": entries }))
+    json_ok(json!({
+        "entries": entries,
+        // 필터 칩(§13.4)과 기본값을 서버가 알려 준다 — 화면이 목록을 따로 들고 있으면 어긋난다.
+        "kinds": audit_kind_options(),
+        "defaultKinds": AuditKind::default_filter()
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>(),
+        // 필터로 몇 줄이 숨겨졌는지 화면이 `+ 12개 더` 로 알려 줄 수 있게.
+        "hiddenCount": rows.len() - entries.len(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditFeedQuery {
+    before: Option<i64>,
+    limit: Option<usize>,
+    /// `song,playlist` 처럼 쉼표로 구분. 없거나 비면 전부 본다.
+    kinds: Option<String>,
+}
+
+fn parse_audit_kinds(raw: Option<&str>) -> Vec<AuditKind> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .filter_map(AuditKind::parse)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default()
+}
+
+fn audit_kind_options() -> Value {
+    json!(
+        AuditKind::ALL
+            .iter()
+            .map(|kind| json!({ "key": kind.as_str(), "label": kind.label() }))
+            .collect::<Vec<_>>()
+    )
 }
 
 fn audit_json(entry: &crate::remote::AuditEntry) -> Value {
@@ -3280,11 +3943,8 @@ async fn api_enqueue(
         );
     }
     let player = state.app.player.get_state(guild_id).await;
-    if request
-        .track
-        .duration
-        .is_some_and(|duration| duration.as_secs_f64() > ctx.settings.max_track_seconds as f64)
-    {
+    // `maxTrackSeconds == 0` 은 무제한이다 (§23.1).
+    if track_too_long(ctx.settings.max_track_seconds, &request.track) {
         audit_failure(
             &state,
             guild_id,
@@ -3326,9 +3986,11 @@ async fn api_enqueue(
         .iter()
         .filter(|item| item.requested_by_user_id == Some(session.user_id))
         .count();
-    if player.upcoming.len() >= ctx.settings.max_queue_per_guild.max(1) as usize
-        || user_count >= ctx.settings.max_queue_per_user.max(1) as usize
-    {
+    // **`0` 은 무제한이다** (§23.1). 예전의 `.max(1)` 클램프는 `0` 을 조용히 `1` 로 바꿔서
+    // 화면에는 "무제한"이라고 뜨는데 서버는 한 곡만 받는 최악의 조합을 만들었다.
+    let guild_full = limit_blocks(ctx.settings.max_queue_per_guild, player.upcoming.len() + 1);
+    let user_full = limit_blocks(ctx.settings.max_queue_per_user, user_count + 1);
+    if guild_full || user_full {
         audit_failure(
             &state,
             guild_id,
@@ -3339,7 +4001,17 @@ async fn api_enqueue(
         );
         return json_error(
             StatusCode::CONFLICT,
-            "서버나 개인 대기열 제한에 닿았어요.",
+            if user_full {
+                format!(
+                    "한 사람이 담을 수 있는 {}곡을 다 채웠어요.",
+                    ctx.settings.max_queue_per_user
+                )
+            } else {
+                format!(
+                    "서버 대기열 {}곡이 꽉 찼어요.",
+                    ctx.settings.max_queue_per_guild
+                )
+            },
         );
     }
     let item = QueueItem::new_user(
@@ -3410,20 +4082,47 @@ async fn api_control(
         );
     }
     // 어떤 권한 키로 볼지도 같이 정한다 — 지정 역할이 키마다 다르기 때문이다 (V3 §1).
-    let (rule_key_for_action, rule) = match request.action.as_str() {
-        "seek" => ("seek", ctx.settings.seek_rule),
-        "volume" => ("volume", ctx.settings.volume_rule),
-        "shuffle" => ("queueEdit", ctx.settings.queue_edit_rule),
-        _ => ("playback", ctx.settings.playback_rule),
+    let (rule_key_for_action, rule, denied) = match request.action.as_str() {
+        "seek" => ("seek", ctx.settings.seek_rule, "재생 위치를 옮길 권한이 없어요."),
+        "volume" => ("volume", ctx.settings.volume_rule, "볼륨을 바꿀 권한이 없어요."),
+        "shuffle" => (
+            "queueEdit",
+            ctx.settings.queue_edit_rule,
+            "대기열을 섞을 권한이 없어요.",
+        ),
+        // 스킵은 재생/일시정지와 성격이 달라 권한이 따로다 (V3 §10.5). 기본은 모든 멤버.
+        "skip" | "skipVoteCancel" => (
+            "skip",
+            ctx.settings.skip_rule,
+            "곡을 넘길 권한이 없어요.",
+        ),
+        // 자동 재생 On/Off 도 일반 유저 권한이다 (V3 §24.3).
+        "autoplay" => (
+            "autoplay",
+            ctx.settings.autoplay_rule,
+            "자동 재생을 바꿀 권한이 없어요.",
+        ),
+        _ => (
+            "playback",
+            ctx.settings.playback_rule,
+            "재생을 조작할 권한이 없어요.",
+        ),
     };
-    if let Err(response) = ctx.require(rule_key_for_action, rule, "재생을 조작할 권한이 없어요.") {
+    if let Err(response) = ctx.require(rule_key_for_action, rule, denied) {
         return response;
     }
     if let Err(response) = ctx.require_not_suspended(SuspensionScope::Queue) {
         return response;
     }
     let player = state.app.player.get_state(guild_id).await;
-    if player.voice_channel_id.is_none() {
+    // 내 표만 거두는 요청은 아무것도 조작하지 않는다. 봇이 이미 나갔어도
+    // 내 표는 거둘 수 있어야 한다 — 안 그러면 화면에 유령 투표가 남는다.
+    if request.action == "skipVoteCancel" {
+        return skip_vote_cancel(&state, &ctx, &player);
+    }
+    // V3 §16 B1 — 저장값이 아니라 캐시가 진실이다. 저장값을 보면 봇이 이미 나갔는데도
+    // 조작이 통과해서 아무 일도 안 일어나는 유령 상태가 된다.
+    if !bot_voice_status(&state, guild_id).in_voice() {
         return json_error(
             StatusCode::CONFLICT,
             "봇이 음성 채널에 안 들어가 있어요.",
@@ -3436,6 +4135,14 @@ async fn api_control(
                 StatusCode::CONFLICT,
                 "재생 상태가 그새 바뀌었어요. 화면을 새로 받아 볼게요.",
             );
+        }
+    }
+    // 투표 스킵이 켜져 있으면 스킵은 "투표를 연다"는 뜻이 된다 (V3 §10.5).
+    // 곡이 맞는지 확인한 **다음에** 표를 센다 — 이미 지나간 곡에 표를 얹으면 안 된다.
+    if request.action == "skip" {
+        match resolve_skip(&state, &ctx, &player) {
+            SkipDecision::Immediate => {}
+            SkipDecision::Pending(response) => return response,
         }
     }
     let mut queue_changed = false;
@@ -3518,6 +4225,15 @@ async fn api_control(
             queue_changed = true;
             Ok(format!("shuffle:{enabled}"))
         }
+        // 🎲 자동 재생 On/Off — 일반 유저도 할 수 있다 (V3 §24.3).
+        "autoplay" => {
+            let enabled = request.value.map(|value| value > 0.5).unwrap_or(false);
+            state.app.player.set_autoplay(guild_id, enabled).await;
+            let mut engine = state.app.db.load_guild_settings(guild_id);
+            engine.autoplay_default_override = Some(enabled);
+            state.app.db.save_guild_settings(&engine);
+            Ok(format!("autoplay:{enabled}"))
+        }
         _ => Err("지원하지 않는 재생 제어예요.".into()),
     };
     match result {
@@ -3548,6 +4264,12 @@ async fn api_control(
             if queue_changed {
                 broadcast_queue(&state, guild_id).await;
             }
+            // 스킵은 "넘어갔는지"를 같이 알려 준다 (V3 §10.5). 여기까지 왔으면 즉시 스킵이다.
+            if request.action == "skip" {
+                state.skip_votes.lock().unwrap().remove(&guild_id);
+                emit(&state, guild_id, "skipvote", Value::Null);
+                return json_ok(json!({ "ok": true, "skipped": true }));
+            }
             json_ok(json!({ "ok": true }))
         }
         Err(error) => {
@@ -3564,11 +4286,131 @@ async fn api_control(
     }
 }
 
+/// 스킵 요청 하나의 결말 (V3 §10.5).
+enum SkipDecision {
+    /// 투표를 안 거치고 지금 넘어간다.
+    Immediate,
+    /// 표만 더해졌다. 응답에 현재 표 상황이 들어 있다.
+    Pending(Response),
+}
+
+/// 지금 이 스킵이 바로 넘어가는지, 투표를 여는지 정한다.
+///
+/// **즉시 스킵**: 서버 관리자·봇 주인 / 그 곡을 신청한 본인 / 모수가 0명일 때.
+/// 마지막 조건이 없으면 아무도 안 듣고 아무도 안 보는 방에서 곡을 영영 못 넘긴다.
+fn resolve_skip(
+    state: &Arc<WebState>,
+    ctx: &AuthContext,
+    player: &crate::models::GuildPlayerState,
+) -> SkipDecision {
+    let guild_id = ctx.guild_id();
+    if !ctx.settings.vote_skip_enabled {
+        return SkipDecision::Immediate;
+    }
+    let Some(current) = player.current_item.as_ref() else {
+        return SkipDecision::Immediate;
+    };
+    // 관리자·봇 주인, 그리고 내가 넣은 곡은 투표 없이 넘어간다.
+    // 내가 넣은 곡을 내가 빼는 건 남에게 피해가 없다.
+    if ctx.tier.is_manager() || current.requested_by_user_id == Some(ctx.user_id()) {
+        return SkipDecision::Immediate;
+    }
+    let listeners = listener_ids(state, guild_id);
+    let viewers: HashSet<u64> = viewers_of(state, guild_id).into_iter().collect();
+    if listeners.is_empty() && viewers.is_empty() {
+        return SkipDecision::Immediate;
+    }
+
+    let (quorum, mine) = {
+        let mut votes = state.skip_votes.lock().unwrap();
+        // 곡이 바뀌었거나 90초가 지난 투표는 없던 것으로 한다 — 표가 다음 곡으로 넘어가면 안 된다.
+        let stale = votes
+            .get(&guild_id)
+            .is_some_and(|vote| vote.item_id != current.id || vote.is_expired());
+        if stale {
+            votes.remove(&guild_id);
+        }
+        let vote = votes
+            .entry(guild_id)
+            .or_insert_with(|| SkipVoteState::new(current.id.clone()));
+        // 다시 누르면 취소다.
+        let mine = if vote.voters.remove(&ctx.user_id()) {
+            false
+        } else {
+            vote.voters.insert(ctx.user_id());
+            true
+        };
+        (
+            skip_quorum(
+                &listeners,
+                &viewers,
+                &vote.voters,
+                ctx.settings.vote_skip_basis,
+                ctx.settings.vote_skip_ratio,
+                ctx.settings.vote_skip_min,
+            ),
+            mine,
+        )
+    };
+
+    if quorum.passed {
+        state.skip_votes.lock().unwrap().remove(&guild_id);
+        // 활동 로그는 실제로 넘긴 뒤 `api_control` 이 한 번만 남긴다 —
+        // 여기서도 남기면 한 번 스킵에 두 줄이 찍힌다. 대신 몇 명이 동의했는지를 남겨 둔다.
+        emit(
+            state,
+            guild_id,
+            "notice",
+            json!({
+                "kind": "info",
+                "message": format!("{}명이 동의해서 곡을 넘겼어요.", quorum.have),
+            }),
+        );
+        return SkipDecision::Immediate;
+    }
+
+    let payload = json!({
+        "have": quorum.have,
+        "need": quorum.need,
+        "mine": mine,
+        "basis": ctx.settings.vote_skip_basis.as_str(),
+        "basisLabel": ctx.settings.vote_skip_basis.description(),
+    });
+    emit(state, guild_id, "skipvote", payload.clone());
+    SkipDecision::Pending(json_ok(json!({
+        "ok": true,
+        "skipped": false,
+        "vote": payload,
+    })))
+}
+
+/// `{action:"skipVoteCancel"}` — 내 표만 거둔다 (V3 §10.5).
+fn skip_vote_cancel(
+    state: &Arc<WebState>,
+    ctx: &AuthContext,
+    player: &crate::models::GuildPlayerState,
+) -> Response {
+    let guild_id = ctx.guild_id();
+    let mut votes = state.skip_votes.lock().unwrap();
+    if let Some(vote) = votes.get_mut(&guild_id) {
+        vote.voters.remove(&ctx.user_id());
+        if vote.voters.is_empty() {
+            votes.remove(&guild_id);
+        }
+    }
+    drop(votes);
+    let payload = skip_vote_json(state, ctx, player);
+    emit(state, guild_id, "skipvote", payload.clone());
+    json_ok(json!({ "ok": true, "skipped": false, "vote": payload }))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VoteRequest {
     item_id: String,
-    kind: Option<QueueVoteKind>,
+    /// `"like"` · `"superLike"` · `"dislike"` · `null`(취소).
+    /// 문자열로 받아 직접 판별한다 — 모르는 값에 422 대신 **이유가 담긴 400**을 주기 위해서다.
+    kind: Option<String>,
 }
 
 async fn api_vote(
@@ -3611,24 +4453,84 @@ async fn api_vote(
             "자기가 신청한 곡에는 투표할 수 없어요.",
         );
     }
-    if let Err(error) = state.app.remote.set_vote(
-        guild_id,
-        &item.id,
-        ctx.user_id(),
-        request.kind,
-        &item.track,
-    ) {
+    let item = item.clone();
+
+    // 종류 판별. 모르는 값에는 **이유를 말하고** 거절한다 (§23.3).
+    let kind = match request.kind.as_deref() {
+        None | Some("") | Some("none") => None,
+        Some(raw) => match parse_vote_kind(raw) {
+            Some(kind) => Some(kind),
+            None if raw == "dislike" => {
+                return json_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "이 서버 버전은 아직 싫어요 투표를 지원하지 않아요.",
+                );
+            }
+            None => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "투표 종류는 like · superLike · dislike 중 하나예요.",
+                );
+            }
+        },
+    };
+
+    let points = ctx.settings.vote_points();
+    let previous = state.app.remote.user_vote(&item.id, ctx.user_id());
+    let is_super = kind == Some(QueueVoteKind::SuperLike);
+    let was_super = previous == Some(QueueVoteKind::SuperLike);
+
+    // 슈퍼 좋아요 쿨타임·하루 제한 (V3 §10.6). 관리자·봇 주인도 **똑같이** 적용된다 —
+    // 여기서 예외를 두면 그게 특혜다. 거절할 때는 이유를 정확히 말한다 (§23.3).
+    //
+    // **먼저 검사만 하고 저장이 성공한 뒤에 소비한다.** 저장이 실패했는데 하루 횟수만
+    // 깎이면 사용자가 이유 없이 한 번을 잃는다.
+    if is_super && !was_super {
+        let verdict = state.app.remote.check_super_like(
+            guild_id,
+            ctx.user_id(),
+            ctx.settings.super_like_cooldown_sec,
+            ctx.settings.super_like_daily_limit,
+        );
+        if let Some(message) = verdict.message() {
+            return json_error(StatusCode::TOO_MANY_REQUESTS, message);
+        }
+    }
+
+    if let Err(error) =
+        state
+            .app
+            .remote
+            .set_vote(guild_id, &item.id, ctx.user_id(), kind, &item.track)
+    {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
     }
+    // 슈퍼를 취소하면 사용 횟수를 돌려준다. 실수로 누른 걸 하루 종일 못 쓰게 하면 가혹하다.
+    if is_super && !was_super {
+        let _ = state.app.remote.consume_super_like(
+            guild_id,
+            ctx.user_id(),
+            ctx.settings.super_like_cooldown_sec,
+            ctx.settings.super_like_daily_limit,
+        );
+    } else if was_super && !is_super {
+        state.app.remote.refund_super_like(guild_id, ctx.user_id());
+    }
+
     state.app.player.refresh_scored_order(guild_id).await;
-    audit_ok(
-        &state,
-        guild_id,
-        &ctx.session,
-        "queue.vote",
-        Some(item.track.display_title()),
-        request.kind.map(QueueVoteKind::as_str),
-    );
+    // 사람이 읽는 피드용 액션명 (V3 §13.3). **취소는 기록하지 않는다** —
+    // 눌렀다 뗐다 반복하면 피드가 도배된다.
+    if let Some(kind) = kind {
+        audit_ok(
+            &state,
+            guild_id,
+            &ctx.session,
+            kind.audit_action(),
+            Some(item.track.display_title()),
+            Some(kind.api_key()),
+        );
+    }
+
     // 투표는 그 항목 한 줄만 바꾼다 — 전체 재조회를 유발하지 않는다.
     let score = state
         .app
@@ -3645,11 +4547,205 @@ async fn api_vote(
             "itemId": item.id,
             "like": score.like_count,
             "super": score.super_like_count,
-            "total": score.total_score(),
+            "dislike": score.dislike_count,
+            "total": score.total_score(&points),
+            "formula": score.formula(&points),
+            "likeBy": voter_ids_json(&score.like_by),
+            "superBy": voter_ids_json(&score.super_by),
+            "dislikeBy": voter_ids_json(&score.dislike_by),
         }),
     );
+
+    // 붐따 — 싫어요가 모이면 대기열에서 내린다 (V3 §10.3).
+    // **재생 중인 곡에는 적용하지 않는다.** 여기서 찾은 항목은 `upcoming` 뿐이라 그 조건은 이미 참이다.
+    let mut boomtta_fired = false;
+    if score.boomtta_triggered(&ctx.settings) {
+        boomtta_fired = apply_boomtta(&state, &ctx, &item, score.dislike_count).await;
+    }
+
     broadcast_queue(&state, guild_id).await;
-    json_ok(json!({ "ok": true }))
+    json_ok(json!({
+        "ok": true,
+        "boomtta": boomtta_fired,
+        "superLike": super_like_status(&state, guild_id, ctx.user_id(), &ctx.settings),
+    }))
+}
+
+/// 한 번에 담기 결과 (V3 §12.3 · §15.4 · §18.2).
+struct BulkOutcome {
+    source: String,
+    added: usize,
+    /// 차단·길이 초과·중복 등으로 건너뛴 곡.
+    skipped: usize,
+    /// 대기열 상한이나 한 번에 담기 상한(기본 200곡)에 걸려 못 담은 곡.
+    limited: usize,
+}
+
+impl BulkOutcome {
+    /// **조용히 자르지 않는다.** 몇 곡이 왜 안 들어갔는지 한 문장으로 말한다.
+    fn message(&self) -> String {
+        let mut text = format!("{} 에서 {}곡을 담았어요.", self.source, self.added);
+        if self.limited > 0 {
+            text.push_str(&format!(" 대기열 한도 때문에 {}곡은 못 담았어요.", self.limited));
+        }
+        if self.skipped > 0 {
+            text.push_str(&format!(
+                " 차단·길이 제한·중복으로 {}곡은 건너뛰었어요.",
+                self.skipped
+            ));
+        }
+        if self.added == 0 {
+            text = format!("{} 에서 담을 수 있는 곡이 없었어요.", self.source);
+            if self.limited > 0 {
+                text.push_str(" 대기열이 꽉 찼어요.");
+            }
+        }
+        text
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "ok": self.added > 0,
+            "added": self.added,
+            "skipped": self.skipped,
+            "limited": self.limited,
+            "message": self.message(),
+        })
+    }
+}
+
+/// 여러 곡을 상한을 지키며 담는다.
+///
+/// `0` 은 무제한이고(§23.1), 그와 별개로 **한 번에 200곡**이라는 상한이 있다(§18.2).
+/// 클릭 한 번이 대기열을 5000곡으로 만들면 되돌리기가 너무 어렵기 때문이다.
+async fn bulk_enqueue(
+    state: &Arc<WebState>,
+    ctx: &AuthContext,
+    tracks: &[TrackRef],
+    existing: &HashSet<String>,
+    player: &crate::models::GuildPlayerState,
+    source: &str,
+) -> BulkOutcome {
+    let guild_id = ctx.guild_id();
+    let session = &ctx.session;
+    let own = player
+        .upcoming
+        .iter()
+        .filter(|item| item.requested_by_user_id == Some(session.user_id))
+        .count();
+    let room = |limit: i32, used: usize| -> usize {
+        if limit <= 0 {
+            usize::MAX
+        } else {
+            (limit as usize).saturating_sub(used)
+        }
+    };
+    // 한 번에 담는 양 자체의 상한 (§18.2 (4)). 길드 설정을 그대로 따르고 `0` 이면 무제한이다(§23.1).
+    // 클릭 한 번이 대기열을 5000곡으로 만들면 되돌리기가 너무 어려워서 기본값이 200곡이다.
+    let per_call = as_limit_u32(ctx.settings.bulk_enqueue_limit)
+        .map(|limit| limit as usize)
+        .unwrap_or(usize::MAX);
+    let cap = room(ctx.settings.max_queue_per_guild, player.upcoming.len())
+        .min(room(ctx.settings.max_queue_per_user, own))
+        .min(per_call);
+
+    let mut outcome = BulkOutcome {
+        source: source.to_string(),
+        added: 0,
+        skipped: 0,
+        limited: 0,
+    };
+    let mut seen: HashSet<String> = existing.clone();
+    for track in tracks {
+        let key = track.cache_key();
+        if seen.contains(&key)
+            || track_too_long(ctx.settings.max_track_seconds, track)
+            || state.app.blacklist.is_blocked(guild_id, track)
+            || !crate::media::resolver::can_resolve(&track.source_url)
+        {
+            outcome.skipped += 1;
+            continue;
+        }
+        if outcome.added >= cap {
+            outcome.limited += 1;
+            continue;
+        }
+        seen.insert(key);
+        state
+            .app
+            .player
+            .enqueue(
+                guild_id,
+                QueueItem::new_user(
+                    track.clone(),
+                    session.display_name.clone(),
+                    Some(session.user_id),
+                ),
+                false,
+            )
+            .await;
+        outcome.added += 1;
+    }
+    if outcome.added > 0 && !session.is_developer {
+        state.app.coordinator.sync_guild(&state.app, guild_id).await;
+    }
+    outcome
+}
+
+/// 붐따 실행 (V3 §10.3). 맨 뒤로 보내거나 아예 뺀다.
+///
+/// 조용히 사라지면 그게 사고다 — 활동 로그에 남기고 접속자에게 토스트를 띄운다.
+async fn apply_boomtta(
+    state: &Arc<WebState>,
+    ctx: &AuthContext,
+    item: &QueueItem,
+    dislikes: i32,
+) -> bool {
+    let guild_id = ctx.guild_id();
+    let remove = ctx.settings.boomtta_action == crate::remote::BoomttaAction::Remove;
+    let title = item.track.display_title().to_string();
+    let done = if remove {
+        matches!(
+            state.app.player.cancel_by_id(guild_id, &item.id).await,
+            crate::player::manager::CancelOutcome::RemovedUpcoming(_)
+        )
+    } else {
+        // 맨 뒤로 — 음수 우선순위를 주면 정렬이 알아서 꼬리로 보낸다.
+        state
+            .app
+            .player
+            .set_manual_priority(guild_id, &item.id, Some(-1_000_000))
+            .await
+            .is_ok()
+    };
+    if !done {
+        return false;
+    }
+    let _ = state.app.remote.add_audit(
+        guild_id,
+        ctx.user_id(),
+        &ctx.session.display_name,
+        "queue.boomtta",
+        Some(&title),
+        None,
+        Some(if remove { "removed" } else { "bottom" }),
+        true,
+        None,
+    );
+    emit(
+        state,
+        guild_id,
+        "notice",
+        json!({
+            "kind": "warn",
+            "message": format!(
+                "{title} 이 싫어요 {dislikes}개로 대기열{}",
+                if remove { "에서 빠졌어요" } else { " 맨 뒤로 갔어요" }
+            ),
+        }),
+    );
+    emit_bare(state, guild_id, "audit");
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -3829,6 +4925,9 @@ struct PlaylistActionRequest {
     name: Option<String>,
     track: Option<TrackRef>,
     entry_index: Option<usize>,
+    /// `"user"` 면 **개인 재생목록**(V3 §12), 그 밖은 서버 재생목록.
+    /// `create` 에서만 의미가 있고, 나머지는 대상 재생목록의 실제 범위를 따른다.
+    scope: Option<String>,
 }
 
 async fn api_playlist_action(
@@ -3842,15 +4941,18 @@ async fn api_playlist_action(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    if let Err(response) = ctx.require(
-        "queueEdit",
-        ctx.settings.queue_edit_rule,
-        "재생목록을 편집할 권한이 없어요.",
-    ) {
-        return response;
-    }
+    // **개인 재생목록을 만들고 고치는 것은 권한 대상이 아니다** (V3 §12.3) — 내 것이니까.
+    // 서버 재생목록만 `queueEdit` 을 본다. 어느 쪽인지는 아래에서 대상을 찾은 뒤 판단한다.
     if let Err(response) = ctx.require_not_suspended(SuspensionScope::Queue) {
         return response;
+    }
+    if ctx.tier.is_viewer() {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            ctx.viewer_reason
+                .clone()
+                .unwrap_or_else(|| "읽기 전용이라 아무것도 조작할 수 없어요.".into()),
+        );
     }
     let session = &ctx.session;
     if rate_limited(
@@ -3866,31 +4968,72 @@ async fn api_playlist_action(
         );
     }
     let name = request.name.as_deref().map(str::trim).unwrap_or("");
+    let personal_new = request
+        .scope
+        .as_deref()
+        .is_some_and(|scope| scope.eq_ignore_ascii_case("user"));
     let target = request
         .playlist_id
         .and_then(|id| state.app.db.find_playlist(id));
+    // 대상이 개인 것인지 서버 것인지. `create` 는 요청의 `scope` 를 따른다.
+    let personal = target
+        .as_ref()
+        .map(|playlist| playlist.scope == PlaylistScope::User)
+        .unwrap_or(personal_new);
     if let Some(playlist) = target.as_ref() {
-        if playlist.scope != PlaylistScope::Guild || playlist.guild_id != Some(guild_id) {
-            return json_error(StatusCode::NOT_FOUND, "이 서버의 재생목록이 아니에요.");
+        match playlist.scope {
+            // 개인 재생목록은 **내 것만** 보인다. 남의 것은 있는지조차 알려 주지 않는다.
+            PlaylistScope::User => {
+                if playlist.owner_user_id != session.user_id {
+                    return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
+                }
+            }
+            PlaylistScope::Guild => {
+                if playlist.guild_id != Some(guild_id) {
+                    return json_error(StatusCode::NOT_FOUND, "이 서버의 재생목록이 아니에요.");
+                }
+                if playlist.owner_user_id != session.user_id && !ctx.tier.is_manager() {
+                    return json_error(
+                        StatusCode::FORBIDDEN,
+                        "만든 사람이나 관리자만 고칠 수 있어요.",
+                    );
+                }
+            }
+            PlaylistScope::Global => {
+                return json_error(
+                    StatusCode::FORBIDDEN,
+                    "봇 전체 재생목록은 여기서 고칠 수 없어요.",
+                );
+            }
         }
-        if playlist.owner_user_id != session.user_id && !ctx.tier.is_manager() {
-            return json_error(
-                StatusCode::FORBIDDEN,
-                "만든 사람이나 관리자만 고칠 수 있어요.",
-            );
-        }
+    }
+    // 서버 재생목록을 고치는 건 여전히 권한 대상이다.
+    if !personal
+        && request.action != "enqueue"
+        && let Err(response) = ctx.require(
+            "queueEdit",
+            ctx.settings.queue_edit_rule,
+            "서버 재생목록을 편집할 권한이 없어요.",
+        )
+    {
+        return response;
     }
     let audit_target = match request.action.as_str() {
         "create" => {
             if name.is_empty() || name.chars().count() > 80 {
                 return json_error(StatusCode::BAD_REQUEST, "이름은 1~80자로 입력해요.");
             }
-            let id = state.app.db.create_playlist(
-                PlaylistScope::Guild,
-                Some(guild_id),
-                session.user_id,
-                name,
-            );
+            let id = if personal_new {
+                // 길드에 안 묶인다 — 내 재생목록은 어느 서버에서든 보인다 (§12.1).
+                state.app.db.create_user_playlist(session.user_id, name)
+            } else {
+                state.app.db.create_playlist(
+                    PlaylistScope::Guild,
+                    Some(guild_id),
+                    session.user_id,
+                    name,
+                )
+            };
             format!("{id}:{name}")
         }
         "rename" => {
@@ -3921,9 +5064,8 @@ async fn api_playlist_action(
             let Some(track) = request.track else {
                 return json_error(StatusCode::BAD_REQUEST, "추가할 곡이 없어요.");
             };
-            if track.duration.is_some_and(|duration| {
-                duration.as_secs_f64() > ctx.settings.max_track_seconds as f64
-            }) || state.app.blacklist.is_blocked(guild_id, &track)
+            if track_too_long(ctx.settings.max_track_seconds, &track)
+                || state.app.blacklist.is_blocked(guild_id, &track)
             {
                 return json_error(
                     StatusCode::BAD_REQUEST,
@@ -3957,6 +5099,14 @@ async fn api_playlist_action(
             let Some(playlist) = target else {
                 return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
             };
+            // 한 번에 수십 곡이 들어가 대기열을 점거할 수 있어 권한이 따로다 (V3 §15.4).
+            if let Err(response) = ctx.require(
+                "bulkEnqueue",
+                ctx.settings.bulk_enqueue_rule,
+                "재생목록을 통째로 담을 권한이 없어요.",
+            ) {
+                return response;
+            }
             let tracks: Vec<TrackRef> = playlist
                 .entries
                 .iter()
@@ -3968,16 +5118,6 @@ async fn api_playlist_action(
                     "재생목록에 담을 수 있는 곡이 없어요.",
                 );
             }
-            if tracks.iter().any(|track| {
-                track.duration.is_some_and(|duration| {
-                    duration.as_secs_f64() > ctx.settings.max_track_seconds as f64
-                }) || state.app.blacklist.is_blocked(guild_id, track)
-            }) {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "재생목록에 길이 제한을 넘거나 차단된 곡이 섞여 있어요.",
-                );
-            }
             let player = state.app.player.get_state(guild_id).await;
             let existing: HashSet<String> = player
                 .current_item
@@ -3985,48 +5125,36 @@ async fn api_playlist_action(
                 .chain(player.upcoming.iter())
                 .map(|item| item.track.cache_key())
                 .collect();
-            if tracks
-                .iter()
-                .any(|track| existing.contains(&track.cache_key()))
-            {
-                return json_error(
-                    StatusCode::CONFLICT,
-                    "재생목록의 곡 하나가 이미 재생 중이거나 대기열에 있어요.",
-                );
+            // **조용히 자르지 않는다** (V3 §12.3). 담을 수 있는 만큼만 담고 몇 곡이 왜 빠졌는지 알려 준다.
+            let outcome = bulk_enqueue(
+                &state,
+                &ctx,
+                &tracks,
+                &existing,
+                &player,
+                &format!("재생목록 {}", playlist.name),
+            )
+            .await;
+            if outcome.added == 0 {
+                return json_error(StatusCode::CONFLICT, outcome.message());
             }
-            let own = player
-                .upcoming
-                .iter()
-                .filter(|item| item.requested_by_user_id == Some(session.user_id))
-                .count();
-            if player.upcoming.len() + tracks.len()
-                > ctx.settings.max_queue_per_guild.max(1) as usize
-                || own + tracks.len() > ctx.settings.max_queue_per_user.max(1) as usize
-            {
-                return json_error(StatusCode::CONFLICT, "대기열 제한을 넘어요.");
-            }
-            for track in tracks {
-                if crate::media::resolver::can_resolve(&track.source_url)
-                    && !state.app.blacklist.is_blocked(guild_id, &track)
-                {
-                    state
-                        .app
-                        .player
-                        .enqueue(
-                            guild_id,
-                            QueueItem::new_user(
-                                track,
-                                session.display_name.clone(),
-                                Some(session.user_id),
-                            ),
-                            false,
-                        )
-                        .await;
-                }
-            }
-            if !session.is_developer {
-                state.app.coordinator.sync_guild(&state.app, guild_id).await;
-            }
+            let _ = state.app.remote.add_audit(
+                guild_id,
+                session.user_id,
+                &session.display_name,
+                "playlist.enqueue",
+                Some(&playlist.name),
+                None,
+                Some(&outcome.added.to_string()),
+                true,
+                None,
+            );
+            emit(
+                &state,
+                guild_id,
+                "notice",
+                json!({ "kind": "info", "message": outcome.message() }),
+            );
             format!("{}:{}", playlist.id, playlist.name)
         }
         _ => {
@@ -4584,6 +5712,7 @@ fn autoplay_seed_json(state: &WebState, guild_id: u64, seed: &AutoplaySeed) -> V
 
 /// 목록 + 상한 + 내가 고칠 수 있는지. 권한이 없어도 **보이기는 한다**(V3 §8.5).
 fn autoplay_payload(state: &WebState, guild_id: u64, can_edit: bool) -> Value {
+    let settings = state.app.remote.load_guild_settings(guild_id);
     let seeds: Vec<Value> = state
         .app
         .remote
@@ -4591,7 +5720,109 @@ fn autoplay_payload(state: &WebState, guild_id: u64, can_edit: bool) -> Value {
         .iter()
         .map(|seed| autoplay_seed_json(state, guild_id, seed))
         .collect();
-    json!({ "seeds": seeds, "max": MAX_AUTOPLAY_SEEDS, "canEdit": can_edit })
+    json!({
+        "seeds": seeds,
+        // 상한은 길드 설정을 따르고 `0` 이면 무제한이다 (§23.1).
+        "max": settings.seed_limit().unwrap_or(MAX_AUTOPLAY_SEEDS as u32),
+        "unlimited": settings.seed_limit().is_none(),
+        "canEdit": can_edit,
+        // 추천 방식·정책 (V3 §8). 시드가 0개면 화면이 "최근에 튼 곡을 참고해요"를 띄운다.
+        "mode": settings.autoplay_mode.as_str(),
+        "modeLabel": settings.autoplay_mode.label(),
+        "modeDescription": settings.autoplay_mode.description(),
+        "recentCount": settings.autoplay_recent_count,
+        "genres": settings.autoplay_genres,
+        "policy": settings.autoplay_policy.as_str(),
+        "policyLabel": settings.autoplay_policy.label(),
+        "policyDescription": settings.autoplay_policy.description(),
+        "artistCooldown": settings.autoplay_artist_cooldown,
+        "recentDecayHours": settings.autoplay_recent_decay_hours,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoplayConfigRequest {
+    mode: Option<String>,
+    policy: Option<String>,
+    recent_count: Option<u32>,
+    genres: Option<Vec<String>>,
+}
+
+/// `PUT .../autoplay` — 추천 방식 부분 갱신 (V3 §8.6).
+/// **일반 사용자도 바꿀 수 있다** — 권한은 `autoplay`(기본 모든 멤버)다.
+async fn api_autoplay_put(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<AutoplayConfigRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = autoplay_gate(&ctx) {
+        return response;
+    }
+    let mut settings = ctx.settings.clone();
+    if let Some(mode) = request.mode.as_deref() {
+        let Some(mode) = AutoplayMode::parse(mode) else {
+            return json_error(StatusCode::BAD_REQUEST, "알 수 없는 자동 재생 방식이에요.");
+        };
+        settings.autoplay_mode = mode;
+    }
+    if let Some(policy) = request.policy.as_deref() {
+        let Some(policy) = AutoplayPolicy::parse(policy) else {
+            return json_error(StatusCode::BAD_REQUEST, "알 수 없는 추천 정책이에요.");
+        };
+        settings.autoplay_policy = policy;
+    }
+    if let Some(count) = request.recent_count {
+        if !(1..=20).contains(&count) {
+            return json_error(StatusCode::BAD_REQUEST, "최근 N곡은 1~20이에요.");
+        }
+        settings.autoplay_recent_count = count;
+    }
+    if let Some(genres) = request.genres {
+        if genres.len() > 20 {
+            return json_error(StatusCode::BAD_REQUEST, "장르는 20개까지 고를 수 있어요.");
+        }
+        settings.autoplay_genres = genres
+            .into_iter()
+            .map(|genre| genre.trim().to_string())
+            .filter(|genre| !genre.is_empty())
+            .collect();
+    }
+    settings.sanitize();
+    if let Err(error) = state.app.remote.save_guild_settings(&settings) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    }
+    audit_ok(
+        &state,
+        guild_id,
+        &ctx.session,
+        "autoplay.config",
+        None,
+        Some(settings.autoplay_mode.as_str()),
+    );
+    broadcast_autoplay(&state, guild_id);
+    emit_bare(&state, guild_id, "settings");
+    json_ok(json!({ "ok": true, "autoplay": autoplay_payload(&state, guild_id, true) }))
+}
+
+/// `GET .../autoplay` — 시드 + 추천 방식 (V3 §8.6).
+async fn api_autoplay_get(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let can_edit = ctx.allows("autoplay", ctx.settings.autoplay_rule);
+    json_ok(autoplay_payload(&state, guild_id, can_edit))
 }
 
 /// 시드가 바뀌면 보고 있는 사람 모두에게 알린다. 개인화 필드가 없어서 그대로 보내도 된다.
@@ -4609,15 +5840,15 @@ async fn api_autoplay_seeds(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    let can_edit = ctx.allows("autoplaySeed", ctx.settings.autoplay_seed_rule);
+    let can_edit = ctx.allows("autoplay", ctx.settings.autoplay_rule);
     json_ok(autoplay_payload(&state, guild_id, can_edit))
 }
 
 /// 기준 곡 편집 공통 게이트 — 권한 + 신청 정지.
 fn autoplay_gate(ctx: &AuthContext) -> Result<(), Response> {
     ctx.require(
-        "autoplaySeed",
-        ctx.settings.autoplay_seed_rule,
+        "autoplay",
+        ctx.settings.autoplay_rule,
         "자동 재생 기준 곡을 바꿀 권한이 없어요.",
     )?;
     ctx.require_not_suspended(SuspensionScope::Queue)
@@ -4942,10 +6173,11 @@ async fn api_settings(
         || request.min_volume > request.max_volume
         || request.default_volume < request.min_volume
         || request.default_volume > request.max_volume
-        || !(1..=100).contains(&request.max_queue_per_user)
-        || !(1..=1000).contains(&request.max_queue_per_guild)
-        || !(60..=86_400).contains(&request.max_track_seconds)
-        || !(1..=3650).contains(&request.audit_retention_days)
+        // §18.1 새 상한 + §23.1 무제한(0). 여기가 막고 있으면 화면에서 아무리 밀어도 안 저장된다.
+        || !unlimited_or(request.max_queue_per_user, 1, 1_000)
+        || !unlimited_or(request.max_queue_per_guild, 1, 10_000)
+        || !unlimited_or(request.max_track_seconds, 60, 86_400)
+        || !unlimited_or(request.audit_retention_days, 1, 3650)
         || request.configured_role_ids.len() > 50
     {
         return json_error(StatusCode::BAD_REQUEST, "설정 값이 허용 범위를 벗어났어요.");
@@ -4971,6 +6203,7 @@ async fn api_settings(
     settings.max_queue_per_guild = request.max_queue_per_guild;
     settings.max_track_seconds = request.max_track_seconds;
     settings.audit_retention_days = request.audit_retention_days;
+    settings.sanitize();
     if let Err(error) = state.app.remote.save_guild_settings(&settings) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
     }
@@ -4991,10 +6224,14 @@ async fn api_settings(
         None,
     );
     emit_bare(&state, guild_id, "settings");
-    let _ = state
-        .app
-        .remote
-        .prune_audit(guild_id, settings.audit_retention_days);
+    // **`0` 은 무제한이다** (§23.1). 0을 그대로 넘기면 `julianday('now','-0 days')` 가 되어
+    // 방금 남긴 기록까지 통째로 지운다 — 무제한을 골랐더니 전부 사라지는 최악의 결과다.
+    if settings.audit_retention_days > 0 {
+        let _ = state
+            .app
+            .remote
+            .prune_audit(guild_id, settings.audit_retention_days);
+    }
     json_ok(json!({ "ok": true }))
 }
 
@@ -5036,7 +6273,7 @@ async fn authorize_admin(
 async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value {
     let settings = state.app.remote.load_guild_settings(guild_id);
     let player = state.app.player.get_state(guild_id).await;
-    json!({
+    let mut snapshot = json!({
         "sortMode": settings.sort_mode.as_str(),
         "autoBgmEnabled": player.autoplay_enabled,
         "repeatMode": repeat_key(player.repeat_mode),
@@ -5050,7 +6287,9 @@ async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value 
         "seekRule": rule_key(settings.seek_rule),
         "volumeRule": rule_key(settings.volume_rule),
         "queueEditRule": rule_key(settings.queue_edit_rule),
-        "autoplaySeedRule": rule_key(settings.autoplay_seed_rule),
+        "skipRule": rule_key(settings.skip_rule),
+        "autoplayRule": rule_key(settings.autoplay_rule),
+        "bulkEnqueueRule": rule_key(settings.bulk_enqueue_rule),
         // V3 §1: 통짜 `configuredRoleIds`는 더 이상 내보내지 않는다.
         // 권한 키마다 지정 역할이 따로이고, 관리자 지정 역할은 아예 별개다.
         // 전부 문자열 배열이다 — JS 숫자 정밀도 손실 방지 (계약 §3).
@@ -5084,8 +6323,67 @@ async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value 
         "chatEnabled": settings.chat_enabled,
         "suggestionEnabled": settings.suggestion_enabled,
         "visualizerEnabled": settings.visualizer_enabled,
-    })
+    });
+    // v3 에서 늘어난 설정은 두 번째 묶음으로 붙인다. `json!` 하나에 다 넣으면
+    // 매크로 재귀 한도에 걸려 컴파일이 안 된다.
+    let extra = json!({
+        // ── V3 §10.1 투표 점수 ──
+        "likePoints": settings.like_points,
+        "dislikePoints": settings.dislike_points,
+        "superLikePoints": settings.super_like_points,
+        "waitPoints": settings.wait_points,
+        // ── V3 §10.3 붐따 ──
+        "boomttaEnabled": settings.boomtta_enabled,
+        "boomttaThreshold": settings.boomtta_threshold,
+        "boomttaAction": settings.boomtta_action.as_str(),
+        // ── V3 §10.5 투표 스킵 ──
+        "voteSkipEnabled": settings.vote_skip_enabled,
+        "voteSkipBasis": settings.vote_skip_basis.as_str(),
+        "voteSkipRatio": settings.vote_skip_ratio,
+        "voteSkipMin": settings.vote_skip_min,
+        // ── V3 §10.6 슈퍼 좋아요 제한 ──
+        "superLikeCooldownSec": settings.super_like_cooldown_sec,
+        "superLikeDailyLimit": settings.super_like_daily_limit,
+        // ── V3 §8 자동 재생 ──
+        "autoplayMode": settings.autoplay_mode.as_str(),
+        "autoplayRecentCount": settings.autoplay_recent_count,
+        "autoplayGenres": settings.autoplay_genres,
+        "autoplayPolicy": settings.autoplay_policy.as_str(),
+        "autoplayArtistCooldown": settings.autoplay_artist_cooldown,
+        "autoplayRecentDecayHours": settings.autoplay_recent_decay_hours,
+        "autoplaySeedMax": settings.autoplay_seed_max,
+        // ── V3 §15.2b · §18.2 ──
+        "chartSuperWeight": settings.chart_super_weight,
+        "bulkEnqueueLimit": settings.bulk_enqueue_limit,
+        // 화면이 `∞` 칸을 그리려면 어떤 항목이 무제한을 받는지 알아야 한다 (§23.1).
+        "unlimitedKeys": UNLIMITED_KEYS,
+    });
+    if let (Some(base), Some(extra)) = (snapshot.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    snapshot
 }
+
+/// `0` 을 무제한으로 받는 숫자 설정 (V3 §23.1). 관리 콘솔이 슬라이더 끝에 `∞` 칸을 붙일 때 쓴다.
+/// **예외 둘**은 여기 없다 — 볼륨(0~200 범위가 있어야 의미가 있다)과
+/// 투표 스킵 비율(백분율이라 무제한이 말이 안 된다).
+const UNLIMITED_KEYS: [&str; 13] = [
+    "maxQueuePerUser",
+    "maxQueuePerGuild",
+    "maxTrackSeconds",
+    "auditRetentionDays",
+    "chatRetentionDays",
+    "superLikeCooldownSec",
+    "superLikeDailyLimit",
+    "voteSkipMin",
+    "autoplayArtistCooldown",
+    "autoplayRecentDecayHours",
+    "boomttaThreshold",
+    "bulkEnqueueLimit",
+    "autoplaySeedMax",
+];
 
 async fn admin_settings_get(
     State(state): State<Arc<WebState>>,
@@ -5185,20 +6483,167 @@ async fn admin_settings_put(
                 };
                 state.app.player.set_repeat(guild_id, mode).await;
             }
+            // ── 투표 점수 (V3 §10.1) ──
+            for (key, slot) in [
+                ("likePoints", &mut settings.like_points),
+                ("dislikePoints", &mut settings.dislike_points),
+                ("superLikePoints", &mut settings.super_like_points),
+                ("waitPoints", &mut settings.wait_points),
+            ] {
+                if let Some(value) = json_i32(&body, key) {
+                    if !(VOTE_POINT_MIN..=VOTE_POINT_MAX).contains(&value) {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            format!("{key}: 점수는 {VOTE_POINT_MIN}~{VOTE_POINT_MAX} 사이여야 해요."),
+                        );
+                    }
+                    *slot = value;
+                }
+            }
+            // ── 붐따 (V3 §10.3) ──
+            if let Some(value) = json_bool(&body, "boomttaEnabled") {
+                settings.boomtta_enabled = value;
+            }
+            if let Some(value) = json_i32(&body, "boomttaThreshold") {
+                // `0` 은 무제한이라 아무리 눌러도 안 터진다 (§23.1).
+                if !(0..=1_000).contains(&value) {
+                    return json_error(StatusCode::BAD_REQUEST, "붐따 기준 수는 0~1000이에요.");
+                }
+                settings.boomtta_threshold = value as u32;
+            }
+            if let Some(value) = body.get("boomttaAction").and_then(Value::as_str) {
+                let Some(action) = BoomttaAction::parse(value) else {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "붐따 동작은 bottom(맨 뒤로) 또는 remove(빼기)예요.",
+                    );
+                };
+                settings.boomtta_action = action;
+            }
+            // ── 투표 스킵 (V3 §10.5) ──
+            if let Some(value) = json_bool(&body, "voteSkipEnabled") {
+                settings.vote_skip_enabled = value;
+            }
+            if let Some(value) = body.get("voteSkipBasis").and_then(Value::as_str) {
+                let Some(basis) = VoteSkipBasis::parse(value) else {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "투표 스킵 기준은 listeners · viewers · either · both 중 하나예요.",
+                    );
+                };
+                settings.vote_skip_basis = basis;
+            }
+            if let Some(value) = json_i32(&body, "voteSkipRatio") {
+                // 백분율이라 무제한이 말이 안 된다 (§23.1 예외).
+                if !(10..=100).contains(&value) {
+                    return json_error(StatusCode::BAD_REQUEST, "투표 스킵 비율은 10~100%예요.");
+                }
+                settings.vote_skip_ratio = value as u32;
+            }
+            if let Some(value) = json_i32(&body, "voteSkipMin") {
+                if !unlimited_or(value, 1, 20) {
+                    return json_error(StatusCode::BAD_REQUEST, "최소 표 수는 0(없음)~20이에요.");
+                }
+                settings.vote_skip_min = value as u32;
+            }
+            // ── 슈퍼 좋아요 제한 (V3 §10.6) ──
+            if let Some(value) = json_i32(&body, "superLikeCooldownSec") {
+                if !unlimited_or(value, 1, 3_600) {
+                    return json_error(StatusCode::BAD_REQUEST, "쿨타임은 0(없음)~3600초예요.");
+                }
+                settings.super_like_cooldown_sec = value as u32;
+            }
+            if let Some(value) = json_i32(&body, "superLikeDailyLimit") {
+                if !unlimited_or(value, 1, 100) {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "하루 횟수는 0(무제한)~100이에요.",
+                    );
+                }
+                settings.super_like_daily_limit = value as u32;
+            }
+            // ── 자동 재생 (V3 §8) ──
+            if let Some(value) = body.get("autoplayMode").and_then(Value::as_str) {
+                let Some(mode) = AutoplayMode::parse(value) else {
+                    return json_error(StatusCode::BAD_REQUEST, "알 수 없는 자동 재생 방식이에요.");
+                };
+                settings.autoplay_mode = mode;
+            }
+            if let Some(value) = body.get("autoplayPolicy").and_then(Value::as_str) {
+                let Some(policy) = AutoplayPolicy::parse(value) else {
+                    return json_error(StatusCode::BAD_REQUEST, "알 수 없는 추천 정책이에요.");
+                };
+                settings.autoplay_policy = policy;
+            }
+            if let Some(value) = json_i32(&body, "autoplayRecentCount") {
+                if !(1..=20).contains(&value) {
+                    return json_error(StatusCode::BAD_REQUEST, "최근 N곡은 1~20이에요.");
+                }
+                settings.autoplay_recent_count = value as u32;
+            }
+            if let Some(value) = json_i32(&body, "autoplayArtistCooldown") {
+                if !unlimited_or(value, 1, 20) {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "아티스트 쿨다운은 0(없음)~20곡이에요.",
+                    );
+                }
+                settings.autoplay_artist_cooldown = value as u32;
+            }
+            if let Some(value) = json_i32(&body, "autoplayRecentDecayHours") {
+                if !unlimited_or(value, 1, 168) {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "재생 이력 감쇠는 0(끔)~168시간이에요.",
+                    );
+                }
+                settings.autoplay_recent_decay_hours = value as u32;
+            }
+            if let Some(value) = json_i32(&body, "autoplaySeedMax") {
+                if !unlimited_or(value, 1, 100) {
+                    return json_error(StatusCode::BAD_REQUEST, "기준 곡 상한은 0(무제한)~100이에요.");
+                }
+                settings.autoplay_seed_max = value as u32;
+            }
+            if let Some(values) = body.get("autoplayGenres").and_then(Value::as_array) {
+                if values.len() > 20 {
+                    return json_error(StatusCode::BAD_REQUEST, "장르는 20개까지 고를 수 있어요.");
+                }
+                settings.autoplay_genres = values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|genre| !genre.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            // ── 차트 가중치 (V3 §15.2b) ──
+            if let Some(value) = json_i32(&body, "chartSuperWeight") {
+                if !(0..=5).contains(&value) {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "슈퍼 좋아요 가중치는 0~5예요. 0이면 아예 안 세요.",
+                    );
+                }
+                settings.chart_super_weight = value as u32;
+            }
         }
         "perms" => {
             // 저장하는 순간 레거시 통짜 값을 8개 키로 펼친다. 그래야 이후로는
             // 읽기 폴백에 기대지 않고 키마다 따로 관리된다 (V3 §1 마이그레이션).
             settings.expand_legacy_roles();
-            let rules: [(&str, &mut PermissionRule); 8] = [
+            // 권한 10종 (V3 §1 + §10.5 + §8.3 + §15.4). 관리자 지정 역할은 별개 축이라 11종이다.
+            let rules: [(&str, &mut PermissionRule); 10] = [
                 ("searchRule", &mut settings.search_rule),
                 ("voteRule", &mut settings.vote_rule),
                 ("chatRule", &mut settings.chat_rule),
                 ("playbackRule", &mut settings.playback_rule),
+                ("skipRule", &mut settings.skip_rule),
                 ("seekRule", &mut settings.seek_rule),
                 ("volumeRule", &mut settings.volume_rule),
                 ("queueEditRule", &mut settings.queue_edit_rule),
-                ("autoplaySeedRule", &mut settings.autoplay_seed_rule),
+                ("autoplayRule", &mut settings.autoplay_rule),
+                ("bulkEnqueueRule", &mut settings.bulk_enqueue_rule),
             ];
             for (key, slot) in rules {
                 match json_rule(&body, key) {
@@ -5207,11 +6652,25 @@ async fn admin_settings_put(
                     Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
                 }
             }
+            // 옛 이름으로 보내는 콘솔도 받아 준다 — 저장이 조용히 안 먹는 게 제일 나쁘다.
+            for (legacy, canonical) in [
+                ("autoplaySeedRule", &mut settings.autoplay_rule),
+                ("playlistEnqueueRule", &mut settings.bulk_enqueue_rule),
+            ] {
+                if body.get(legacy).is_some() {
+                    match json_rule(&body, legacy) {
+                        Ok(Some(rule)) => *canonical = rule,
+                        Ok(None) => {}
+                        Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
+                    }
+                }
+            }
             // `ruleRoleIds`는 보낸 키만 갱신한다. 안 보낸 키는 건드리지 않는다 —
             // 관리 콘솔이 섹션 일부만 저장해도 다른 권한의 역할이 날아가면 안 된다.
             if let Some(map) = body.get("ruleRoleIds").and_then(Value::as_object) {
                 for (key, value) in map {
-                    if !PERMISSION_KEYS.contains(&key.as_str()) {
+                    let key = canonical_permission_key(key);
+                    if !PERMISSION_KEYS.contains(&key) {
                         return json_error(
                             StatusCode::BAD_REQUEST,
                             format!("{key}: 알 수 없는 권한 키예요."),
@@ -5221,7 +6680,7 @@ async fn admin_settings_put(
                         Ok(ids) => ids,
                         Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
                     };
-                    settings.rule_role_ids.insert(key.clone(), ids);
+                    settings.rule_role_ids.insert(key.to_string(), ids);
                 }
             }
             if let Some(value) = body.get("managerRoleIds") {
@@ -5250,17 +6709,29 @@ async fn admin_settings_put(
             if let Some(value) = json_i32(&body, "auditRetentionDays") {
                 settings.audit_retention_days = value;
             }
+            if let Some(value) = json_i32(&body, "bulkEnqueueLimit") {
+                // 클릭 한 번이 대기열을 5000곡으로 만들면 되돌리기가 너무 어렵다 (§18.2 (4)).
+                if !unlimited_or(value, 1, 10_000) {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "한 번에 담기 상한은 0(무제한)~10000이에요.",
+                    );
+                }
+                settings.bulk_enqueue_limit = value as u32;
+            }
             if let Some(value) = json_i32(&body, "chatRetentionDays") {
-                settings.chat_retention_days = value.max(1) as u32;
+                // `.max(1)` 클램프 제거 — `0` 은 무제한이라 그대로 저장한다 (§23.1).
+                settings.chat_retention_days = value.max(0) as u32;
             }
             if settings.min_volume < 0
                 || settings.max_volume > 200
                 || settings.min_volume > settings.max_volume
-                || !(1..=100).contains(&settings.max_queue_per_user)
-                || !(1..=1000).contains(&settings.max_queue_per_guild)
-                || !(60..=86_400).contains(&settings.max_track_seconds)
-                || !(1..=3650).contains(&settings.audit_retention_days)
-                || !(1..=365).contains(&settings.chat_retention_days)
+                // §18.1 새 상한(1인 1000 / 서버 10000) + §23.1 무제한(0).
+                || !unlimited_or(settings.max_queue_per_user, 1, 1_000)
+                || !unlimited_or(settings.max_queue_per_guild, 1, 10_000)
+                || !unlimited_or(settings.max_track_seconds, 60, 86_400)
+                || !unlimited_or(settings.audit_retention_days, 1, 3650)
+                || !unlimited_or(settings.chat_retention_days as i32, 1, 365)
             {
                 return json_error(StatusCode::BAD_REQUEST, "허용 범위를 벗어난 값이 있어요.");
             }
@@ -5282,6 +6753,9 @@ async fn admin_settings_put(
         _ => return json_error(StatusCode::NOT_FOUND, "알 수 없는 설정 섹션이에요."),
     }
 
+    // `0 = 무제한` 규약과 각 범위를 저장 직전에 한 번 더 못 박는다 (§23.1).
+    // 어떤 라우트를 거쳐 들어와도 서버가 실제로 그 규약대로 동작해야 한다.
+    settings.sanitize();
     if let Err(error) = state.app.remote.save_guild_settings(&settings) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
     }
@@ -5391,7 +6865,10 @@ async fn admin_queue_preview(
         .map(|(index, item)| (item.id.as_str(), index + 1))
         .collect();
     let mut preview = player.upcoming.clone();
-    ranking::sort_queue(&mut preview, &scores, mode);
+    ranking::sort_queue(&mut preview, &scores, mode, &ctx.settings.vote_points());
+    // 미리보기 점수도 서버 설정을 그대로 쓴다 (V3 §10.1) — 화면과 실제 순서가 어긋나면
+    // 미리보기가 쓸모없어진다.
+    let points = ctx.settings.vote_points();
 
     let items: Vec<Value> = preview
         .iter()
@@ -5407,7 +6884,8 @@ async fn admin_queue_preview(
                 "title": item.track.display_title(),
                 "requestedBy": item.requested_by_display,
                 "roundLabel": format!("{}번째 곡", score.round + 1),
-                "score": score.total_score(),
+                "score": score.total_score(&points),
+                "formula": score.formula(&points),
                 "currentPosition": current,
                 "previewPosition": index + 1,
                 "delta": current as i64 - (index as i64 + 1),
@@ -5453,6 +6931,7 @@ async fn admin_permission_preview(
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .unwrap_or("search");
+    let key = canonical_permission_key(key);
     if !PERMISSION_KEYS.contains(&key) {
         return json_error(StatusCode::BAD_REQUEST, "알 수 없는 권한 키예요.");
     }
@@ -5467,7 +6946,8 @@ async fn admin_permission_preview(
         settings.rule_role_ids.insert(key.to_string(), ids);
     }
 
-    let player = state.app.player.get_state(guild_id).await;
+    // V3 §16 B1 — 저장값이 아니라 캐시가 봇의 현재 위치다.
+    let bot_channel = bot_voice_status(&state, guild_id).channel_id;
     let mut member_count = 0usize;
     let mut pass_count = 0usize;
     let mut bypass_count = 0usize;
@@ -5498,7 +6978,7 @@ async fn admin_permission_preview(
                             })
                             .unwrap_or(false)
                     });
-                let same_voice = player.voice_channel_id.is_some_and(|channel| {
+                let same_voice = bot_channel.is_some_and(|channel| {
                     guild
                         .voice_states
                         .get(user_id)
@@ -5542,7 +7022,7 @@ async fn admin_permission_preview(
         note = "아직 멤버 캐시가 비어 있어요. 봇이 접속을 마치면 정확해져요.".into();
     } else if rule == PermissionRule::Disabled {
         note = "사용 안 함은 관리자와 봇 주인까지 전부 막아요.".into();
-    } else if rule == PermissionRule::SameVoiceChannel && player.voice_channel_id.is_none() {
+    } else if rule == PermissionRule::SameVoiceChannel && bot_channel.is_none() {
         note = "봇이 음성 채널에 없어서 지금은 관리자만 통과해요.".into();
     } else if rule == PermissionRule::ConfiguredRole && settings.roles_for(key).is_empty() {
         note = "이 권한에 지정된 역할이 없어서 지금은 관리자만 통과해요.".into();
@@ -5982,25 +7462,15 @@ async fn admin_diagnostics(
     if let Err(response) = authorize_admin(&state, &cookies, guild_id, None).await {
         return response;
     }
-    let player = state.app.player.get_state(guild_id).await;
-    let voice_channel_name = player.voice_channel_id.and_then(|channel| {
-        state
-            .app
-            .discord_cache
-            .get()
-            .and_then(|cache| cache.guild(GuildId::new(guild_id)))
-            .and_then(|guild| {
-                guild
-                    .channels
-                    .get(&serenity::all::ChannelId::new(channel))
-                    .map(|channel| channel.name.clone())
-            })
-    });
+    // V3 §16 B1 — 진단 화면이야말로 저장값이 아니라 실제 상태를 보여 줘야 한다.
+    let bot = bot_voice_status(&state, guild_id);
     json_ok(json!({
         "bot": {
             "online": bot_in_guild(&state, guild_id),
-            "voiceConnected": player.voice_channel_id.is_some(),
-            "voiceChannelName": voice_channel_name,
+            "inGuild": bot.in_guild,
+            "voiceConnected": bot.in_voice(),
+            "voiceChannelId": bot.channel_id.map(|id| id.to_string()),
+            "voiceChannelName": bot.channel_name,
             // 게이트웨이 지연은 ShardManager 핸들이 있어야 읽을 수 있다(App에 없음).
             "gatewayLatencyMs": Value::Null,
         },
@@ -6009,6 +7479,778 @@ async fn admin_diagnostics(
         "schemaVersion": Value::Null,
         "uptimeSeconds": uptime_seconds(),
     }))
+}
+
+// ───────────────────────── 대기열 페이지네이션 (V3 §18.2) ─────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct QueuePageQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// `/state/hot` 과 `queue.set` 은 앞 200곡만 싣는다. 그 뒤를 보고 싶을 때만 여기로 온다.
+/// 보통 사람은 앞 20곡만 보므로 **평소에는 이 요청이 아예 일어나지 않는다**.
+async fn api_queue_page(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    Query(query): Query<QueuePageQuery>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(QUEUE_PAGE_MAX).clamp(1, QUEUE_PAGE_MAX);
+    let player = state.app.player.get_state(guild_id).await;
+    let mut scores = state.app.remote.queue_scores(guild_id);
+    ranking::apply_rounds(&player.upcoming, &mut scores);
+    let points = ctx.settings.vote_points();
+    let items: Vec<Value> = player
+        .upcoming
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|item| {
+            let score = scores.get(&item.id).cloned().unwrap_or_default();
+            let my_vote = state.app.remote.user_vote(&item.id, ctx.user_id());
+            queue_item_json(item, &score, ctx.user_id(), my_vote, &points)
+        })
+        .collect();
+    json_ok(json!({
+        "items": items,
+        "offset": offset,
+        "limit": limit,
+        "queueTotal": player.upcoming.len(),
+        "hasMore": offset + items.len() < player.upcoming.len(),
+    }))
+}
+
+// ───────────────────────── 통계 (V3 §22.6) · 사람 카드 (§24.2) ─────────────────────────
+
+/// 봇 전체 합계를 가리키는 길드 ID (통계 DB 규약).
+const STATS_ALL_GUILDS: u64 = crate::stats::all_guilds();
+
+/// **60초 캐시** (V3 §22.6 · §23.2). 통계는 실시간일 이유가 없고,
+/// 캐시가 없으면 사람 카드를 열 때마다 집계 쿼리가 돈다.
+fn stats_cached(state: &WebState, key: String, build: impl FnOnce() -> Value) -> Value {
+    {
+        let cache = state.stats_cache.lock().unwrap();
+        if let Some((stored, value)) = cache.get(&key) {
+            if stored.elapsed() < STATS_CACHE_TTL {
+                return value.clone();
+            }
+        }
+    }
+    let value = build();
+    state
+        .stats_cache
+        .lock()
+        .unwrap()
+        .insert(key, (Instant::now(), value.clone()));
+    value
+}
+
+/// 통계 기능이 꺼져 있을 때의 답. **빈 숫자를 0으로 꾸미지 않는다** —
+/// 0회 재생과 "기록을 못 받고 있음"은 완전히 다른 이야기다.
+fn stats_unavailable() -> Response {
+    json_ok(json!({
+        "available": false,
+        "message": "통계 기록이 꺼져 있어서 보여 줄 게 없어요.",
+    }))
+}
+
+fn user_stats_json(
+    stats: &crate::stats::Stats,
+    guild_id: u64,
+    user_id: u64,
+    include_given: bool,
+) -> Value {
+    let totals = stats.user_stats(guild_id, user_id);
+    let top = |order: &str| -> Value {
+        json!(
+            stats
+                .top_user_tracks(guild_id, user_id, order, 5)
+                .into_iter()
+                .map(|row| json!({
+                    "cacheKey": row.cache_key,
+                    "track": row.track,
+                    "requested": row.requested,
+                    "liked": row.liked,
+                    "played": row.played,
+                    "likesRecv": row.likes_recv,
+                    "lastUtc": row.last_utc,
+                }))
+                .collect::<Vec<_>>()
+        )
+    };
+    let daily: Vec<Value> = stats
+        .user_daily(guild_id, user_id, 30)
+        .into_iter()
+        .map(|(day, queued, played, likes)| {
+            json!({ "day": day, "queued": queued, "played": played, "likesRecv": likes })
+        })
+        .collect();
+
+    let mut summary = json!({
+        "queuedSingle": totals.queued_single,
+        "queuedBulk": totals.queued_bulk,
+        "bulkTimes": totals.bulk_times,
+        "queuedTotal": totals.queued_total(),
+        "played": totals.played,
+        "skipped": totals.skipped,
+        "boomtta": totals.boomtta,
+        "likesRecv": totals.likes_recv,
+        "supersRecv": totals.supers_recv,
+        "dislikesRecv": totals.dislikes_recv,
+        "chats": totals.chats,
+        "firstUtc": totals.first_utc,
+        "lastUtc": totals.last_utc,
+        // 마참 점수 (§22.4) — 대기열 순서·권한에 **일절 영향을 주지 않는다.** 보는 재미다.
+        "karma": totals.karma(),
+    });
+    // 남의 기록은 **받은 것만** 보여 준다 (§22.5). 누가 누구에게 눌렀는지가 드러나면
+    // 채팅방 분위기가 이상해진다.
+    if include_given {
+        summary["likesGive"] = json!(totals.likes_give);
+        summary["supersGive"] = json!(totals.supers_give);
+        summary["dislikesGive"] = json!(totals.dislikes_give);
+    }
+
+    json!({
+        "available": true,
+        "userId": user_id.to_string(),
+        "summary": summary,
+        "topRequested": top("requested"),
+        "topLoved": top("likes_recv"),
+        // 내가 누구 곡에 좋아요를 눌렀는지는 나만 본다.
+        "topLiked": if include_given { top("liked") } else { json!([]) },
+        // 3일치도 없으면 화면이 그래프 대신 안내를 띄운다 (§22.5).
+        "daily": daily,
+    })
+}
+
+async fn api_stats_me(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let Some(stats) = state.app.stats.clone() else {
+        return stats_unavailable();
+    };
+    let user_id = ctx.user_id();
+    json_ok(stats_cached(&state, format!("me:{guild_id}:{user_id}"), || {
+        user_stats_json(&stats, guild_id, user_id, true)
+    }))
+}
+
+async fn api_stats_user(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path((guild_id, user_id)): Path<(u64, u64)>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let Some(stats) = state.app.stats.clone() else {
+        return stats_unavailable();
+    };
+    // 자기 자신이면 준 것도 같이 본다 — 내 기록이니까.
+    let mine = user_id == ctx.user_id();
+    json_ok(stats_cached(
+        &state,
+        format!("user:{guild_id}:{user_id}:{mine}"),
+        || user_stats_json(&stats, guild_id, user_id, mine),
+    ))
+}
+
+/// 서버 전체 요약 (관리 콘솔용). 통계 보기는 길드 멤버면 누구나 —
+/// 권한을 하나 더 만들지 않는다(§22.6).
+async fn api_stats_server(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let Some(stats) = state.app.stats.clone() else {
+        return stats_unavailable();
+    };
+    let weight = ctx.settings.chart_super_weight;
+    json_ok(stats_cached(&state, format!("server:{guild_id}"), || {
+        let plays = stats.chart(
+            guild_id,
+            crate::stats::ChartKind::Plays,
+            crate::stats::ChartWindow::Month,
+            weight,
+            10,
+        );
+        let love = stats.chart(
+            guild_id,
+            crate::stats::ChartKind::Love,
+            crate::stats::ChartWindow::Month,
+            weight,
+            10,
+        );
+        json!({
+            "available": true,
+            "superWeight": weight,
+            "topPlayed": chart_rows_json(&plays, weight),
+            "topLoved": chart_rows_json(&love, weight),
+        })
+    }))
+}
+
+// ───────────────────────── 차트 (V3 §15.5) ─────────────────────────
+
+fn chart_rows_json(rows: &[crate::stats::ChartRow], weight: u32) -> Value {
+    json!(
+        rows.iter()
+            .enumerate()
+            .map(|(index, row)| json!({
+                "rank": index + 1,
+                "cacheKey": row.cache_key,
+                "track": row.track,
+                "playsUser": row.plays_user,
+                // 자동재생 횟수는 순위에 안 쓰지만 궁금하니 툴팁용으로 같이 준다 (§15.2b).
+                "playsAutoplay": row.plays_autoplay,
+                "likes": row.likes,
+                "supers": row.supers,
+                "requesters": row.requesters,
+                "loveScore": row.love_score,
+                // 순위가 왜 그런지 보여야 한다 — 계산을 그대로 문장으로 준다.
+                "loveFormula": format!("👍{} + ⭐{}×{} = {}", row.likes, row.supers, weight, row.love_score),
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+fn chart_def_json(chart: &ChartDef) -> Value {
+    json!({
+        "id": chart.id,
+        "name": chart.name,
+        "provider": chart.provider,
+        "category": chart.category.as_str(),
+        "internal": chart.is_internal(),
+        "builtin": chart.builtin,
+        "enabled": chart.enabled,
+        "trackCount": chart.track_count,
+        "lastFetchedUtc": chart.last_fetched_utc,
+        "lastFailureUtc": chart.last_failure_utc,
+        "lastFailureReason": chart.last_failure_reason,
+        "ok": chart.ok(),
+    })
+}
+
+/// `GET .../charts` — 1단계 분류 카드 + 각 분류의 차트 목록 (V3 §15.3).
+///
+/// **작동하지 않는 차트는 유저 UI 목록에서 뺀다**(§15.2). 빈 차트를 눌렀는데 아무 일도
+/// 안 일어나는 게 제일 나쁘다. 관리자에게는 실패까지 그대로 보여 준다.
+async fn api_charts(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let manager = ctx.tier.is_manager();
+    let stats_on = state.app.stats.is_some();
+    let charts = state.app.remote.list_charts(guild_id);
+    let categories: Vec<Value> = ChartCategory::ALL
+        .iter()
+        .map(|category| {
+            let items: Vec<Value> = charts
+                .iter()
+                .filter(|chart| chart.category == *category)
+                .filter(|chart| manager || (chart.enabled && chart.ok()))
+                // 통계가 꺼져 있으면 우리 차트는 만들 수가 없다 — 조용히 뺀다 (§15.2b).
+                .filter(|chart| stats_on || !chart.is_internal())
+                .map(chart_def_json)
+                .collect();
+            json!({
+                "key": category.as_str(),
+                "label": category.label(),
+                "icon": category.icon(),
+                "blurb": category.blurb(),
+                "charts": items,
+            })
+        })
+        .filter(|category| {
+            manager
+                || !category["charts"]
+                    .as_array()
+                    .map(|items| items.is_empty())
+                    .unwrap_or(true)
+        })
+        .collect();
+    json_ok(json!({
+        "categories": categories,
+        "superWeight": ctx.settings.chart_super_weight,
+        // 전부 담기 버튼을 숨기지 말고 비활성 + 이유로 그리기 위한 값 (§15.3 · §23.3).
+        "canBulkEnqueue": ctx.allows("bulkEnqueue", ctx.settings.bulk_enqueue_rule),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartWindowQuery {
+    window: Option<String>,
+}
+
+/// 우리 차트(`internal:…`)를 통계 DB 에서 만든다 (V3 §15.2b).
+///
+/// **자동재생으로 나간 곡은 순위에 안 센다.** 같이 세면 차트가 "자동재생이 많이 튼 곡"이 된다.
+/// 전체 차트는 곡 제목과 횟수만 준다 — 어느 서버에서 나왔는지, 누가 신청했는지는 안 보낸다.
+fn internal_chart_json(
+    state: &WebState,
+    chart: &ChartDef,
+    guild_id: u64,
+    window: crate::stats::ChartWindow,
+    weight: u32,
+) -> Option<Value> {
+    let stats = state.app.stats.as_ref()?;
+    let suffix = chart.url.trim_start_matches(INTERNAL_CHART_PREFIX);
+    let (scope, kind) = match suffix {
+        "guild-plays" => (guild_id, crate::stats::ChartKind::Plays),
+        "guild-love" => (guild_id, crate::stats::ChartKind::Love),
+        "global-plays" => (STATS_ALL_GUILDS, crate::stats::ChartKind::Plays),
+        "global-love" => (STATS_ALL_GUILDS, crate::stats::ChartKind::Love),
+        _ => return None,
+    };
+    let rows = stats.chart(scope, kind, window, weight, OURS_CHART_LIMIT);
+    Some(json!({
+        "chart": chart_def_json(chart),
+        "rows": chart_rows_json(&rows, weight),
+        "tracks": rows.iter().map(|row| row.track.clone()).collect::<Vec<_>>(),
+        "fetchedUtc": now_utc(),
+        "stale": false,
+        "internal": true,
+        // 전체 차트는 서버 이름도 신청자도 안 보여 준다 (§15.2b 사생활).
+        "anonymous": scope == STATS_ALL_GUILDS,
+    }))
+}
+
+/// `GET .../charts/{id}` — 그 차트의 곡 목록.
+async fn api_chart_detail(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path((guild_id, chart_id)): Path<(u64, i64)>,
+    Query(query): Query<ChartWindowQuery>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let Some(chart) = state.app.remote.get_chart(guild_id, chart_id) else {
+        return json_error(StatusCode::NOT_FOUND, "그 차트를 찾지 못했어요.");
+    };
+    let weight = ctx.settings.chart_super_weight;
+    if chart.is_internal() {
+        let window = crate::stats::ChartWindow::parse(query.window.as_deref().unwrap_or("month"));
+        return match internal_chart_json(&state, &chart, guild_id, window, weight) {
+            Some(payload) => json_ok(payload),
+            None => stats_unavailable(),
+        };
+    }
+    match fetch_chart_tracks(&state, &chart, false).await {
+        Ok(snapshot) => json_ok(json!({
+            "chart": chart_def_json(&chart),
+            "tracks": snapshot.tracks,
+            "fetchedUtc": snapshot.fetched_utc,
+            "stale": snapshot.stale,
+            "internal": false,
+        })),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, error),
+    }
+}
+
+/// 차트 하나를 펼친다. 캐시가 살아 있으면 그걸 그대로 준다 (V3 §15.1).
+///
+/// **같은 차트를 동시에 요청하면 하나만 실행한다.** 안 그러면 yt-dlp 가 줄줄이 선다.
+/// 뒤에 선 요청은 잠깐 기다렸다 캐시를 다시 본다.
+async fn fetch_chart_tracks(
+    state: &Arc<WebState>,
+    chart: &ChartDef,
+    force: bool,
+) -> Result<ChartSnapshot, String> {
+    if !force {
+        if let Some(snapshot) = state.app.remote.chart_cache(chart.id) {
+            if !snapshot.stale {
+                return Ok(snapshot);
+            }
+        }
+    }
+    if !state.app.remote.try_begin_chart_fetch(chart.id) {
+        // 다른 요청이 이미 돌고 있다. 잠깐 기다렸다 캐시를 본다.
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if !state.app.remote.is_chart_fetching(chart.id) {
+                break;
+            }
+        }
+        return state
+            .app
+            .remote
+            .chart_cache(chart.id)
+            .ok_or_else(|| "차트를 가져오는 중이에요. 잠시 뒤에 다시 열어 주세요.".to_string());
+    }
+    let provider = match chart.provider.as_str() {
+        "YouTubeMusic" => ProviderKind::YouTubeMusic,
+        "SoundCloud" => ProviderKind::SoundCloud,
+        _ => ProviderKind::YouTube,
+    };
+    let tracks = state
+        .app
+        .ytdlp()
+        .expand_collection(&chart.url, provider)
+        .await;
+    state.app.remote.end_chart_fetch(chart.id);
+    if tracks.is_empty() {
+        // **숨기지 말고 그대로 알린다** (§15.2). 관리 콘솔이 실패 시각을 보여 준다.
+        let _ = state
+            .app
+            .remote
+            .mark_chart_failure(chart.id, "곡 목록이 비어 있어요.");
+        // 캐시에 예전 값이 있으면 빈 화면보다는 그게 낫다.
+        return state
+            .app
+            .remote
+            .chart_cache(chart.id)
+            .ok_or_else(|| "지금 이 차트를 가져오지 못했어요.".to_string());
+    }
+    let _ = state.app.remote.save_chart_cache(chart.id, &tracks);
+    Ok(ChartSnapshot {
+        tracks,
+        fetched_utc: now_utc(),
+        stale: false,
+    })
+}
+
+/// `POST .../charts/{id}/enqueue` — 전부 담기. `bulkEnqueue` 권한 (V3 §15.4).
+async fn api_chart_enqueue(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path((guild_id, chart_id)): Path<(u64, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = ctx.require(
+        "bulkEnqueue",
+        ctx.settings.bulk_enqueue_rule,
+        "차트를 통째로 담을 권한이 없어요.",
+    ) {
+        return response;
+    }
+    if let Err(response) = ctx.require_not_suspended(SuspensionScope::Queue) {
+        return response;
+    }
+    let Some(chart) = state.app.remote.get_chart(guild_id, chart_id) else {
+        return json_error(StatusCode::NOT_FOUND, "그 차트를 찾지 못했어요.");
+    };
+    let tracks: Vec<TrackRef> = if chart.is_internal() {
+        let Some(stats) = state.app.stats.as_ref() else {
+            return stats_unavailable();
+        };
+        let suffix = chart.url.trim_start_matches(INTERNAL_CHART_PREFIX);
+        let (scope, kind) = match suffix {
+            "guild-love" => (guild_id, crate::stats::ChartKind::Love),
+            "global-plays" => (STATS_ALL_GUILDS, crate::stats::ChartKind::Plays),
+            "global-love" => (STATS_ALL_GUILDS, crate::stats::ChartKind::Love),
+            _ => (guild_id, crate::stats::ChartKind::Plays),
+        };
+        stats
+            .chart(
+                scope,
+                kind,
+                crate::stats::ChartWindow::Month,
+                ctx.settings.chart_super_weight,
+                OURS_CHART_LIMIT,
+            )
+            .into_iter()
+            .filter_map(|row| serde_json::from_value::<TrackRef>(row.track).ok())
+            .collect()
+    } else {
+        match fetch_chart_tracks(&state, &chart, false).await {
+            Ok(snapshot) => snapshot.tracks,
+            Err(error) => return json_error(StatusCode::BAD_GATEWAY, error),
+        }
+    };
+    if tracks.is_empty() {
+        return json_error(StatusCode::CONFLICT, "이 차트에는 담을 곡이 없어요.");
+    }
+
+    let player = state.app.player.get_state(guild_id).await;
+    let existing: HashSet<String> = player
+        .current_item
+        .iter()
+        .chain(player.upcoming.iter())
+        .map(|item| item.track.cache_key())
+        .collect();
+    let outcome = bulk_enqueue(
+        &state,
+        &ctx,
+        &tracks,
+        &existing,
+        &player,
+        &format!("차트 {}", chart.name),
+    )
+    .await;
+    if outcome.added > 0 {
+        // 사람 피드에는 **한 줄**만 남긴다 (§13.3). 100곡을 한 줄씩 남기면 피드가 도배된다.
+        let titles: Vec<String> = tracks
+            .iter()
+            .take(200)
+            .map(|track| track.display_title().to_string())
+            .collect();
+        let _ = state.app.remote.add_audit_bulk(
+            guild_id,
+            ctx.user_id(),
+            &ctx.session.display_name,
+            "chart.enqueue",
+            Some(&chart.name),
+            outcome.added as u32,
+            &titles,
+        );
+        emit_bare(&state, guild_id, "audit");
+        broadcast_queue(&state, guild_id).await;
+    }
+    let mut payload = outcome.to_json();
+    payload["chart"] = json!(chart.name);
+    json_ok(payload)
+}
+
+/// `POST .../charts/{id}/refresh` — 관리자만. 캐시를 무시하고 다시 가져온다.
+async fn api_chart_refresh(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path((guild_id, chart_id)): Path<(u64, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match authorize_admin(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let Some(chart) = state.app.remote.get_chart(guild_id, chart_id) else {
+        return json_error(StatusCode::NOT_FOUND, "그 차트를 찾지 못했어요.");
+    };
+    if chart.is_internal() {
+        // 우리 차트는 통계 DB 에서 즉석에서 만든다 — 새로 받을 것 자체가 없다.
+        return json_ok(json!({
+            "ok": true,
+            "message": "우리 차트는 늘 최신이라 새로고침할 게 없어요.",
+        }));
+    }
+    match fetch_chart_tracks(&state, &chart, true).await {
+        Ok(snapshot) => {
+            audit_ok(
+                &state,
+                guild_id,
+                &ctx.session,
+                "chart.refresh",
+                Some(&chart.name),
+                Some(&snapshot.tracks.len().to_string()),
+            );
+            json_ok(json!({
+                "ok": true,
+                "trackCount": snapshot.tracks.len(),
+                "fetchedUtc": snapshot.fetched_utc,
+                "message": format!("{}곡을 새로 받았어요.", snapshot.tracks.len()),
+            }))
+        }
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, error),
+    }
+}
+
+// ───────────────────────── 서버 차단 목록 (V3 §19.2) ─────────────────────────
+
+fn blacklist_json(entry: &crate::models::BlacklistEntry, guild_id: u64) -> Value {
+    let global = entry.guild_id == 0;
+    json!({
+        "id": entry.id,
+        "kind": entry.kind.as_str(),
+        "kindLabel": entry.kind.label(),
+        "pattern": entry.pattern,
+        "note": entry.note,
+        "createdUtc": entry.created_utc,
+        "createdByUserId": entry.created_by_user_id.to_string(),
+        // 전역 항목은 보여는 주되 못 지운다 — 왜 막혔는지 모르는 게 제일 답답하다 (§19.1).
+        "scope": if global { "global" } else { "guild" },
+        "removable": !global && entry.guild_id == guild_id,
+    })
+}
+
+async fn admin_blacklist_get(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+) -> Response {
+    if let Err(response) = authorize_admin(&state, &cookies, guild_id, None).await {
+        return response;
+    }
+    let items: Vec<Value> = state
+        .app
+        .db
+        .list_blacklist(guild_id)
+        .iter()
+        .map(|entry| blacklist_json(entry, guild_id))
+        .collect();
+    json_ok(json!({ "items": items }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlacklistAddRequest {
+    kind: String,
+    pattern: String,
+    note: Option<String>,
+}
+
+async fn admin_blacklist_add(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<BlacklistAddRequest>,
+) -> Response {
+    let ctx = match authorize_admin(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let Some(kind) = crate::models::BlacklistKind::parse(&request.kind) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "차단 종류는 TitleContains · TitleExact · UrlExact 중 하나예요.",
+        );
+    };
+    let pattern = request.pattern.trim();
+    if pattern.is_empty() || pattern.chars().count() > 300 {
+        return json_error(StatusCode::BAD_REQUEST, "패턴은 1~300자로 입력해요.");
+    }
+    let id = state.app.db.add_blacklist(
+        guild_id,
+        kind,
+        pattern,
+        ctx.user_id(),
+        request.note.as_deref().map(str::trim).filter(|note| !note.is_empty()),
+    );
+    audit_ok(
+        &state,
+        guild_id,
+        &ctx.session,
+        "blacklist.add",
+        Some(pattern),
+        Some(kind.as_str()),
+    );
+    emit_bare(&state, guild_id, "audit");
+    json_ok(json!({ "ok": true, "id": id }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BlacklistRemoveRequest {
+    id: i64,
+}
+
+/// **전역 항목이면 403** (V3 §19.1). UI 에서 숨기는 것에 의존하지 않고 서버가 막는다.
+async fn admin_blacklist_remove(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<BlacklistRemoveRequest>,
+) -> Response {
+    let ctx = match authorize_admin(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let target = state
+        .app
+        .db
+        .list_blacklist(guild_id)
+        .into_iter()
+        .find(|entry| entry.id == request.id);
+    let Some(target) = target else {
+        return json_error(StatusCode::NOT_FOUND, "그 차단 항목을 찾지 못했어요.");
+    };
+    if !state.app.db.remove_guild_blacklist(request.id, guild_id) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            if target.guild_id == 0 {
+                "이건 봇 전체 규칙이라 서버 관리자가 지울 수 없어요."
+            } else {
+                "이 서버가 만든 항목만 지울 수 있어요."
+            },
+        );
+    }
+    audit_ok(
+        &state,
+        guild_id,
+        &ctx.session,
+        "blacklist.remove",
+        Some(&target.pattern),
+        Some(target.kind.as_str()),
+    );
+    emit_bare(&state, guild_id, "audit");
+    json_ok(json!({ "ok": true }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BlacklistTestRequest {
+    query: String,
+}
+
+/// 지금 규칙으로 막히는지 시험한다 (V3 §19.3).
+/// 규칙을 넣고 나서 왜 안 막히는지 모르는 상황을 막는 게 목적이라, **어떤 규칙에 걸렸는지**도 준다.
+async fn admin_blacklist_test(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<BlacklistTestRequest>,
+) -> Response {
+    if let Err(response) = authorize_admin(&state, &cookies, guild_id, Some(&headers)).await {
+        return response;
+    }
+    let query = request.query.trim();
+    if query.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "시험할 제목이나 주소를 넣어 주세요.");
+    }
+    // 제목으로도 주소로도 걸릴 수 있으니 둘 다 채운 가짜 곡으로 시험한다.
+    let probe = TrackRef {
+        provider: ProviderKind::YouTube,
+        content_id: query.to_string(),
+        source_url: query.to_string(),
+        title: Some(query.to_string()),
+        artist: None,
+        duration: None,
+        variant_key: None,
+    };
+    match state.app.blacklist.try_get_blocker(guild_id, &probe) {
+        Some(rule) => json_ok(json!({
+            "blocked": true,
+            "rule": blacklist_json(&rule, guild_id),
+            "message": format!(
+                "막혀요 — {}",
+                crate::blacklist::Blacklist::describe_rule(&rule)
+            ),
+        })),
+        None => json_ok(json!({
+            "blocked": false,
+            "rule": Value::Null,
+            "message": "지금 규칙으로는 안 막혀요.",
+        })),
+    }
 }
 
 // ───────────────────────── WebSocket ─────────────────────────
@@ -6389,15 +8631,25 @@ mod tests {
         assert!(!permission_allowed("search", settings.search_rule, &settings, &member));
     }
 
-    /// 자동 재생 기준 곡 권한도 같은 판정 경로를 탄다(기본은 관리자만).
+    /// 자동 재생 권한도 같은 판정 경로를 탄다.
+    /// **기본은 모든 사람**이다 (V3 §8.3 — "일반사용자도 할수있고").
     #[test]
-    fn autoplay_seed_rule_defaults_to_administrator_only() {
-        let settings = RemoteGuildSettings::default();
-        assert_eq!(settings.autoplay_seed_rule, PermissionRule::Administrator);
+    fn autoplay_rule_defaults_to_every_member() {
+        let mut settings = RemoteGuildSettings::default();
+        assert_eq!(settings.autoplay_rule, PermissionRule::GuildMember);
         let member = MemberContext::default();
+        assert!(permission_allowed(
+            "autoplay",
+            settings.autoplay_rule,
+            &settings,
+            &member
+        ));
+
+        // 필요하면 관리자가 조일 수 있다.
+        settings.autoplay_rule = PermissionRule::Administrator;
         assert!(!permission_allowed(
-            "autoplaySeed",
-            settings.autoplay_seed_rule,
+            "autoplay",
+            settings.autoplay_rule,
             &settings,
             &member
         ));
@@ -6406,8 +8658,8 @@ mod tests {
             ..Default::default()
         };
         assert!(permission_allowed(
-            "autoplaySeed",
-            settings.autoplay_seed_rule,
+            "autoplay",
+            settings.autoplay_rule,
             &settings,
             &admin
         ));
@@ -6484,13 +8736,13 @@ mod tests {
 
     /// 카운트다운 기준은 `app.rs`의 재정렬 주기와 같은 값이어야 한다.
     /// 상수가 갈라지면 화면의 숫자가 실제 재정렬과 어긋난다.
+    ///
+    /// **길이에 따라 달라진다** (§18.2 (3)) — 500곡을 넘으면 5초가 아니라 15초다.
     #[test]
     fn countdown_period_follows_the_sort_loop() {
-        assert_eq!(
-            QUEUE_SORT_PERIOD_SECONDS,
-            crate::app::QUEUE_SORT_INTERVAL.as_secs() as i64
-        );
-        assert_eq!(QUEUE_SORT_PERIOD_SECONDS, 5);
+        assert_eq!(crate::app::queue_sort_interval_for_len(0).as_secs(), 5);
+        assert_eq!(crate::app::queue_sort_interval_for_len(500).as_secs(), 5);
+        assert_eq!(crate::app::queue_sort_interval_for_len(501).as_secs(), 15);
     }
 
     // ── V3 §6: 브라우저 검색 ──
@@ -6826,5 +9078,294 @@ mod tests {
         );
         assert!(!cleared.has_client_secret());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ══════════════ V3 §16 B1 — 봇이 음성채널에 없는데 있다고 나오던 버그 ══════════════
+
+    /// **회귀 테스트**: Discord 캐시에 봇 voice_state 가 없고 저장값(`player.voice_channel_id`)만
+    /// 남아 있는 상태 → 봇은 음성에 **없다**.
+    ///
+    /// 예전 코드의 `.or(player_channel)` 이 정확히 이 상황에서 stale 값을 살려 냈다.
+    /// 봇이 재시작·연결 끊김·강제 퇴장으로 빠져나가도 화면은 계속 들어가 있다고 말했다.
+    #[test]
+    fn stored_voice_channel_never_revives_a_bot_that_left() {
+        // 캐시: 없음 / 저장값: 있음 → 결과는 없음이어야 한다.
+        assert_eq!(authoritative_voice_channel(None, Some(123)), None);
+        // 캐시가 말하면 그게 진실이다. 저장값이 달라도 캐시가 이긴다.
+        assert_eq!(authoritative_voice_channel(Some(777), Some(123)), Some(777));
+        assert_eq!(authoritative_voice_channel(Some(777), None), Some(777));
+
+        // 그 결과가 `inVoice` 로 그대로 흘러간다.
+        let stale = BotVoiceStatus {
+            in_guild: true,
+            channel_id: authoritative_voice_channel(None, Some(123)),
+            channel_name: None,
+        };
+        assert!(!stale.in_voice(), "저장값만으로 inVoice 가 켜지면 B1 재발이다");
+    }
+
+    /// 봇이 음성에 없으면 `듣는 중`은 **언제나 빈 배열**이다 (§4).
+    /// 봇 없는 방에서 나는 소리를 듣는 중이라고 부를 수는 없다.
+    #[test]
+    fn nobody_is_listening_when_the_bot_is_not_in_voice() {
+        let members = vec![(10u64, Some(500u64)), (11, Some(500)), (12, None)];
+        let (listening, other) = split_voice_members(None, &members);
+        assert!(listening.is_empty());
+        assert_eq!(other, vec!["10".to_string(), "11".to_string()]);
+
+        // 봇이 500번 방에 있으면 그 방 사람만 듣는 중이다.
+        let members = vec![(10u64, Some(500u64)), (11, Some(600))];
+        let (listening, other) = split_voice_members(Some(500), &members);
+        assert_eq!(listening, vec!["10".to_string()]);
+        assert_eq!(other, vec!["11".to_string()]);
+    }
+
+    // ══════════════ V3 §10.5 — 투표 스킵 정족수 ══════════════
+
+    fn ids(values: &[u64]) -> HashSet<u64> {
+        values.iter().copied().collect()
+    }
+
+    /// 모수가 1명이면 그 사람 혼자 눌러도 넘어간다 —
+    /// 혼자 듣는데 투표를 시키면 그냥 괴롭힘이다.
+    #[test]
+    fn a_single_listener_can_always_skip() {
+        assert_eq!(VoteSkipBasis::votes_needed(1, 50, 2), 1);
+        let quorum = skip_quorum(
+            &ids(&[10]),
+            &HashSet::new(),
+            &ids(&[10]),
+            VoteSkipBasis::Listeners,
+            50,
+            2,
+        );
+        assert!(quorum.passed);
+        assert_eq!((quorum.have, quorum.need), (1, 1));
+    }
+
+    /// 3명 중 50% → 2표. 1표로는 안 넘어가고 2표에서 넘어간다.
+    #[test]
+    fn listener_quorum_needs_a_majority() {
+        assert_eq!(VoteSkipBasis::votes_needed(3, 50, 2), 2);
+        let listeners = ids(&[10, 11, 12]);
+        let one = skip_quorum(
+            &listeners,
+            &HashSet::new(),
+            &ids(&[10]),
+            VoteSkipBasis::Listeners,
+            50,
+            2,
+        );
+        assert!(!one.passed);
+        assert_eq!((one.have, one.need), (1, 2));
+
+        let two = skip_quorum(
+            &listeners,
+            &HashSet::new(),
+            &ids(&[10, 11]),
+            VoteSkipBasis::Listeners,
+            50,
+            2,
+        );
+        assert!(two.passed);
+    }
+
+    /// 듣지 않는 사람의 표는 `listeners` 기준에서 안 센다.
+    #[test]
+    fn viewers_do_not_count_towards_the_listener_basis() {
+        let quorum = skip_quorum(
+            &ids(&[10, 11]),
+            &ids(&[90, 91]),
+            &ids(&[90, 91]),
+            VoteSkipBasis::Listeners,
+            50,
+            1,
+        );
+        assert_eq!(quorum.have, 0);
+        assert!(!quorum.passed);
+    }
+
+    /// `either` 는 한쪽만 넘어도 통과하고, `both` 는 둘 다 넘어야 통과한다.
+    #[test]
+    fn either_and_both_bases_behave_differently() {
+        let listeners = ids(&[10, 11]);
+        let viewers = ids(&[90, 91, 92, 93]);
+        let voters = ids(&[10, 11]); // 듣는 사람은 전원, 보는 사람은 0표
+
+        let either = skip_quorum(&listeners, &viewers, &voters, VoteSkipBasis::Either, 50, 1);
+        assert!(either.passed, "한쪽만 넘어도 통과해야 한다");
+
+        let both = skip_quorum(&listeners, &viewers, &voters, VoteSkipBasis::Both, 50, 1);
+        assert!(!both.passed, "보는 사람 쪽이 모자라면 통과하면 안 된다");
+    }
+
+    /// 모수가 0명이면 필요 표도 0이고 정족수로는 절대 통과하지 않는다.
+    /// (그 상황은 호출부에서 **즉시 스킵**으로 따로 처리한다 — 투표가 무의미하니까.)
+    #[test]
+    fn an_empty_room_never_passes_by_vote() {
+        assert_eq!(VoteSkipBasis::votes_needed(0, 50, 2), 0);
+        let quorum = skip_quorum(
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            VoteSkipBasis::Listeners,
+            50,
+            2,
+        );
+        assert!(!quorum.passed);
+    }
+
+    /// 최소 표 수가 모수보다 크면 모수가 곧 필요 표 수다 — 안 그러면 영원히 안 넘어간다.
+    #[test]
+    fn minimum_votes_never_exceed_the_population() {
+        assert_eq!(VoteSkipBasis::votes_needed(2, 50, 20), 2);
+    }
+
+    // ══════════════ V3 §10.3 — 붐따 임계값 ══════════════
+
+    fn score_with_dislikes(dislikes: i32) -> QueueScore {
+        QueueScore {
+            dislike_count: dislikes,
+            ..Default::default()
+        }
+    }
+
+    /// 꺼져 있으면(기본) 싫어요가 아무리 모여도 곡이 사라지지 않는다.
+    #[test]
+    fn boomtta_stays_off_by_default() {
+        let settings = RemoteGuildSettings::default();
+        assert!(!settings.boomtta_enabled);
+        assert!(!score_with_dislikes(99).boomtta_triggered(&settings));
+    }
+
+    /// 켜면 기준 수에 **닿는 순간** 터진다. 하나 모자라면 안 터진다.
+    #[test]
+    fn boomtta_fires_exactly_at_the_threshold() {
+        let settings = RemoteGuildSettings {
+            boomtta_enabled: true,
+            boomtta_threshold: 3,
+            ..Default::default()
+        };
+        assert!(!score_with_dislikes(2).boomtta_triggered(&settings));
+        assert!(score_with_dislikes(3).boomtta_triggered(&settings));
+        assert!(score_with_dislikes(4).boomtta_triggered(&settings));
+    }
+
+    /// 기준 수 `0` 은 무제한이라 절대 안 터진다 (§23.1).
+    #[test]
+    fn boomtta_threshold_zero_means_never() {
+        let settings = RemoteGuildSettings {
+            boomtta_enabled: true,
+            boomtta_threshold: 0,
+            ..Default::default()
+        };
+        assert!(!score_with_dislikes(1000).boomtta_triggered(&settings));
+    }
+
+    // ══════════════ V3 §23.1 — 무제한(0) ══════════════
+
+    /// **`0` 은 무제한이다.** 예전 `.max(1)` 클램프는 `0` 을 `1` 로 바꿔서
+    /// 화면에는 "무제한"이 뜨는데 서버는 한 곡만 받는 최악의 조합을 만들었다.
+    #[test]
+    fn zero_limits_block_nothing() {
+        assert!(!limit_blocks(0, 1));
+        assert!(!limit_blocks(0, 10_000));
+        assert!(!limit_blocks(-1, 10_000));
+    }
+
+    /// 양수 상한은 정확히 그 수까지만 받는다.
+    #[test]
+    fn positive_limits_stop_at_the_configured_number() {
+        assert!(!limit_blocks(5, 5), "5번째 곡은 들어가야 한다");
+        assert!(limit_blocks(5, 6), "6번째 곡은 막혀야 한다");
+    }
+
+    /// 길이 제한 `0` 이면 아무리 긴 곡도 담을 수 있다.
+    #[test]
+    fn zero_track_length_limit_allows_anything() {
+        let long = TrackRef {
+            provider: ProviderKind::YouTube,
+            content_id: "x".into(),
+            source_url: "https://example.test/x".into(),
+            title: Some("10시간 백색소음".into()),
+            artist: None,
+            duration: Some(CsTimeSpan::from_secs_f64(36_000.0)),
+            variant_key: None,
+        };
+        assert!(!track_too_long(0, &long));
+        assert!(track_too_long(3600, &long));
+        assert!(!track_too_long(40_000, &long));
+    }
+
+    /// 설정 검증도 `0` 을 통과시켜야 한다. 여기가 막혀 있으면
+    /// 화면에서 아무리 `∞` 로 밀어도 저장이 안 된다.
+    /// §18.1 새 상한(1인 1000곡 / 서버 10000곡)도 같이 못 박는다.
+    #[test]
+    fn settings_validation_accepts_unlimited_and_the_new_maxima() {
+        assert!(unlimited_or(0, 1, 1_000));
+        assert!(unlimited_or(1_000, 1, 1_000));
+        assert!(!unlimited_or(1_001, 1, 1_000));
+        assert!(unlimited_or(10_000, 1, 10_000));
+        assert!(!unlimited_or(10_001, 1, 10_000));
+    }
+
+    // ══════════════ V3 §10.1 — 점수는 설정값으로 계산한다 ══════════════
+
+    /// 좋아요를 2점으로 바꾸면 총점도 화면 계산식도 같이 바뀐다.
+    /// 서버와 화면이 다른 숫자로 더하면 화면이 거짓말을 하게 된다.
+    #[test]
+    fn total_score_follows_the_configured_points() {
+        let score = QueueScore {
+            wait_score: 2,
+            like_count: 3,
+            super_like_count: 1,
+            dislike_count: 0,
+            ..Default::default()
+        };
+        let default_points = VotePoints::default();
+        assert_eq!(score.total_score(&default_points), 2 + 3 + 2);
+
+        let doubled = VotePoints {
+            like: 2,
+            ..VotePoints::default()
+        };
+        assert_eq!(score.total_score(&doubled), 2 + 6 + 2);
+    }
+
+    // ══════════════ V3 §13.5 — 활동 로그 분류 필터 ══════════════
+
+    #[test]
+    fn audit_kind_filter_parses_only_known_kinds() {
+        assert_eq!(
+            parse_audit_kinds(Some("song,playlist")),
+            vec![AuditKind::Song, AuditKind::Playlist]
+        );
+        // 모르는 값은 조용히 버린다 — 필터 하나 오타로 전체가 500이 되면 안 된다.
+        assert_eq!(parse_audit_kinds(Some("song,nope")), vec![AuditKind::Song]);
+        assert!(parse_audit_kinds(None).is_empty());
+        assert!(parse_audit_kinds(Some("")).is_empty());
+    }
+
+    /// 기본 필터는 조용해야 쓸모가 있다 — 곡과 재생목록만 켠다 (§13.4).
+    #[test]
+    fn audit_default_filter_is_quiet() {
+        assert_eq!(
+            AuditKind::default_filter(),
+            [AuditKind::Song, AuditKind::Playlist]
+        );
+    }
+
+    // ══════════════ V3 §10.2 — 투표 종류 ══════════════
+
+    #[test]
+    fn vote_kinds_round_trip_through_the_api_key() {
+        for kind in [
+            QueueVoteKind::Like,
+            QueueVoteKind::SuperLike,
+            QueueVoteKind::Dislike,
+        ] {
+            assert_eq!(parse_vote_kind(kind.api_key()), Some(kind));
+        }
+        assert_eq!(parse_vote_kind("nope"), None);
     }
 }

@@ -7,9 +7,16 @@
  *   8) 1024px 이하에서 좌측 네비가 상단 가로 스크롤 탭으로 (네비는 어떤 폭에서도 사라지지 않는다)
  *
  * v3 추가분 (docs/REMOTE-API-V3.md)
- *   §1   권한 8개가 각각 자기 지정 역할(`ruleRoleIds`)을 갖는다. 관리자 역할(`managerRoleIds`)은 별도 카드.
- *   §4   진단에 봇의 서버/음성 참가 여부와 듣는 사람 수를 노출한다.
- *   §8.5 "순서와 재생"에 자동 재생 기준 곡(시드) 목록 + 드래그 정렬 + 삭제.
+ *   §1    권한 10개가 각각 자기 지정 역할(`ruleRoleIds`)을 갖는다. 관리자 역할(`managerRoleIds`)은 별도 카드.
+ *   §4    진단에 봇의 서버/음성 참가 여부와 듣는 사람 수를 노출한다.
+ *   §8    자동 재생 방식 3종 · 추천 정책 4종 · 기준 곡(시드) · 최근 N곡 · 장르.
+ *   §10   투표 점수 4종 + 미리보기, 붐따(싫어요로 대기열에서 내리기), 투표 스킵, 슈퍼 좋아요 제한.
+ *   §15   우리 차트 가중치 + 차트 관리(켜기/끄기·순서·주소).
+ *   §18.1 1인 1000곡 / 서버 10000곡.
+ *   §19.3 차단 목록 섹션 — 전역 항목은 읽기 전용, 시험 입력창 포함.
+ *   §20   아이콘만 있는 버튼은 예외 없이 `data-tip`. 네이티브 `title=` 은 쓰지 않는다.
+ *   §23.1 숫자 설정은 전부 `0 = 무제한`. 슬라이더 최댓값 다음 칸이 `∞` 다.
+ *   §23.3 막힌 컨트롤에는 "왜 안 되는지" + "누가 되는지(역할 + 인원수)" 를 붙인다.
  *   말투  UI에 나가는 모든 문구는 ~해요체.
  *
  * 렌더링은 전부 클라이언트. innerHTML을 쓰지 않고 core.js의 h()로만 DOM을 만든다(XSS 차단).
@@ -49,7 +56,8 @@ const SECTIONS = [
   { id: 'limits',  icon: '📐', label: '제한값',      desc: '한 사람이 얼마나 쓸 수 있는지, 기록을 얼마나 보관할지 숫자로 정해요.' },
   { id: 'users',   icon: '👥', label: '유저 관리',   desc: '리모컨을 써 본 사람 목록과 접속 상태예요. 문제를 일으킨 사람은 기능별·기간제로 정지할 수 있어요.' },
   { id: 'chat',    icon: '💬', label: '채팅과 제안', desc: '웹 채팅과 제안 게시판을 켜고 꺼요. 신고된 메시지와 들어온 제안도 여기서 처리해요.' },
-  { id: 'audit',   icon: '📜', label: '활동 기록',   desc: '이 서버에서 일어난 모든 조작 기록이에요. 누가 언제 무엇을 바꿨는지 남아요.' },
+  { id: 'blocked', icon: '🚫', label: '차단 목록',   desc: '이 서버에서 안 나왔으면 하는 곡을 막아요. 봇 전체 규칙은 보이기만 하고 못 지워요.' },
+  { id: 'audit',   icon: '📜', label: '활동 기록',   desc: '이 서버에서 일어난 모든 조작 기록이에요. 누가 언제 무엇을 바꿨는지 남아요. 여기서는 합치지 않고 하나하나 다 보여드려요.' },
   { id: 'diag',    icon: '🩺', label: '진단',        desc: '봇 연결·인텐트·버전 상태예요. 뭔가 안 될 때 여기부터 보시면 돼요.' },
 ];
 
@@ -63,18 +71,77 @@ const RULE_OPTIONS = [
 ];
 
 /**
- * 권한 8종. `key` 는 설정 JSON의 필드명, `permKey` 는 v3 §1의 권한 키다.
+ * 권한 10종 (v3 §1 · §10.5 · §8.3 · §15.4). `key` 는 설정 JSON의 필드명, `permKey` 는 권한 키다.
  * `permKey` 는 `ruleRoleIds` 의 키이자 `permission-preview?key=` 로 보내는 값이라 철자가 정확해야 한다.
+ * 관리자 역할(`managerRoleIds`)까지 세면 11종이고, 그건 아래 별도 카드에서 다룬다.
  */
 const PERM_FIELDS = [
-  { key: 'searchRule',       permKey: 'search',       label: '곡 검색·신청',       desc: '검색해서 대기열에 곡을 넣는 동작이에요. 막으면 아무도 새 곡을 못 넣어요.' },
-  { key: 'voteRule',         permKey: 'vote',         label: '좋아요·슈퍼 좋아요', desc: '대기열 곡에 점수를 주는 동작이에요. 점수제일 때만 실제 순서에 영향을 줘요.' },
-  { key: 'chatRule',         permKey: 'chat',         label: '채팅 쓰기',          desc: '웹 채팅에 글·반응·답장을 쓰는 동작이에요. 읽기는 멤버라면 언제나 돼요.' },
-  { key: 'playbackRule',     permKey: 'playback',     label: '재생·일시정지·스킵', desc: '지금 나오는 곡을 직접 조작하는 동작이에요. 모두에게 즉시 영향이 가요.' },
-  { key: 'seekRule',         permKey: 'seek',         label: '구간 이동(시크)',    desc: '진행바를 끌어 재생 위치를 옮기는 동작이에요.' },
-  { key: 'volumeRule',       permKey: 'volume',       label: '볼륨 조절',          desc: '음성 채널 전체에 들리는 볼륨을 바꾸는 동작이에요. 웹에서 듣기의 개인 볼륨은 여기 해당하지 않아요.' },
-  { key: 'queueEditRule',    permKey: 'queueEdit',    label: '대기열 편집',        desc: '남의 곡을 지우거나 순서를 바꾸는 동작이에요. 자기가 넣은 곡을 빼는 건 언제나 돼요.' },
-  { key: 'autoplaySeedRule', permKey: 'autoplaySeed', label: '자동 재생 기준 곡',  desc: '자동 재생이 참고할 기준 곡을 등록·삭제하는 동작이에요. 등록된 목록은 누구나 볼 수 있어요.' },
+  { key: 'searchRule',      permKey: 'search',      label: '곡 검색·신청',        desc: '검색해서 대기열에 곡을 한 곡씩 넣는 동작이에요. 막으면 아무도 새 곡을 못 넣어요.' },
+  { key: 'voteRule',        permKey: 'vote',        label: '좋아요·싫어요·슈퍼',  desc: '대기열 곡에 점수를 주는 동작이에요. 점수제일 때만 실제 순서에 영향을 줘요.' },
+  { key: 'chatRule',        permKey: 'chat',        label: '채팅 쓰기',           desc: '웹 채팅에 글·반응·답장을 쓰는 동작이에요. 읽기는 멤버라면 언제나 돼요.' },
+  { key: 'playbackRule',    permKey: 'playback',    label: '재생·일시정지',       desc: '지금 나오는 곡을 멈추고 다시 트는 동작이에요. 모두에게 즉시 영향이 가요.' },
+  { key: 'skipRule',        permKey: 'skip',        label: '곡 넘기기',           desc: '지금 곡을 다음으로 넘기는 동작이에요. 재생/일시정지와 성격이 달라서 따로 뒀어요. 투표 스킵을 켜면 여기 통과한 사람들끼리 표를 모아요.' },
+  { key: 'seekRule',        permKey: 'seek',        label: '구간 이동(시크)',     desc: '진행바를 끌어 재생 위치를 옮기는 동작이에요.' },
+  { key: 'volumeRule',      permKey: 'volume',      label: '볼륨 조절',           desc: '음성 채널 전체에 들리는 볼륨을 바꾸는 동작이에요. 웹에서 듣기의 개인 볼륨은 여기 해당하지 않아요.' },
+  { key: 'queueEditRule',   permKey: 'queueEdit',   label: '대기열 편집',         desc: '남의 곡을 지우거나 순서를 바꾸는 동작이에요. 자기가 넣은 곡을 빼는 건 언제나 돼요.' },
+  { key: 'autoplayRule',    permKey: 'autoplay',    label: '자동 재생 설정',      desc: '자동 재생을 켜고 끄고, 방식·기준 곡·최근 N곡·장르를 바꾸는 동작이에요. 기본은 모든 멤버예요.' },
+  { key: 'bulkEnqueueRule', permKey: 'bulkEnqueue', label: '한 번에 담기',        desc: '재생목록이나 차트를 통째로 담는 동작이에요. 한 번에 수십 곡이 들어가서 대기열을 오래 차지할 수 있어요.' },
+];
+
+/** 붐따 동작 (v3 §10.3). */
+const BOOMTTA_ACTIONS = [
+  { value: 'bottom', label: '맨 뒤로',  desc: '대기열 맨 뒤로 보내요. 언젠가는 나오지만 한참 뒤예요.' },
+  { value: 'remove', label: '아예 빼기', desc: '대기열에서 지워요. 되돌리려면 다시 신청해야 해요.' },
+];
+
+/** 투표 스킵 모수 (v3 §10.5). */
+const VOTE_SKIP_BASIS = [
+  { value: 'listeners', label: '듣는 사람', desc: '봇과 같은 음성 채널에 있는 사람만 세요. 실제로 듣는 사람이 정하니 제일 자연스러워요.' },
+  { value: 'viewers',   label: '보는 사람', desc: '리모컨을 열어 두고 있는 사람을 세요. 음성엔 안 들어와도 같이 고르는 분위기에 맞아요.' },
+  { value: 'either',    label: '둘 중 하나', desc: '듣는 사람이든 보는 사람이든 한쪽만 넘으면 넘어가요. 느슨해서 잘 넘어가요.' },
+  { value: 'both',      label: '둘 다',      desc: '듣는 사람과 보는 사람 양쪽 다 넘어야 넘어가요. 엄격해서 잘 안 넘어가요.' },
+];
+
+/** 자동 재생 방식 3종 (v3 §8). */
+const AUTOPLAY_MODES = [
+  { value: 'seed',   label: '기준 곡',   desc: '아래에 등록한 기준 곡들을 돌아가며 참고해요. 취향을 확실히 잡고 싶을 때 좋아요.' },
+  { value: 'recent', label: '최근 튼 곡', desc: '최근에 튼 몇 곡 중 하나를 무작위로 골라 참고해요. 지금까지의 동작이라 기본값이에요.' },
+  { value: 'genre',  label: '장르',      desc: '고른 장르 차트에서 곡을 뽑아요. 장르를 여러 개 고르면 번갈아 가며 써요.' },
+];
+
+/** 자동 재생 추천 정책 4종 (v3 §8.5). 시드를 어디서 고르냐와는 다른 문제다. */
+const AUTOPLAY_POLICIES = [
+  { value: 'similar',  label: '비슷하게', desc: '후보 상위 3곡 중에서 골라요. 분위기가 잘 유지되지만 곡이 자주 겹쳐요.' },
+  { value: 'balanced', label: '적당히',   desc: '후보 상위 10곡 중 앞쪽이 잘 뽑히게 골라요. 비슷하되 매번 달라서 기본값이에요.' },
+  { value: 'explore',  label: '새롭게',   desc: '후보 전체에서 균등하게 골라요. 예상 못 한 곡이 자주 나와요.' },
+  { value: 'popular',  label: '무난하게', desc: '후보 중 많이 들은 곡 위주로 골라요. 튀는 곡이 적어요.' },
+];
+
+/** 차트 분류 (v3 §15.2). 관리 콘솔의 차트 목록을 이 순서로 묶는다. */
+const CHART_CATEGORIES = [
+  { key: 'ours',       icon: '⭐', label: '우리 차트',  desc: '우리가 실제로 튼 곡으로 만드는 차트예요. 주소가 없고 지울 수도 없어요.' },
+  { key: 'popular',    icon: '🔥', label: '인기',       desc: '전세계·한국·오늘 뜨는 곡이에요.' },
+  { key: 'region',     icon: '🌏', label: '나라별',     desc: '미국·일본·영국 차트예요.' },
+  { key: 'genre',      icon: '🎸', label: '장르',       desc: 'K-Pop·힙합·록 같은 장르 차트예요. 자동 재생의 "장르" 방식이 이 목록을 그대로 써요.' },
+  { key: 'karaoke',    icon: '🎤', label: '노래방',     desc: 'TJ·금영 공식 재생목록이에요.' },
+  { key: 'soundcloud', icon: '☁', label: 'SoundCloud', desc: 'SoundCloud 인기 차트예요.' },
+];
+
+/** 차단 규칙 종류 (models.rs 의 BlacklistKind). */
+const BLACKLIST_KINDS = [
+  { value: 'TitleContains', label: '제목 포함', desc: '제목에 이 글자가 들어가면 막아요. 가장 많이 쓰는 방식이에요.' },
+  { value: 'TitleExact',    label: '제목 일치', desc: '제목이 정확히 같을 때만 막아요. 한 곡만 콕 집을 때 써요.' },
+  { value: 'UrlExact',      label: '링크 일치', desc: '이 주소를 그대로 신청하면 막아요.' },
+];
+
+/** 활동 기록 분류 칩 (v3 §13.4). 관리 콘솔은 기본으로 전부 켠다. */
+const AUDIT_KINDS = [
+  { value: 'song',       icon: '🎵', label: '곡' },
+  { value: 'vote',       icon: '👍', label: '투표' },
+  { value: 'playback',   icon: '▶',  label: '재생' },
+  { value: 'playlist',   icon: '📃', label: '재생목록' },
+  { value: 'moderation', icon: '🛡', label: '관리' },
+  { value: 'admin',      icon: '⚙',  label: '설정' },
 ];
 
 /** 정렬 모드 3종. 각 모드에 한 문단 설명(요구사항). */
@@ -102,24 +169,150 @@ const REPEAT_MODES = [
   { value: 'queue', label: '전체 반복', desc: '대기열 끝까지 가면 처음으로 돌아가요.' },
 ];
 
-/** 숫자 항목 정의 — 슬라이더 + 직접입력 + 단위 + 허용범위 + 한 줄 설명(구림 해소 #1, #6). */
+/**
+ * 숫자 항목 정의 — 슬라이더 + 직접입력 + 단위 + 허용범위 + 한 줄 설명(구림 해소 #1, #6).
+ *
+ * `unlimited: true` 면 v3 §23.1 의 무제한을 지원한다. 슬라이더 **최댓값 다음 칸이 `∞`** 이고
+ * 거기로 밀면 값이 `0` 이 된다. 직접입력에 `0` 이나 빈 값을 넣어도 무제한이다.
+ * `zeroLabel` 은 그때 화면에 뜨는 문구다 — 항목마다 "무제한"의 의미가 다르니 정확하게 쓴다.
+ *
+ * 무제한을 두지 않는 예외는 둘뿐이다(§23.1): 볼륨 3종(0~200 범위가 있어야 의미가 있다)과
+ * 투표 스킵 비율(백분율이라 무제한이 말이 안 된다).
+ */
 const NUM_SPECS = {
-  minVolume:          { label: '최소 볼륨',      min: 0,  max: 100,    step: 5,  unit: '%',  desc: '이 아래로는 볼륨을 못 내려요. 0이면 음소거까지 허용해요.' },
+  minVolume:          { label: '최소 볼륨',      min: 0,  max: 100,    step: 5,  unit: '%',  desc: '이 아래로는 볼륨을 못 내려요. 0이면 음소거까지 허용해요. 볼륨은 범위가 있어야 의미가 있어서 무제한이 없어요.' },
   maxVolume:          { label: '최대 볼륨',      min: 10, max: 200,    step: 5,  unit: '%',  desc: '멤버가 올릴 수 있는 볼륨 상한이에요. 관리자도 이 값을 넘기지 못해요.' },
   defaultVolume:      { label: '기본 볼륨',      min: 0,  max: 200,    step: 5,  unit: '%',  desc: '봇이 음성 채널에 새로 들어갈 때 시작하는 볼륨이에요.' },
-  maxQueuePerUser:    { label: '1인 대기열 수',  min: 1,  max: 100,    step: 1,  unit: '곡', desc: '한 사람이 동시에 대기열에 넣어 둘 수 있는 곡 수예요. 작을수록 골고루 돌아가요.' },
-  maxQueuePerGuild:   { label: '서버 대기열 수', min: 1,  max: 1000,   step: 10, unit: '곡', desc: '서버 전체 대기열 상한이에요. 넘으면 새 신청이 거절돼요.' },
-  maxTrackSeconds:    { label: '곡 최대 길이',   min: 60, max: 86400,  step: 60, unit: '초', desc: '이보다 긴 곡은 신청할 수 없어요. 몇 시간짜리 라이브 통짜 등록을 막아요.', pretty: prettySeconds },
-  auditRetentionDays: { label: '로그 보관일',    min: 1,  max: 3650,   step: 1,  unit: '일', desc: '활동 기록을 며칠 보관할지 정해요. 지난 기록은 하루 한 번 정리돼요.' },
-  chatRetentionDays:  { label: '채팅 보관일',    min: 1,  max: 365,    step: 1,  unit: '일', desc: '웹 채팅을 며칠 보관할지 정해요. 기본은 30일이에요.' },
+
+  maxQueuePerUser: {
+    label: '1인 대기열 수', min: 1, max: 1000, step: 1, unit: '곡', unlimited: true,
+    zeroLabel: '무제한 · 한 사람이 얼마든지 넣을 수 있어요',
+    desc: '한 사람이 동시에 대기열에 넣어 둘 수 있는 곡 수예요. 작을수록 골고루 돌아가요.',
+    hint: (value) => (value === 0 ? '한 사람이 대기열을 통째로 차지할 수 있어요'
+      : value <= 50 ? '골고루 돌아가요'
+      : value <= 200 ? '넉넉해요'
+      : '한 사람이 대기열을 오래 차지할 수 있어요'),
+  },
+  maxQueuePerGuild: {
+    label: '서버 대기열 수', min: 1, max: 10000, step: 10, unit: '곡', unlimited: true,
+    zeroLabel: '무제한 · 아무리 쌓여도 안 막아요',
+    desc: '서버 전체 대기열 상한이에요. 넘으면 새 신청이 거절돼요.',
+    hint: (value) => (value === 0 || value > 500
+      ? '500곡을 넘으면 순서를 5초가 아니라 15초마다 다시 정해요'
+      : '5초마다 순서를 다시 정해요'),
+  },
+  maxTrackSeconds: {
+    label: '곡 최대 길이', min: 60, max: 86400, step: 60, unit: '초', unlimited: true,
+    zeroLabel: '무제한 · 몇 시간짜리도 들어와요',
+    desc: '이보다 긴 곡은 신청할 수 없어요. 몇 시간짜리 라이브 통짜 등록을 막아요.',
+    pretty: prettySeconds,
+  },
+  auditRetentionDays: {
+    label: '로그 보관일', min: 1, max: 3650, step: 1, unit: '일', unlimited: true,
+    zeroLabel: '무제한 · 영원히 남겨요',
+    desc: '활동 기록을 며칠 보관할지 정해요. 지난 기록은 하루 한 번 정리돼요. 투표·재생 기록은 3일만 남아요.',
+  },
+  chatRetentionDays: {
+    label: '채팅 보관일', min: 1, max: 365, step: 1, unit: '일', unlimited: true,
+    zeroLabel: '무제한 · 지우지 않아요',
+    desc: '웹 채팅을 며칠 보관할지 정해요. 기본은 30일이에요.',
+  },
+  bulkEnqueueLimit: {
+    label: '한 번에 담기 상한', min: 10, max: 1000, step: 10, unit: '곡', unlimited: true,
+    zeroLabel: '무제한 · 한 번에 다 들어와요',
+    desc: '재생목록이나 차트를 통째로 담을 때 한 번에 들어올 수 있는 곡 수예요. 클릭 한 번이 대기열을 몇천 곡으로 만들면 되돌리기가 너무 어려워요.',
+  },
+
+  /* ── 투표 점수 (v3 §10.1) ── 음수가 의미 있는 값이라 무제한이 없다. */
+  likePoints:      { label: '좋아요 점수',      min: -10, max: 10, step: 1, unit: '점', desc: '좋아요 하나가 몇 점인지예요. 기본 1점이에요.' },
+  dislikePoints:   { label: '싫어요 점수',      min: -10, max: 10, step: 1, unit: '점', desc: '싫어요 하나가 몇 점인지예요. 기본 -1점이라 순서가 뒤로 밀려요.' },
+  superLikePoints: { label: '슈퍼 좋아요 점수', min: -10, max: 10, step: 1, unit: '점', desc: '슈퍼 좋아요 하나가 몇 점인지예요. 기본 2점이에요.' },
+  waitPoints:      { label: '대기 점수',        min: -10, max: 10, step: 1, unit: '점', desc: '앞 곡이 하나 지날 때마다 붙는 점수예요. 오래 기다린 곡에 언젠가 차례가 오게 해요.' },
+
+  boomttaThreshold: {
+    label: '붐따 기준', min: 1, max: 20, step: 1, unit: '개', unlimited: true,
+    zeroLabel: '무제한 · 아무리 모여도 안 내려가요',
+    desc: '싫어요가 이만큼 모이면 곡이 대기열에서 내려가요.',
+  },
+
+  /* ── 투표 스킵 (v3 §10.5) ── */
+  voteSkipRatio: {
+    label: '동의 비율', min: 10, max: 100, step: 5, unit: '%',
+    desc: '모수의 몇 %가 동의해야 넘어갈지예요. 백분율이라 무제한은 없어요.',
+  },
+  voteSkipMin: {
+    label: '최소 동의 인원', min: 1, max: 20, step: 1, unit: '명', unlimited: true,
+    zeroLabel: '무제한 · 비율만 보고 정해요',
+    desc: '비율로 계산한 값이 이보다 작아도 최소한 이만큼은 눌러야 해요. 모수가 1명이면 그 사람 혼자 눌러도 넘어가요.',
+  },
+
+  /* ── 슈퍼 좋아요 제한 (v3 §10.6) ── 기본은 둘 다 꺼짐(0)이다. */
+  superLikeCooldownSec: {
+    label: '슈퍼 좋아요 쿨타임', min: 5, max: 3600, step: 5, unit: '초', unlimited: true,
+    zeroLabel: '쿨타임 없음 · 연달아 쓸 수 있어요',
+    desc: '슈퍼 좋아요를 한 번 쓰면 이만큼 기다려야 다시 쓸 수 있어요. 취소해도 쿨타임은 안 돌려줘요.',
+    pretty: prettySeconds,
+  },
+  superLikeDailyLimit: {
+    label: '하루 슈퍼 좋아요 수', min: 1, max: 100, step: 1, unit: '번', unlimited: true,
+    zeroLabel: '무제한 · 하루에 몇 번이든 돼요',
+    desc: '한 사람이 하루에 쓸 수 있는 슈퍼 좋아요 횟수예요. UTC 자정에 초기화돼요. 취소하면 횟수는 돌려줘요.',
+  },
+
+  /* ── 자동 재생 (v3 §8) ── */
+  autoplayRecentCount: {
+    label: '참고할 최근 곡 수', min: 1, max: 20, step: 1, unit: '곡',
+    desc: '"최근 튼 곡" 방식일 때 최근 몇 곡 중에서 기준을 고를지예요.',
+  },
+  autoplayArtistCooldown: {
+    label: '같은 가수 쿨다운', min: 1, max: 20, step: 1, unit: '곡', unlimited: true,
+    zeroLabel: '무제한 · 같은 가수가 바로 또 나올 수 있어요',
+    desc: '최근 이만큼의 곡 안에 나온 가수는 자동 재생 후보에서 빼요. 같은 가수가 연달아 나오는 걸 막아요.',
+  },
+  autoplayRecentDecayHours: {
+    label: '최근 곡 회피 시간', min: 1, max: 168, step: 1, unit: '시간', unlimited: true,
+    zeroLabel: '무제한 · 한 번 튼 곡은 계속 피해요',
+    desc: '최근에 튼 곡을 이 시간 동안 강하게 피하고, 지나면 다시 나와도 괜찮게 봐요. 영원히 빼면 고를 곡이 계속 줄어들어요.',
+  },
+  autoplaySeedMax: {
+    label: '기준 곡 최대 개수', min: 1, max: 50, step: 1, unit: '곡', unlimited: true,
+    zeroLabel: '무제한 · 얼마든지 넣을 수 있어요',
+    desc: '자동 재생 기준 곡을 몇 곡까지 등록할 수 있는지예요.',
+  },
+
+  /* ── 우리 차트 (v3 §15.2b) ── 0 은 "슈퍼 좋아요를 아예 안 센다"는 뜻이라 무제한이 아니다. */
+  chartSuperWeight: {
+    label: '슈퍼 좋아요 가중치', min: 0, max: 5, step: 1, unit: '배',
+    desc: '"많이 사랑받은 곡" 차트에서 슈퍼 좋아요를 몇 배로 칠지예요. 0이면 슈퍼 좋아요를 아예 안 세요.',
+  },
 };
 
 /** 섹션이 소유하는 설정 키 — 부분 저장(구림 해소 #7)의 단위. 한 키는 정확히 한 섹션에만 속한다. */
 const SECTION_KEYS = {
-  order:  ['sortMode', 'autoBgmEnabled', 'repeatMode', 'defaultVolume'],
+  order: [
+    'sortMode', 'autoBgmEnabled', 'repeatMode', 'defaultVolume',
+    'likePoints', 'dislikePoints', 'superLikePoints', 'waitPoints',
+    'boomttaEnabled', 'boomttaThreshold', 'boomttaAction',
+    'voteSkipEnabled', 'voteSkipBasis', 'voteSkipRatio', 'voteSkipMin',
+    'superLikeCooldownSec', 'superLikeDailyLimit',
+    'autoplayMode', 'autoplayRecentCount', 'autoplayGenres',
+    'autoplayPolicy', 'autoplayArtistCooldown', 'autoplayRecentDecayHours', 'autoplaySeedMax',
+    'chartSuperWeight',
+  ],
   perms:  PERM_FIELDS.map((field) => field.key).concat(['ruleRoleIds', 'managerRoleIds']),
-  limits: ['minVolume', 'maxVolume', 'maxQueuePerUser', 'maxQueuePerGuild', 'maxTrackSeconds', 'auditRetentionDays', 'chatRetentionDays'],
+  limits: ['minVolume', 'maxVolume', 'maxQueuePerUser', 'maxQueuePerGuild', 'maxTrackSeconds', 'bulkEnqueueLimit', 'auditRetentionDays', 'chatRetentionDays'],
   chat:   ['chatEnabled', 'suggestionEnabled'],
+};
+
+/** 설정에 값이 없을 때 콘솔이 가정하는 기본값 — 서버가 아직 v2 응답을 줘도 화면이 비지 않게 한다. */
+const SETTING_DEFAULTS = {
+  likePoints: 1, dislikePoints: -1, superLikePoints: 2, waitPoints: 1,
+  boomttaEnabled: false, boomttaThreshold: 3, boomttaAction: 'bottom',
+  voteSkipEnabled: false, voteSkipBasis: 'listeners', voteSkipRatio: 50, voteSkipMin: 2,
+  superLikeCooldownSec: 0, superLikeDailyLimit: 0,
+  autoplayMode: 'recent', autoplayRecentCount: 5, autoplayGenres: [],
+  autoplayPolicy: 'balanced', autoplayArtistCooldown: 3, autoplayRecentDecayHours: 24,
+  autoplaySeedMax: 10, chartSuperWeight: 2, bulkEnqueueLimit: 200,
 };
 
 /** 정지 범위 · 기간 (사양서 결정 #14). */
@@ -174,8 +367,25 @@ const S = {
   suspensions: null,
   reports: null,
   suggestions: null,
-  audit: { items: [], cursor: null, done: false, loading: false, query: '' },
+  /** 관리 콘솔의 활동 기록은 **합치지 않는다**(§13.3) — 분류 필터와 실패만 보기만 있다. */
+  audit: {
+    items: [], cursor: null, done: false, loading: false, query: '',
+    kinds: AUDIT_KINDS.map((kind) => kind.value),   // 관리 콘솔은 기본으로 전부 켠다
+    failedOnly: false,
+  },
   diag: null,
+  /** 차트 관리 (§15.5). */
+  charts: { items: null, error: null, loading: false },
+  /** 차단 목록 (§19.3). */
+  blocked: { items: null, error: null, loading: false, kind: 'TitleContains' },
+  /** 자동 재생 장르 후보 (§8.4) — 장르 차트 목록을 그대로 쓴다. */
+  genreOptions: null,
+  /**
+   * 투표 스킵을 "지금 인원"으로 환산할 모수 (§10.5).
+   * WS presence 가 실시간으로 갱신하고, 없으면 진단의 listenerCount 로 채운다.
+   * 새 폴링은 만들지 않는다(§23.2).
+   */
+  basis: { listeners: null, viewers: null },
 };
 
 /** 섹션 루트 DOM. 한 번에 한 섹션만 DOM에 존재한다(저장 버튼 testid 중복 방지 + 렌더 비용 절감). */
@@ -237,11 +447,25 @@ function renderList(box, items, keyOf, render) {
 /**
  * 서버 응답 → 콘솔이 다루는 형태.
  * v3 §1의 마이그레이션(비어 있으면 `configuredRoleIds` 폴백)을 클라이언트에서도 한 번 더 태운다.
- * 서버가 아직 v2 형태로 답해도 화면이 통짜 역할을 8개 항목에 그대로 보여 주므로 동작이 조용히 바뀌지 않는다.
+ * 서버가 아직 v2 형태로 답해도 화면이 통짜 역할을 10개 항목에 그대로 보여 주므로 동작이 조용히 바뀌지 않는다.
  * force 는 부팅 시 baseline 을 만들 때만 true — 부분 저장 응답에는 권한 키가 없을 수 있다.
  */
 function normalizeSettings(raw, force) {
   const next = Object.assign({}, raw || {});
+
+  // v3 에서 새로 생긴 값들은 서버가 아직 안 보낼 수 있다. 없으면 기본값을 채워 둔다.
+  // 여기서 채운 값은 baseline 에도 같이 들어가므로 "안 바꿨는데 바꿈"으로 보이지 않는다.
+  if (force) {
+    Object.entries(SETTING_DEFAULTS).forEach(([key, value]) => {
+      if (next[key] === undefined) next[key] = clone(value);
+    });
+    // 자동 재생 권한은 v2 의 `autoplaySeedRule` 을 이어받는다 (§8.3 — 기본은 모든 멤버).
+    if (next.autoplayRule === undefined) next.autoplayRule = next.autoplaySeedRule || 'guildMember';
+    // 스킵은 재생 권한에서 갈라져 나왔다. 기본은 모든 멤버지만, 예전 값이 있으면 그걸 잇는다 (§10.5).
+    if (next.skipRule === undefined) next.skipRule = 'guildMember';
+    if (next.bulkEnqueueRule === undefined) next.bulkEnqueueRule = 'guildMember';
+  }
+
   const touchesPerms = force
     || 'ruleRoleIds' in next || 'managerRoleIds' in next || 'configuredRoleIds' in next;
   if (!touchesPerms) return next;
@@ -252,7 +476,9 @@ function normalizeSettings(raw, force) {
 
   const map = {};
   PERM_FIELDS.forEach((field) => {
-    const ids = source[field.permKey];
+    // v2 의 `autoplaySeed` 역할은 v3 의 `autoplay` 가 그대로 물려받는다.
+    const ids = source[field.permKey]
+      || (field.permKey === 'autoplay' ? source.autoplaySeed : null);
     if (Array.isArray(ids) && ids.length) map[field.permKey] = ids.map(String);
     else map[field.permKey] = anySet ? [] : legacy.slice();
   });
@@ -264,7 +490,7 @@ function normalizeSettings(raw, force) {
 
   // v2 필드는 더 이상 주고받지 않는다 (v3 §1).
   delete next.configuredRoleIds;
-  if (next.autoplaySeedRule === undefined) next.autoplaySeedRule = 'administrator';
+  delete next.autoplaySeedRule;
   return next;
 }
 
@@ -332,6 +558,12 @@ function validate() {
   if (Number(S.draft.defaultVolume) < Number(S.draft.minVolume) || Number(S.draft.defaultVolume) > Number(S.draft.maxVolume)) {
     errors.defaultVolume = `기본 볼륨은 최소~최대(${S.draft.minVolume}~${S.draft.maxVolume}%) 안에 있어야 해요.`;
   }
+  // 무제한(0)끼리는 비교하지 않는다 — 0은 "상한 없음"이라 언제나 서로 모순이 아니다.
+  const perUser = Number(S.draft.maxQueuePerUser);
+  const perGuild = Number(S.draft.maxQueuePerGuild);
+  if (perUser > 0 && perGuild > 0 && perUser > perGuild) {
+    errors.maxQueuePerUser = `1인 상한(${perUser}곡)이 서버 전체 상한(${perGuild}곡)보다 커요. 한 사람도 그만큼 못 넣어요.`;
+  }
   PERM_FIELDS.forEach((field) => {
     if (S.draft[field.key] !== 'configuredRole') return;
     const ids = (S.draft.ruleRoleIds || {})[field.permKey] || [];
@@ -358,11 +590,24 @@ function validate() {
 
 /* ═══════════════════════════ 필드 위젯 ═══════════════════════════ */
 
-/** 모든 필드의 공통 껍데기 — 라벨 · 변경 배지 · 항목별 되돌리기 · 설명 · 오류 슬롯. */
+/**
+ * 툴팁 문구 — 한 줄, 마침표 없이 (§20.1).
+ * 긴 설명문을 그대로 넣으면 툴팁이 아니라 벽이 되므로 첫 문장만 쓰고 마침표를 뗀다.
+ */
+function tipOf(text, fallback) {
+  if (!text) return fallback || null;
+  const first = String(text).split(/(?<=요)\.\s/)[0].split('. ')[0];
+  return first.replace(/[.\s]+$/, '');
+}
+
+/** 모든 필드의 공통 껍데기 — 라벨 · ⓘ · 변경 배지 · 항목별 되돌리기 · 설명 · 오류 슬롯. */
 function fieldShell(key, label, desc, control, extra) {
   return h('div', { class: 'fld', 'data-field': key },
     h('div', { class: 'fld__head' },
       h('span', { class: 'fld__label' }, label),
+      desc ? h('span', {
+        class: 'fld__info', 'aria-hidden': 'true', 'data-tip': tipOf(desc),
+      }, 'ⓘ') : null,
       h('span', { class: 'fld__badge' }, '바꿨어요'),
       h('button', {
         class: 'fld__undo', type: 'button', 'data-tip': '이 항목만 저장 전 값으로 되돌려요',
@@ -388,6 +633,7 @@ function segmentControl(key, options, onPick) {
       'aria-checked': selected ? 'true' : 'false',
       tabindex: selected ? '0' : '-1',
       'data-value': option.value,
+      'data-tip': tipOf(option.desc, `${option.label}(으)로 바꿔요`),
       onclick: () => { setValue(key, option.value); onPick && onPick(option.value); renderSection(S.activeSection); },
       onkeydown: (event) => {
         const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
@@ -404,9 +650,10 @@ function segmentControl(key, options, onPick) {
 }
 
 /** 드롭다운. */
-function selectControl(key, options, onPick) {
+function selectControl(key, options, onPick, label) {
   const select = h('select', {
-    class: 'field', 'aria-label': '선택',
+    class: 'field', 'aria-label': label || '선택',
+    'data-tip': label ? `${label}을(를) 누가 할 수 있는지 골라요` : '값을 골라요',
     onchange: (event) => { setValue(key, event.target.value); onPick && onPick(event.target.value); },
   });
   options.forEach((option) => {
@@ -415,60 +662,101 @@ function selectControl(key, options, onPick) {
   return select;
 }
 
-/** 체크 스위치. */
-function toggleControl(key, onText, offText) {
+/** 체크 스위치. 아이콘도 글자도 없는 컨트롤이라 툴팁과 aria-label 이 필수다 (§20.1). */
+function toggleControl(key, onText, offText, label) {
   const on = Boolean(S.draft[key]);
   const button = h('button', {
     class: 'sw' + (on ? ' is-on' : ''), type: 'button', role: 'switch',
     'aria-checked': on ? 'true' : 'false',
+    'aria-label': label || (on ? offText : onText),
+    'data-tip': on ? '눌러서 꺼요' : '눌러서 켜요',
     onclick: () => { setValue(key, !S.draft[key]); renderSection(S.activeSection); },
   }, h('span', { class: 'sw__knob' }));
   return h('div', { class: 'sw__row' }, button, h('span', { class: 'sw__text' }, on ? onText : offText));
 }
 
+/** 이 항목의 `0` 이 화면에서 어떻게 읽히는지. */
+function zeroText(spec) {
+  return spec.zeroLabel || '무제한 · 아무도 안 막아요';
+}
+
 /**
- * 숫자 — 슬라이더 + 직접입력 + 단위 + 허용범위 (구림 해소 #6).
+ * 숫자 — 슬라이더 + 직접입력 + 단위 + 허용범위 (구림 해소 #6) + 무제한 (v3 §23.1).
  * bounds 로 min/max 를 런타임에 덮을 수 있다(기본 볼륨은 최소~최대 볼륨을 따라간다).
+ *
+ * 무제한 항목은 슬라이더가 한 칸 더 길다. 그 마지막 칸이 `∞` 이고 값은 `0` 이다.
+ * 슬라이더 위치와 실제 값이 다르므로 둘 사이를 `toSlider`/`fromSlider` 로만 오간다.
  */
 function numberField(key, bounds) {
   const spec = NUM_SPECS[key];
   const min = bounds && bounds.min != null ? bounds.min : spec.min;
   const max = bounds && bounds.max != null ? bounds.max : spec.max;
+  const unlimited = Boolean(spec.unlimited);
+  const infinitySlot = max + spec.step;          // 최댓값 다음 칸 = ∞
   const value = Number(S.draft[key]);
 
-  const readout = h('span', { class: 'num__pretty' }, spec.pretty ? spec.pretty(value) : '');
+  const toSlider = (v) => (unlimited && Number(v) === 0 ? infinitySlot : Number(v));
+  const fromSlider = (pos) => (unlimited && Number(pos) > max ? 0 : Number(pos));
+
+  const readout = h('span', { class: 'num__pretty' });
+  const hintNode = h('span', { class: 'num__hint' });
   const number = h('input', {
     class: 'field num__input', type: 'number', inputmode: 'numeric',
-    min: String(spec.min), max: String(spec.max), step: String(spec.step), value: String(value),
+    min: String(unlimited ? 0 : spec.min), max: String(spec.max), step: String(spec.step),
+    value: String(value),
     'aria-label': spec.label,
+    'data-tip': unlimited ? '0을 넣으면 무제한이에요' : `${spec.min}~${spec.max}${spec.unit} 사이로 넣어요`,
   });
   const range = h('input', {
     class: 'num__range', type: 'range',
-    min: String(min), max: String(max), step: String(spec.step), value: String(value),
+    min: String(min), max: String(unlimited ? infinitySlot : max), step: String(spec.step),
+    value: String(toSlider(value)),
     'aria-label': `${spec.label} 슬라이더`, tabindex: '-1',
+    'data-tip': unlimited ? '맨 오른쪽 칸(∞)으로 밀면 무제한이에요' : '끌어서 값을 바꿔요',
   });
+
+  const paint = (next) => {
+    const isZero = unlimited && next === 0;
+    readout.classList.toggle('is-inf', isZero);
+    readout.textContent = isZero ? zeroText(spec) : (spec.pretty ? spec.pretty(next) : '');
+    hintNode.textContent = spec.hint ? spec.hint(next) : '';
+    number.classList.toggle('is-inf', isZero);
+  };
 
   const apply = (raw, syncRange, syncNumber) => {
     let next = Number(raw);
-    if (!Number.isFinite(next)) next = S.saved[key];
-    next = Math.min(spec.max, Math.max(spec.min, Math.round(next)));
-    if (syncRange) range.value = String(next);
+    if (raw === '' || !Number.isFinite(next)) next = unlimited ? 0 : Number(S.saved[key]);
+    next = Math.round(next);
+    if (!(unlimited && next === 0)) next = Math.min(spec.max, Math.max(spec.min, next));
+    if (syncRange) range.value = String(toSlider(next));
     if (syncNumber) number.value = String(next);
-    readout.textContent = spec.pretty ? spec.pretty(next) : '';
+    paint(next);
     setValue(key, next);
   };
-  range.addEventListener('input', (event) => apply(event.target.value, false, true));
+  range.addEventListener('input', (event) => apply(fromSlider(event.target.value), false, true));
   number.addEventListener('input', (event) => apply(event.target.value, true, false));
   number.addEventListener('blur', (event) => apply(event.target.value, true, true));
+  paint(value);
 
-  const control = h('div', { class: 'num' },
+  const rangeLabel = unlimited
+    ? `${spec.min}~${spec.max}${spec.unit} · 맨 끝은 ∞(무제한)이에요`
+    : `${spec.min}~${spec.max}${spec.unit} 안에서 고를 수 있어요`;
+
+  const control = h('div', { class: 'num' + (unlimited ? ' num--inf' : '') },
     range,
     h('div', { class: 'num__side' },
       number,
       h('span', { class: 'num__unit' }, spec.unit),
+      unlimited ? h('button', {
+        class: 'btn btn--sm num__infbtn', type: 'button',
+        'data-tip': '이 항목을 무제한으로 바꿔요',
+        'aria-label': `${spec.label} 무제한으로`,
+        onclick: () => apply(0, true, true),
+      }, '∞') : null,
     ),
     h('div', { class: 'num__meta' },
-      h('span', { class: 'num__range-label' }, `${spec.min}~${spec.max}${spec.unit} 안에서 고를 수 있어요`),
+      h('span', { class: 'num__range-label' }, rangeLabel),
+      hintNode,
       readout,
     ),
   );
@@ -484,53 +772,658 @@ function sectionOrder() {
   const previewBox = h('div', { class: 'prev' });
   const modeField = fieldShell('sortMode', '대기열 정렬 방식',
     null,
-    segmentControl('sortMode', SORT_MODES, (value) => loadQueuePreview(value)),
+    segmentControl('sortMode', SORT_MODES, () => loadQueuePreview()),
     h('div', { class: 'sortnote' },
       h('p', { class: 'sortnote__body' }, modeSpec.desc),
       previewBox,
     ),
   );
 
-  const seedsBox = h('div', { class: 'card seeds' });
-
   const body = h('div', { class: 'sec__body' },
     modeField,
-    fieldShell('autoBgmEnabled', '자동 BGM',
-      '대기열이 비면 아래 기준 곡과 비슷한 곡을 알아서 이어 틀어요. 끄면 조용해져요.',
-      toggleControl('autoBgmEnabled', '대기열이 비면 알아서 이어 틀어요', '대기열이 비면 재생을 멈춰요')),
+    votePointsGroup(previewBox),
+    boomttaGroup(),
+    voteSkipGroup(),
+    superLikeGroup(),
+    playbackGroup(),
+    autoplayGroup(),
+    chartsGroup(),
+  );
+
+  renderQueuePreview(previewBox);
+  loadQueuePreview();
+  return body;
+}
+
+/* ── 재생 (반복·기본 볼륨) ── */
+
+function playbackGroup() {
+  return h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '▶ 재생'),
+    h('p', { class: 'grp__desc' }, '대기열 끝에 닿았을 때 어떻게 할지와, 봇이 새로 들어갈 때의 볼륨이에요.'),
     fieldShell('repeatMode', '반복',
       REPEAT_MODES.find((item) => item.value === S.draft.repeatMode)?.desc || null,
       segmentControl('repeatMode', REPEAT_MODES)),
     numberField('defaultVolume', { min: Number(S.draft.minVolume), max: Number(S.draft.maxVolume) }),
-    h('div', { class: 'grp' },
-      h('h3', { class: 'grp__title' }, '📻 자동 재생 기준 곡'),
-      h('p', { class: 'grp__desc' },
-        '자동 재생이 이 곡들과 비슷한 곡을 찾아와요. 여러 곡을 넣으면 돌아가며 참고하니 한 장르로 쏠리지 않아요. ' +
-        '여기서 바꾼 건 저장 버튼 없이 바로 반영돼요.'),
-      seedsBox,
-    ),
   );
-
-  renderQueuePreview(previewBox);
-  loadQueuePreview(mode);
-  paintSeeds(seedsBox);
-  if (!S.seeds.items && !S.seeds.loading) loadSeeds().then(() => repaintSeeds());
-  return body;
 }
 
-/** 지금 대기열에 그 모드를 적용하면 순서가 어떻게 되는지 (구림 해소 #4). */
-async function loadQueuePreview(mode) {
-  if (S.queuePreview.mode === mode && S.queuePreview.data) return;
-  S.queuePreview = { mode, data: null, loading: true };
+/* ── 투표 점수 (v3 §10.1) ── 화면의 계산식과 실제 정렬이 같은 값을 써야 한다. */
+
+function votePointsGroup(previewBox) {
+  const formula = h('div', { class: 'formula' });
+  const paint = () => paintFormula(formula);
+
+  const group = h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '👍 투표 점수'),
+    h('p', { class: 'grp__desc' },
+      '좋아요·싫어요·슈퍼 좋아요·기다린 시간이 각각 몇 점인지 정해요. ' +
+      '리모컨 화면에 뜨는 계산식도 이 값을 그대로 쓰니까 화면이 거짓말하지 않아요.'),
+    numberField('likePoints'),
+    numberField('superLikePoints'),
+    numberField('dislikePoints'),
+    numberField('waitPoints'),
+    formula,
+  );
+  paint();
+
+  // 점수를 바꾸면 계산식도, 아래 대기열 미리보기도 같이 따라간다.
+  group.addEventListener('input', () => { paint(); scheduleQueuePreview(); });
+  group.addEventListener('click', () => { paint(); });
+  if (S.draft.sortMode === 'fifo') {
+    group.append(h('div', { class: 'warnbox warnbox--info' },
+      h('span', null, 'ℹ'),
+      h('span', null,
+        '지금은 시간제라 점수가 순서를 바꾸지 않아요. 화면에는 계속 보이지만 신청한 순서대로 나가요.'),
+    ));
+  }
+  if (previewBox) group.append(h('p', { class: 'hint' }, '점수를 바꾸면 위쪽 미리보기가 새 점수로 다시 계산돼요.'));
+  return group;
+}
+
+/** `👍3 × 1 + ⭐1 × 2 + 👎0 × -1 + 대기 2 × 1 = 7` — 예시 한 곡으로 지금 설정을 보여준다. */
+function paintFormula(box) {
+  const like = Number(S.draft.likePoints) || 0;
+  const superLike = Number(S.draft.superLikePoints) || 0;
+  const dislike = Number(S.draft.dislikePoints) || 0;
+  const wait = Number(S.draft.waitPoints) || 0;
+  const total = 3 * like + 1 * superLike + 0 * dislike + 2 * wait;
+  box.replaceChildren(
+    h('span', { class: 'formula__label' }, '예를 들면'),
+    h('code', { class: 'formula__body' },
+      `👍3 × ${like} + ⭐1 × ${superLike} + 👎0 × ${dislike} + 대기 2 × ${wait} = ${total}점`),
+    h('span', { class: 'hint' }, '좋아요 3개·슈퍼 1개를 받고 두 곡을 기다린 곡이에요'),
+  );
+}
+
+/* ── 붐따 (v3 §10.3) ── */
+
+function boomttaGroup() {
+  const on = Boolean(S.draft.boomttaEnabled);
+  const action = BOOMTTA_ACTIONS.find((item) => item.value === S.draft.boomttaAction) || BOOMTTA_ACTIONS[0];
+
+  const group = h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '💥 붐따 — 싫어요가 모이면 내리기'),
+    h('p', { class: 'grp__desc' },
+      '싫어요가 일정 수 이상 모인 곡을 대기열에서 내려요. 꺼 두면 싫어요는 점수에만 영향을 주고 곡이 사라지지 않아요. ' +
+      '지금 재생 중인 곡에는 적용하지 않아요.'),
+    fieldShell('boomttaEnabled', '붐따 사용',
+      '켜면 기준을 넘는 순간 바로 실행되고, 신청한 분에게 알려 드려요. 조용히 사라지지 않아요.',
+      toggleControl('boomttaEnabled', '기준을 넘으면 대기열에서 내려요', '싫어요는 점수에만 반영해요')),
+  );
+  if (!on) return group;
+
+  group.append(
+    numberField('boomttaThreshold'),
+    fieldShell('boomttaAction', '내릴 때 어떻게 할까요', action.desc,
+      segmentControl('boomttaAction', BOOMTTA_ACTIONS)),
+    h('p', { class: 'hint' }, Number(S.draft.boomttaThreshold) === 0
+      ? '기준을 무제한으로 두셔서 싫어요가 아무리 모여도 곡이 내려가지 않아요. 사실상 꺼 둔 것과 같아요.'
+      : `지금 설정이면 싫어요 ${S.draft.boomttaThreshold}개가 모이는 순간 그 곡을 ${action.label} 처리해요.`),
+  );
+  return group;
+}
+
+/* ── 투표 스킵 (v3 §10.5) ── 고른 기준을 지금 인원으로 환산해서 보여준다. */
+
+function voteSkipGroup() {
+  const on = Boolean(S.draft.voteSkipEnabled);
+  const basis = VOTE_SKIP_BASIS.find((item) => item.value === S.draft.voteSkipBasis) || VOTE_SKIP_BASIS[0];
+  const convert = h('div', { class: 'convert' });
+
+  const group = h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '⏭ 투표 스킵'),
+    h('p', { class: 'grp__desc' },
+      '혼자 계속 넘기면 남의 곡이 다 날아가요. 켜면 여러 명이 동의해야 곡이 넘어가요. ' +
+      '관리자·봇 주인·그 곡을 신청한 본인은 투표 없이 바로 넘길 수 있어요.'),
+    fieldShell('voteSkipEnabled', '투표로 넘기기',
+      '끄면 "곡 넘기기" 권한이 있는 사람은 누구나 혼자서 바로 넘길 수 있어요.',
+      toggleControl('voteSkipEnabled', '여러 명이 동의해야 넘어가요', '권한이 있으면 혼자서도 넘어가요')),
+  );
+  if (!on) return group;
+
+  group.append(
+    fieldShell('voteSkipBasis', '누구를 세나요', basis.desc,
+      segmentControl('voteSkipBasis', VOTE_SKIP_BASIS, () => paintSkipConvert(convert))),
+    numberField('voteSkipRatio'),
+    numberField('voteSkipMin'),
+    convert,
+  );
+  paintSkipConvert(convert);
+  // 숫자를 끌면 환산도 같이 따라간다.
+  group.addEventListener('input', () => paintSkipConvert(convert));
+  // 아직 인원을 모르면 진단을 한 번만 불러 채운다. 그 뒤로는 WS presence 가 알아서 갱신한다.
+  if (S.basis.listeners === null && !S.diag) {
+    loadDiag().then(() => {
+      const live = sectionBox && sectionBox.querySelector('.convert');
+      if (live) paintSkipConvert(live);
+    });
+  }
+  return group;
+}
+
+/** 모수 × 비율을 지금 접속 인원으로 환산해 "몇 명 중 몇 명"으로 보여준다. */
+function paintSkipConvert(box) {
+  const ratio = Number(S.draft.voteSkipRatio) || 0;
+  const minimum = Number(S.draft.voteSkipMin) || 0;
+  const listeners = S.basis.listeners;
+  const viewers = S.basis.viewers;
+  const need = (population) => {
+    if (population <= 0) return 0;
+    const byRatio = Math.ceil((population * ratio) / 100);
+    return Math.max(1, Math.max(minimum, byRatio));
+  };
+  const line = (label, population) => {
+    if (population == null) {
+      return h('div', { class: 'convert__row' },
+        h('span', { class: 'convert__label' }, label),
+        h('span', { class: 'hint' }, '지금 인원을 아직 못 받았어요. 잠시 뒤 다시 보여드릴게요.'));
+    }
+    if (population === 0) {
+      return h('div', { class: 'convert__row' },
+        h('span', { class: 'convert__label' }, label),
+        h('span', { class: 'convert__value' }, '0명 — 아무도 없어서 투표 없이 바로 넘어가요'));
+    }
+    return h('div', { class: 'convert__row' },
+      h('span', { class: 'convert__label' }, label),
+      h('span', { class: 'convert__value' }, `${population}명 중 ${need(population)}명이 눌러야 넘어가요`));
+  };
+
+  const basis = String(S.draft.voteSkipBasis || 'listeners');
+  const rows = [];
+  if (basis === 'listeners' || basis === 'either' || basis === 'both') rows.push(line('🎧 듣는 사람', listeners));
+  if (basis === 'viewers' || basis === 'either' || basis === 'both') rows.push(line('🖥 보는 사람', viewers));
+  if (basis === 'either') rows.push(h('p', { class: 'hint' }, '둘 중 한쪽만 채워도 넘어가요.'));
+  if (basis === 'both') rows.push(h('p', { class: 'hint' }, '두 줄을 모두 채워야 넘어가요.'));
+
+  box.replaceChildren(
+    h('div', { class: 'convert__head' }, '지금 이 서버 인원으로 환산하면'),
+    ...rows,
+    h('p', { class: 'hint' }, '모수가 1명이면 그 사람 혼자 눌러도 넘어가요. 혼자 듣는데 투표를 시키면 괴롭힘이니까요.'),
+  );
+}
+
+/* ── 슈퍼 좋아요 제한 (v3 §10.6) ── */
+
+function superLikeGroup() {
+  const cooldown = Number(S.draft.superLikeCooldownSec) || 0;
+  const daily = Number(S.draft.superLikeDailyLimit) || 0;
+  return h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '⭐ 슈퍼 좋아요 제한'),
+    h('p', { class: 'grp__desc' },
+      '슈퍼 좋아요는 점수를 크게 움직여요. 한 사람이 자기 취향 곡마다 박으면 대기열이 그 사람 것이 돼요. ' +
+      '기본은 둘 다 꺼져 있고, 필요한 서버만 켜시면 돼요. 관리자와 봇 주인도 똑같이 적용돼요.'),
+    numberField('superLikeCooldownSec'),
+    numberField('superLikeDailyLimit'),
+    h('p', { class: 'hint' },
+      daily > 0
+        ? '하루 기준은 UTC 자정이에요. 한국 시간으로는 오전 9시에 초기화돼요. 취소하면 횟수는 돌려드려요.'
+        : '하루 제한을 켜면 UTC 자정(한국 시간 오전 9시)에 초기화돼요.'),
+    cooldown > 0
+      ? h('p', { class: 'hint' }, '쿨타임 중에는 ⭐ 버튼에 남은 시간이 숫자로 떠요. 회색으로만 두면 고장인 줄 알거든요.')
+      : null,
+  );
+}
+
+/* ── 자동 재생 (v3 §8) ── 방식 3종 · 정책 4종 · 기준 곡 · 최근 N곡 · 장르 ── */
+
+function autoplayGroup() {
+  const on = Boolean(S.draft.autoBgmEnabled);
+  const mode = String(S.draft.autoplayMode || 'recent');
+  const modeSpec = AUTOPLAY_MODES.find((item) => item.value === mode) || AUTOPLAY_MODES[1];
+  const policy = AUTOPLAY_POLICIES.find((item) => item.value === S.draft.autoplayPolicy) || AUTOPLAY_POLICIES[1];
+
+  const group = h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '📻 자동 재생'),
+    h('p', { class: 'grp__desc' },
+      '대기열이 비었을 때 무엇을 기준으로 다음 곡을 고를지 정해요. ' +
+      '기본값은 "최근 튼 곡"이라 지금까지의 동작 그대로예요.'),
+    fieldShell('autoBgmEnabled', '자동 재생 사용',
+      '끄면 대기열이 비는 순간 조용해져요. 아래 설정은 그대로 남아 있다가 다시 켜면 이어서 써요.',
+      toggleControl('autoBgmEnabled', '대기열이 비면 알아서 이어 틀어요', '대기열이 비면 재생을 멈춰요')),
+  );
+  if (!on) {
+    group.append(h('p', { class: 'hint' }, '자동 재생이 꺼져 있어서 아래 설정은 지금 쓰이지 않아요. 위에서 켜시면 바로 나타나요.'));
+  }
+
+  group.append(fieldShell('autoplayMode', '무엇을 기준으로 고를까요', modeSpec.desc,
+    segmentControl('autoplayMode', AUTOPLAY_MODES)));
+
+  if (mode === 'recent') {
+    group.append(numberField('autoplayRecentCount'));
+  }
+  if (mode === 'genre') {
+    const genreBox = h('div', { class: 'genres' });
+    group.append(fieldShell('autoplayGenres', '어떤 장르를 쓸까요',
+      '고른 장르 차트에서 곡을 뽑아요. 여러 개 고르면 번갈아 가며 써서 한 장르로 쏠리지 않아요.',
+      genreBox));
+    paintGenres(genreBox);
+    if (S.genreOptions === null) loadGenreOptions().then(() => {
+      const live = sectionBox && sectionBox.querySelector('.genres');
+      if (live) paintGenres(live);
+    });
+  }
+
+  // 기준 곡 목록은 방식과 무관하게 늘 보여준다 — `seed` 가 아니어도 폴백 사슬에서 쓰인다.
+  const seedsBox = h('div', { class: 'card seeds' });
+  group.append(
+    h('h4', { class: 'grp__sub' }, '기준 곡'),
+    h('p', { class: 'grp__desc' },
+      '자동 재생이 이 곡들과 비슷한 곡을 찾아와요. 여러 곡을 넣으면 돌아가며 참고해요. ' +
+      '여기서 바꾼 건 저장 버튼 없이 바로 반영돼요.'),
+    seedsBox,
+    numberField('autoplaySeedMax'),
+  );
+  paintSeeds(seedsBox);
+  if (!S.seeds.items && !S.seeds.loading) loadSeeds().then(() => repaintSeeds());
+
+  group.append(
+    h('h4', { class: 'grp__sub' }, '추천 정책'),
+    h('p', { class: 'grp__desc' },
+      '기준 곡을 정하는 것과, 그 라디오 결과에서 어떤 곡을 집어 오는지는 다른 문제예요. ' +
+      '아래에서 얼마나 비슷하게 고를지 정해요.'),
+    fieldShell('autoplayPolicy', '얼마나 비슷하게 고를까요', policy.desc,
+      segmentControl('autoplayPolicy', AUTOPLAY_POLICIES)),
+    numberField('autoplayArtistCooldown'),
+    numberField('autoplayRecentDecayHours'),
+    h('p', { class: 'hint' },
+      '정책을 바꾸면 지금 잡혀 있는 다음 추천곡을 바로 다시 뽑아요. 안 그러면 언제 반영됐는지 알 수 없으니까요.'),
+  );
+  return group;
+}
+
+/** 장르 칩 — 장르 차트 목록을 그대로 쓴다. 새 크롤러도 새 목록도 만들지 않는다. */
+function paintGenres(box) {
+  if (S.genreOptions === null) {
+    box.replaceChildren(h('div', { class: 'skel', style: 'height:30px;width:240px' }));
+    return;
+  }
+  if (!S.genreOptions.length) {
+    box.replaceChildren(h('p', { class: 'hint' },
+      '고를 수 있는 장르 차트가 없어요. 아래 "차트 관리"에서 장르 차트를 켜시면 여기에 나타나요.'));
+    return;
+  }
+  const picked = new Set((S.draft.autoplayGenres || []).map(String));
+  box.replaceChildren();
+  S.genreOptions.forEach((option) => {
+    const key = String(option.key);
+    const on = picked.has(key);
+    const chip = h('button', {
+      class: 'role' + (on ? ' is-on' : ''), type: 'button',
+      'aria-pressed': on ? 'true' : 'false',
+      'data-tip': on ? '이 장르를 빼요' : '이 장르를 넣어요',
+    }, h('span', { class: 'role__name' }, option.label || key));
+    chip.addEventListener('click', () => {
+      const next = new Set((S.draft.autoplayGenres || []).map(String));
+      const was = next.has(key);
+      if (was) next.delete(key); else next.add(key);
+      setValue('autoplayGenres', Array.from(next));
+      chip.classList.toggle('is-on', !was);
+      chip.setAttribute('aria-pressed', was ? 'false' : 'true');
+    });
+    box.append(chip);
+  });
+  if (!picked.size) {
+    box.append(h('p', { class: 'hint' }, '아직 고른 장르가 없어요. 이대로 두면 "최근 튼 곡"으로 대신 골라요.'));
+  }
+  tooltip(box);
+}
+
+/**
+ * 장르 후보. 전용 엔드포인트가 있으면 그걸 쓰고, 없으면 차트 목록의 `genre` 분류에서 뽑는다.
+ * 둘 다 없으면 빈 목록을 그대로 보여준다 — 없는 걸 있는 척하지 않는다.
+ */
+async function loadGenreOptions() {
+  try {
+    const data = await api('/autoplay');
+    if (Array.isArray(data.genreOptions)) { S.genreOptions = data.genreOptions; return; }
+  } catch { /* 아래 차트 목록으로 폴백한다 */ }
+  try {
+    const data = await api('/charts');
+    const category = (data.categories || []).find((item) => item.key === 'genre');
+    S.genreOptions = (category ? category.charts || [] : [])
+      .map((chart) => ({ key: String(chart.id), label: chart.name }));
+  } catch {
+    S.genreOptions = [];
+  }
+}
+
+/* ── 차트 관리 (v3 §15.5) ── 켜기/끄기 · 순서 · 주소 수정 · 차트 추가 ── */
+
+function chartsGroup() {
+  const box = h('div', { class: 'card charts' });
+  const group = h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '📈 차트 관리'),
+    h('p', { class: 'grp__desc' },
+      '리모컨의 차트 탭에 무엇을 보여줄지 정해요. 차트는 결국 재생목록 주소라, 유튜브가 주소를 바꾸면 ' +
+      '코드를 고치지 않고 여기서 주소만 갈아 끼우시면 돼요. 기본 제공 차트는 지울 수 없고 끄기만 돼요.'),
+    numberField('chartSuperWeight'),
+    box,
+    h('button', {
+      class: 'btn', type: 'button', style: 'align-self:flex-start',
+      'data-tip': '주소를 직접 넣어 차트를 하나 추가해요',
+      onclick: () => openChartSheet(null),
+    }, '+ 차트 추가'),
+  );
+  paintCharts(box);
+  if (S.charts.items === null && !S.charts.loading) loadCharts().then(() => repaintCharts());
+  return group;
+}
+
+async function loadCharts() {
+  if (S.charts.loading) return;
+  S.charts.loading = true;
+  try {
+    const data = await api('/admin/charts');
+    S.charts = { items: data.items || [], error: null, loading: false };
+  } catch (error) {
+    S.charts = { items: [], error: error.message, loading: false };
+  }
+}
+
+function repaintCharts() {
+  const box = sectionBox && sectionBox.querySelector('.charts');
+  if (box) paintCharts(box);
+}
+
+function paintCharts(box) {
+  if (S.charts.loading || S.charts.items === null) {
+    box.replaceChildren(h('div', { class: 'skel', style: 'height:120px;margin:12px' }));
+    return;
+  }
+  if (S.charts.error) {
+    box.replaceChildren(h('p', { class: 'hint', style: 'padding:12px' },
+      `차트 목록을 못 불러왔어요 — ${S.charts.error}`));
+    return;
+  }
+  if (!S.charts.items.length) {
+    box.replaceChildren(h('div', { class: 'empty' },
+      h('div', { class: 'empty__icon' }, '📈'),
+      h('div', { class: 'empty__title' }, '차트가 하나도 없어요'),
+      h('div', { class: 'empty__desc' }, '아래 "차트 추가"로 재생목록 주소를 넣으시면 리모컨의 차트 탭에 나타나요.'),
+    ));
+    return;
+  }
+
+  box.replaceChildren();
+  CHART_CATEGORIES.forEach((category) => {
+    const items = chartsIn(category.key);
+    if (!items.length) return;
+    box.append(h('div', { class: 'charts__cat' },
+      h('span', { class: 'charts__caticon' }, category.icon),
+      h('span', { class: 'charts__catname' }, category.label),
+      h('span', { class: 'hint' }, category.desc),
+    ));
+    const rows = h('ul', { class: 'rows' });
+    items.forEach((item, index) => rows.append(chartRow(item, index, items.length)));
+    box.append(rows);
+  });
+  tooltip(box);
+}
+
+function chartRow(item, index, total) {
+  const builtin = item.builtin || item.guildId == null || Number(item.guildId) === 0;
+  const enabled = item.enabled !== false;
+  const failed = item.ok === false;
+  const fetched = item.lastFetchedUtc
+    ? (failed ? `마지막 갱신 실패 · ${fmtAgo(item.lastFetchedUtc)}` : `${fmtAgo(item.lastFetchedUtc)} 갱신했어요`)
+    : '아직 한 번도 안 가져왔어요';
+
+  return h('li', { class: 'row row--chart' + (enabled ? '' : ' is-off') },
+    h('button', {
+      class: 'sw sw--sm' + (enabled ? ' is-on' : ''), type: 'button', role: 'switch',
+      'aria-checked': enabled ? 'true' : 'false',
+      'data-tip': enabled ? '리모컨 차트 목록에서 숨겨요' : '리모컨 차트 목록에 다시 보여요',
+      'aria-label': `${item.name} ${enabled ? '끄기' : '켜기'}`,
+      onclick: () => updateChart(item, { enabled: !enabled }),
+    }, h('span', { class: 'sw__knob' })),
+    h('div', { class: 'row__main' },
+      h('div', { class: 'row__name' },
+        item.name,
+        builtin ? h('span', { class: 'chip' }, '기본 제공') : null,
+        failed ? h('span', { class: 'chip chip--warn' }, '가져오기 실패') : null,
+      ),
+      h('div', { class: 'row__sub' },
+        h('span', null, item.provider || '공급자 미상'),
+        h('span', null, `· ${fetched}`),
+        item.trackCount != null ? h('span', null, `· ${item.trackCount}곡`) : null,
+        failed && item.failureReason ? h('span', null, `· ${item.failureReason}`) : null,
+      ),
+    ),
+    h('div', { class: 'row__acts' },
+      h('button', {
+        class: 'btn btn--sm btn--icon', type: 'button', disabled: index === 0,
+        'data-tip': index === 0 ? '이미 맨 위예요' : '한 칸 위로 올려요',
+        'aria-label': `${item.name} 한 칸 위로`,
+        onclick: () => moveChart(item, -1),
+      }, '↑'),
+      h('button', {
+        class: 'btn btn--sm btn--icon', type: 'button', disabled: index === total - 1,
+        'data-tip': index === total - 1 ? '이미 맨 아래예요' : '한 칸 아래로 내려요',
+        'aria-label': `${item.name} 한 칸 아래로`,
+        onclick: () => moveChart(item, 1),
+      }, '↓'),
+      h('button', {
+        class: 'btn btn--sm btn--icon', type: 'button',
+        'data-tip': '캐시를 무시하고 지금 다시 가져와요',
+        'aria-label': `${item.name} 새로고침`,
+        onclick: () => refreshChart(item),
+      }, '↻'),
+      item.url ? h('button', {
+        class: 'btn btn--sm', type: 'button',
+        'data-tip': '이름과 주소를 고쳐요',
+        onclick: () => openChartSheet(item),
+      }, '수정') : null,
+      builtin ? h('button', {
+        class: 'btn btn--sm', type: 'button', disabled: true,
+        'data-tip': '기본 제공 차트는 지울 수 없어요. 대신 왼쪽 스위치로 끄시면 돼요',
+      }, '삭제') : h('button', {
+        class: 'btn btn--sm btn--danger', type: 'button',
+        'data-tip': '이 차트를 목록에서 지워요',
+        onclick: () => removeChart(item),
+      }, '삭제'),
+    ),
+  );
+}
+
+async function updateChart(item, patch) {
+  try {
+    await api(`/admin/charts/${item.id}`, { method: 'PUT', body: patch });
+    Object.assign(item, patch);
+    repaintCharts();
+  } catch (error) {
+    toast(`차트를 못 바꿨어요 — ${error.message}`, 'danger');
+  }
+}
+
+/** 한 분류의 차트를 저장된 순서대로. 화면과 `sortOrder` 가 어긋나면 순서 바꾸기가 먹지 않은 것처럼 보인다. */
+function chartsIn(category) {
+  return (S.charts.items || [])
+    .filter((entry) => entry.category === category)
+    .sort((a, b) => (Number(a.sortOrder) || 0) - (Number(b.sortOrder) || 0));
+}
+
+/** 같은 분류 안에서만 자리를 옮긴다. 분류를 넘나들면 사용자가 찾던 차트가 사라진 것처럼 보인다. */
+async function moveChart(item, step) {
+  const siblings = chartsIn(item.category);
+  const from = siblings.indexOf(item);
+  const to = from + step;
+  if (from < 0 || to < 0 || to >= siblings.length) return;
+  // 되돌릴 때 배열만 되돌리면 안 된다 — 순서는 항목마다의 `sortOrder` 에 들어 있다.
+  const before = siblings.map((entry) => [entry, entry.sortOrder]);
+  siblings.splice(from, 1);
+  siblings.splice(to, 0, item);
+  siblings.forEach((entry, index) => { entry.sortOrder = index; });
+  repaintCharts();
+  try {
+    await api('/admin/charts/reorder', {
+      method: 'POST',
+      body: { category: item.category, ids: siblings.map((entry) => entry.id) },
+    });
+  } catch (error) {
+    before.forEach(([entry, order]) => { entry.sortOrder = order; });
+    repaintCharts();
+    toast(`순서를 못 바꿨어요 — ${error.message}`, 'danger');
+  }
+}
+
+async function refreshChart(item) {
+  toast(`"${item.name}"을(를) 다시 가져오는 중이에요. 곡이 많으면 몇 초 걸려요.`, 'info');
+  try {
+    await api(`/charts/${item.id}/refresh`, { method: 'POST', body: {} });
+    await loadCharts();
+    repaintCharts();
+    toast('차트를 새로 가져왔어요.', 'ok');
+  } catch (error) {
+    toast(`가져오지 못했어요 — ${error.message}`, 'danger');
+  }
+}
+
+async function removeChart(item) {
+  const ok = await confirmSheet({
+    title: '차트 지우기',
+    desc: `"${item.name}"을(를) 목록에서 지워요. 다시 쓰시려면 주소를 새로 넣어야 해요.`,
+    confirmText: '지울게요', cancelText: '그냥 둘게요', danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api(`/admin/charts/${item.id}/remove`, { method: 'POST', body: {} });
+    S.charts.items = S.charts.items.filter((entry) => entry.id !== item.id);
+    repaintCharts();
+    toast('차트를 지웠어요.', 'ok');
+  } catch (error) {
+    toast(`지우지 못했어요 — ${error.message}`, 'danger');
+  }
+}
+
+/** 차트 추가·수정 시트. 기본 제공 차트는 이름과 주소만 고칠 수 있다. */
+async function openChartSheet(item) {
+  const editing = Boolean(item);
+  let category = editing ? item.category : 'popular';
+  let provider = editing ? item.provider : 'YouTubeMusic';
+  const nameInput = h('input', { class: 'field', placeholder: '차트 이름 (예: 한국 인기곡)', value: editing ? item.name : '' });
+  const urlInput = h('input', { class: 'field', placeholder: '재생목록 주소 (https://…)', value: editing ? (item.url || '') : '' });
+
+  const categoryBox = h('div', { class: 'seg' });
+  CHART_CATEGORIES.filter((entry) => entry.key !== 'ours').forEach((entry) => {
+    categoryBox.append(h('button', {
+      class: 'seg__btn' + (entry.key === category ? ' is-on' : ''), type: 'button',
+      'data-tip': entry.desc,
+      onclick: (event) => {
+        category = entry.key;
+        categoryBox.querySelectorAll('.seg__btn').forEach((node) => node.classList.remove('is-on'));
+        event.currentTarget.classList.add('is-on');
+      },
+    }, entry.label));
+  });
+
+  const providerBox = h('div', { class: 'seg' });
+  ['YouTubeMusic', 'YouTube', 'SoundCloud'].forEach((value) => {
+    providerBox.append(h('button', {
+      class: 'seg__btn' + (value === provider ? ' is-on' : ''), type: 'button',
+      'data-tip': `${value} 주소로 다뤄요`,
+      onclick: (event) => {
+        provider = value;
+        providerBox.querySelectorAll('.seg__btn').forEach((node) => node.classList.remove('is-on'));
+        event.currentTarget.classList.add('is-on');
+      },
+    }, value));
+  });
+
+  const body = h('div', { class: 'sheetform' },
+    h('label', { class: 'sheetform__label' }, '이름'), nameInput,
+    h('label', { class: 'sheetform__label' }, '주소'), urlInput,
+    h('p', { class: 'hint' }, '재생목록 주소면 돼요. 곡 목록은 6시간마다 한 번만 가져오니 서버가 무거워지지 않아요.'),
+    editing ? null : h('label', { class: 'sheetform__label' }, '분류'),
+    editing ? null : categoryBox,
+    editing ? null : h('label', { class: 'sheetform__label' }, '공급자'),
+    editing ? null : providerBox,
+  );
+
+  const ok = await sheet({
+    title: editing ? `"${item.name}" 수정` : '차트 추가',
+    body,
+    dismissValue: false,
+    actions: [
+      { label: '취소', kind: 'ghost', value: false },
+      { label: editing ? '저장' : '추가', kind: 'primary', value: true },
+    ],
+  }).result;
+  if (!ok) return;
+
+  const name = nameInput.value.trim();
+  const url = urlInput.value.trim();
+  if (!name) { toast('이름을 넣어 주세요.', 'warn'); return; }
+  if (!url) { toast('재생목록 주소를 넣어 주세요.', 'warn'); return; }
+  try {
+    if (editing) await api(`/admin/charts/${item.id}`, { method: 'PUT', body: { name, url } });
+    else await api('/admin/charts', { method: 'POST', body: { category, provider, name, url } });
+    await loadCharts();
+    repaintCharts();
+    toast(editing ? '차트를 고쳤어요.' : '차트를 추가했어요.', 'ok');
+  } catch (error) {
+    toast(`저장하지 못했어요 — ${error.message}`, 'danger');
+  }
+}
+
+/* ── 대기열 미리보기 ── */
+
+/** 점수를 끌 때마다 서버를 때리지 않게 한 박자 묶는다 (§23.2 — 새 폴링을 만들지 않는다). */
+let queuePreviewTimer = null;
+function scheduleQueuePreview() {
+  clearTimeout(queuePreviewTimer);
+  queuePreviewTimer = setTimeout(() => loadQueuePreview(), 260);
+}
+
+/** 지금 대기열에 이 모드·이 점수를 적용하면 순서가 어떻게 되는지 (구림 해소 #4 + v3 §10.1). */
+function queuePreviewKey() {
+  return [
+    S.draft.sortMode,
+    S.draft.likePoints, S.draft.dislikePoints, S.draft.superLikePoints, S.draft.waitPoints,
+  ].join('|');
+}
+
+async function loadQueuePreview() {
+  const key = queuePreviewKey();
+  if (S.queuePreview.mode === key && S.queuePreview.data) return;
+  S.queuePreview = { mode: key, data: null, loading: true };
   const box = sectionBox && sectionBox.querySelector('.prev');
   if (box) renderQueuePreview(box);
+  // 점수도 같이 보낸다 — 서버가 이 값들로 계산해야 "저장하면 이렇게 돼요"가 사실이 된다.
+  const params = new URLSearchParams({
+    mode: String(S.draft.sortMode),
+    likePoints: String(S.draft.likePoints),
+    dislikePoints: String(S.draft.dislikePoints),
+    superLikePoints: String(S.draft.superLikePoints),
+    waitPoints: String(S.draft.waitPoints),
+  });
   try {
-    const data = await api(`/admin/queue-preview?mode=${encodeURIComponent(mode)}`);
-    if (S.queuePreview.mode !== mode) return;   // 그 사이 모드가 또 바뀌었으면 버린다
-    S.queuePreview = { mode, data, loading: false };
+    const data = await api(`/admin/queue-preview?${params.toString()}`);
+    if (S.queuePreview.mode !== key) return;   // 그 사이 값이 또 바뀌었으면 버린다
+    S.queuePreview = { mode: key, data, loading: false };
   } catch (error) {
-    if (S.queuePreview.mode !== mode) return;
-    S.queuePreview = { mode, data: { error: error.message }, loading: false };
+    if (S.queuePreview.mode !== key) return;
+    S.queuePreview = { mode: key, data: { error: error.message }, loading: false };
   }
   const target = sectionBox && sectionBox.querySelector('.prev');
   if (target) renderQueuePreview(target);
@@ -591,6 +1484,9 @@ function renderQueuePreview(box) {
 /** 드래그 중인 시드의 cacheKey. 드롭 대상이 이 값을 보고 자리를 계산한다. */
 let seedDragKey = null;
 
+/** 기준 곡을 못 고칠 때의 이유 — 조건과 대상을 같이 말한다 (§23.3). */
+const LOCKED_SEED_TIP = '"자동 재생 설정" 권한이 있어야 고쳐요';
+
 async function loadSeeds() {
   if (S.seeds.loading) return;
   S.seeds.loading = true;
@@ -627,13 +1523,19 @@ function paintSeeds(box) {
   }
 
   const items = state.items;
-  const max = state.max || SEED_MAX_FALLBACK;
+  // 상한은 저장한 설정(`autoplaySeedMax`)이 이긴다. 0이면 무제한이라 "가득 참"이 없다 (§23.1).
+  const configured = S.draft && S.draft.autoplaySeedMax != null ? Number(S.draft.autoplaySeedMax) : null;
+  const max = configured != null ? configured : (state.max || SEED_MAX_FALLBACK);
+  const unlimited = max === 0;
+  const full = !unlimited && items.length >= max;
   const head = h('div', { class: 'seeds__head' },
-    h('span', { class: 'seeds__count' + (items.length >= max ? ' is-full' : '') },
-      `${items.length} / ${max}곡`),
+    h('span', {
+      class: 'seeds__count' + (full ? ' is-full' : ''),
+      'data-tip': unlimited ? '상한을 무제한으로 두셨어요' : `${max}곡까지 넣을 수 있어요`,
+    }, unlimited ? `${items.length}곡 · 무제한` : `${items.length} / ${max}곡`),
     h('span', { class: 'hint' },
-      items.length >= max
-        ? '자리가 다 찼어요. 새로 넣으려면 하나를 빼 주세요.'
+      unlimited ? '몇 곡이든 넣을 수 있어요.'
+        : full ? '자리가 다 찼어요. 새로 넣으려면 하나를 빼 주세요.'
         : `${max}곡까지 넣을 수 있어요.`),
   );
 
@@ -654,11 +1556,12 @@ function paintSeeds(box) {
   const notes = [];
   if (!state.canEdit) {
     notes.push(h('p', { class: 'hint' },
-      '이 서버에서는 기준 곡을 바꿀 권한이 없어서 목록만 보여 드려요. 권한 섹션의 "자동 재생 기준 곡"에서 바꿀 수 있어요.'));
+      '이 서버에서는 기준 곡을 바꿀 권한이 없어서 목록만 보여 드려요. ' +
+      '권한 섹션의 "자동 재생 설정"을 관리자나 내 역할이 통과하도록 바꾸시면 편집할 수 있어요.'));
   }
-  if (!S.draft.autoBgmEnabled) {
+  if (S.draft.autoplayMode !== 'seed') {
     notes.push(h('p', { class: 'hint' },
-      '지금은 자동 BGM이 꺼져 있어서 기준 곡이 쓰이지 않아요. 위에서 켜 주시면 바로 참고하기 시작해요.'));
+      '지금 방식은 "기준 곡"이 아니에요. 그래도 다른 방식으로 후보를 못 구하면 이 목록으로 넘어와서 골라요.'));
   }
   box.replaceChildren(head, rows, ...notes);
   tooltip(box);
@@ -689,27 +1592,29 @@ function seedRow(item, index, total, canEdit) {
       h('div', { class: 'seed__title mq' }, h('span', { class: 'mq__i' }, track.title || '(제목이 없어요)')),
       h('div', { class: 'seed__sub' }, sub),
     ),
-    canEdit ? h('div', { class: 'seed__acts' },
+    // 권한이 없어도 버튼을 숨기지 않는다 (§23.3). 회색으로 두되 왜 안 되는지 툴팁에 적는다.
+    h('div', { class: 'seed__acts' },
       h('button', {
         class: 'btn btn--sm btn--icon', type: 'button',
-        disabled: index === 0,
-        'data-tip': '한 칸 위로 올려요',
+        disabled: !canEdit || index === 0,
+        'data-tip': !canEdit ? LOCKED_SEED_TIP : index === 0 ? '이미 맨 위예요' : '한 칸 위로 올려요',
         'aria-label': `${track.title || '이 곡'} 한 칸 위로`,
         onclick: () => moveSeedBy(index, -1),
       }, '↑'),
       h('button', {
         class: 'btn btn--sm btn--icon', type: 'button',
-        disabled: index === total - 1,
-        'data-tip': '한 칸 아래로 내려요',
+        disabled: !canEdit || index === total - 1,
+        'data-tip': !canEdit ? LOCKED_SEED_TIP : index === total - 1 ? '이미 맨 아래예요' : '한 칸 아래로 내려요',
         'aria-label': `${track.title || '이 곡'} 한 칸 아래로`,
         onclick: () => moveSeedBy(index, 1),
       }, '↓'),
       h('button', {
-        class: 'btn btn--sm btn--danger', type: 'button',
-        'data-tip': '기준 곡에서 빼요',
+        class: 'btn btn--sm' + (canEdit ? ' btn--danger' : ''), type: 'button',
+        disabled: !canEdit,
+        'data-tip': canEdit ? '기준 곡에서 빼요' : LOCKED_SEED_TIP,
         onclick: () => removeSeed(item),
       }, '빼기'),
-    ) : null,
+    ),
   );
 
   if (!canEdit) return row;
@@ -807,10 +1712,17 @@ function sectionPerms() {
   const body = h('div', { class: 'sec__body' });
 
   const group = h('div', { class: 'grp' },
-    h('h3', { class: 'grp__title' }, '기능별 권한'),
+    h('h3', { class: 'grp__title' }, `기능별 권한 ${PERM_FIELDS.length}종`),
     h('p', { class: 'grp__desc' },
       '각 동작을 누가 할 수 있는지 따로 정해요. "지정 역할"을 고른 항목에만 역할 선택기가 펼쳐지고, ' +
       '고른 역할은 그 항목에만 적용돼요. 검색용으로 @DJ를 줬다고 볼륨까지 열리지 않아요.'),
+    h('div', { class: 'warnbox warnbox--info' },
+      h('span', null, 'ℹ'),
+      h('span', null,
+        '여기서 막은 기능은 리모컨에서 그냥 회색이 되지 않아요. ' +
+        '"왜 안 되는지"와 "지금 누가 쓸 수 있는지(역할 이름 + 인원수)"가 버튼 툴팁에 같이 떠요. ' +
+        '그래서 아래 통과 인원이 0명이면 멤버에게도 0명이라고 보여요.'),
+    ),
   );
 
   PERM_FIELDS.forEach((field) => group.append(permField(field)));
@@ -876,7 +1788,7 @@ function permField(field) {
       if (note) note.textContent = ruleDesc(next);
       paintRolesNote(rolesNote, field);
       loadPermPreview(field, next, preview);
-    }),
+    }, field.label),
     h('span', { class: 'permrow__note', 'data-rule-note': field.key }, ruleDesc(value)),
   );
 
@@ -905,7 +1817,7 @@ function setRuleRoles(permKey, ids) {
 /**
  * 역할 다중 선택 칩.
  * read/write 로 어느 값에 붙을지 정한다 — 권한별 역할과 관리자 역할이 같은 위젯을 쓴다.
- * 칩 하나를 눌렀다고 섹션 전체를 다시 그리면 8개 미리보기가 전부 다시 날아가므로 제자리에서 토글한다.
+ * 칩 하나를 눌렀다고 섹션 전체를 다시 그리면 10개 미리보기가 전부 다시 날아가므로 제자리에서 토글한다.
  */
 function roleChecklist(read, write, onChange) {
   const box = h('div', { class: 'roles' });
@@ -968,11 +1880,28 @@ function paintPermPreview(box, data, rule) {
   const total = Number(data.memberCount || 0);
   const tone = rule === 'disabled' ? 'is-none' : pass === 0 ? 'is-none' : pass === total ? 'is-all' : 'is-some';
   const kids = [
-    h('span', { class: `permprev__count ${tone}` },
-      rule === 'disabled' ? '지금 통과: 0명 — 아무도 못 써요' : `지금 통과: ${pass}명 / 멤버 ${total}명`),
+    h('span', {
+      class: `permprev__count ${tone}`,
+      'data-tip': rule === 'disabled'
+        ? '규칙이 사용 안 함이라 관리자도 못 써요'
+        : '지금 이 서버에서 이 규칙을 통과하는 사람 수예요',
+    }, rule === 'disabled' ? '지금 통과: 0명 — 아무도 못 써요' : `지금 통과: ${pass}명 / 멤버 ${total}명`),
   ];
   if (data.managerBypassCount) {
     kids.push(h('span', { class: 'permprev__note' }, `그중 ${data.managerBypassCount}명은 관리자라서 통과해요`));
+  }
+  // §23.3 — 막힌 사람에게 보여줄 "누가 되는지" 문구를 관리자도 미리 확인한다.
+  const allowedRoles = data.allowedRoleNames || [];
+  if (allowedRoles.length) {
+    kids.push(h('span', { class: 'permprev__note' },
+      `멤버에게는 "지금은 ${allowedRoles.map((name) => `@${name}`).join(' · ')}이 쓸 수 있어요 (${data.allowedCount != null ? data.allowedCount : pass}명)"로 보여요`));
+  } else if (rule === 'administrator') {
+    kids.push(h('span', { class: 'permprev__note' },
+      `멤버에게는 "서버 관리자 ${data.allowedCount != null ? data.allowedCount : pass}명이 쓸 수 있어요"로 보여요`));
+  } else if (rule === 'disabled') {
+    kids.push(h('span', { class: 'permprev__note' }, '멤버에게는 "이 기능은 서버에서 꺼 뒀어요"로 보여요'));
+  } else if (rule === 'sameVoiceChannel') {
+    kids.push(h('span', { class: 'permprev__note' }, '멤버에게는 "봇과 같은 음성 채널에 있어야 눌러요"로 보여요'));
   }
   if (data.note) kids.push(h('span', { class: 'permprev__note' }, data.note));
   const sample = data.sample || [];
@@ -1002,18 +1931,220 @@ function sectionLimits() {
     ),
     h('div', { class: 'grp' },
       h('h3', { class: 'grp__title' }, '대기열'),
-      h('p', { class: 'grp__desc' }, '한 사람이 얼마나 넣을 수 있고 서버 전체로는 얼마까지 받을지 정해요.'),
+      h('p', { class: 'grp__desc' },
+        '한 사람이 얼마나 넣을 수 있고 서버 전체로는 얼마까지 받을지 정해요. ' +
+        '모든 칸은 맨 끝으로 밀면 ∞(무제한)이 되고, 직접입력에 0을 넣어도 같아요.'),
       numberField('maxQueuePerUser'),
       numberField('maxQueuePerGuild'),
       numberField('maxTrackSeconds'),
+      numberField('bulkEnqueueLimit'),
     ),
     h('div', { class: 'grp' },
       h('h3', { class: 'grp__title' }, '보관 기간'),
-      h('p', { class: 'grp__desc' }, '오래된 기록은 자동으로 지워요. 길게 잡으면 DB가 커져요.'),
+      h('p', { class: 'grp__desc' },
+        '오래된 기록은 자동으로 지워요. 길게 잡으면 DB가 커져요. ' +
+        '투표와 재생 조작 기록은 양이 많아서 여기 값과 상관없이 3일만 남아요.'),
       numberField('auditRetentionDays'),
       numberField('chatRetentionDays'),
     ),
   );
+}
+
+/* ═══════════════════════════ 섹션 3b · 차단 목록 (v3 §19) ═══════════════════════════ */
+
+function sectionBlocked() {
+  const body = h('div', { class: 'sec__body' });
+
+  // 시험 입력창 — 규칙을 넣고 나서 "왜 안 막히지?"를 남기지 않는다.
+  const testResult = h('div', { class: 'testbox__result' });
+  const testInput = h('input', {
+    class: 'field', type: 'search',
+    placeholder: '곡 제목이나 주소를 넣어 보세요',
+    'data-tip': '지금 규칙으로 막히는지 바로 확인해요',
+  });
+  let testTimer = null;
+  testInput.addEventListener('input', (event) => {
+    clearTimeout(testTimer);
+    const query = event.target.value;
+    if (!query.trim()) { testResult.replaceChildren(); return; }
+    testTimer = setTimeout(() => runBlacklistTest(query, testResult), 260);
+  });
+
+  body.append(h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '🔎 막히는지 시험해 보기'),
+    h('p', { class: 'grp__desc' },
+      '지금 규칙으로 이 곡이 막히는지, 막힌다면 어떤 규칙에 걸렸는지 바로 알려드려요.'),
+    h('div', { class: 'testbox' }, testInput, testResult),
+  ));
+
+  // 추가 폼 — 모달까지 갈 일이 아니라 인라인이다.
+  const kindBox = h('div', { class: 'seg' });
+  BLACKLIST_KINDS.forEach((kind) => {
+    kindBox.append(h('button', {
+      class: 'seg__btn' + (kind.value === S.blocked.kind ? ' is-on' : ''), type: 'button',
+      'data-tip': kind.desc,
+      onclick: (event) => {
+        S.blocked.kind = kind.value;
+        kindBox.querySelectorAll('.seg__btn').forEach((node) => node.classList.remove('is-on'));
+        event.currentTarget.classList.add('is-on');
+        const note = body.querySelector('[data-kind-note]');
+        if (note) note.textContent = kind.desc;
+        repaintBlocked();
+      },
+    }, kind.label));
+  });
+  const patternInput = h('input', { class: 'field', placeholder: '막을 제목이나 주소', maxlength: '200' });
+  const noteInput = h('input', { class: 'field', placeholder: '메모 (왜 막았는지 · 선택)', maxlength: '120' });
+
+  const listBox = h('div', { class: 'card blocklist' });
+  body.append(h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '차단 규칙'),
+    h('p', { class: 'grp__desc' },
+      '종류를 고르고 패턴을 넣으시면 돼요. 여기서 만든 규칙은 이 서버에만 적용돼요. ' +
+      '봇 전체 규칙은 목록에 보이지만 지울 수 없어요.'),
+    kindBox,
+    h('p', { class: 'hint', 'data-kind-note': '1' },
+      (BLACKLIST_KINDS.find((kind) => kind.value === S.blocked.kind) || BLACKLIST_KINDS[0]).desc),
+    h('div', { class: 'addform' },
+      patternInput,
+      noteInput,
+      h('button', {
+        class: 'btn btn--primary', type: 'button',
+        'data-tip': '이 서버의 차단 목록에 넣어요',
+        onclick: () => addBlocked(patternInput, noteInput),
+      }, '추가'),
+    ),
+    listBox,
+  ));
+
+  paintBlocked(listBox);
+  if (S.blocked.items === null && !S.blocked.loading) loadBlocked().then(() => repaintBlocked());
+  return body;
+}
+
+async function runBlacklistTest(query, box) {
+  box.replaceChildren(h('div', { class: 'skel', style: 'height:20px;width:200px' }));
+  try {
+    const data = await api('/admin/blacklist/test', { method: 'POST', body: { query } });
+    if (data.blocked) {
+      const rule = data.rule || {};
+      box.replaceChildren(h('div', { class: 'testbox__hit is-blocked' },
+        h('span', null, '🚫 막혀요'),
+        h('span', { class: 'hint' },
+          `${(BLACKLIST_KINDS.find((kind) => kind.value === rule.kind) || {}).label || rule.kind || '규칙'}` +
+          ` · "${rule.pattern || ''}"` +
+          `${rule.scope === 'global' ? ' · 봇 전체 규칙이에요' : ' · 이 서버 규칙이에요'}`),
+      ));
+    } else {
+      box.replaceChildren(h('div', { class: 'testbox__hit is-pass' },
+        h('span', null, '✅ 안 막혀요'),
+        h('span', { class: 'hint' }, '지금 규칙으로는 이 곡이 그대로 들어와요.'),
+      ));
+    }
+  } catch (error) {
+    box.replaceChildren(h('p', { class: 'hint' }, `시험해 보지 못했어요 — ${error.message}`));
+  }
+}
+
+async function loadBlocked() {
+  if (S.blocked.loading) return;
+  S.blocked.loading = true;
+  try {
+    const data = await api('/admin/blacklist');
+    S.blocked = { items: data.items || [], error: null, loading: false, kind: S.blocked.kind };
+  } catch (error) {
+    S.blocked = { items: [], error: error.message, loading: false, kind: S.blocked.kind };
+  }
+}
+
+function repaintBlocked() {
+  const box = sectionBox && sectionBox.querySelector('.blocklist');
+  if (box) paintBlocked(box);
+}
+
+function paintBlocked(box) {
+  if (S.blocked.loading || S.blocked.items === null) {
+    box.replaceChildren(h('div', { class: 'skel', style: 'height:80px;margin:12px' }));
+    return;
+  }
+  if (S.blocked.error) {
+    box.replaceChildren(h('p', { class: 'hint', style: 'padding:12px' },
+      `차단 목록을 못 불러왔어요 — ${S.blocked.error}`));
+    return;
+  }
+  const items = S.blocked.items.filter((item) => item.kind === S.blocked.kind);
+  if (!items.length) {
+    box.replaceChildren(h('div', { class: 'empty' },
+      h('div', { class: 'empty__icon' }, '🕊'),
+      h('div', { class: 'empty__title' }, '이 종류로 막아 둔 게 없어요'),
+      h('div', { class: 'empty__desc' },
+        '리모컨의 대기열이나 검색 결과에서 곡의 ⋯ 메뉴를 열면 "차단 목록에 넣기"로 바로 넣을 수도 있어요.'),
+    ));
+    return;
+  }
+  const rows = h('ul', { class: 'rows' });
+  items.forEach((item) => {
+    const global = item.scope === 'global';
+    rows.append(h('li', { class: 'row row--block' + (global ? ' is-global' : '') },
+      h('div', { class: 'row__main' },
+        h('div', { class: 'row__name' },
+          global ? h('span', { 'data-tip': '봇 주인이 만든 전체 규칙이라 여기서는 못 지워요' }, '🔒') : null,
+          h('code', { class: 'block__pattern' }, item.pattern),
+          global ? h('span', { class: 'chip chip--warn' }, '봇 전체 규칙') : null,
+        ),
+        h('div', { class: 'row__sub' },
+          item.note ? h('span', null, item.note) : h('span', null, '메모가 없어요'),
+          h('span', null, `· ${item.createdByName || '누군가'}이 넣었어요`),
+          item.createdUtc ? h('span', null, `· ${fmtAgo(item.createdUtc)}`) : null,
+        ),
+      ),
+      h('button', {
+        class: 'btn btn--sm' + (global ? '' : ' btn--danger'), type: 'button',
+        disabled: global,
+        'data-tip': global
+          ? '봇 전체 규칙이에요. 봇 주인만 지울 수 있어요'
+          : '이 규칙을 지워요',
+        onclick: () => removeBlocked(item),
+      }, global ? '못 지워요' : '지우기'),
+    ));
+  });
+  box.replaceChildren(rows);
+  tooltip(box);
+}
+
+async function addBlocked(patternInput, noteInput) {
+  const pattern = patternInput.value.trim();
+  if (!pattern) { toast('막을 제목이나 주소를 넣어 주세요.', 'warn'); return; }
+  try {
+    await api('/admin/blacklist', {
+      method: 'POST',
+      body: { kind: S.blocked.kind, pattern, note: noteInput.value.trim() },
+    });
+    patternInput.value = '';
+    noteInput.value = '';
+    await loadBlocked();
+    repaintBlocked();
+    toast('차단 목록에 넣었어요.', 'ok');
+  } catch (error) {
+    toast(`넣지 못했어요 — ${error.message}`, 'danger');
+  }
+}
+
+async function removeBlocked(item) {
+  const ok = await confirmSheet({
+    title: '차단 규칙 지우기',
+    desc: `"${item.pattern}" 규칙을 지워요. 지금부터 이 곡이 다시 들어올 수 있어요.`,
+    confirmText: '지울게요', cancelText: '그냥 둘게요', danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api('/admin/blacklist/remove', { method: 'POST', body: { id: item.id } });
+    S.blocked.items = S.blocked.items.filter((entry) => entry.id !== item.id);
+    repaintBlocked();
+    toast('규칙을 지웠어요.', 'ok');
+  } catch (error) {
+    toast(`지우지 못했어요 — ${error.message}`, 'danger');
+  }
 }
 
 /* ═══════════════════════════ 섹션 4 · 유저 관리 ═══════════════════════════ */
@@ -1031,6 +2162,7 @@ function sectionUsers() {
   const listBox = h('div', { class: 'card userlist' });
   const filter = h('input', {
     class: 'field', type: 'search', placeholder: '이름으로 찾아요',
+    'data-tip': '적은 글자가 들어간 사람만 남겨요',
     oninput: (event) => paintParticipants(listBox, event.target.value),
   });
   body.append(h('div', { class: 'grp' },
@@ -1090,6 +2222,7 @@ function paintSuspensions(box) {
       h('button', {
         class: 'btn btn--sm', type: 'button',
         onclick: () => liftSuspension(item),
+        'data-tip': '지금 바로 정지를 풀어요',
       }, '풀어 주기'),
     ));
   });
@@ -1176,6 +2309,7 @@ async function openSuspendSheet(person) {
   SUSPEND_SCOPES.forEach((item) => {
     scopeBox.append(h('button', {
       class: 'seg__btn' + (item.value === scope ? ' is-on' : ''), type: 'button',
+      'data-tip': tipOf(item.desc),
       onclick: (event) => {
         scope = item.value;
         scopeNote.textContent = item.desc;
@@ -1189,6 +2323,7 @@ async function openSuspendSheet(person) {
   SUSPEND_DURATIONS.forEach((item) => {
     durationBox.append(h('button', {
       class: 'seg__btn' + (item.minutes === minutes ? ' is-on' : ''), type: 'button',
+      'data-tip': item.minutes === null ? '직접 풀 때까지 계속 막아요' : `${item.label} 동안 막아요`,
       onclick: (event) => {
         minutes = item.minutes;
         durationBox.querySelectorAll('.seg__btn').forEach((node) => node.classList.remove('is-on'));
@@ -1268,7 +2403,11 @@ function sectionChat() {
         h('div', { class: 'mirror__value' }, `${S.draft.chatRetentionDays}일`),
         h('p', { class: 'hint' }, '이 값은 "제한값" 섹션에서 다른 보관 기간들과 함께 관리해요.'),
       ),
-      h('button', { class: 'btn btn--sm', type: 'button', onclick: () => goSection('limits') }, '제한값에서 바꾸기 →'),
+      h('button', {
+        class: 'btn btn--sm', type: 'button',
+        'data-tip': '보관 기간을 모아 둔 제한값 섹션으로 가요',
+        onclick: () => goSection('limits'),
+      }, '제한값에서 바꾸기 →'),
     ),
   ));
 
@@ -1333,8 +2472,16 @@ function paintReports(box) {
           `${report.reporterDisplayName}이 신고했어요 · ${report.reason || '사유 없음'} · ${fmtAgo(report.createdUtc)}`),
       ),
       h('div', { class: 'row__acts' },
-        h('button', { class: 'btn btn--sm btn--danger', type: 'button', onclick: () => resolveReport(report, 'delete') }, '메시지 삭제'),
-        h('button', { class: 'btn btn--sm', type: 'button', onclick: () => resolveReport(report, 'dismiss') }, '문제 없어요'),
+        h('button', {
+          class: 'btn btn--sm btn--danger', type: 'button',
+          'data-tip': '이 채팅을 지우고 신고를 닫아요',
+          onclick: () => resolveReport(report, 'delete'),
+        }, '메시지 삭제'),
+        h('button', {
+          class: 'btn btn--sm', type: 'button',
+          'data-tip': '메시지는 두고 신고만 닫아요',
+          onclick: () => resolveReport(report, 'dismiss'),
+        }, '문제 없어요'),
       ),
     ));
   });
@@ -1378,6 +2525,7 @@ function paintSuggestions(box) {
     const statusSelect = h('select', {
       class: 'field field--sm',
       'aria-label': '제안 상태',
+      'data-tip': '이 제안의 처리 상태를 바꿔요',
       onchange: (event) => changeSuggestionStatus(item, event.target.value),
     });
     SUGGESTION_STATUS.forEach((status) => {
@@ -1418,24 +2566,68 @@ function sectionAudit() {
   const rows = h('ul', { class: 'rows rows--audit' });
   const sentinel = h('div', { class: 'audit__more' });
 
+  /** 조건이 바뀌면 목록을 처음부터 다시 받는다. 커서 기반이라 이어 붙이면 안 된다. */
+  const reload = () => {
+    S.audit.items = [];
+    S.audit.cursor = null;
+    S.audit.done = false;
+    S.audit.loading = false;
+    paintAudit(rows, sentinel);
+    loadAudit(rows, sentinel);
+  };
+
   const filter = h('input', {
     class: 'field', type: 'search', 'data-testid': 'audit-filter',
     placeholder: '사람 · 동작 · 곡 제목으로 찾아요',
     value: S.audit.query,
+    'data-tip': '적은 글자가 들어간 기록만 남겨요',
   });
   let timer = null;
   filter.addEventListener('input', (event) => {
     clearTimeout(timer);
     const value = event.target.value;
-    timer = setTimeout(() => {
-      S.audit = { items: [], cursor: null, done: false, loading: false, query: value };
-      paintAudit(rows, sentinel);
-      loadAudit(rows, sentinel);
-    }, 220);
+    timer = setTimeout(() => { S.audit.query = value; reload(); }, 220);
+  });
+
+  // 분류 칩 — 관리 콘솔은 기본으로 전부 켠다. 관리자는 다 봐야 하는 화면이니까.
+  const chips = h('div', { class: 'chips' });
+  AUDIT_KINDS.forEach((kind) => {
+    const on = S.audit.kinds.includes(kind.value);
+    const chip = h('button', {
+      class: 'kindchip' + (on ? ' is-on' : ''), type: 'button',
+      'aria-pressed': on ? 'true' : 'false',
+      'data-tip': on ? `${kind.label} 기록을 숨겨요` : `${kind.label} 기록을 다시 보여요`,
+    }, `${kind.icon} ${kind.label}`);
+    chip.addEventListener('click', () => {
+      const next = new Set(S.audit.kinds);
+      const was = next.has(kind.value);
+      if (was) next.delete(kind.value); else next.add(kind.value);
+      S.audit.kinds = Array.from(next);
+      chip.classList.toggle('is-on', !was);
+      chip.setAttribute('aria-pressed', was ? 'false' : 'true');
+      reload();
+    });
+    chips.append(chip);
+  });
+
+  const failedOnly = h('button', {
+    class: 'kindchip' + (S.audit.failedOnly ? ' is-on' : ''), type: 'button',
+    'aria-pressed': S.audit.failedOnly ? 'true' : 'false',
+    'data-tip': '거부되거나 실패한 기록만 남겨요',
+  }, '⚠ 실패만 보기');
+  failedOnly.addEventListener('click', () => {
+    S.audit.failedOnly = !S.audit.failedOnly;
+    failedOnly.classList.toggle('is-on', S.audit.failedOnly);
+    failedOnly.setAttribute('aria-pressed', S.audit.failedOnly ? 'true' : 'false');
+    reload();
   });
 
   const body = h('div', { class: 'sec__body' },
-    h('div', { class: 'grp__tools' }, filter),
+    h('div', { class: 'grp__tools' }, filter, failedOnly),
+    chips,
+    h('p', { class: 'hint' },
+      '관리 콘솔의 기록은 합치지 않아요. 누가 무엇을 넣었는지 하나하나 다 보여드려요. ' +
+      '멤버가 보는 로그 탭에서만 "곡 7개를 담았어요"처럼 묶여요.'),
     h('div', { class: 'card' }, rows, sentinel),
   );
 
@@ -1454,12 +2646,23 @@ function sectionAudit() {
 
 async function loadAudit(rows, sentinel) {
   if (S.audit.loading || S.audit.done) return;
+  // 칩을 전부 끄면 볼 게 없다. 그걸 "전부 보기"로 해석하면 필터가 거짓말을 한다.
+  if (!S.audit.kinds.length) {
+    S.audit.done = true;
+    paintAudit(rows, sentinel);
+    return;
+  }
   S.audit.loading = true;
   sentinel.replaceChildren(h('div', { class: 'skel', style: 'height:28px' }));
   try {
     const params = new URLSearchParams({ limit: '50' });
     if (S.audit.cursor) params.set('before', String(S.audit.cursor));
     if (S.audit.query) params.set('q', S.audit.query);
+    // 전부 켜져 있으면 아예 안 보낸다 — 서버가 필터를 모르는 버전이어도 똑같이 동작한다.
+    if (S.audit.kinds.length && S.audit.kinds.length < AUDIT_KINDS.length) {
+      params.set('kinds', S.audit.kinds.join(','));
+    }
+    if (S.audit.failedOnly) params.set('success', 'false');
     const data = await api(`/admin/audit?${params.toString()}`);
     const items = data.items || [];
     S.audit.items = S.audit.items.concat(items);
@@ -1476,6 +2679,9 @@ async function loadAudit(rows, sentinel) {
 }
 
 function paintAudit(rows, sentinel) {
+  // 서버가 `kinds` 를 모르는 버전이어도 화면은 칩과 일치해야 한다. 분류를 모르는 줄은 남긴다.
+  const wanted = new Set(S.audit.kinds);
+  S.audit.items = S.audit.items.filter((entry) => !entry.kind || wanted.has(entry.kind));
   if (!S.audit.items.length && S.audit.done) {
     rows.replaceChildren(h('li', null, h('div', { class: 'empty' },
       h('div', { class: 'empty__icon' }, '📜'),
@@ -1489,14 +2695,30 @@ function paintAudit(rows, sentinel) {
     : h('span'));
 }
 
+/**
+ * 기록 한 줄. 서버가 사람 문장(`text`)을 완성해서 주면 그걸 그대로 쓴다 (§13.5) —
+ * 클라이언트가 액션명을 문장으로 바꾸는 로직을 갖지 않는다.
+ * 관리 콘솔에만 전후값과 실패 사유가 같이 내려온다 (§13.2).
+ */
 function auditRow(entry) {
-  return h('li', { class: 'row row--audit' + (entry.success ? '' : ' is-fail') },
+  const failed = entry.success === false;
+  const kind = AUDIT_KINDS.find((item) => item.value === entry.kind);
+  const changed = entry.beforeValue != null || entry.afterValue != null;
+  const detail = failed
+    ? (entry.failureReason || '이유를 남기지 못했어요')
+    : changed
+      ? `${entry.beforeValue == null ? '(없음)' : entry.beforeValue} → ${entry.afterValue == null ? '(없음)' : entry.afterValue}`
+      : (entry.text || entry.target || '');
+
+  return h('li', {
+    class: 'row row--audit' + (failed ? ' is-fail' : ''),
+    'data-tip': entry.text || entry.action,
+  },
     h('time', { class: 'audit__time' }, fmtAgo(entry.createdUtc)),
-    h('strong', { class: 'audit__who' }, entry.displayName || String(entry.userId)),
-    h('span', { class: 'audit__what' }, entry.action),
-    h('span', { class: 'audit__detail mq' },
-      h('span', { class: 'mq__i' },
-        entry.failureReason || entry.target || entry.afterValue || '')),
+    h('strong', { class: 'audit__who' }, entry.actorName || entry.displayName || String(entry.userId)),
+    h('span', { class: 'audit__what' },
+      kind ? `${kind.icon} ` : '', entry.action),
+    h('span', { class: 'audit__detail mq' }, h('span', { class: 'mq__i' }, detail)),
   );
 }
 
@@ -1514,6 +2736,7 @@ function sectionDiag() {
     h('button', {
       class: 'btn', type: 'button', style: 'margin-top:12px',
       onclick: () => { S.diag = null; renderSection('diag'); },
+      'data-tip': '봇 상태를 지금 다시 물어봐요',
     }, '다시 확인할게요'),
   ));
 
@@ -1558,6 +2781,12 @@ function intentCards() {
 async function loadDiag() {
   try {
     S.diag = await api('/admin/diagnostics');
+    // 투표 스킵 환산의 모수도 여기서 한 번 채운다. 그 뒤로는 WS presence 가 갱신한다.
+    const bot = S.diag.bot || {};
+    const inVoice = bot.inVoice != null ? bot.inVoice : bot.voiceConnected;
+    if (bot.listenerCount != null) S.basis.listeners = inVoice ? Number(bot.listenerCount) : 0;
+    else if (inVoice === false) S.basis.listeners = 0;
+    if (S.diag.viewerCount != null) S.basis.viewers = Number(S.diag.viewerCount);
   } catch (error) {
     S.diag = { error: error.message };
   }
@@ -1580,29 +2809,37 @@ function paintDiag(box) {
   const channel = bot.voiceChannelName || '이름을 모르는 채널';
 
   const cells = [
-    ['봇 연결', bot.online ? '온라인이에요' : '오프라인이에요', bot.online ? 'is-ok' : 'is-bad'],
+    ['봇 연결', bot.online ? '온라인이에요' : '오프라인이에요', bot.online ? 'is-ok' : 'is-bad',
+      'Discord 게이트웨이에 붙어 있는지예요'],
     ['서버 참가 여부',
       inGuild == null ? '알 수 없어요' : inGuild ? '이 서버에 들어와 있어요' : '이 서버에 없어요',
-      inGuild == null ? '' : inGuild ? 'is-ok' : 'is-bad'],
+      inGuild == null ? '' : inGuild ? 'is-ok' : 'is-bad',
+      '봇이 이 Discord 서버의 멤버인지예요'],
     ['음성 채널 참가 여부',
       inVoice == null ? '알 수 없어요' : inVoice ? `참가 중이에요 (${channel})` : '아직 안 들어갔어요',
-      inVoice ? 'is-ok' : ''],
+      inVoice ? 'is-ok' : '',
+      'Discord 가 지금 알려 주는 값이라 저장된 값과 어긋나지 않아요'],
     ['듣는 사람 수',
       listeners == null ? '알 수 없어요' : inVoice ? `${listeners}명이 듣고 있어요` : '0명 (음성 채널에 없어요)',
-      listeners > 0 ? 'is-ok' : ''],
-    ['게이트웨이 지연', bot.gatewayLatencyMs != null ? `${bot.gatewayLatencyMs}ms` : '알 수 없어요', ''],
-    ['빌드 ID', S.diag.buildId || M.buildId || '-', ''],
-    ['DB 스키마 버전', S.diag.schemaVersion != null ? `v${S.diag.schemaVersion}` : '-', ''],
-    ['가동 시간', S.diag.uptimeSeconds != null ? prettySeconds(S.diag.uptimeSeconds) : '-', ''],
+      listeners > 0 ? 'is-ok' : '',
+      '봇과 같은 음성 채널에 있는 사람 수예요'],
+    ['게이트웨이 지연', bot.gatewayLatencyMs != null ? `${bot.gatewayLatencyMs}ms` : '알 수 없어요', '',
+      'Discord 와 주고받는 데 걸리는 시간이에요'],
+    ['빌드 ID', S.diag.buildId || M.buildId || '-', '', '지금 돌고 있는 봇의 빌드예요'],
+    ['DB 스키마 버전', S.diag.schemaVersion != null ? `v${S.diag.schemaVersion}` : '-', '',
+      '마이그레이션이 어디까지 적용됐는지예요'],
+    ['가동 시간', S.diag.uptimeSeconds != null ? prettySeconds(S.diag.uptimeSeconds) : '-', '',
+      '마지막으로 재시작한 뒤 지난 시간이에요'],
   ];
   const grid = h('div', { class: 'diag__grid' });
-  cells.forEach(([label, value, tone]) => {
-    grid.append(h('div', { class: `diag__cell ${tone}` },
+  cells.forEach(([label, value, tone, tip]) => {
+    grid.append(h('div', { class: `diag__cell ${tone}`, 'data-tip': tipOf(tip) },
       h('div', { class: 'diag__label' }, label),
       h('div', { class: 'diag__value' }, String(value)),
     ));
   });
   box.replaceChildren(grid);
+  tooltip(box);
 
   if (inGuild === false) {
     box.append(h('div', { class: 'warnbox' },
@@ -1632,6 +2869,7 @@ const SECTION_RENDER = {
   limits: sectionLimits,
   users: sectionUsers,
   chat: sectionChat,
+  blocked: sectionBlocked,
   audit: sectionAudit,
   diag: sectionDiag,
 };
@@ -1656,10 +2894,12 @@ function renderSection(id) {
       h('button', {
         class: 'btn', type: 'button', disabled: true,
         onclick: () => revertSection(spec.id),
+        'data-tip': '이 섹션에서 바꾼 걸 전부 저장 전 값으로 돌려요',
       }, '되돌리기'),
       h('button', {
         class: 'btn btn--primary', type: 'button', disabled: true,
         'data-testid': 'settings-save',
+        'data-tip': '이 섹션에서 바꾼 항목만 서버에 보내요',
         onclick: () => saveSection(spec.id),
       }, '저장'),
     ) : null,
@@ -1765,7 +3005,10 @@ function renderShell() {
   const root = document.getElementById('app') || document.body;
   root.replaceChildren();
 
-  dirtyBadge = h('span', { class: 'head__dirty', hidden: true });
+  dirtyBadge = h('span', {
+    class: 'head__dirty', hidden: true,
+    'data-tip': '아직 저장하지 않은 항목이 있어요',
+  });
 
   const back = h('a', {
     class: 'btn btn--ghost head__back',
@@ -1785,7 +3028,10 @@ function renderShell() {
     ),
     dirtyBadge,
     h('div', { class: 'head__spacer' }),
-    h('span', { class: `tier tier--${M.tier}` }, IS_OWNER ? '🛡 봇 주인' : '🛡 서버 관리자'),
+    h('span', {
+      class: `tier tier--${M.tier}`,
+      'data-tip': IS_OWNER ? '봇을 돌리는 사람이라 모든 서버를 볼 수 있어요' : '이 서버의 관리자라 여기 설정을 바꿀 수 있어요',
+    }, IS_OWNER ? '🛡 봇 주인' : '🛡 서버 관리자'),
     h('button', {
       class: 'btn btn--icon btn--ghost', type: 'button',
       'data-tip': '밝게 / 어둡게 바꿔요',
@@ -1801,6 +3047,7 @@ function renderShell() {
   SECTIONS.forEach((spec) => {
     navBox.append(h('button', {
       class: 'nav__item', type: 'button', 'data-section': spec.id,
+      'data-tip': tipOf(spec.desc),
       onclick: () => goSection(spec.id),
     },
       h('span', { class: 'nav__icon' }, spec.icon),
@@ -1827,7 +3074,10 @@ function renderDenied() {
       h('div', { class: 'denied__icon' }, '🔒'),
       h('h1', null, '서버 관리 콘솔은 관리자만 들어올 수 있어요'),
       h('p', { class: 'hint' }, '이 서버에서는 관리 권한이 없으세요. 서버 관리자에게 "관리자 지정 역할"을 받으시면 들어올 수 있어요.'),
-      h('a', { class: 'btn btn--primary', href: `/music/guilds/${GUILD_ID}` }, '← 리모컨으로 돌아가기'),
+      h('a', {
+        class: 'btn btn--primary', href: `/music/guilds/${GUILD_ID}`,
+        'data-tip': '유저용 리모컨 화면으로 가요',
+      }, '← 리모컨으로 돌아가기'),
     ),
   ));
 }
@@ -1854,7 +3104,11 @@ async function boot() {
       h('div', { class: 'empty__icon' }, '⚠'),
       h('div', { class: 'empty__title' }, '설정을 불러오지 못했어요'),
       h('div', { class: 'empty__desc' }, error.message),
-      h('button', { class: 'btn btn--primary', onclick: () => location.reload() }, '다시 시도할게요'),
+      h('button', {
+        class: 'btn btn--primary', type: 'button',
+        'data-tip': '화면을 새로고침해서 설정을 다시 불러와요',
+        onclick: () => location.reload(),
+      }, '다시 시도할게요'),
     ));
     return;
   }
@@ -1891,6 +3145,18 @@ async function boot() {
 
 /** WS 이벤트 머지 — 전체 재조회는 하지 않는다 (성능 계약 §5.2 B). */
 function onRemoteEvent(topic, data) {
+  if (topic === 'presence') {
+    // 투표 스킵 환산(§10.5)의 모수. 새 요청 없이 이미 오는 프레임에서 세기만 한다.
+    const bot = (data && data.bot) || {};
+    S.basis.listeners = bot.inVoice === false
+      ? 0
+      : (bot.listenerCount != null ? Number(bot.listenerCount) : ((data && data.listening) || []).length);
+    S.basis.viewers = ((data && data.viewing) || []).length;
+    if (S.activeSection === 'order') {
+      const box = sectionBox && sectionBox.querySelector('.convert');
+      if (box) paintSkipConvert(box);
+    }
+  }
   if (topic === 'presence' && S.participants) {
     const listening = new Set((data && data.listening) || []);
     const otherVoice = new Set((data && data.inOtherVoice) || []);
@@ -1938,9 +3204,20 @@ function onRemoteEvent(topic, data) {
     }
     return;
   }
+  if (topic === 'charts') {
+    S.charts = { items: null, error: null, loading: false };
+    S.genreOptions = null;
+    if (S.activeSection === 'order') loadCharts().then(() => repaintCharts());
+    return;
+  }
+  if (topic === 'blacklist') {
+    S.blocked = { items: null, error: null, loading: false, kind: S.blocked.kind };
+    if (S.activeSection === 'blocked') loadBlocked().then(() => repaintBlocked());
+    return;
+  }
   if (topic === 'queue.set' && S.activeSection === 'order') {
     S.queuePreview = { mode: null, data: null, loading: false };
-    loadQueuePreview(S.draft.sortMode);
+    loadQueuePreview();
   }
 }
 

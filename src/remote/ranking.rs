@@ -1,16 +1,22 @@
-use super::{QueueScore, QueueSortMode};
+use super::{QueueScore, QueueSortMode, VotePoints};
 use crate::models::{PlaybackRequestKind, QueueItem};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 /// 정렬을 한 곳에 고정한다. 수동 우선순위는 어느 모드에서든 관리자의 명시적 예외다.
+///
+/// 점수는 서버가 정한 점수표(`points`, §10.1)로 계산한다 — 여기에 배수를 다시 박으면
+/// 화면과 정렬이 서로 다른 말을 하게 된다.
 pub fn sort_queue(
     items: &mut [QueueItem],
     scores: &HashMap<String, QueueScore>,
     mode: QueueSortMode,
+    points: &VotePoints,
 ) {
     match mode {
-        QueueSortMode::Score => items.sort_by(|left, right| compare_score(left, right, scores)),
+        QueueSortMode::Score => {
+            items.sort_by(|left, right| compare_score(left, right, scores, points))
+        }
         QueueSortMode::Fifo => items.sort_by(|left, right| compare_fifo(left, right, scores)),
         QueueSortMode::Fair => {
             // 라운드는 항목 쌍이 아니라 전체 대기열을 봐야 정해지므로 비교 전에 한 번만 계산한다.
@@ -62,15 +68,17 @@ fn compare_score(
     left: &QueueItem,
     right: &QueueItem,
     scores: &HashMap<String, QueueScore>,
+    points: &VotePoints,
 ) -> Ordering {
     compare_manual(left, right, scores)
         .then_with(|| {
-            let left_total = scores.get(&left.id).map(QueueScore::total_score).unwrap_or(0);
-            let right_total = scores
-                .get(&right.id)
-                .map(QueueScore::total_score)
-                .unwrap_or(0);
-            right_total.cmp(&left_total)
+            let total = |item: &QueueItem| {
+                scores
+                    .get(&item.id)
+                    .map(|score| score.total_score(points))
+                    .unwrap_or(0)
+            };
+            total(right).cmp(&total(left))
         })
         .then_with(|| compare_tail(left, right, scores))
 }
@@ -193,15 +201,17 @@ mod tests {
         QueueScore {
             item_id: id.into(),
             guild_id: 1,
-            requester_user_id: None,
             wait_score: wait,
             like_count: likes,
             super_like_count: supers,
-            manual_priority: None,
             original_order: order,
-            round: 0,
-            last_played_utc: None,
+            ..Default::default()
         }
+    }
+
+    /// 기본 점수표 (👍1 · ⭐2 · 대기1). 테스트가 서버 설정과 같은 값을 쓰는지 한 곳에서 본다.
+    fn points() -> VotePoints {
+        VotePoints::default()
     }
 
     fn ids(items: &[QueueItem]) -> Vec<&str> {
@@ -230,7 +240,7 @@ mod tests {
     #[test]
     fn score_mode_ranks_by_total_then_registration_order() {
         let (mut items, scores) = three_people();
-        sort_queue(&mut items, &scores, QueueSortMode::Score);
+        sort_queue(&mut items, &scores, QueueSortMode::Score, &points());
         // 수연1=4점, 민수1=2점·등록0, 지훈1=2점·등록3, 민수3=1점, 민수2=0점
         assert_eq!(ids(&items), vec!["수연1", "민수1", "지훈1", "민수3", "민수2"]);
     }
@@ -238,7 +248,7 @@ mod tests {
     #[test]
     fn fifo_mode_ignores_votes_entirely() {
         let (mut items, scores) = three_people();
-        sort_queue(&mut items, &scores, QueueSortMode::Fifo);
+        sort_queue(&mut items, &scores, QueueSortMode::Fifo, &points());
         assert_eq!(ids(&items), vec!["민수1", "민수2", "민수3", "지훈1", "수연1"]);
     }
 
@@ -249,7 +259,7 @@ mod tests {
         for id in ["민수1", "민수2", "민수3"] {
             scores.get_mut(id).unwrap().last_played_utc = Some("2026-08-06T10:00:00+00:00".into());
         }
-        sort_queue(&mut items, &scores, QueueSortMode::Fair);
+        sort_queue(&mut items, &scores, QueueSortMode::Fair, &points());
         // 1라운드: 지훈1·수연1(미재생) → 민수1. 그 다음에야 민수의 2·3번째 곡.
         assert_eq!(ids(&items), vec!["지훈1", "수연1", "민수1", "민수2", "민수3"]);
     }
@@ -288,7 +298,7 @@ mod tests {
         let scores = HashMap::from([("popular".into(), popular), ("forced".into(), forced)]);
         for mode in [QueueSortMode::Score, QueueSortMode::Fifo, QueueSortMode::Fair] {
             let mut items = vec![item("popular", 1), item("forced", 2)];
-            sort_queue(&mut items, &scores, mode);
+            sort_queue(&mut items, &scores, mode, &points());
             assert_eq!(items[0].id, "forced", "{mode:?} 모드에서 수동 우선순위가 무시됨");
         }
     }

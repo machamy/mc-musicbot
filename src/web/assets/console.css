@@ -693,6 +693,156 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
 .denied__icon { font-size: 34px; }
 .denied h1 { font-size: var(--fs-xl); }
 
+/* ═══════════════════════════ v3 추가분 ═══════════════════════════ */
+
+/* ── 필드 라벨 옆 ⓘ (§20.2) ──
+ * 설명문은 필드 아래에 이미 있지만, 좁은 화면에서 접히거나 스크롤 밖으로 나가면 안 보인다.
+ * 라벨 옆 ⓘ 는 어느 폭에서도 같은 자리에 있다. */
+.fld__info {
+  flex: none;
+  color: var(--text-4);
+  font-size: var(--fs-sm);
+  cursor: help;
+}
+.fld__info:hover { color: var(--accent); }
+
+/* ── 무제한(∞) 숫자 (§23.1) ── */
+.num__hint { color: var(--text-3); font-size: var(--fs-xs); text-align: center; }
+.num__infbtn {
+  flex: none;
+  min-width: 30px;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-base);
+  line-height: 1;
+}
+/* 무제한이면 숫자칸이 회색으로 죽고 옆의 문구가 주인공이 된다 — 0이라는 숫자 자체는 의미가 없다 */
+.num__input.is-inf { color: var(--text-4); }
+.num__pretty.is-inf { color: var(--accent); font-weight: var(--fw-semi); }
+/* ∞ 칸이 끝에 하나 더 붙어 있다는 걸 슬라이더 트랙 오른쪽 끝 표식으로 알린다 */
+.num--inf .num__range { background-image: linear-gradient(to right, transparent 92%, var(--accent-line) 92%); }
+
+/* ── 점수 계산식 미리보기 (§10.1) ── */
+.formula {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-3);
+  background: var(--surface-inset);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-sm);
+}
+.formula__label { color: var(--text-3); font-size: var(--fs-sm); }
+.formula__body {
+  padding: 2px var(--sp-2);
+  border-radius: var(--r-xs);
+  background: var(--surface-3);
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-md);
+  overflow-wrap: anywhere;
+}
+
+/* ── 투표 스킵 인원 환산 (§10.5) ── */
+.convert {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  background: var(--surface-inset);
+  border-left: 2px solid var(--accent-line);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+.convert__head { color: var(--text-1); font-size: var(--fs-sm); font-weight: var(--fw-semi); }
+.convert__row { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
+.convert__label { flex: none; min-width: 92px; color: var(--text-3); font-size: var(--fs-sm); }
+.convert__value { color: var(--text-1); font-size: var(--fs-md); font-weight: var(--fw-medium); }
+
+/* ── 그룹 안의 소제목 ── */
+.grp__sub {
+  margin-top: var(--sp-2);
+  color: var(--text-2);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semi);
+}
+
+/* ── 장르 칩 (§8.4) ── .role 칩을 그대로 재사용한다 */
+.genres { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.genres .hint { flex-basis: 100%; }
+
+/* ── 차트 관리 (§15.5) ── */
+.charts { overflow: hidden; }
+.charts__cat {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
+  border-top: 1px solid var(--line-1);
+  background: var(--surface-2);
+}
+.charts > .charts__cat:first-child { border-top: none; }
+.charts__caticon { flex: none; font-size: var(--fs-base); line-height: 1; }
+.charts__catname { color: var(--text-1); font-size: var(--fs-md); font-weight: var(--fw-semi); }
+.charts__cat .hint { flex: 1; min-width: 0; }
+
+/* 꺼진 차트는 지운 게 아니라 숨긴 것이다 — 흐리게 두되 글자는 읽히게 남긴다 */
+.row--chart.is-off .row__main { opacity: 0.55; }
+.row--chart .block__pattern { font-family: var(--font-mono); }
+
+/* 목록 안에서 쓰는 작은 스위치 */
+.sw--sm { width: 34px; height: 20px; }
+.sw--sm .sw__knob { width: 14px; height: 14px; }
+.sw--sm.is-on .sw__knob { transform: translateX(14px); }
+
+/* ── 차단 목록 (§19.3) ── */
+.testbox { display: flex; flex-direction: column; gap: var(--sp-2); }
+.testbox .field { max-width: 520px; }
+.testbox__result { min-height: 22px; }
+.testbox__hit {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+}
+.testbox__hit.is-blocked { background: var(--danger-soft); color: var(--danger); }
+.testbox__hit.is-pass { background: var(--ok-soft); color: var(--ok); }
+
+.addform { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
+.addform .field { flex: 1 1 200px; min-width: 0; }
+.addform .btn { flex: none; }
+
+.blocklist { overflow: hidden; }
+.block__pattern {
+  padding: 1px var(--sp-2);
+  border-radius: var(--r-xs);
+  background: var(--surface-inset);
+  font-family: var(--font-mono);
+  font-size: var(--fs-md);
+  overflow-wrap: anywhere;
+}
+/* 전역 규칙은 "여기서는 못 건드린다"가 한눈에 보여야 한다 */
+.row--block.is-global { background: color-mix(in srgb, var(--surface-2) 70%, transparent); }
+.row--block.is-global .row__main { opacity: 0.78; }
+
+/* ── 활동 기록 분류 칩 (§13.4) ── */
+.chips { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.kindchip {
+  height: 28px;
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-full);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: var(--fs-sm);
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.kindchip:hover { background: var(--surface-4); color: var(--text-1); }
+.kindchip.is-on { background: var(--accent-soft); border-color: var(--accent); color: var(--text-1); }
+
 /* ═══════════════════════════ 반응형 ═══════════════════════════ */
 
 /* 1024px 이하 — 좌측 네비를 상단 가로 스크롤 탭으로. 절대 숨기지 않는다. */
@@ -762,6 +912,15 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
 
   .row { flex-wrap: wrap; }
   .row__acts { width: 100%; justify-content: flex-end; }
+
+  /* 차트 줄은 스위치를 왼쪽에 두고 버튼을 아래 줄로 내린다 */
+  .row--chart .row__main { flex-basis: calc(100% - 50px); }
+  .charts__cat { flex-wrap: wrap; }
+  .charts__cat .hint { flex-basis: 100%; }
+
+  .convert__label { min-width: 100%; }
+  .addform .field { flex-basis: 100%; }
+  .addform .btn { width: 100%; }
 
   .row--audit {
     grid-template-columns: minmax(0, 1fr) auto;

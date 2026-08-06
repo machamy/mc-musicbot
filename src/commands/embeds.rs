@@ -191,7 +191,7 @@ pub fn queue_page_embed(state: &GuildPlayerState, page: usize) -> (CreateEmbed, 
         ));
         embed = embed.description(line);
     } else {
-        embed = embed.description("(재생 중인 곡 없음)");
+        embed = embed.description("지금은 재생 중인 곡이 없어요.");
     }
 
     // C# 과 동일한 "다음 곡" 필드 — 대기열 첫 곡 또는 자동추천 예정 곡.
@@ -209,7 +209,7 @@ pub fn queue_page_embed(state: &GuildPlayerState, page: usize) -> (CreateEmbed, 
     }
 
     if state.upcoming.is_empty() {
-        embed = embed.field("대기열", "(비어 있음)", false);
+        embed = embed.field("대기열", "아직 비어 있어요.", false);
     } else {
         let start = page * PER_PAGE;
         let lines: Vec<String> = state
@@ -297,7 +297,7 @@ pub fn status_embed(
     let on = |b: bool| if b { "켜짐" } else { "꺼짐" };
     let now = match &state.current_item {
         Some(i) => truncate(i.track.display_title(), 60),
-        None => "없음".to_string(),
+        None => "없어요".to_string(),
     };
     let voice = if state.voice_channel_id.is_some() {
         "연결됨"
@@ -318,7 +318,7 @@ pub fn status_embed(
         on(state.autoplay_enabled),
     );
     let global = format!(
-        "✨ 자동추천 기본값: **{}**\n⏱ 자동추천 최대 길이: **10분** (초과 곡은 추천 제외)\n✂️ 인트로/아웃트로 제거: **{}** (SponsorBlock)\n🎚 볼륨 평준화: **{}**\n🔔 곡 시작 알림: **{}**\n📡 음성 비트레이트: **{}kbps**\n🚪 빈 채널 정책: **{}** (지연 {}초)\n💾 캐시 한도: **{}GB**\n🗂 로그 보관: **{}일**",
+        "✨ 자동추천 기본값: **{}**\n⏱ 자동추천 최대 길이: **10분** (더 긴 곡은 추천에서 빠져요)\n✂️ 인트로/아웃트로 제거: **{}** (SponsorBlock)\n🎚 볼륨 평준화: **{}**\n🔔 곡 시작 알림: **{}**\n📡 음성 비트레이트: **{}kbps**\n🚪 빈 채널일 때: **{}** ({}초 뒤에)\n💾 캐시 한도: **{}GB**\n🗂 로그 보관: **{}일**",
         on(g.autoplay_default),
         on(g.sponsorblock_remove),
         on(g.normalize_enabled),
@@ -349,7 +349,7 @@ pub fn status_embed(
         .field("전역 설정", global, false)
         .field("끊김 최적화 토글", tweaks, false)
         .footer(CreateEmbedFooter::new(
-            "설정 변경은 웹 대시보드(포트 8693)에서.",
+            "설정은 웹 대시보드(포트 8693)에서 바꿔요.",
         ))
 }
 
@@ -382,12 +382,12 @@ pub fn search_results_embed(
             provider.as_str()
         ))
         .description(if lines.is_empty() {
-            "결과가 없습니다.".to_string()
+            "찾은 곡이 없어요.".to_string()
         } else {
             lines.join("\n")
         })
         .footer(CreateEmbedFooter::new(
-            "아래 메뉴에서 곡을 고르면 대기열에 추가됩니다. ✖ 취소로 닫을 수 있어요.",
+            "아래 메뉴에서 곡을 고르면 대기열에 담겨요. ✖ 취소로 닫을 수 있어요.",
         ))
 }
 
@@ -412,7 +412,7 @@ pub fn search_results_components(token: &str, candidates: &[TrackRef]) -> Vec<Cr
         format!("mbsel:{token}"),
         CreateSelectMenuKind::String { options },
     )
-    .placeholder("재생할 곡을 선택하세요");
+    .placeholder("재생할 곡을 골라 주세요");
 
     vec![
         CreateActionRow::SelectMenu(menu),

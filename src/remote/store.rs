@@ -1,20 +1,23 @@
 use super::{
-    AuditEntry, AutoplaySeed, ChatMessage, ChatReactionSummary, ChatReplyPreview, ChatReport,
-    ChatTrackTag, LyricsCacheHit, LyricsDocument, MAX_AUTOPLAY_SEEDS, Participant, PruneReport,
-    QueueScore, QueueVoteKind, RecentTrack, RemoteGuildSettings, RetentionConfig, SeedAddOutcome,
-    StoredSession, Suggestion, SuggestionStatus, Suspension, SuspensionScope, UserTrack,
-    UserTrackKind,
+    AUDIT_MERGE_WINDOW_SECS, AuditEntry, AuditKind, AutoplaySeed, CHART_CACHE_TTL_HOURS,
+    ChartCategory, ChartDef, ChartSnapshot, ChatMessage, ChatReactionSummary, ChatReplyPreview,
+    ChatReport, ChatTrackTag, LyricsCacheHit, LyricsDocument, MAX_VOTER_IDS, Participant,
+    PruneReport, QueueScore, QueueVoteKind, RecentTrack, RemoteGuildSettings, RetentionConfig,
+    SeedAddOutcome, StoredSession, Suggestion, SuggestionStatus, SuperLikeStatus, SuperLikeVerdict,
+    Suspension, SuspensionScope, UserTrack, UserTrackKind, as_limit_u32, audit_kind_for,
+    audit_text, is_mergeable_action, truncate_title,
 };
 use crate::models::{QueueItem, TrackRef};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 13;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -247,9 +250,132 @@ const MIGRATION_V10: &str = r#"
         ON remote_autoplay_seeds(guild_id, sort_order);
 "#;
 
+/// v10 → v11. 차트 (§15.1). 차트는 **코드가 아니라 데이터**라 유튜브가 주소를 바꿔도
+/// 관리 콘솔에서 갈아 끼우면 된다.
+const MIGRATION_V11: &str = r#"
+    CREATE TABLE IF NOT EXISTS remote_charts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NULL,
+        category TEXT NOT NULL,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        url TEXT NOT NULL,
+        sort_order INTEGER NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        builtin INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_remote_charts_scope
+        ON remote_charts(guild_id, category, sort_order);
+    -- 기본 제공분은 이름으로 한 번만 심는다(마이그레이션을 다시 돌려도 중복되지 않게).
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_charts_builtin_name
+        ON remote_charts(name) WHERE builtin = 1;
+
+    CREATE TABLE IF NOT EXISTS remote_chart_cache (
+        chart_id INTEGER PRIMARY KEY,
+        tracks_json TEXT NOT NULL,
+        fetched_utc TEXT NOT NULL,
+        failed_utc TEXT NULL,
+        failure_reason TEXT NULL
+    );
+"#;
+
+/// v11 → v12. 슈퍼 좋아요 하루 사용량 (§10.6).
+/// 재시작해도 살아남아야 하니 메모리가 아니라 DB다. 쿨타임만 메모리로 둔다.
+const MIGRATION_V12: &str = r#"
+    CREATE TABLE IF NOT EXISTS remote_super_like_usage (
+        guild_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        day TEXT NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0,
+        last_utc TEXT NOT NULL,
+        PRIMARY KEY(guild_id, user_id, day)
+    );
+"#;
+
+/// v12 → v13. 막힌 자동재생 후보(§8.5-3)와 사람이 읽는 활동 로그(§13).
+const MIGRATION_V13: &str = r#"
+    CREATE TABLE IF NOT EXISTS remote_autoplay_blocked (
+        guild_id INTEGER NOT NULL,
+        cache_key TEXT NOT NULL,
+        until_utc TEXT NOT NULL,
+        reason TEXT NULL,
+        created_utc TEXT NOT NULL,
+        PRIMARY KEY(guild_id, cache_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_autoplay_blocked_until
+        ON remote_autoplay_blocked(guild_id, until_utc);
+    CREATE INDEX IF NOT EXISTS idx_remote_audit_kind
+        ON remote_audit_logs(guild_id, kind, id DESC);
+    -- 합치기(§13.3)가 "같은 사람 · 같은 종류의 최신 한 줄"을 곧장 찾아가게 한다.
+    -- 이 인덱스가 없으면 최근에 아무 일도 안 한 사람이 곡을 담을 때마다
+    -- 그 길드의 로그를 통째로 거슬러 훑는다.
+    CREATE INDEX IF NOT EXISTS idx_remote_audit_merge
+        ON remote_audit_logs(guild_id, user_id, action, id DESC);
+"#;
+
+/// 기본 제공 차트 (§15.2). `guild_id IS NULL` 이라 모든 서버가 같이 본다.
+///
+/// **주소가 재생목록 ID 대신 `ytsearchN:` 인 것들이 있다.** 유튜브 뮤직의 장르·노래방 차트는
+/// 공개 재생목록 ID 가 자주 바뀌어서, 바뀔 때마다 코드를 고치느니 검색을 쓰는 편이 안 죽는다.
+/// 더 좋은 재생목록을 아는 관리자는 관리 콘솔에서 주소만 갈아 끼우면 된다.
+/// `internal:` 로 시작하는 것은 바깥에서 가져오지 않고 통계 DB 로 만드는 차트다(§15.2b).
+const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 22] = [
+    // 우리가 실제로 튼 것으로 만드는 차트 — 자동재생으로 나간 곡은 세지 않는다.
+    (ChartCategory::Ours, "우리 서버 인기곡", "Internal", "internal:guild-plays"),
+    (ChartCategory::Ours, "우리 서버 사랑받은 곡", "Internal", "internal:guild-love"),
+    (ChartCategory::Ours, "마참뮤직 전체 인기곡", "Internal", "internal:global-plays"),
+    (ChartCategory::Ours, "마참뮤직 전체 사랑받은 곡", "Internal", "internal:global-love"),
+    // 인기
+    (
+        ChartCategory::Popular,
+        "전세계 인기곡",
+        "YouTubeMusic",
+        "https://music.youtube.com/playlist?list=PL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i",
+    ),
+    (
+        ChartCategory::Popular,
+        "한국 인기곡",
+        "YouTubeMusic",
+        "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5Kj4TvUZBcNlkzuxCe4vVh",
+    ),
+    (ChartCategory::Popular, "오늘 뜨는 곡", "YouTube", "ytsearch50:인기 급상승 음악"),
+    // 나라별
+    (ChartCategory::Region, "미국 인기곡", "YouTube", "ytsearch50:US top songs this week"),
+    (ChartCategory::Region, "일본 인기곡", "YouTube", "ytsearch50:日本 人気曲 ランキング"),
+    (ChartCategory::Region, "영국 인기곡", "YouTube", "ytsearch50:UK top songs this week"),
+    // 장르
+    (ChartCategory::Genre, "K-Pop", "YouTube", "ytsearch50:K-Pop 인기곡"),
+    (ChartCategory::Genre, "J-Pop", "YouTube", "ytsearch50:J-Pop 人気曲"),
+    (ChartCategory::Genre, "힙합", "YouTube", "ytsearch50:힙합 인기곡"),
+    (ChartCategory::Genre, "R&B", "YouTube", "ytsearch50:R&B 인기곡"),
+    (ChartCategory::Genre, "록", "YouTube", "ytsearch50:록 밴드 인기곡"),
+    (ChartCategory::Genre, "일렉트로닉", "YouTube", "ytsearch50:EDM 인기곡"),
+    // 노래방
+    (ChartCategory::Karaoke, "TJ 인기차트", "YouTube", "ytsearch50:TJ노래방 인기차트"),
+    (ChartCategory::Karaoke, "TJ 발라드", "YouTube", "ytsearch50:TJ노래방 발라드"),
+    (ChartCategory::Karaoke, "TJ 댄스", "YouTube", "ytsearch50:TJ노래방 댄스"),
+    (ChartCategory::Karaoke, "금영 인기차트", "YouTube", "ytsearch50:금영노래방 인기차트"),
+    // SoundCloud
+    (
+        ChartCategory::Soundcloud,
+        "SoundCloud 인기 (한국)",
+        "SoundCloud",
+        "https://soundcloud.com/discover/sets/charts-top:all-music:kr",
+    ),
+    (
+        ChartCategory::Soundcloud,
+        "SoundCloud 인기 (전세계)",
+        "SoundCloud",
+        "https://soundcloud.com/discover/sets/charts-top:all-music",
+    ),
+];
+
+/// 막힌 자동재생 후보를 며칠 기억할지 (§8.5-3).
+pub const AUTOPLAY_BLOCK_DAYS: i64 = 7;
+
 /// 서버가 받아 주는 개인 설정 키. 여기 없는 키는 조용히 버린다 —
 /// 아무 값이나 저장되면 개인 설정 테이블이 남의 키-밸류 저장소가 돼 버린다.
-pub const PREF_KEYS: [&str; 7] = [
+pub const PREF_KEYS: [&str; 9] = [
     "layout",
     "theme",
     "layoutSizes",
@@ -257,6 +383,15 @@ pub const PREF_KEYS: [&str; 7] = [
     "lyricsOpen",
     "webPlayback",
     "webVolume",
+    "auditFilter",
+    "notify",
+];
+
+/// 화면 배치 6종 (§7.2).
+pub const LAYOUT_VALUES: [&str; 6] = ["three", "two", "focus", "dj", "talk", "panel"];
+/// 테마 7종 + 시스템 따라가기 (§17.1 · §17.3).
+pub const THEME_VALUES: [&str; 8] = [
+    "auto", "dark", "light", "midnight", "slate", "sepia", "retro", "nord",
 ];
 
 /// `layoutSizes` 값 길이 상한(바이트). 열 너비 몇 개면 충분한 크기다.
@@ -268,8 +403,8 @@ const PREF_PANEL_LAYOUT_MAX: usize = 8 * 1024;
 /// (화면에서 통과한 값이 서버에서 조용히 버려지면 원인을 못 찾는다.)
 pub fn is_valid_pref(key: &str, value: &str) -> bool {
     match key {
-        "layout" => matches!(value, "three" | "two" | "panel"),
-        "theme" => matches!(value, "dark" | "light"),
+        "layout" => LAYOUT_VALUES.contains(&value),
+        "theme" => THEME_VALUES.contains(&value),
         "lyricsOpen" | "webPlayback" => matches!(value, "0" | "1"),
         "webVolume" => value
             .parse::<u32>()
@@ -277,6 +412,18 @@ pub fn is_valid_pref(key: &str, value: &str) -> bool {
             .unwrap_or(false),
         "layoutSizes" => is_valid_json_pref(value, PREF_LAYOUT_SIZES_MAX),
         "panelLayout" => is_valid_json_pref(value, PREF_PANEL_LAYOUT_MAX),
+        // 로그 필터 칩 선택 (§13.4). 분류 이름을 콤마로 이은 값이다.
+        // 전부 끈 상태는 빈 문자열이 아니라 `none` 으로 저장한다 —
+        // 빈 값은 "저장한 적 없음"과 구분이 안 돼서 기본 필터가 되살아난다.
+        "auditFilter" => {
+            value == "none"
+                || (value.len() <= 128
+                    && value
+                        .split(',')
+                        .all(|kind| AuditKind::parse(kind.trim()).is_some()))
+        }
+        // 알림 종류별 on/off (§16 B3). 예: {"song":1,"mention":1,"reply":0}
+        "notify" => is_valid_json_pref(value, 512),
         _ => false,
     }
 }
@@ -291,6 +438,12 @@ fn is_valid_json_pref(value: &str, max_bytes: usize) -> bool {
 /// 마참뮤직 전용 테이블 저장소. 기존 음악봇 테이블과 같은 SQLite 파일을 WAL로 공유한다.
 pub struct RemoteStore {
     conn: Mutex<Connection>,
+    /// 지금 yt-dlp 로 펼치는 중인 차트 (§15.1). 같은 차트를 여러 사람이 동시에 눌러도
+    /// **하나만 돌리고 나머지는 그 결과를 기다린다** — 안 그러면 yt-dlp 가 줄줄이 선다.
+    chart_inflight: Mutex<HashSet<i64>>,
+    /// 슈퍼 좋아요 쿨타임 (§10.6). 짧고 재시작 때 풀려도 손해가 없어 메모리로 충분하다.
+    /// 하루 사용량만 DB에 둔다.
+    super_like_cooldowns: Mutex<HashMap<(u64, u64), DateTime<Utc>>>,
 }
 
 impl RemoteStore {
@@ -307,11 +460,19 @@ impl RemoteStore {
         migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            chart_inflight: Mutex::new(HashSet::new()),
+            super_like_cooldowns: Mutex::new(HashMap::new()),
         })
     }
 
     fn now_iso() -> String {
         chrono::Utc::now().to_rfc3339()
+    }
+
+    /// UTC 자정 기준의 오늘 (§10.6). 서버마다 시간대를 따로 두면
+    /// "언제 초기화되지?"가 헷갈리고 코드도 지저분해진다.
+    fn utc_day() -> String {
+        Utc::now().format("%Y-%m-%d").to_string()
     }
 
     /// 세션 토큰의 SHA-256 16진 해시. 저장소에는 이 값만 남는다.
@@ -339,10 +500,17 @@ impl RemoteStore {
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default();
         settings.guild_id = guild_id;
+        // 읽을 때도 한 번 정리한다 — 옛 버전이 저장한 범위 밖 값이 그대로 동작에 쓰이면 안 된다.
+        settings.sanitize();
         settings
     }
 
+    /// **저장 직전에 `sanitize`를 강제한다** (§23.1). 어느 라우트를 거쳐 들어와도
+    /// `0 = 무제한` 규약과 허용 범위가 실제로 지켜진다.
     pub fn save_guild_settings(&self, settings: &RemoteGuildSettings) -> rusqlite::Result<()> {
+        let mut settings = settings.clone();
+        settings.sanitize();
+        let settings = &settings;
         let key = format!("remote_guild_settings:{}", settings.guild_id);
         let json = serde_json::to_string(settings).unwrap_or_else(|_| "{}".into());
         let conn = self.conn.lock().unwrap();
@@ -398,28 +566,26 @@ impl RemoteStore {
         tx.commit()
     }
 
+    /// 대기열 점수 + **누가 눌렀는지**(§10.4)를 한 방 쿼리로 가져온다.
+    /// 항목마다 투표자를 다시 물으면 대기열이 길어질수록 쿼리가 N배로 늘어난다.
+    /// 투표자 ID 는 항목·종류당 `MAX_VOTER_IDS`(12)명까지만 싣는다 — 그 이상은 개수로 보여 준다.
     pub fn queue_scores(&self, guild_id: u64) -> HashMap<String, QueueScore> {
         let conn = self.conn.lock().unwrap();
         let mut statement = match conn.prepare(
             r#"SELECT s.item_id, s.requester_user_id, s.wait_score, s.manual_priority, s.original_order,
-                      s.round, s.last_played_utc,
-                      SUM(CASE WHEN v.kind = 'Like' THEN 1 ELSE 0 END) AS likes,
-                      SUM(CASE WHEN v.kind = 'SuperLike' THEN 1 ELSE 0 END) AS super_likes
+                      s.round, s.last_played_utc, v.user_id, v.kind
                FROM remote_queue_scores s
                LEFT JOIN remote_queue_votes v ON v.item_id = s.item_id
                WHERE s.guild_id = ?1
-               GROUP BY s.item_id, s.requester_user_id, s.wait_score, s.manual_priority,
-                        s.original_order, s.round, s.last_played_utc"#,
+               ORDER BY s.item_id, v.created_utc, v.user_id"#,
         ) {
             Ok(statement) => statement,
             Err(_) => return HashMap::new(),
         };
         let rows = match statement.query_map(params![guild_id as i64], |row| {
-            let item_id: String = row.get(0)?;
             Ok((
-                item_id.clone(),
                 QueueScore {
-                    item_id,
+                    item_id: row.get(0)?,
                     guild_id,
                     requester_user_id: row.get::<_, Option<i64>>(1)?.map(|id| id as u64),
                     wait_score: row.get(2)?,
@@ -427,15 +593,37 @@ impl RemoteStore {
                     original_order: row.get(4)?,
                     round: row.get(5)?,
                     last_played_utc: row.get(6)?,
-                    like_count: row.get::<_, i64>(7)? as i32,
-                    super_like_count: row.get::<_, i64>(8)? as i32,
+                    ..Default::default()
                 },
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         }) {
             Ok(rows) => rows,
             Err(_) => return HashMap::new(),
         };
-        rows.flatten().collect()
+
+        let mut scores: HashMap<String, QueueScore> = HashMap::new();
+        for (score, voter, kind) in rows.flatten() {
+            let entry = scores.entry(score.item_id.clone()).or_insert(score);
+            let (Some(voter), Some(kind)) = (voter, kind.as_deref().and_then(QueueVoteKind::parse))
+            else {
+                continue; // 투표가 하나도 없는 항목의 LEFT JOIN 행.
+            };
+            let voter = voter as u64;
+            let (count, ids) = match kind {
+                QueueVoteKind::Like => (&mut entry.like_count, &mut entry.like_by),
+                QueueVoteKind::SuperLike => {
+                    (&mut entry.super_like_count, &mut entry.super_by)
+                }
+                QueueVoteKind::Dislike => (&mut entry.dislike_count, &mut entry.dislike_by),
+            };
+            *count += 1;
+            if ids.len() < MAX_VOTER_IDS {
+                ids.push(voter);
+            }
+        }
+        scores
     }
 
     pub fn increment_wait_scores(&self, item_ids: &[String]) -> rusqlite::Result<()> {
@@ -544,11 +732,15 @@ impl RemoteStore {
             params![item_id, user_id as i64],
         )?;
         let cache_key = track.cache_key();
+        // 싫어요는 개인 "좋아요 목록"에 들어가면 안 된다 — 좋아요를 싫어요로 바꾸면 목록에서 빠진다.
+        let liked = matches!(kind, Some(QueueVoteKind::Like | QueueVoteKind::SuperLike));
         if let Some(kind) = kind {
             tx.execute(
                 "INSERT INTO remote_queue_votes(item_id, guild_id, user_id, kind, created_utc) VALUES(?1, ?2, ?3, ?4, ?5)",
                 params![item_id, guild_id as i64, user_id as i64, kind.as_str(), now],
             )?;
+        }
+        if liked {
             let payload = serde_json::to_string(track).unwrap_or_else(|_| "{}".into());
             tx.execute(
                 r#"INSERT INTO remote_user_tracks(guild_id, user_id, kind, cache_key, payload_json, created_utc)
@@ -1480,13 +1672,16 @@ impl RemoteStore {
             .collect()
     }
 
-    /// 기준 곡 추가. 상한(10곡)과 중복은 여기서 막는다 — 라우트마다 다시 세면 어긋난다.
+    /// 기준 곡 추가. 상한과 중복은 여기서 막는다 — 라우트마다 다시 세면 어긋난다.
+    /// 상한은 길드 설정 `autoplay_seed_max`이고 `0`이면 무제한이다(§23.1).
     pub fn add_autoplay_seed(
         &self,
         guild_id: u64,
         track: &TrackRef,
         added_by_user_id: u64,
     ) -> rusqlite::Result<SeedAddOutcome> {
+        // 설정을 먼저 읽는다 — 같은 뮤텍스라 커넥션을 잡은 뒤에 읽으면 교착한다.
+        let seed_limit = self.load_guild_settings(guild_id).seed_limit();
         let cache_key = track.cache_key();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -1498,13 +1693,15 @@ impl RemoteStore {
         if exists {
             return Ok(SeedAddOutcome::Duplicate);
         }
-        let count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM remote_autoplay_seeds WHERE guild_id = ?1",
-            params![guild_id as i64],
-            |row| row.get(0),
-        )?;
-        if count as usize >= MAX_AUTOPLAY_SEEDS {
-            return Ok(SeedAddOutcome::LimitReached);
+        if let Some(limit) = seed_limit {
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM remote_autoplay_seeds WHERE guild_id = ?1",
+                params![guild_id as i64],
+                |row| row.get(0),
+            )?;
+            if count as u32 >= limit {
+                return Ok(SeedAddOutcome::LimitReached(limit));
+            }
         }
         let next_order: i64 = tx.query_row(
             "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM remote_autoplay_seeds WHERE guild_id = ?1",
@@ -1580,6 +1777,9 @@ impl RemoteStore {
 
     // ───────── 활동 로그 ─────────
 
+    /// 활동 로그 한 줄. **분류와 사람 문장은 서버가 정한다** (§13.3·§13.5) —
+    /// 클라이언트가 액션명을 문장으로 바꾸는 로직을 갖지 않게 하려는 것이다.
+    /// 같은 사람이 같은 종류를 60초 안에 다시 하면 새 줄을 만들지 않고 기존 줄을 갱신한다(§13.3).
     #[allow(clippy::too_many_arguments)]
     pub fn add_audit(
         &self,
@@ -1593,44 +1793,245 @@ impl RemoteStore {
         success: bool,
         failure_reason: Option<&str>,
     ) -> rusqlite::Result<i64> {
+        self.write_audit(
+            guild_id,
+            user_id,
+            display_name,
+            action,
+            target,
+            before_value,
+            after_value,
+            success,
+            failure_reason,
+            1,
+        )
+    }
+
+    /// 재생목록·차트처럼 **한 번에 여러 곡**이 들어간 일 (§13.3).
+    /// 사람 피드에는 `…에서 50곡을 담았어요` 한 줄만 남는다.
+    pub fn add_audit_bulk(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        display_name: &str,
+        action: &str,
+        label: Option<&str>,
+        count: u32,
+        items: &[String],
+    ) -> rusqlite::Result<i64> {
+        let id = self.write_audit(
+            guild_id,
+            user_id,
+            display_name,
+            action,
+            label,
+            None,
+            None,
+            true,
+            None,
+            count.max(1),
+        )?;
+        if !items.is_empty() {
+            // 펼치면 무엇이 들어갔는지 보여야 한다. 숫자만 남기면 "뭘 넣은 거지?"가 남는다.
+            let trimmed: Vec<String> = items.iter().take(200).map(|it| truncate_title(it)).collect();
+            let json = serde_json::to_string(&trimmed).unwrap_or_else(|_| "[]".into());
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE remote_audit_logs SET merged_items_json = ?2 WHERE id = ?1",
+                params![id, json],
+            )?;
+        }
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_audit(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        display_name: &str,
+        action: &str,
+        target: Option<&str>,
+        before_value: Option<&str>,
+        after_value: Option<&str>,
+        success: bool,
+        failure_reason: Option<&str>,
+        count: u32,
+    ) -> rusqlite::Result<i64> {
+        let kind = audit_kind_for(action);
         let conn = self.conn.lock().unwrap();
+        let now = Self::now_iso();
+
+        // ── 합치기 (§13.3). 실패한 시도는 합치지 않는다 — 관리자가 각각을 봐야 한다.
+        if success && is_mergeable_action(action) {
+            let cutoff = (Utc::now() - ChronoDuration::seconds(AUDIT_MERGE_WINDOW_SECS)).to_rfc3339();
+            let previous: Option<(i64, i64, Option<String>, Option<String>)> = conn
+                .query_row(
+                    r#"SELECT id, merged_count, merged_items_json, target
+                       FROM remote_audit_logs
+                       WHERE guild_id = ?1 AND user_id = ?2 AND action = ?3 AND success = 1
+                         AND julianday(created_utc) >= julianday(?4)
+                       ORDER BY id DESC LIMIT 1"#,
+                    params![guild_id as i64, user_id as i64, action, cutoff],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            if let Some((id, merged_count, items_json, first_target)) = previous {
+                let mut items: Vec<String> = items_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_else(|| first_target.iter().map(|t| truncate_title(t)).collect());
+                if let Some(title) = target {
+                    items.push(truncate_title(title));
+                }
+                items.truncate(200);
+                let merged_count = (merged_count.max(1) as u32).saturating_add(count);
+                let text = audit_text(
+                    action,
+                    display_name,
+                    target.or(first_target.as_deref()),
+                    before_value,
+                    after_value,
+                    merged_count,
+                );
+                conn.execute(
+                    r#"UPDATE remote_audit_logs
+                       SET merged_count = ?2, merged_items_json = ?3, human_text = ?4, created_utc = ?5
+                       WHERE id = ?1"#,
+                    params![
+                        id,
+                        merged_count as i64,
+                        serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
+                        text,
+                        now
+                    ],
+                )?;
+                return Ok(id);
+            }
+        }
+
+        let text = audit_text(
+            action,
+            display_name,
+            target,
+            before_value,
+            after_value,
+            count,
+        );
         conn.execute(
             r#"INSERT INTO remote_audit_logs
-               (guild_id, user_id, display_name, action, target, before_value, after_value, success, failure_reason, created_utc)
-               VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
-            params![guild_id as i64, user_id as i64, display_name, action, target, before_value,
-                after_value, success as i64, failure_reason, Self::now_iso()],
+               (guild_id, user_id, display_name, action, kind, human_text, target,
+                before_value, after_value, success, failure_reason, created_utc, merged_count)
+               VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+            params![
+                guild_id as i64,
+                user_id as i64,
+                display_name,
+                action,
+                kind.as_str(),
+                text,
+                target,
+                before_value,
+                after_value,
+                success as i64,
+                failure_reason,
+                now,
+                count.max(1) as i64,
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
     /// `before_id`가 있으면 그보다 과거만. 활동 로그 탭의 커서 페이지네이션이다.
-    pub fn list_audit(&self, guild_id: u64, limit: usize, before_id: Option<i64>) -> Vec<AuditEntry> {
+    /// 분류 필터가 필요하면 `list_audit_kinds`를 쓴다.
+    pub fn list_audit(
+        &self,
+        guild_id: u64,
+        limit: usize,
+        before_id: Option<i64>,
+    ) -> Vec<AuditEntry> {
+        self.list_audit_kinds(guild_id, limit, before_id, &[])
+    }
+
+    /// 분류 필터(§13.5). `kinds`가 비어 있으면 전부 본다.
+    pub fn list_audit_kinds(
+        &self,
+        guild_id: u64,
+        limit: usize,
+        before_id: Option<i64>,
+        kinds: &[AuditKind],
+    ) -> Vec<AuditEntry> {
         let conn = self.conn.lock().unwrap();
-        let mut statement = match conn.prepare(
-            r#"SELECT id, user_id, display_name, action, target, before_value, after_value,
-                      success, failure_reason, created_utc
+        let mut sql = String::from(
+            r#"SELECT id, user_id, display_name, action, kind, human_text, target,
+                      before_value, after_value, success, failure_reason, created_utc,
+                      merged_count, merged_items_json
                FROM remote_audit_logs
-               WHERE guild_id = ?1 AND (?2 IS NULL OR id < ?2)
-               ORDER BY id DESC LIMIT ?3"#,
-        ) {
+               WHERE guild_id = ?1 AND (?2 IS NULL OR id < ?2)"#,
+        );
+        let mut binds: Vec<SqlValue> = vec![
+            SqlValue::Integer(guild_id as i64),
+            match before_id {
+                Some(id) => SqlValue::Integer(id),
+                None => SqlValue::Null,
+            },
+        ];
+        if !kinds.is_empty() {
+            sql.push_str(&format!(" AND kind IN ({})", placeholders(kinds.len())));
+            binds.extend(kinds.iter().map(|kind| SqlValue::Text(kind.as_str().into())));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        binds.push(SqlValue::Integer(limit as i64));
+
+        let mut statement = match conn.prepare(&sql) {
             Ok(statement) => statement,
             Err(_) => return Vec::new(),
         };
         statement
-            .query_map(params![guild_id as i64, before_id, limit as i64], |row| {
+            .query_map(params_from_iter(binds), |row| {
+                let action: String = row.get(3)?;
+                let kind: Option<String> = row.get(4)?;
+                let stored_text: Option<String> = row.get(5)?;
+                let target: Option<String> = row.get(6)?;
+                let before_value: Option<String> = row.get(7)?;
+                let after_value: Option<String> = row.get(8)?;
+                let display_name: String = row.get(2)?;
+                let merged_count: i64 = row.get::<_, Option<i64>>(12)?.unwrap_or(1).max(1);
+                let items: Vec<String> = row
+                    .get::<_, Option<String>>(13)?
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
+                // v13 이전에 쌓인 줄에는 문장이 없다 — 읽는 자리에서 만들어 준다.
+                let text = stored_text.filter(|t| !t.is_empty()).unwrap_or_else(|| {
+                    audit_text(
+                        &action,
+                        &display_name,
+                        target.as_deref(),
+                        before_value.as_deref(),
+                        after_value.as_deref(),
+                        merged_count as u32,
+                    )
+                });
                 Ok(AuditEntry {
                     id: row.get(0)?,
                     guild_id,
                     user_id: row.get::<_, i64>(1)? as u64,
-                    display_name: row.get(2)?,
-                    action: row.get(3)?,
-                    target: row.get(4)?,
-                    before_value: row.get(5)?,
-                    after_value: row.get(6)?,
-                    success: row.get::<_, i64>(7)? != 0,
-                    failure_reason: row.get(8)?,
-                    created_utc: row.get(9)?,
+                    kind: kind
+                        .as_deref()
+                        .and_then(AuditKind::parse)
+                        .unwrap_or_else(|| audit_kind_for(&action)),
+                    display_name,
+                    action,
+                    text,
+                    target,
+                    before_value,
+                    after_value,
+                    success: row.get::<_, i64>(9)? != 0,
+                    failure_reason: row.get(10)?,
+                    created_utc: row.get(11)?,
+                    merged_count: merged_count as u32,
+                    merged_items: items,
                 })
             })
             .map(|rows| rows.flatten().collect())
@@ -1639,16 +2040,12 @@ impl RemoteStore {
 
     /// created_utc 는 RFC3339(`...T...+00:00`)라 문자열로 `datetime('now')`(`... ...`)와 비교하면
     /// 'T' > ' ' 때문에 아무것도 안 지워진다. julianday 로 실제 시각을 비교한다.
+    ///
+    /// **분류별 보존**(§13.6): 투표·재생은 3일, 나머지는 설정값 그대로.
+    /// `retention_days == 0`이면 무제한이라 **한 줄도 지우지 않는다**(§23.1).
     pub fn prune_audit(&self, guild_id: u64, retention_days: i32) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            r#"DELETE FROM remote_audit_logs
-               WHERE guild_id = ?1 AND julianday(created_utc) < julianday('now', ?2)"#,
-            params![
-                guild_id as i64,
-                format!("-{} days", retention_days.clamp(1, 3650))
-            ],
-        )
+        prune_audit_with(&conn, guild_id, retention_days)
     }
 
     // ───────── 보존 정리 ─────────
@@ -1665,34 +2062,34 @@ impl RemoteStore {
             .into_iter()
             .map(|guild_id| {
                 let settings = self.load_guild_settings(guild_id);
-                let chat_days = if settings.chat_retention_days == 0 {
-                    retention.chat_days
+                // "길드 설정이 있으면 길드 설정이 이긴다." 한 번도 저장한 적 없는 길드만
+                // 앱 기본값을 쓴다 — 저장된 0은 "일부러 무제한"이라 기본값으로 덮으면 안 된다.
+                if self.has_guild_settings(guild_id) {
+                    (
+                        guild_id,
+                        settings.chat_retention_days,
+                        settings.audit_retention_days,
+                    )
                 } else {
-                    settings.chat_retention_days
-                };
-                (guild_id, chat_days, settings.audit_retention_days)
+                    (guild_id, retention.chat_days, retention.audit_days)
+                }
             })
             .collect();
 
         let mut report = PruneReport::default();
         let conn = self.conn.lock().unwrap();
         for (guild_id, chat_days, audit_days) in plans {
-            report.chat += conn.execute(
-                r#"DELETE FROM remote_chat_messages
-                   WHERE guild_id = ?1 AND julianday(created_utc) < julianday('now', ?2)"#,
-                params![
-                    guild_id as i64,
-                    format!("-{} days", chat_days.clamp(1, 3650))
-                ],
-            )?;
-            report.audit += conn.execute(
-                r#"DELETE FROM remote_audit_logs
-                   WHERE guild_id = ?1 AND julianday(created_utc) < julianday('now', ?2)"#,
-                params![
-                    guild_id as i64,
-                    format!("-{} days", audit_days.clamp(1, 3650))
-                ],
-            )?;
+            // 0 = 무제한(§23.1). 예전 코드의 `.clamp(1, ..)` 는 0을 1일로 바꿔 버려서
+            // "무제한"을 고른 서버의 채팅이 하루 만에 사라졌다.
+            // (설정을 한 번도 안 만진 길드는 필드 기본값 30이 오므로 0은 "일부러 무제한"뿐이다.)
+            if let Some(chat_days) = as_limit_u32(chat_days) {
+                report.chat += conn.execute(
+                    r#"DELETE FROM remote_chat_messages
+                       WHERE guild_id = ?1 AND julianday(created_utc) < julianday('now', ?2)"#,
+                    params![guild_id as i64, format!("-{} days", chat_days.min(3650))],
+                )?;
+            }
+            report.audit += prune_audit_with(&conn, guild_id, audit_days)?;
             report.recent += conn.execute(
                 r#"DELETE FROM remote_recent_tracks
                    WHERE guild_id = ?1 AND id NOT IN (
@@ -1722,7 +2119,428 @@ impl RemoteStore {
             "DELETE FROM remote_web_sessions WHERE julianday(expires_utc) <= julianday('now')",
             [],
         )?;
+        // 기한이 지난 자동재생 차단(§8.5-3)과 지난 날짜의 슈퍼 좋아요 사용량(§10.6).
+        // 둘 다 오래된 행이 남아 있어도 동작에는 영향이 없지만 계속 불어나서 같이 턴다.
+        conn.execute(
+            "DELETE FROM remote_autoplay_blocked WHERE julianday(until_utc) <= julianday('now')",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM remote_super_like_usage WHERE day < ?1",
+            params![(Utc::now() - ChronoDuration::days(7))
+                .format("%Y-%m-%d")
+                .to_string()],
+        )?;
         Ok(report)
+    }
+
+    // ───────── 슈퍼 좋아요 제한 (§10.6) ─────────
+
+    /// 지금 슈퍼 좋아요를 쓸 수 있는지 본다. **소비하지 않는다.**
+    /// 관리자·봇 주인도 똑같이 적용된다 — 여기서 예외를 두면 그게 특혜다.
+    pub fn check_super_like(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        cooldown_sec: u32,
+        daily_limit: u32,
+    ) -> SuperLikeVerdict {
+        if let Some(remaining) = self.super_like_cooldown_remaining(guild_id, user_id, cooldown_sec)
+        {
+            return SuperLikeVerdict::Cooldown {
+                remaining_sec: remaining,
+            };
+        }
+        let used = self.super_like_used_today(guild_id, user_id);
+        match as_limit_u32(daily_limit) {
+            Some(limit) if used >= limit => SuperLikeVerdict::DailyLimitReached { limit },
+            Some(limit) => SuperLikeVerdict::Allowed {
+                used_today: used,
+                remaining: Some(limit - used),
+            },
+            None => SuperLikeVerdict::Allowed {
+                used_today: used,
+                remaining: None,
+            },
+        }
+    }
+
+    /// 통과하면 하루 사용량을 올리고 쿨타임을 건다. 막히면 아무것도 바꾸지 않는다.
+    pub fn consume_super_like(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        cooldown_sec: u32,
+        daily_limit: u32,
+    ) -> SuperLikeVerdict {
+        let verdict = self.check_super_like(guild_id, user_id, cooldown_sec, daily_limit);
+        if !verdict.is_allowed() {
+            return verdict;
+        }
+        let day = Self::utc_day();
+        {
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute(
+                r#"INSERT INTO remote_super_like_usage(guild_id, user_id, day, used, last_utc)
+                   VALUES(?1, ?2, ?3, 1, ?4)
+                   ON CONFLICT(guild_id, user_id, day) DO UPDATE SET
+                     used = used + 1, last_utc = excluded.last_utc"#,
+                params![guild_id as i64, user_id as i64, day, Self::now_iso()],
+            );
+        }
+        if cooldown_sec > 0 {
+            let mut map = self
+                .super_like_cooldowns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            map.insert(
+                (guild_id, user_id),
+                Utc::now() + ChronoDuration::seconds(cooldown_sec as i64),
+            );
+        }
+        let used = self.super_like_used_today(guild_id, user_id);
+        SuperLikeVerdict::Allowed {
+            used_today: used,
+            remaining: as_limit_u32(daily_limit).map(|limit| limit.saturating_sub(used)),
+        }
+    }
+
+    /// **취소하면 횟수를 돌려준다** (§10.6). 실수로 누른 걸 하루 종일 못 쓰게 하면 가혹하다.
+    /// 쿨타임은 안 돌려준다 — 연타 방지가 목적이라 취소로 풀리면 의미가 없다.
+    pub fn refund_super_like(&self, guild_id: u64, user_id: u64) -> u32 {
+        {
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute(
+                r#"UPDATE remote_super_like_usage SET used = used - 1
+                   WHERE guild_id = ?1 AND user_id = ?2 AND day = ?3 AND used > 0"#,
+                params![guild_id as i64, user_id as i64, Self::utc_day()],
+            );
+        }
+        self.super_like_used_today(guild_id, user_id)
+    }
+
+    /// `/state/cold` 의 `superLike` (§10.6).
+    pub fn super_like_status(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        cooldown_sec: u32,
+        daily_limit: u32,
+    ) -> SuperLikeStatus {
+        let used = self.super_like_used_today(guild_id, user_id);
+        let available_at = self
+            .super_like_cooldown_remaining(guild_id, user_id, cooldown_sec)
+            .map(|remaining| (Utc::now() + ChronoDuration::seconds(remaining as i64)).to_rfc3339());
+        SuperLikeStatus {
+            cooldown_sec,
+            daily_limit,
+            used_today: used,
+            remaining: as_limit_u32(daily_limit).map(|limit| limit.saturating_sub(used)),
+            available_at_utc: available_at,
+        }
+    }
+
+    pub fn super_like_used_today(&self, guild_id: u64, user_id: u64) -> u32 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT used FROM remote_super_like_usage WHERE guild_id = ?1 AND user_id = ?2 AND day = ?3",
+            params![guild_id as i64, user_id as i64, Self::utc_day()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+        .max(0) as u32
+    }
+
+    /// 남은 쿨타임(초). 쿨타임이 없거나 이미 풀렸으면 `None`.
+    fn super_like_cooldown_remaining(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        cooldown_sec: u32,
+    ) -> Option<u32> {
+        if cooldown_sec == 0 {
+            return None;
+        }
+        let map = self
+            .super_like_cooldowns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let until = map.get(&(guild_id, user_id))?;
+        let remaining = (*until - Utc::now()).num_seconds();
+        (remaining > 0).then_some(remaining as u32)
+    }
+
+    // ───────── 자동재생 차단 후보 (§8.5-3) ─────────
+
+    /// `📻 이 곡 말고`로 뺀 곡과 재생에 실패한 곡을 7일간 기억한다.
+    pub fn block_autoplay_candidate(
+        &self,
+        guild_id: u64,
+        cache_key: &str,
+        reason: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let until = (Utc::now() + ChronoDuration::days(AUTOPLAY_BLOCK_DAYS)).to_rfc3339();
+        conn.execute(
+            r#"INSERT INTO remote_autoplay_blocked(guild_id, cache_key, until_utc, reason, created_utc)
+               VALUES(?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(guild_id, cache_key) DO UPDATE SET
+                 until_utc = excluded.until_utc, reason = excluded.reason"#,
+            params![guild_id as i64, cache_key, until, reason, Self::now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// 아직 살아 있는 차단만. 만료된 행은 이 자리에서 지운다(지연 삭제).
+    pub fn blocked_autoplay_keys(&self, guild_id: u64) -> HashSet<String> {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            r#"DELETE FROM remote_autoplay_blocked
+               WHERE guild_id = ?1 AND julianday(until_utc) <= julianday('now')"#,
+            params![guild_id as i64],
+        );
+        let mut statement = match conn
+            .prepare("SELECT cache_key FROM remote_autoplay_blocked WHERE guild_id = ?1")
+        {
+            Ok(statement) => statement,
+            Err(_) => return HashSet::new(),
+        };
+        statement
+            .query_map(params![guild_id as i64], |row| row.get::<_, String>(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn unblock_autoplay_candidate(
+        &self,
+        guild_id: u64,
+        cache_key: &str,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM remote_autoplay_blocked WHERE guild_id = ?1 AND cache_key = ?2",
+            params![guild_id as i64, cache_key],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// 최근 재생 이력을 자동추천이 쓰기 좋은 모양으로. (§8.5-1·2)
+    /// `cache_key → 재생 후 지난 시간(시간 단위)` 과 **최신순 아티스트 목록**을 같이 돌려준다.
+    /// 한 번의 조회로 둘 다 만든다 — 추천 한 번에 쿼리를 두 번 돌 이유가 없다.
+    pub fn recent_play_history(
+        &self,
+        guild_id: u64,
+        limit: usize,
+    ) -> (HashMap<String, f64>, Vec<String>) {
+        let now = Utc::now();
+        let mut ages: HashMap<String, f64> = HashMap::new();
+        let mut artists: Vec<String> = Vec::new();
+        for recent in self.list_recent(guild_id, limit) {
+            let key = recent.track.cache_key();
+            let hours = DateTime::parse_from_rfc3339(&recent.played_utc)
+                .map(|played| {
+                    (now - played.with_timezone(&Utc)).num_minutes() as f64 / 60.0
+                })
+                .unwrap_or(f64::MAX);
+            // 같은 곡이 여러 번 나오면 **가장 최근**이 기준이다.
+            ages.entry(key).and_modify(|old| *old = old.min(hours)).or_insert(hours);
+            if let Some(artist) = recent.track.artist.as_deref() {
+                let artist = artist.trim();
+                if !artist.is_empty() {
+                    artists.push(artist.to_lowercase());
+                }
+            }
+        }
+        (ages, artists)
+    }
+
+    // ───────── 차트 (§15) ─────────
+
+    /// 이 길드가 볼 수 있는 차트 전부(공용 + 자기 것). 꺼진 것도 포함하니
+    /// 유저 UI 는 `enabled`와 `ok()`로 한 번 더 거른다.
+    pub fn list_charts(&self, guild_id: u64) -> Vec<ChartDef> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = match conn.prepare(CHART_SELECT) {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+        statement
+            .query_map(params![guild_id as i64], map_chart)
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn get_chart(&self, guild_id: u64, chart_id: i64) -> Option<ChartDef> {
+        self.list_charts(guild_id)
+            .into_iter()
+            .find(|chart| chart.id == chart_id)
+    }
+
+    /// 캐시된 곡 목록. `stale`이면 TTL(6시간)이 지난 것이라 다시 받아야 한다 —
+    /// 그래도 일단 보여 주는 편이 빈 화면보다 낫다.
+    pub fn chart_cache(&self, chart_id: i64) -> Option<ChartSnapshot> {
+        let conn = self.conn.lock().unwrap();
+        let (json, fetched): (String, String) = conn
+            .query_row(
+                "SELECT tracks_json, fetched_utc FROM remote_chart_cache WHERE chart_id = ?1",
+                params![chart_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        let tracks: Vec<TrackRef> = serde_json::from_str(&json).ok()?;
+        if tracks.is_empty() {
+            return None;
+        }
+        let stale = DateTime::parse_from_rfc3339(&fetched)
+            .map(|at| Utc::now() - at.with_timezone(&Utc) > ChronoDuration::hours(CHART_CACHE_TTL_HOURS))
+            .unwrap_or(true);
+        Some(ChartSnapshot {
+            tracks,
+            fetched_utc: fetched,
+            stale,
+        })
+    }
+
+    pub fn save_chart_cache(&self, chart_id: i64, tracks: &[TrackRef]) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO remote_chart_cache(chart_id, tracks_json, fetched_utc, failed_utc, failure_reason)
+               VALUES(?1, ?2, ?3, NULL, NULL)
+               ON CONFLICT(chart_id) DO UPDATE SET
+                 tracks_json = excluded.tracks_json, fetched_utc = excluded.fetched_utc,
+                 failed_utc = NULL, failure_reason = NULL"#,
+            params![
+                chart_id,
+                serde_json::to_string(tracks).unwrap_or_else(|_| "[]".into()),
+                Self::now_iso()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 갱신 실패를 그대로 남긴다 (§15.2). 숨기면 빈 차트를 눌렀는데 아무 일도 안 일어난다.
+    pub fn mark_chart_failure(&self, chart_id: i64, reason: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO remote_chart_cache(chart_id, tracks_json, fetched_utc, failed_utc, failure_reason)
+               VALUES(?1, '[]', ?2, ?2, ?3)
+               ON CONFLICT(chart_id) DO UPDATE SET
+                 failed_utc = excluded.failed_utc, failure_reason = excluded.failure_reason"#,
+            params![chart_id, Self::now_iso(), reason],
+        )?;
+        Ok(())
+    }
+
+    /// **동시 요청 합치기** (§15.1). `true`가 돌아온 쪽만 yt-dlp 를 돌리고,
+    /// `false`를 받은 쪽은 잠깐 기다렸다 캐시를 다시 본다.
+    /// `resolve_preview`의 `try_begin_preview_resolve`와 같은 방식이다.
+    pub fn try_begin_chart_fetch(&self, chart_id: i64) -> bool {
+        let mut inflight = self
+            .chart_inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inflight.insert(chart_id)
+    }
+
+    pub fn end_chart_fetch(&self, chart_id: i64) {
+        let mut inflight = self
+            .chart_inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inflight.remove(&chart_id);
+    }
+
+    pub fn is_chart_fetching(&self, chart_id: i64) -> bool {
+        let inflight = self
+            .chart_inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inflight.contains(&chart_id)
+    }
+
+    /// 관리 콘솔의 차트 추가. 길드 것으로만 만들 수 있다.
+    pub fn add_chart(
+        &self,
+        guild_id: u64,
+        category: ChartCategory,
+        name: &str,
+        provider: &str,
+        url: &str,
+    ) -> rusqlite::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let next_order: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM remote_charts WHERE guild_id = ?1",
+            params![guild_id as i64],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            r#"INSERT INTO remote_charts(guild_id, category, name, provider, url, sort_order, enabled, builtin)
+               VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1, 0)"#,
+            params![guild_id as i64, category.as_str(), name, provider, url, next_order],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 주소·이름 수정과 켜기/끄기. 기본 제공분도 여기까지는 만질 수 있다.
+    pub fn update_chart(
+        &self,
+        chart_id: i64,
+        name: Option<&str>,
+        url: Option<&str>,
+        enabled: Option<bool>,
+        sort_order: Option<i64>,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            r#"UPDATE remote_charts SET
+                 name = COALESCE(?2, name),
+                 url = COALESCE(?3, url),
+                 enabled = COALESCE(?4, enabled),
+                 sort_order = COALESCE(?5, sort_order)
+               WHERE id = ?1"#,
+            params![chart_id, name, url, enabled.map(|on| on as i64), sort_order],
+        )?;
+        if url.is_some() {
+            // 주소가 바뀌면 예전 곡 목록은 거짓말이다.
+            conn.execute(
+                "DELETE FROM remote_chart_cache WHERE chart_id = ?1",
+                params![chart_id],
+            )?;
+        }
+        Ok(changed > 0)
+    }
+
+    /// **기본 제공분은 지울 수 없고 끄기만 된다** (§15.5). 되돌릴 수 없는 삭제는 위험하다.
+    pub fn remove_chart(&self, guild_id: u64, chart_id: i64) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "DELETE FROM remote_charts WHERE id = ?1 AND guild_id = ?2 AND builtin = 0",
+            params![chart_id, guild_id as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM remote_chart_cache WHERE chart_id = ?1",
+            params![chart_id],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    /// 이 길드가 리모컨 설정을 한 번이라도 저장한 적이 있는지.
+    /// 저장한 적 없는 길드에 앱 기본 보존값을 쓰기 위한 판정이다.
+    fn has_guild_settings(&self, guild_id: u64) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1)",
+            params![format!("remote_guild_settings:{guild_id}")],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
     }
 
     /// 마참뮤직 테이블에 흔적이 있는 길드 id 전부.
@@ -1836,6 +2654,32 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             }
             8 => tx.execute_batch(MIGRATION_V9)?,
             9 => tx.execute_batch(MIGRATION_V10)?,
+            10 => {
+                tx.execute_batch(MIGRATION_V11)?;
+                seed_builtin_charts(&tx)?;
+            }
+            11 => tx.execute_batch(MIGRATION_V12)?,
+            12 => {
+                // 컬럼을 먼저 붙이고 나서 그 컬럼을 쓰는 인덱스를 만든다.
+                add_column(
+                    &tx,
+                    "remote_audit_logs",
+                    "kind",
+                    "TEXT NOT NULL DEFAULT 'admin'",
+                )?;
+                // `text` 는 타입 이름과 겹쳐 헷갈리므로 컬럼명은 human_text 로 둔다.
+                add_column(&tx, "remote_audit_logs", "human_text", "TEXT")?;
+                add_column(
+                    &tx,
+                    "remote_audit_logs",
+                    "merged_count",
+                    "INTEGER NOT NULL DEFAULT 1",
+                )?;
+                add_column(&tx, "remote_audit_logs", "merged_items_json", "TEXT")?;
+                tx.execute_batch(MIGRATION_V13)?;
+                // 이미 쌓인 줄에도 분류를 채워 준다 — 필터가 옛 줄만 통째로 놓치면 안 된다.
+                backfill_audit_kinds(&tx)?;
+            }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -1844,6 +2688,109 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.commit()?;
     }
     Ok(())
+}
+
+/// 기본 제공 차트를 한 번 심는다 (§15.2). `guild_id IS NULL` 이라 모든 서버가 같이 본다.
+/// 이름에 unique 인덱스가 걸려 있어 다시 돌아도 중복되지 않는다.
+fn seed_builtin_charts(conn: &Connection) -> rusqlite::Result<()> {
+    let now_order = 0i64;
+    for (index, (category, name, provider, url)) in BUILTIN_CHARTS.iter().enumerate() {
+        conn.execute(
+            r#"INSERT OR IGNORE INTO remote_charts
+               (guild_id, category, name, provider, url, sort_order, enabled, builtin)
+               VALUES(NULL, ?1, ?2, ?3, ?4, ?5, 1, 1)"#,
+            params![
+                category.as_str(),
+                name,
+                provider,
+                url,
+                now_order + index as i64
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// v13 이전에 쌓인 활동 로그에 분류를 채운다. 액션명만 보면 정할 수 있어 손실이 없다.
+fn backfill_audit_kinds(conn: &Connection) -> rusqlite::Result<()> {
+    let actions: Vec<String> = {
+        let mut statement = conn.prepare("SELECT DISTINCT action FROM remote_audit_logs")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
+    for action in actions {
+        conn.execute(
+            "UPDATE remote_audit_logs SET kind = ?2 WHERE action = ?1",
+            params![action, audit_kind_for(&action).as_str()],
+        )?;
+    }
+    Ok(())
+}
+
+/// 분류별 보존 정리 (§13.6). `retention_days == 0`이면 무제한이라 한 줄도 안 지운다(§23.1).
+fn prune_audit_with(
+    conn: &Connection,
+    guild_id: u64,
+    retention_days: i32,
+) -> rusqlite::Result<usize> {
+    if retention_days <= 0 {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for kind in AuditKind::ALL {
+        let days = kind.retention_days(retention_days).clamp(1, 3650);
+        removed += conn.execute(
+            r#"DELETE FROM remote_audit_logs
+               WHERE guild_id = ?1 AND kind = ?2
+                 AND julianday(created_utc) < julianday('now', ?3)"#,
+            params![guild_id as i64, kind.as_str(), format!("-{days} days")],
+        )?;
+    }
+    // 분류가 비어 있는(아주 오래된) 줄도 설정값 기준으로 같이 턴다.
+    removed += conn.execute(
+        r#"DELETE FROM remote_audit_logs
+           WHERE guild_id = ?1 AND (kind IS NULL OR kind = '')
+             AND julianday(created_utc) < julianday('now', ?2)"#,
+        params![
+            guild_id as i64,
+            format!("-{} days", retention_days.clamp(1, 3650))
+        ],
+    )?;
+    Ok(removed)
+}
+
+/// 공용(기본 제공) 차트 + 이 길드 차트. ?1 = guild_id.
+const CHART_SELECT: &str = concat!(
+    "SELECT c.id, c.guild_id, c.category, c.name, c.provider, c.url, c.sort_order, ",
+    "c.enabled, c.builtin, k.fetched_utc, k.failed_utc, k.failure_reason, k.tracks_json ",
+    "FROM remote_charts c LEFT JOIN remote_chart_cache k ON k.chart_id = c.id ",
+    "WHERE c.guild_id IS NULL OR c.guild_id = ?1 ",
+    "ORDER BY c.category, c.sort_order, c.id"
+);
+
+fn map_chart(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChartDef> {
+    let category: String = row.get(2)?;
+    let tracks_json: Option<String> = row.get(12)?;
+    let track_count = tracks_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<TrackRef>>(json).ok())
+        .map(|tracks| tracks.len())
+        .unwrap_or(0);
+    Ok(ChartDef {
+        id: row.get(0)?,
+        guild_id: row.get::<_, Option<i64>>(1)?.map(|id| id as u64),
+        category: ChartCategory::parse(&category).unwrap_or(ChartCategory::Popular),
+        name: row.get(3)?,
+        provider: row.get(4)?,
+        url: row.get(5)?,
+        sort_order: row.get(6)?,
+        enabled: row.get::<_, i64>(7)? != 0,
+        builtin: row.get::<_, i64>(8)? != 0,
+        last_fetched_utc: row.get(9)?,
+        last_failure_utc: row.get(10)?,
+        last_failure_reason: row.get(11)?,
+        track_count,
+    })
 }
 
 /// `ALTER TABLE ... ADD COLUMN`은 이미 있으면 에러가 나므로 먼저 확인한다.
@@ -2094,6 +3041,7 @@ fn map_suspension(row: &rusqlite::Row<'_>, guild_id: u64) -> rusqlite::Result<Su
 mod tests {
     use super::*;
     use crate::models::ProviderKind;
+    use crate::remote::{MAX_AUTOPLAY_SEEDS, VotePoints};
 
     fn temp_store(tag: &str) -> (RemoteStore, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(
@@ -2102,6 +3050,14 @@ mod tests {
         ));
         let store = RemoteStore::open(&path).unwrap();
         (store, path)
+    }
+
+    /// 길드 설정은 **레거시(C# 공용) `settings` 테이블**에 얹혀 산다.
+    /// 이 러너는 그 테이블을 만들지 않으므로(절대 안 건드린다는 규칙) 테스트에서만 흉내낸다.
+    fn with_legacy_settings_table(store: &RemoteStore) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, json TEXT NOT NULL)")
+            .unwrap();
     }
 
     fn cleanup(store: RemoteStore, path: std::path::PathBuf) {
@@ -2172,15 +3128,30 @@ mod tests {
         store
             .set_vote(1, &item.id, 20, Some(QueueVoteKind::SuperLike), &item.track)
             .unwrap();
-        assert_eq!(store.queue_scores(1)["item"].total_score(), 2);
+        let points = VotePoints::default();
+        let score = store.queue_scores(1)["item"].clone();
+        assert_eq!(score.total_score(&points), 2);
+        // 누가 눌렀는지도 같은 조회에서 나온다 (§10.4).
+        assert_eq!(score.super_by, vec![20]);
+        assert!(score.like_by.is_empty());
         assert_eq!(store.list_user_tracks(1, 20, UserTrackKind::Liked).len(), 1);
         store.set_vote(1, &item.id, 20, None, &item.track).unwrap();
-        assert_eq!(store.queue_scores(1)["item"].total_score(), 0);
+        assert_eq!(store.queue_scores(1)["item"].total_score(&points), 0);
         assert!(
             store
                 .list_user_tracks(1, 20, UserTrackKind::Liked)
                 .is_empty()
         );
+
+        // 싫어요는 점수를 깎고, 개인 "좋아요 목록"에는 들어가지 않는다 (§10.2).
+        store
+            .set_vote(1, &item.id, 21, Some(QueueVoteKind::Dislike), &item.track)
+            .unwrap();
+        let score = store.queue_scores(1)["item"].clone();
+        assert_eq!(score.dislike_count, 1);
+        assert_eq!(score.dislike_by, vec![21]);
+        assert_eq!(score.total_score(&points), -1);
+        assert!(store.list_user_tracks(1, 21, UserTrackKind::Liked).is_empty());
         cleanup(store, path);
     }
 
@@ -2574,6 +3545,21 @@ mod tests {
         ));
         assert!(!is_valid_pref("panelLayout", &"\"".repeat(9000)));
         assert!(!is_valid_pref("unknown", "value"));
+        // v3 에서 넓어진 값들 (§7.2 배치 6종 · §17.1 테마 7종 + auto).
+        for layout in LAYOUT_VALUES {
+            assert!(is_valid_pref("layout", layout), "배치 {layout} 이 막혔다");
+        }
+        for theme in THEME_VALUES {
+            assert!(is_valid_pref("theme", theme), "테마 {theme} 이 막혔다");
+        }
+        assert!(!is_valid_pref("layout", "grid"));
+        assert!(!is_valid_pref("theme", "solarized"));
+        // 로그 필터 칩(§13.4)과 알림 설정(§16 B3).
+        assert!(is_valid_pref("auditFilter", "song,playlist"));
+        assert!(is_valid_pref("auditFilter", "none"));
+        assert!(!is_valid_pref("auditFilter", "song,없는분류"));
+        assert!(is_valid_pref("notify", r#"{"song":1,"mention":0}"#));
+        assert!(!is_valid_pref("notify", "song"));
         // 화이트리스트 상수와 판정이 어긋나지 않는지.
         for key in PREF_KEYS {
             assert!(!is_valid_pref(key, ""), "빈 값은 어떤 키도 통과하면 안 된다");
@@ -2593,7 +3579,7 @@ mod tests {
 
         // 11번째는 거부. 문구까지 계약이다.
         let overflow = store.add_autoplay_seed(1, &test_track("seed11"), 10).unwrap();
-        assert_eq!(overflow, SeedAddOutcome::LimitReached);
+        assert_eq!(overflow, SeedAddOutcome::LimitReached(10));
         assert_eq!(overflow.message(), "시드곡은 10곡까지 넣을 수 있어요.");
         assert_eq!(store.list_autoplay_seeds(1).len(), MAX_AUTOPLAY_SEEDS);
 
@@ -2675,6 +3661,469 @@ mod tests {
         store.prune_all(RetentionConfig::default()).unwrap();
         assert_eq!(store.load_prefs(10).get("layout").map(String::as_str), Some("two"));
         assert_eq!(store.list_autoplay_seeds(1).len(), 1);
+        cleanup(store, path);
+    }
+
+    // ───────── V3 §10.6 슈퍼 좋아요 제한 ─────────
+
+    /// 기본은 둘 다 꺼져 있고(기존 서버 동작 유지), 켜면 정확히 그 이유로 막는다.
+    /// **취소하면 횟수를 돌려준다** — 실수로 누른 걸 하루 종일 못 쓰게 하면 가혹하다.
+    #[test]
+    fn super_like_limits_are_off_by_default_and_refund_on_cancel() {
+        let (store, path) = temp_store("superlike");
+        // 기본(0/0) — 몇 번을 써도 안 막힌다.
+        for _ in 0..20 {
+            assert!(store.consume_super_like(1, 10, 0, 0).is_allowed());
+        }
+        assert!(store.check_super_like(1, 10, 0, 0).is_allowed());
+
+        // 하루 3번으로 조이면 이미 20번 쓴 사람은 바로 막힌다.
+        let verdict = store.check_super_like(1, 10, 0, 3);
+        assert_eq!(verdict, SuperLikeVerdict::DailyLimitReached { limit: 3 });
+        assert!(verdict.message().unwrap().contains("UTC 자정에 초기화돼요"));
+
+        // 다른 사람·다른 서버는 따로 센다.
+        assert!(store.check_super_like(1, 11, 0, 3).is_allowed());
+        assert!(store.check_super_like(2, 10, 0, 3).is_allowed());
+
+        // 취소하면 횟수가 돌아온다.
+        let before = store.super_like_used_today(1, 10);
+        assert_eq!(store.refund_super_like(1, 10), before - 1);
+        // 0 아래로는 안 내려간다.
+        for _ in 0..50 {
+            store.refund_super_like(1, 10);
+        }
+        assert_eq!(store.super_like_used_today(1, 10), 0);
+        cleanup(store, path);
+    }
+
+    /// 쿨타임은 메모리로 충분하고, 남은 시간을 초 단위로 정확히 말해 준다.
+    #[test]
+    fn super_like_cooldown_says_how_long_is_left() {
+        let (store, path) = temp_store("superlike-cool");
+        assert!(store.consume_super_like(1, 10, 300, 0).is_allowed());
+        match store.check_super_like(1, 10, 300, 0) {
+            SuperLikeVerdict::Cooldown { remaining_sec } => {
+                assert!(remaining_sec > 290 && remaining_sec <= 300);
+            }
+            other => panic!("쿨타임이 안 걸렸다: {other:?}"),
+        }
+        // 쿨타임 설정이 0이면 아무리 눌러도 안 걸린다.
+        assert!(store.check_super_like(1, 10, 0, 0).is_allowed());
+
+        let status = store.super_like_status(1, 10, 300, 5);
+        assert_eq!(status.used_today, 1);
+        assert_eq!(status.remaining, Some(4));
+        assert!(status.available_at_utc.is_some());
+        // 무제한이면 남은 횟수를 세지 않는다.
+        assert!(store.super_like_status(1, 10, 0, 0).remaining.is_none());
+        cleanup(store, path);
+    }
+
+    // ───────── V3 §13 활동 로그 ─────────
+
+    /// 문장과 분류는 서버가 채운다. 옛 줄(문장 없음)도 읽는 자리에서 문장이 만들어진다.
+    #[test]
+    fn audit_rows_carry_a_kind_and_a_human_sentence() {
+        let (store, path) = temp_store("audit-kind");
+        store
+            .add_audit(1, 10, "민수", "queue.add", Some("I AM"), None, None, true, None)
+            .unwrap();
+        store
+            .add_audit(1, 11, "지훈", "settings.maxVolume", Some("최대 볼륨"), Some("200"), Some("150"), true, None)
+            .unwrap();
+
+        let entries = store.list_audit(1, 50, None);
+        assert_eq!(entries.len(), 2);
+        let song = entries.iter().find(|e| e.action == "queue.add").unwrap();
+        assert_eq!(song.kind, AuditKind::Song);
+        assert_eq!(song.text, "민수님이 **I AM** 을 담았어요");
+        let admin = entries.iter().find(|e| e.kind == AuditKind::Admin).unwrap();
+        assert!(admin.text.contains("200 → 150"));
+
+        // 유저 투영에는 전후값 JSON 이 아예 없다 (§13.2).
+        let feed = admin.feed_item();
+        let json = serde_json::to_string(&feed).unwrap();
+        assert!(!json.contains("beforeValue"));
+        assert!(!json.contains("failureReason"));
+        assert!(json.contains("actorName"));
+        cleanup(store, path);
+    }
+
+    /// 같은 사람이 같은 종류를 60초 안에 반복하면 **새 줄을 만들지 않는다** (§13.3).
+    /// 펼치면 무엇이 들어갔는지 목록이 나와야 한다.
+    #[test]
+    fn repeated_actions_merge_into_one_line() {
+        let (store, path) = temp_store("audit-merge");
+        let mut ids = Vec::new();
+        for title in ["곡1", "곡2", "곡3"] {
+            ids.push(
+                store
+                    .add_audit(1, 10, "민수", "queue.add", Some(title), None, None, true, None)
+                    .unwrap(),
+            );
+        }
+        // 세 번 담았지만 줄은 하나다.
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        let entries = store.list_audit(1, 50, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].merged_count, 3);
+        assert_eq!(entries[0].text, "민수님이 곡 3개를 담았어요");
+        assert_eq!(entries[0].merged_items, vec!["곡1", "곡2", "곡3"]);
+        assert_eq!(entries[0].feed_item().merged_count, Some(3));
+
+        // 다른 사람은 따로 쌓인다.
+        store
+            .add_audit(1, 11, "지훈", "queue.add", Some("곡4"), None, None, true, None)
+            .unwrap();
+        assert_eq!(store.list_audit(1, 50, None).len(), 2);
+
+        // 합치지 않는 종류는 매번 새 줄이다.
+        store
+            .add_audit(1, 10, "민수", "playback.skip", None, None, None, true, None)
+            .unwrap();
+        store
+            .add_audit(1, 10, "민수", "playback.skip", None, None, None, true, None)
+            .unwrap();
+        assert_eq!(store.list_audit(1, 50, None).len(), 4);
+        cleanup(store, path);
+    }
+
+    /// 한 번에 담기는 사람 피드에 한 줄, 곡 목록은 펼침용으로 남는다 (§13.3).
+    #[test]
+    fn bulk_enqueue_leaves_exactly_one_line() {
+        let (store, path) = temp_store("audit-bulk");
+        let songs: Vec<String> = (1..=50).map(|index| format!("곡{index}")).collect();
+        store
+            .add_audit_bulk(1, 10, "민수", "playlist.enqueue", Some("밤샘용"), 50, &songs)
+            .unwrap();
+        let entries = store.list_audit(1, 50, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].text,
+            "민수님이 재생목록 **밤샘용** 에서 50곡을 담았어요"
+        );
+        assert_eq!(entries[0].merged_items.len(), 50);
+        assert_eq!(entries[0].kind, AuditKind::Song);
+        cleanup(store, path);
+    }
+
+    #[test]
+    fn audit_can_be_filtered_by_kind() {
+        let (store, path) = temp_store("audit-filter");
+        store
+            .add_audit(1, 10, "민수", "queue.add", Some("곡"), None, None, true, None)
+            .unwrap();
+        store
+            .add_audit(1, 10, "민수", "vote.like", Some("곡"), None, None, true, None)
+            .unwrap();
+        store
+            .add_audit(1, 10, "민수", "settings.update", None, None, None, true, None)
+            .unwrap();
+
+        assert_eq!(store.list_audit(1, 50, None).len(), 3);
+        assert_eq!(
+            store.list_audit_kinds(1, 50, None, &[AuditKind::Vote]).len(),
+            1
+        );
+        // 기본 필터(곡 + 재생목록)에는 투표와 설정이 안 잡힌다.
+        let default_view = store.list_audit_kinds(1, 50, None, &AuditKind::default_filter());
+        assert_eq!(default_view.len(), 1);
+        assert_eq!(default_view[0].kind, AuditKind::Song);
+        cleanup(store, path);
+    }
+
+    /// 투표·재생은 3일, 나머지는 설정값. `0`이면 한 줄도 안 지운다 (§13.6 · §23.1).
+    #[test]
+    fn audit_retention_is_per_kind_and_zero_means_forever() {
+        let (store, path) = temp_store("audit-retention");
+        let song = store
+            .add_audit(1, 10, "민수", "queue.add", Some("곡"), None, None, true, None)
+            .unwrap();
+        let vote = store
+            .add_audit(1, 10, "민수", "vote.like", Some("곡"), None, None, true, None)
+            .unwrap();
+        // 둘 다 5일 전으로 밀어 둔다.
+        let five_days_ago = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE remote_audit_logs SET created_utc = ?1",
+                params![five_days_ago],
+            )
+            .unwrap();
+        }
+
+        // 무제한이면 아무것도 안 지운다 — `.max(1)` 이 남아 있으면 여기서 전부 날아간다.
+        assert_eq!(store.prune_audit(1, 0).unwrap(), 0);
+        assert_eq!(store.list_audit(1, 50, None).len(), 2);
+
+        // 14일 설정이어도 투표는 3일만 남는다.
+        assert_eq!(store.prune_audit(1, 14).unwrap(), 1);
+        let left = store.list_audit(1, 50, None);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, song);
+        assert_ne!(left[0].id, vote);
+        cleanup(store, path);
+    }
+
+    // ───────── V3 §8.5 자동재생 정책 입력 ─────────
+
+    /// `📻 이 곡 말고`로 뺀 곡은 7일간 다시 안 뽑히고, 기한이 지나면 스스로 사라진다.
+    #[test]
+    fn blocked_autoplay_candidates_expire_on_their_own() {
+        let (store, path) = temp_store("blocked");
+        let track = test_track("싫은곡");
+        store
+            .block_autoplay_candidate(1, &track.cache_key(), Some("이 곡 말고"))
+            .unwrap();
+        assert!(store.blocked_autoplay_keys(1).contains(&track.cache_key()));
+        // 길드끼리 섞이지 않는다.
+        assert!(store.blocked_autoplay_keys(2).is_empty());
+
+        // 기한이 지난 행은 읽는 자리에서 사라진다.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE remote_autoplay_blocked SET until_utc = ?1",
+                params![(chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()],
+            )
+            .unwrap();
+        }
+        assert!(store.blocked_autoplay_keys(1).is_empty());
+
+        store
+            .block_autoplay_candidate(1, &track.cache_key(), None)
+            .unwrap();
+        assert!(store.unblock_autoplay_candidate(1, &track.cache_key()).unwrap());
+        assert!(!store.unblock_autoplay_candidate(1, "없는키").unwrap());
+        cleanup(store, path);
+    }
+
+    /// 이력 감쇠·아티스트 쿨다운이 쓸 입력을 한 번의 조회로 만든다 (§8.5-1·2).
+    #[test]
+    fn recent_history_gives_ages_and_artists_for_the_policy() {
+        let (store, path) = temp_store("recent-history");
+        let mut old = test_track("옛날곡");
+        old.artist = Some("아이브".into());
+        let mut fresh = test_track("방금곡");
+        fresh.artist = Some("뉴진스".into());
+
+        let mut item_old = QueueItem::new_user(old.clone(), "민수".into(), Some(10));
+        item_old.id = "old".into();
+        let mut item_fresh = QueueItem::new_user(fresh.clone(), "민수".into(), Some(10));
+        item_fresh.id = "fresh".into();
+        store.record_recent(1, &item_old, "completed").unwrap();
+        store.record_recent(1, &item_fresh, "completed").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE remote_recent_tracks SET played_utc = ?1 WHERE track_json LIKE '%옛날곡%'",
+                params![(chrono::Utc::now() - chrono::Duration::hours(30)).to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let (ages, artists) = store.recent_play_history(1, 50);
+        assert!(ages[&old.cache_key()] > 29.0);
+        assert!(ages[&fresh.cache_key()] < 1.0);
+        // 최신순 — 방금 튼 곡의 가수가 앞이다.
+        assert_eq!(artists.first().map(String::as_str), Some("뉴진스"));
+        assert!(artists.contains(&"아이브".to_string()));
+        cleanup(store, path);
+    }
+
+    // ───────── V3 §15 차트 ─────────
+
+    /// 기본 제공 차트가 심어지고, 마이그레이션을 다시 돌려도 중복되지 않는다.
+    #[test]
+    fn builtin_charts_are_seeded_once_and_cover_every_category() {
+        let (store, path) = temp_store("charts");
+        let charts = store.list_charts(1);
+        assert_eq!(charts.len(), BUILTIN_CHARTS.len());
+        for category in ChartCategory::ALL {
+            assert!(
+                charts.iter().any(|chart| chart.category == category),
+                "{} 분류의 기본 차트가 없다",
+                category.as_str()
+            );
+        }
+        // 우리 차트는 바깥에서 가져오지 않는다 (§15.2b).
+        assert!(
+            charts
+                .iter()
+                .filter(|chart| chart.category == ChartCategory::Ours)
+                .all(|chart| chart.is_internal())
+        );
+        // 전부 공용이고 지울 수 없다.
+        assert!(charts.iter().all(|chart| chart.guild_id.is_none() && chart.builtin));
+        let builtin_id = charts[0].id;
+        assert!(!store.remove_chart(1, builtin_id).unwrap());
+
+        // 다시 심어도 늘지 않는다.
+        {
+            let conn = store.conn.lock().unwrap();
+            seed_builtin_charts(&conn).unwrap();
+        }
+        assert_eq!(store.list_charts(1).len(), BUILTIN_CHARTS.len());
+        cleanup(store, path);
+    }
+
+    /// 캐시는 6시간짜리고, 실패는 숨기지 않고 그대로 남는다 (§15.1 · §15.2).
+    #[test]
+    fn chart_cache_expires_after_six_hours_and_records_failures() {
+        let (store, path) = temp_store("chart-cache");
+        let chart_id = store
+            .add_chart(1, ChartCategory::Genre, "우리 장르", "YouTube", "ytsearch10:테스트")
+            .unwrap();
+        assert!(store.chart_cache(chart_id).is_none());
+
+        store
+            .save_chart_cache(chart_id, &[test_track("곡1"), test_track("곡2")])
+            .unwrap();
+        let snapshot = store.chart_cache(chart_id).expect("캐시 유실");
+        assert_eq!(snapshot.tracks.len(), 2);
+        assert!(!snapshot.stale, "방금 받은 캐시가 낡았다고 나온다");
+        assert_eq!(store.get_chart(1, chart_id).unwrap().track_count, 2);
+
+        // 6시간을 넘기면 낡은 것으로 보되 내용은 그대로 준다 — 빈 화면보다 낫다.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE remote_chart_cache SET fetched_utc = ?1",
+                params![(chrono::Utc::now() - chrono::Duration::hours(7)).to_rfc3339()],
+            )
+            .unwrap();
+        }
+        assert!(store.chart_cache(chart_id).unwrap().stale);
+
+        // 실패는 그대로 남는다.
+        store.mark_chart_failure(chart_id, "재생목록이 비어 있어요").unwrap();
+        let chart = store.get_chart(1, chart_id).unwrap();
+        assert!(chart.last_failure_utc.is_some());
+        assert_eq!(chart.last_failure_reason.as_deref(), Some("재생목록이 비어 있어요"));
+
+        // 주소를 갈면 옛 곡 목록은 버린다 — 거짓말이 되니까.
+        assert!(store.update_chart(chart_id, None, Some("ytsearch10:다른것"), None, None).unwrap());
+        assert!(store.chart_cache(chart_id).is_none());
+
+        // 길드 차트는 지울 수 있고, 남의 길드 것은 못 지운다.
+        assert!(!store.remove_chart(2, chart_id).unwrap());
+        assert!(store.remove_chart(1, chart_id).unwrap());
+        cleanup(store, path);
+    }
+
+    /// 동시에 같은 차트를 요청하면 **하나만 yt-dlp 를 돌린다** (§15.1).
+    #[test]
+    fn only_one_fetch_runs_per_chart() {
+        let (store, path) = temp_store("chart-inflight");
+        assert!(store.try_begin_chart_fetch(7));
+        assert!(!store.try_begin_chart_fetch(7), "두 번째 요청이 같이 돌고 있다");
+        assert!(store.is_chart_fetching(7));
+        // 다른 차트는 막히지 않는다.
+        assert!(store.try_begin_chart_fetch(8));
+        store.end_chart_fetch(7);
+        assert!(!store.is_chart_fetching(7));
+        assert!(store.try_begin_chart_fetch(7));
+        cleanup(store, path);
+    }
+
+    /// 길드 차트는 자기 서버에서만 보인다.
+    #[test]
+    fn guild_charts_stay_in_their_guild() {
+        let (store, path) = temp_store("chart-scope");
+        let mine = store
+            .add_chart(1, ChartCategory::Karaoke, "우리 노래방", "YouTube", "ytsearch10:노래방")
+            .unwrap();
+        assert!(store.list_charts(1).iter().any(|chart| chart.id == mine));
+        assert!(!store.list_charts(2).iter().any(|chart| chart.id == mine));
+        // 공용 차트는 양쪽 다 본다.
+        assert!(store.list_charts(2).iter().any(|chart| chart.builtin));
+        cleanup(store, path);
+    }
+
+    // ───────── V3 §23.1 무제한 ─────────
+
+    /// 설정 저장이 `0 = 무제한`을 실제로 지키는지. 저장했다 다시 읽어도 0이 살아 있어야 하고,
+    /// 범위를 벗어난 값은 저장 시점에 잘려야 한다 (§23.1).
+    #[test]
+    fn saved_settings_keep_zero_as_unlimited() {
+        let (store, path) = temp_store("settings-zero");
+        with_legacy_settings_table(&store);
+        store
+            .save_guild_settings(&RemoteGuildSettings {
+                guild_id: 1,
+                max_queue_per_user: 0,
+                max_queue_per_guild: 0,
+                audit_retention_days: 0,
+                super_like_daily_limit: 0,
+                autoplay_seed_max: 0,
+                like_points: 99,
+                vote_skip_ratio: 1,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let loaded = store.load_guild_settings(1);
+        assert_eq!(loaded.max_queue_per_user, 0, "0이 1로 둔갑했다");
+        assert_eq!(loaded.max_queue_per_guild, 0);
+        assert_eq!(loaded.audit_retention_days, 0);
+        assert_eq!(loaded.super_like_daily_limit, 0);
+        assert!(loaded.seed_limit().is_none());
+        // 무제한이면 11번째 기준 곡도 들어간다.
+        for index in 0..12 {
+            assert!(
+                store
+                    .add_autoplay_seed(1, &test_track(&format!("무제한{index}")), 10)
+                    .unwrap()
+                    .is_added()
+            );
+        }
+        assert_eq!(store.list_autoplay_seeds(1).len(), 12);
+
+        // 범위 밖 값은 잘렸다.
+        assert_eq!(loaded.like_points, 10);
+        assert_eq!(loaded.vote_skip_ratio, 10);
+        cleanup(store, path);
+    }
+
+    /// 보존 정리도 `0 = 무제한`을 지킨다 — 무제한을 고른 서버의 채팅이 하루 만에 사라지면 안 된다.
+    #[test]
+    fn pruning_never_deletes_when_retention_is_unlimited() {
+        let (store, path) = temp_store("prune-zero");
+        with_legacy_settings_table(&store);
+        store
+            .save_guild_settings(&RemoteGuildSettings {
+                guild_id: 1,
+                chat_retention_days: 0,
+                audit_retention_days: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        let message = store
+            .add_chat_message(1, 10, "민수", None, "아주 오래된 메시지", None)
+            .unwrap();
+        store
+            .add_audit(1, 10, "민수", "queue.add", Some("곡"), None, None, true, None)
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE remote_chat_messages SET created_utc = '2020-01-01T00:00:00+00:00' WHERE id = ?1",
+                params![message],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE remote_audit_logs SET created_utc = '2020-01-01T00:00:00+00:00'",
+                [],
+            )
+            .unwrap();
+        }
+        let report = store.prune_all(RetentionConfig::default()).unwrap();
+        assert_eq!(report.audit, 0, "무제한인데 활동 로그가 지워졌다");
+        assert_eq!(store.list_audit(1, 50, None).len(), 1);
+        assert_eq!(report.chat, 0, "무제한인데 채팅이 지워졌다");
+        assert_eq!(store.list_chat_messages(1, 10, 50, None).len(), 1);
         cleanup(store, path);
     }
 

@@ -7,7 +7,7 @@
 
 import {
   ctx, store, connect, api, ApiError, clock, h, frag, list, tooltip, marquee, marqueeRows, mqText,
-  toast, sheet, confirmSheet, theme, notify, artColor, fmtTime, fmtAgo, fmtClock, fmtDate,
+  toast, sheet, confirmSheet, notify, artColor, fmtTime, fmtAgo, fmtClock, fmtDate,
   parseUtc, escapeText, clear, debounce, prefersReduced,
 } from './core.js';
 
@@ -71,10 +71,10 @@ const SCOPE_LABELS = { all: '전체', chat: '채팅만', queue: '곡 신청만' 
 
 const QUICK_EMOJI = ['👍', '❤️', '🔥', '😂', '😮', '🎵', '👏', '🙏', '✨', '😭', '🤔', '💜'];
 
+/* 제안은 §11에서 탭을 떠나 헤더 버튼 + 모달로 갔다. 그래서 여기에 없다. */
 const SIDE_TABS = [
   { id: 'chat', icon: '💬', label: '채팅' },
   { id: 'members', icon: '👥', label: '멤버' },
-  { id: 'suggest', icon: '💡', label: '제안' },
   { id: 'recent', icon: '🕘', label: '최근' },
   { id: 'audit', icon: '📜', label: '로그' },
 ];
@@ -85,16 +85,62 @@ const LS = {
   railTab: 'macham.rail.tab',
   layout: 'macham.layout',        // 구버전 키 — 서버 저장이 없던 시절 값을 한 번 물려받는다
   prefs: 'macham.prefs',          // 서버 개인 설정의 로컬 거울
+  theme: 'macham.theme',          // FOUC 방지 인라인 스크립트가 읽는 키
 };
 
-/* 화면 배치 3종. 3단·2단은 DOM이 완전히 같고 portal.css의 그리드 배치만 갈린다.
+/* ── 테마 7종 + 시스템 따라가기 (§17) ──
+ * 스와치 색은 tokens.css의 --surface-1 / --accent / --text-1 을 그대로 옮겨 적은 것이다.
+ * 적용해 보기 전에는 그 테마의 토큰을 읽을 방법이 없어서 여기 한 벌 둔다.
+ * tokens.css를 고치면 여기도 같이 고쳐야 색이 안 어긋난다. */
+const THEMES = {
+  auto: { label: '시스템 따라가기', desc: '기기가 밝으면 라이트, 어두우면 다크로 따라가요', swatch: null },
+  dark: { label: '다크', desc: '거의 검정 배경에 남보라 강조', swatch: ['#0d111a', '#8b5cf6', '#f2f5fa'] },
+  light: { label: '라이트', desc: '흰 배경. 밝은 방에서 잘 보여요', swatch: ['#ffffff', '#7c3aed', '#0f172a'] },
+  midnight: { label: '미드나잇', desc: '짙은 곤색에 하늘색 강조', swatch: ['#1a1b26', '#7aa2f7', '#c0caf5'] },
+  slate: { label: '그레이', desc: '채도가 낮아 눈이 가장 덜 피곤해요', swatch: ['#22272e', '#539bf5', '#adbac7'] },
+  sepia: { label: '베이지', desc: '따뜻한 종이색. 밝은 방에서 좋아요', swatch: ['#fdf6e3', '#9c5a2d', '#3b3228'] },
+  retro: { label: '레트로', desc: '옛날 CRT 터미널처럼 앰버 단색이에요', swatch: ['#12100a', '#ffb000', '#ffcc55'] },
+  nord: { label: '노르드', desc: '차가운 청회색 팔레트', swatch: ['#2e3440', '#88c0d0', '#eceff4'] },
+};
+
+/* 모바일 주소창 색. 각 테마의 --surface-0 이다. */
+const THEME_META = {
+  dark: '#07090f', light: '#f4f6fa', midnight: '#16161e', slate: '#1c2128',
+  sepia: '#efe6d3', retro: '#0a0803', nord: '#242933',
+};
+
+/* 활동 로그 분류 (§13.4). 기본은 곡 + 재생목록만 켠다 — 투표까지 켜면 다른 게 안 보인다. */
+const AUDIT_KINDS = {
+  song: { icon: '🎵', label: '곡' },
+  vote: { icon: '👍', label: '투표' },
+  playback: { icon: '▶', label: '재생' },
+  playlist: { icon: '📃', label: '재생목록' },
+  moderation: { icon: '🛡', label: '관리' },
+  admin: { icon: '⚙', label: '설정' },
+};
+const AUDIT_DEFAULT = ['song', 'playlist'];
+
+/* 차트 분류 카드 (§15.3). 서버가 주는 순서를 우선하고, 이건 아이콘·설명 사전이다. */
+const CHART_CATEGORIES = {
+  ours: { icon: '⭐', label: '우리 차트', desc: '우리가 실제로 많이 튼 곡' },
+  popular: { icon: '🔥', label: '인기', desc: '지금 많이 듣는 곡' },
+  region: { icon: '🌏', label: '나라별', desc: '미국·일본·영국' },
+  genre: { icon: '🎸', label: '장르', desc: 'K-Pop·힙합·록·R&B' },
+  karaoke: { icon: '🎤', label: '노래방', desc: 'TJ·금영 장르별' },
+  soundcloud: { icon: '☁', label: 'SoundCloud', desc: '사운드클라우드 인기곡' },
+};
+const CHART_PERIODS = [['week', '이번 주'], ['month', '이번 달'], ['all', '전체']];
+
+/* 화면 배치 6종 (§7.2). DOM은 한 벌이다.
+ * 배치가 바꾸는 건 CSS 그리드 배치와 "누가 스크롤하는가"뿐이고, 기능은 6종 전부에서 똑같이 된다.
  * 패널형만 도킹 트리를 따로 그린다(패널 노드는 새로 만들지 않고 옮기기만 한다).
- * cells는 프로필 메뉴의 미니 도식 — true인 칸이 '주 영역'이다. */
+ * cells는 미니 도식 — true인 칸이 '주 영역'이다. */
 const LAYOUTS = {
   three: {
     label: '3단',
     desc: '검색·대기열을 늘 왼쪽에 띄워요.',
     extra: '처음이라면 이게 가장 무난해요.',
+    when: '뭘 고를지 모르겠으면 이걸 고르세요.',
     hint: '가장 무난해요',
     cells: [false, true, false],
     drawerUnder: 1280,
@@ -103,27 +149,54 @@ const LAYOUTS = {
     label: '2단',
     desc: '재생 화면을 넓게 쓰고 채팅을 오른쪽에 고정해요.',
     extra: '노래를 크게 보면서 대화도 놓치지 않아요.',
+    when: '노래를 크게 보면서 대화도 같이 볼 때 좋아요.',
     cells: [true, false, false],
     drawerUnder: 981,
+  },
+  focus: {
+    label: '집중',
+    desc: '재생 화면만 크게 띄우고 나머지는 접어 둬요.',
+    extra: '검색·채팅은 가장자리에서 잠깐 열었다 닫아요.',
+    when: '음악만 틀어놓고 볼 때 좋아요.',
+    cells: [true],
+    drawerUnder: 99999,     // 언제나 가장자리 오버레이로 연다
+  },
+  dj: {
+    label: 'DJ',
+    desc: '왼쪽에 넓은 대기열과 검색, 오른쪽에 작은 재생 화면과 채팅이에요.',
+    extra: '곡을 계속 고르고 넣기 좋아요.',
+    when: '곡을 계속 고르고 넣을 때 좋아요.',
+    cells: [true, false, false],
+    drawerUnder: 1180,
+  },
+  talk: {
+    label: '수다',
+    desc: '오른쪽 채팅을 가장 넓게 쓰고, 왼쪽은 작은 재생 바와 대기열이에요.',
+    extra: '대화가 주인공일 때 좋아요.',
+    when: '채팅이 주인공일 때 좋아요.',
+    cells: [false, true],
+    drawerUnder: 900,
   },
   panel: {
     label: '패널',
     desc: '창을 원하는 대로 붙이고 나눠요.',
     extra: '탭을 끌어다 붙이면 내 마음대로 배치돼요. 넓은 화면에서 진가가 나와요.',
+    when: '내 맘대로 짜고 싶을 때 좋아요.',
     cells: [true, false, false, false],
     drawerUnder: 0,
   },
 };
 
-/* 패널형에서 다룰 수 있는 창 목록. id는 prefs.panelLayout에 그대로 저장된다. */
+/* 패널형에서 다룰 수 있는 창 목록. id는 prefs.panelLayout에 그대로 저장된다.
+ * 제안은 §11에서 모달로 빠졌으므로 패널 목록에 없다. */
 const PANELS = {
   now: { icon: '▶', label: '지금 재생' },
   queue: { icon: '📋', label: '대기열' },
   search: { icon: '🔎', label: '검색' },
+  charts: { icon: '📈', label: '차트' },
   library: { icon: '📚', label: '보관함' },
   chat: { icon: '💬', label: '채팅' },
   members: { icon: '👥', label: '멤버' },
-  suggest: { icon: '💡', label: '제안' },
   recent: { icon: '🕘', label: '최근' },
   audit: { icon: '📜', label: '로그' },
   lyrics: { icon: '🎤', label: '가사' },
@@ -142,6 +215,8 @@ const SIDE_DEF_TWO = 390;   // 2단은 채팅이 배치의 절반이라 기본�
 const PREF_DEFAULTS = {
   layout: null, theme: 'dark', layoutSizes: null, panelLayout: null,
   lyricsOpen: '1', webPlayback: '0', webVolume: '60',
+  auditFilter: null,          // JSON 배열 문자열. 없으면 곡+재생목록
+  notify: null,               // {"song":1,"mention":1,"reply":1}
 };
 
 let prefsCache = readPrefsMirror();
@@ -227,6 +302,68 @@ function adoptServerPrefs(serverPrefs) {
   return touched;
 }
 
+/* ═══════════════════════ 테마 (§17) ═══════════════════════
+ * tokens.css가 [data-theme="X"]로 토큰을 통째로 갈아 끼운다. 여기서는 값 하나만 박으면 된다.
+ * `auto`는 값이 아니라 규칙이라 여기서 풀어 준다(remote_page.rs의 FOUC 스크립트는 아직 못 푼다).
+ */
+
+let themePreview = null;        // 미리보기 중 되돌릴 원래 값
+
+function systemTheme() {
+  return window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+
+/** 저장된 선택값. `auto`도 그대로 돌려준다. */
+function themeChoice() {
+  const saved = prefGet('theme');
+  if (saved && THEMES[saved]) return saved;
+  let local = null;
+  try { local = localStorage.getItem(LS.theme); } catch { /* 시크릿 모드 */ }
+  return local && THEMES[local] ? local : 'dark';
+}
+
+/** 실제로 화면에 박히는 값. `auto`는 여기서 풀린다. */
+function resolveTheme(choice) {
+  return choice === 'auto' ? systemTheme() : (THEMES[choice] ? choice : 'dark');
+}
+
+/** 화면에만 적용한다(미리보기). 저장은 하지 않는다. */
+function paintTheme(choice) {
+  const value = resolveTheme(choice);
+  document.documentElement.dataset.theme = value;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', THEME_META[value] || THEME_META.dark);
+  if (el.themeBtn) el.themeBtn.textContent = themeIcon(choice);
+  readVizColors();
+  scheduleViz();
+}
+
+function themeIcon(choice) {
+  if (choice === 'auto') return '🌗';
+  return resolveTheme(choice) === 'light' ? '☀' : '🌙';
+}
+
+/** 고른 값을 확정한다. 계정(prefs)과 로컬 거울 양쪽에 남긴다. */
+function commitTheme(choice) {
+  const value = THEMES[choice] ? choice : 'dark';
+  themePreview = null;
+  paintTheme(value);
+  prefSet('theme', value);
+  try { localStorage.setItem(LS.theme, value); } catch { /* 시크릿 모드 */ }
+}
+
+/* 서버 셸의 FOUC 스크립트는 저장값을 그대로 박는다. `auto`만 여기서 한 번 풀어 준다.
+ * el 이 아직 없는 시점이라 paintTheme 대신 최소한만 만진다. */
+if (themeChoice() === 'auto') document.documentElement.dataset.theme = systemTheme();
+
+/* 시스템 따라가기를 골라 둔 사람은 OS 설정이 바뀌면 같이 바뀌어야 한다. */
+if (window.matchMedia) {
+  const media = window.matchMedia('(prefers-color-scheme: light)');
+  const onChange = () => { if (themeChoice() === 'auto' && !themePreview) paintTheme('auto'); };
+  if (media.addEventListener) media.addEventListener('change', onChange);
+  else if (media.addListener) media.addListener(onChange);
+}
+
 /* ═══════════════════════ 화면 배치 ═══════════════════════
  * 첫 페인트에 배치가 튀면 안 된다. 셸을 만들기 전, 모듈이 로드되는 이 시점에 바로 박는다.
  * CSS는 <html data-layout="...">만 본다.
@@ -251,12 +388,26 @@ function panelMode() {
   return effectiveLayout() === 'panel';
 }
 
-/* 우측 사이드가 드로어로 빠지는 구간인가. 3단은 1280px 미만, 2단은 981px 미만. */
+/* 우측 사이드가 드로어로 빠지는 구간인가. 3단은 1280px 미만, 2단은 981px 미만,
+ * 집중 배치는 폭과 무관하게 언제나(가장자리 오버레이). */
 function drawerActive() {
   if (narrowScreen()) return false;
   const layout = effectiveLayout();
   if (layout === 'panel') return false;
   return window.innerWidth < (LAYOUTS[layout] || LAYOUTS.three).drawerUnder;
+}
+
+/* 좌측 레일도 오버레이로 빠지는 배치는 집중 하나뿐이다. */
+function railDrawerActive() {
+  return !narrowScreen() && effectiveLayout() === 'focus';
+}
+
+function openRailDrawer(open) {
+  if (!el.rail) return;
+  el.rail.dataset.open = open ? '1' : '0';
+  el.railDrawerBtn?.setAttribute('aria-expanded', String(!!open));
+  syncScrim();
+  if (open) marquee.scan(el.rail);
 }
 
 /* ── 열 너비 (prefs.layoutSizes) ── */
@@ -321,6 +472,25 @@ let serverSkewMs = 0;          // 서버 시계 − 내 시계. 카운트다운�
 let lastBotState = null;       // presence.bot — WS 이벤트가 안 실어 보내도 잃어버리지 않게 따로 보관
 let seedState = null;          // { seeds, max, canEdit } — 없으면 서버가 아직 시드곡을 모른다는 뜻
 let seedOpen = false;
+let autoplayState = null;      // { mode, recentCount, genres, policy, genreOptions, canEdit }
+let myScore = null;            // 마참 점수 (§22.4)
+let chartState = null;         // 차트 화면 상태 — 없으면 서버가 차트를 모른다는 뜻
+let suggestUnread = false;
+let queueTotal = 0;            // 서버가 잘라 보냈을 때의 전체 곡 수 (§18.2)
+let queueTruncated = false;
+
+/** 알림은 앱 스위치 → 종류 스위치 → 브라우저 권한을 다 통과해야 울린다 (§16 B3). */
+function pushNotify(kind, payload) {
+  if (!notifyOn(kind)) return null;
+  return notify.push(payload);
+}
+
+/** 0 = 무제한 (§23.1). 숫자 설정을 화면에 쓸 때는 반드시 이걸로 통과시킨다. */
+function fmtLimit(value, unit) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return '무제한';
+  return `${n}${unit || ''}`;
+}
 
 function trackKey(track) {
   if (!track) return '';
@@ -383,19 +553,51 @@ function tierOf() {
   return store.get().tier || 'member';
 }
 
-/** 왜 못 하는지 한 줄로. 정지 중이면 정지 사유가 이긴다. */
+/** 왜 못 하는지 + 누가 되는지 한 줄로 (§23.3). 정지 중이면 정지 사유가 이긴다.
+ *  `권한 없음`은 답이 아니다. 조건을 그대로 말하고, 통과하는 대상(역할 이름 + 인원수)을 덧붙인다.
+ *  사람 이름은 절대 나열하지 않는다 — 그러면 그 사람들이 부탁 받는 창구가 된다. */
 function lockReason(key) {
   const state = store.get();
   if (state.conn === 'down') return '연결이 끊겨서 지금은 조작할 수 없어요. 새로고침해 주세요.';
   const suspension = state.suspension;
   if (suspension && (suspension.scope === 'all' || matchScope(suspension.scope, key))) {
-    return `정지 중이라 지금은 못 해요 · ${suspensionRemain(suspension)}`;
+    return `${SCOPE_LABELS[suspension.scope] || '전체'}가 정지돼 있어요 · ${suspensionRemain(suspension)}`;
   }
   if (state.tier === 'viewer') return '읽기 전용이라 조작할 수 없어요.';
   const entry = (state.permissions?.entries || []).find((row) => row.key === key);
-  if (entry && entry.reason) return entry.reason;
-  if (entry) return `${RULE_LABELS[entry.rule] || entry.ruleLabel || '관리자'}만 할 수 있어요.`;
-  return '권한이 없어요.';
+  return [whyBlocked(entry, key), whoCan(entry), whereToChange()].filter(Boolean).join(' · ');
+}
+
+/** 1) 왜 안 되는지 — 조건을 그대로. */
+function whyBlocked(entry, key) {
+  if (!entry) return '이 기능을 쓸 권한이 없어요';
+  if (entry.rule === 'disabled') return '이 기능은 서버에서 꺼 뒀어요';
+  if (entry.reason) return String(entry.reason).replace(/\.$/, '');
+  if (entry.rule === 'sameVoiceChannel') return '봇과 같은 음성 채널에 있어야 눌러요';
+  if (entry.rule === 'administrator' || entry.rule === 'manager') return '서버 관리자만 할 수 있어요';
+  if (entry.rule === 'owner') return '봇 주인만 할 수 있어요';
+  if (entry.rule === 'configuredRole') {
+    const roles = (entry.roleNames || []).map((name) => `@${name}`).join(' · ');
+    return roles ? `${roles} 역할이 있어야 눌러요` : '지정된 역할이 있어야 눌러요';
+  }
+  return `${RULE_LABELS[entry.rule] || entry.ruleLabel || PERM_LABELS[key] || '관리자'}만 할 수 있어요`;
+}
+
+/** 2) 누구는 되는지 — 역할 이름 + 인원수까지만. */
+function whoCan(entry) {
+  if (!entry) return '';
+  const names = entry.allowedRoleNames || entry.roleNames || [];
+  const count = Number(entry.allowedCount);
+  const who = names.length ? names.map((name) => `@${name}`).join(' · ') : '';
+  if (who && Number.isFinite(count) && count > 0) return `지금은 ${who} 이 쓸 수 있어요 (${count}명)`;
+  if (who) return `지금은 ${who} 이 쓸 수 있어요`;
+  if (Number.isFinite(count) && count > 0) return `${count}명이 쓸 수 있어요`;
+  return '';
+}
+
+/** 4) 어디서 바뀌는지 — 못 들어가는 사람에게 링크를 보여주면 놀리는 거다. */
+function whereToChange() {
+  return can('console') ? '관리 콘솔에서 바꿀 수 있어요' : '';
 }
 
 function matchScope(scope, key) {
@@ -711,14 +913,26 @@ function buildHeader() {
   });
 
   el.themeBtn = h('button', {
-    class: 'btn btn--ghost btn--icon', type: 'button', tip: '밝게 / 어둡게',
-    'aria-label': '테마 전환',
-    onClick: () => {
-      const mode = theme.toggle();
-      el.themeBtn.textContent = mode === 'dark' ? '🌙' : '☀';
-      prefSet('theme', mode);        // 기기가 아니라 계정에 남는다
-    },
-  }, theme.current() === 'dark' ? '🌙' : '☀');
+    class: 'btn btn--ghost btn--icon', type: 'button', tip: '테마 고르기 · 7가지가 있어요',
+    'aria-label': '테마 고르기', 'aria-haspopup': 'menu',
+    onClick: (event) => openThemeMenu(event.currentTarget),
+  }, themeIcon(themeChoice()));
+
+  el.suggestBtn = h('button', {
+    class: 'btn btn--ghost btn--icon hdr__suggest', type: 'button',
+    tip: '제안 게시판 열기 · 불편한 걸 적어 두면 반영될 수도 있어요',
+    'aria-label': '제안 게시판',
+    onClick: openSuggestModal,
+  }, '💡');
+  el.suggestDot = h('span', { class: 'hdr__dot', hidden: true, 'aria-hidden': 'true' });
+  el.suggestBtn.appendChild(el.suggestDot);
+
+  // 집중 배치에서만 보이는 왼쪽 가장자리 손잡이. 검색·대기열을 잠깐 열었다 닫는다.
+  el.railDrawerBtn = h('button', {
+    class: 'btn btn--ghost btn--icon hdr__raildrawer', type: 'button',
+    tip: '검색·대기열 열기', 'aria-label': '검색·대기열 열기',
+    onClick: () => openRailDrawer(el.rail.dataset.open !== '1'),
+  }, '📋');
 
   el.drawerBtn = h('button', {
     class: 'btn btn--ghost btn--icon hdr__drawer', type: 'button', tip: '채팅·멤버 열기',
@@ -730,19 +944,75 @@ function buildHeader() {
 
   el.meBtn = h('button', {
     class: 'hdr__me', type: 'button', 'aria-haspopup': 'menu', 'aria-expanded': 'false',
-    tip: '내 권한 · 설정',
+    tip: '내 권한 · 내 기록 · 설정',
     onClick: () => toggleMenu(el.meMenu, el.meBtn),
   });
   el.meMenu = buildProfileMenu();
 
   return h('header', { class: 'hdr' },
     h('div', { class: 'hdr__brand' }, '마참뮤직', h('small', null, 'REMOTE')),
+    el.railDrawerBtn,
     h('div', { class: 'dd' }, el.guildBtn, el.guildMenu),
     h('div', { class: 'hdr__spacer' }),
     el.presenceBtn,
+    el.suggestBtn,
     el.themeBtn,
     el.drawerBtn,
     h('div', { class: 'dd' }, el.meBtn, el.meMenu));
+}
+
+/* ── 테마 고르기 (§17.3) ──
+ * 이름만 있으면 뭐가 뭔지 모른다. 스와치 세 색을 나란히 보여주고, 올리면 바로 미리보기로 적용한다.
+ * 고르지 않고 닫으면 원래 테마로 되돌린다 — 실수로 바뀌어 있으면 그게 제일 당황스럽다.
+ */
+function openThemeMenu(anchor) {
+  const original = themeChoice();
+  themePreview = original;
+  let done = false;
+
+  const menu = h('div', { class: 'pop pop--menu themepop', role: 'menu', 'aria-label': '테마' });
+  for (const [id, meta] of Object.entries(THEMES)) {
+    const row = h('button', {
+      class: 'themeopt', type: 'button', role: 'menuitemradio',
+      'aria-checked': String(id === original),
+      tip: meta.desc,
+      onMouseenter: () => paintTheme(id),
+      onFocus: () => paintTheme(id),
+      onClick: () => { done = true; commitTheme(id); close(); toast(`${meta.label} 테마로 바꿨어요.`, 'ok'); },
+    },
+      h('span', { class: 'themeopt__sw', 'aria-hidden': 'true' },
+        ...(meta.swatch || ['#0d111a', '#8b5cf6', '#f2f5fa'])
+          .map((color) => h('i', { style: { background: color } }))),
+      h('span', { class: 'themeopt__main' },
+        h('strong', null, meta.label),
+        h('small', null, meta.desc)),
+      id === original ? h('span', { class: 'themeopt__on', 'aria-hidden': 'true' }, '✓') : null);
+    if (id === 'auto') row.classList.add('themeopt--auto');
+    menu.appendChild(row);
+  }
+
+  const close = () => {
+    if (!menu.isConnected) return;
+    menu.remove();
+    document.removeEventListener('pointerdown', onOutside, true);
+    document.removeEventListener('keydown', onKey, true);
+    if (!done) paintTheme(original);       // 확정 안 했으면 원래대로
+    themePreview = null;
+  };
+  const onOutside = (event) => { if (!menu.contains(event.target) && event.target !== anchor) close(); };
+  const onKey = (event) => { if (event.key === 'Escape') { event.stopPropagation(); close(); } };
+
+  document.body.appendChild(menu);
+  const rect = anchor.getBoundingClientRect();
+  const box = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(rect.right - box.width, window.innerWidth - box.width - 8))}px`;
+  menu.style.top = `${Math.min(rect.bottom + 6, Math.max(8, window.innerHeight - box.height - 8))}px`;
+  menu.addEventListener('mouseleave', () => { if (!done) paintTheme(themePreview || original); });
+  menu.querySelector('button')?.focus();
+  setTimeout(() => {
+    document.addEventListener('pointerdown', onOutside, true);
+    document.addEventListener('keydown', onKey, true);
+  }, 0);
 }
 
 function buildProfileMenu() {
@@ -759,8 +1029,11 @@ function buildProfileMenu() {
   el.opsLink = h('a', { class: 'dd__item', role: 'menuitem', href: '/', target: '_blank', rel: 'noreferrer' },
     h('span', null, '🛠'), h('span', null, '운영 패널'));
 
-  el.notifyBtn = h('button', { class: 'dd__item', type: 'button', role: 'menuitem', onClick: askNotify },
-    h('span', null, '🔔'), h('span', null, '알림 허용'));
+  el.statsBtn = h('button', {
+    class: 'dd__item', type: 'button', role: 'menuitem',
+    tip: '담은 곡·재생·받은 반응을 모아 봐요',
+    onClick: () => { closeMenus(); openStatsModal(null); },
+  }, h('span', null, '📊'), h('span', null, '내 기록'));
 
   const logout = h('button', {
     class: 'dd__item dd__item--danger', type: 'button', role: 'menuitem',
@@ -775,11 +1048,124 @@ function buildProfileMenu() {
   }, h('span', null, '↩'), h('span', null, '로그아웃'));
 
   return h('div', { class: 'dd__menu dd__menu--wide', role: 'menu', hidden: true },
-    el.meHead, permBtn, el.consoleBtn, el.opsLink,
+    el.meHead, permBtn, el.statsBtn, el.consoleBtn, el.opsLink,
     h('div', { class: 'dd__sep' }),
     buildLayoutPicker(),
     h('div', { class: 'dd__sep' }),
-    el.notifyBtn, logout);
+    buildNotifyBox(),
+    logout);
+}
+
+/* ── 알림 켜고 끄기 (§16 B3) ──
+ * 브라우저 권한은 JS로 철회할 수 없다. 그래서 앱이 자기 스위치를 따로 가진다.
+ * 꺼 두면 브라우저 알림도, 탭 제목 숫자도 안 띄운다.
+ */
+
+const NOTIFY_KINDS = [
+  ['song', '내 신청곡이 시작될 때'],
+  ['mention', '나를 부를 때 (@멘션)'],
+  ['reply', '내 메시지에 답장이 올 때'],
+];
+
+function notifySettings() {
+  const raw = prefGet('notify');
+  let parsed = null;
+  try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = null; }
+  const base = { on: 1, song: 1, mention: 1, reply: 1 };
+  if (parsed && typeof parsed === 'object') Object.assign(base, parsed);
+  return base;
+}
+
+function saveNotifySettings(next) {
+  prefSet('notify', JSON.stringify(next));
+  renderNotifyBox();
+  notify.badge(notifyOn('mention') || notifyOn('reply') ? unread : 0);
+}
+
+/** 앱 스위치 + 종류별 스위치 + 브라우저 권한을 모두 통과해야 울린다. */
+function notifyOn(kind) {
+  if (!notify.granted()) return false;
+  const settings = notifySettings();
+  if (!settings.on) return false;
+  return kind ? !!settings[kind] : true;
+}
+
+function buildNotifyBox() {
+  el.notifyMain = h('button', {
+    class: 'dd__item dd__item--switch', type: 'button', role: 'menuitemcheckbox',
+    onClick: onNotifyMainClick,
+  },
+    h('span', null, '🔔'),
+    h('span', { class: 'dd__grow' }, '알림'),
+    h('span', { class: 'sw', 'aria-hidden': 'true' }, h('i')));
+
+  el.notifyKinds = NOTIFY_KINDS.map(([key, label]) => h('button', {
+    class: 'dd__item dd__item--sub', type: 'button', role: 'menuitemcheckbox',
+    tip: `${label} 알려 드릴게요`,
+    onClick: () => {
+      const next = notifySettings();
+      next[key] = next[key] ? 0 : 1;
+      saveNotifySettings(next);
+    },
+  },
+    h('span', null, ''),
+    h('span', { class: 'dd__grow' }, label),
+    h('span', { class: 'sw sw--sm', 'aria-hidden': 'true' }, h('i'))));
+
+  el.notifyBox = h('div', { class: 'notifybox' }, el.notifyMain, ...el.notifyKinds);
+  return el.notifyBox;
+}
+
+async function onNotifyMainClick() {
+  if (!notify.supported()) { toast('이 브라우저는 알림을 지원하지 않아요.', 'warn'); return; }
+  if (Notification.permission === 'denied') {
+    toast('브라우저 설정에서 알림이 막혀 있어요. 주소창 옆 자물쇠에서 풀 수 있어요.', 'warn');
+    return;
+  }
+  if (Notification.permission === 'default') {
+    const result = await notify.ask();
+    if (result !== 'granted') { toast('알림 권한을 받지 못했어요.', 'warn'); renderNotifyBox(); return; }
+    const next = notifySettings();
+    next.on = 1;
+    saveNotifySettings(next);
+    toast('알림을 켰어요. 다른 탭을 보고 있을 때만 울려요.', 'ok');
+    return;
+  }
+  const next = notifySettings();
+  next.on = next.on ? 0 : 1;
+  saveNotifySettings(next);
+  toast(next.on ? '알림을 켰어요.' : '알림을 껐어요. 탭 제목의 숫자도 안 띄워요.', 'ok');
+}
+
+function renderNotifyBox() {
+  if (!el.notifyMain) return;
+  const supported = notify.supported();
+  const permission = supported ? Notification.permission : 'denied';
+  const settings = notifySettings();
+  const on = supported && permission === 'granted' && !!settings.on;
+
+  const label = !supported ? '알림을 못 써요'
+    : permission === 'denied' ? '알림이 막혀 있어요'
+      : permission === 'default' ? '알림 켜기'
+        : on ? '알림 켜짐' : '알림 꺼짐';
+  el.notifyMain.children[1].textContent = label;
+  el.notifyMain.setAttribute('aria-checked', String(on));
+  el.notifyMain.dataset.on = on ? '1' : '0';
+  setLock(el.notifyMain, !supported || permission === 'denied',
+    !supported ? '이 브라우저는 알림을 지원하지 않아요'
+      : '브라우저 설정에서 알림이 막혀 있어요');
+  if (supported && permission !== 'denied') {
+    el.notifyMain.setAttribute('data-tip', permission === 'default'
+      ? '누르면 브라우저에 알림 권한을 물어봐요'
+      : on ? '지금은 알림이 켜져 있어요 · 누르면 꺼요' : '지금은 알림이 꺼져 있어요 · 누르면 켜요');
+  }
+
+  el.notifyKinds.forEach((node, index) => {
+    const key = NOTIFY_KINDS[index][0];
+    node.hidden = !on;
+    node.setAttribute('aria-checked', String(!!settings[key]));
+    node.dataset.on = settings[key] ? '1' : '0';
+  });
 }
 
 /* ── 화면 배치 고르기 ── */
@@ -799,12 +1185,13 @@ function buildLayoutPicker() {
     reset);
 }
 
-/** 프로필 메뉴와 첫 진입 시트가 같은 카드를 쓴다. */
+/** 프로필 메뉴와 첫 진입 시트가 같은 카드를 쓴다. 6개라 3×2로 놓인다. */
 function layoutOption(id, def, role) {
   return h('button', {
     class: 'lay__opt', type: 'button', role,
     'aria-checked': String(id === activeLayout),
     dataset: { layout: id },
+    tip: def.when,
     onClick: () => setLayout(id),
   },
     h('span', { class: `lay__glyph lay__glyph--${id}`, 'aria-hidden': 'true' },
@@ -844,6 +1231,8 @@ function applyLayout() {
   document.documentElement.dataset.layout = layout;
   el.portal.dataset.layout = layout;
   openDrawer(false);
+  openRailDrawer(false);
+  el.railDrawerBtn.hidden = !railDrawerActive();
   syncLayoutOptions();
 
   if (layout === 'panel') mountDock();
@@ -862,11 +1251,12 @@ function applyLayout() {
 /** 서버에서 받은 개인 설정을 화면에 반영한다. 로컬 값과 다르면 서버 쪽이 이긴다. */
 function applyServerPrefs() {
   const savedTheme = prefGet('theme');
-  if ((savedTheme === 'dark' || savedTheme === 'light') && savedTheme !== theme.current()) {
-    theme.apply(savedTheme);
-    try { localStorage.setItem('macham.theme', savedTheme); } catch { /* 시크릿 모드 */ }
-    if (el.themeBtn) el.themeBtn.textContent = savedTheme === 'dark' ? '🌙' : '☀';
+  if (THEMES[savedTheme] && resolveTheme(savedTheme) !== document.documentElement.dataset.theme) {
+    paintTheme(savedTheme);
+    try { localStorage.setItem(LS.theme, savedTheme); } catch { /* 시크릿 모드 */ }
   }
+  syncAuditChips();
+  renderNotifyBox();
 
   const savedLyrics = prefGet('lyricsOpen') === '1';
   if (savedLyrics !== lyricsOpen && el.lyricsToggle) {
@@ -898,6 +1288,7 @@ function openLayoutSheet() {
 
   const cards = Object.entries(LAYOUTS).map(([id, def]) => h('button', {
     class: 'pick__card', type: 'button', dataset: { layout: id },
+    tip: def.when,
     onClick: () => { setLayout(id, true); handle?.close(id); },
   },
     h('span', { class: `lay__glyph lay__glyph--${id}`, 'aria-hidden': 'true' },
@@ -908,7 +1299,7 @@ function openLayoutSheet() {
 
   handle = sheet({
     title: '화면을 어떻게 볼까요',
-    desc: '처음 오셨네요. 셋 중 마음에 드는 걸 고르면 바로 그렇게 보여드려요.',
+    desc: '처음 오셨네요. 여섯 가지 중 마음에 드는 걸 고르면 바로 그렇게 보여드려요.',
     wide: true,
     dismissValue: null,
     body: h('div', null,
@@ -935,8 +1326,8 @@ function openLayoutSheet() {
 /* 패널 알맹이가 원래 살던 자리. 패널형을 끄면 이 순서대로 되돌린다. */
 const HOME_ORDER = {
   stage: ['now', 'lyrics'],
-  rail: ['search', 'queue', 'library'],
-  side: ['chat', 'members', 'suggest', 'recent', 'audit'],
+  rail: ['search', 'charts', 'queue', 'library'],
+  side: ['chat', 'members', 'recent', 'audit'],
 };
 
 let dockTree = null;
@@ -987,9 +1378,9 @@ function defaultDockTree() {
     a: {
       type: 'split', dir: 'col', ratio: 0.56,
       a: { type: 'tabs', panels: ['now'], active: 'now' },
-      b: { type: 'tabs', panels: ['queue', 'search', 'library'], active: 'queue' },
+      b: { type: 'tabs', panels: ['queue', 'search', 'charts', 'library'], active: 'queue' },
     },
-    b: { type: 'tabs', panels: ['chat', 'members', 'suggest', 'recent', 'audit'], active: 'chat' },
+    b: { type: 'tabs', panels: ['chat', 'members', 'recent', 'audit'], active: 'chat' },
   };
 }
 
@@ -1266,8 +1657,8 @@ function activateDockPanel(group, id) {
 /** 패널을 열면 그 탭이 필요로 하는 데이터도 같이 챙긴다. */
 function onPanelShown(id) {
   if (id === 'chat') { markChatRead(); scrollChatToEnd(false); }
-  if (id === 'suggest') loadSuggestions();
   if (id === 'audit') loadAudit();
+  if (id === 'charts') loadCharts();
   if (id === 'lyrics' && lyricsOpen) loadLyrics();
   marquee.scan(el.dock);
   scheduleViz();
@@ -1487,14 +1878,6 @@ function endTabDrag() {
   onPanelShown(id);
 }
 
-async function askNotify() {
-  const result = await notify.ask();
-  if (result === 'granted') toast('알림을 켰어요. 다른 탭을 보고 있을 때만 울려요.', 'ok');
-  else if (result === 'denied') toast('브라우저에서 알림이 막혀 있어요.', 'warn');
-  else toast('이 브라우저는 알림을 지원하지 않아요.', 'warn');
-  renderProfile();
-}
-
 /* ── 메뉴 토글 (공용) ── */
 
 function toggleMenu(menu, button) {
@@ -1527,20 +1910,23 @@ document.addEventListener('keydown', (event) => {
 let activeRailTab = localStorage.getItem(LS.railTab) || 'queue';
 
 function buildRail() {
+  // 탭이 4개가 되니 아이콘 + 짧은 라벨로 (§15.3)
   const tabs = [
-    { id: 'search', icon: '🔎', label: '검색' },
-    { id: 'queue', icon: '📋', label: '대기열' },
-    { id: 'library', icon: '📚', label: '보관함' },
+    { id: 'search', icon: '🔎', label: '검색', tip: '곡을 찾아 대기열에 담아요' },
+    { id: 'charts', icon: '📈', label: '차트', tip: '인기·나라·장르·노래방 차트에서 곡을 담아요' },
+    { id: 'queue', icon: '📋', label: '대기열', tip: '다음에 나갈 곡들이에요' },
+    { id: 'library', icon: '📚', label: '보관함', tip: '좋아요·담아둔 곡·재생목록이에요' },
   ];
   el.railTabs = tabs.map((tab) => h('button', {
     class: 'tab', type: 'button', role: 'tab', id: `railtab-${tab.id}`,
     'aria-selected': String(tab.id === activeRailTab),
-    dataset: { rail: tab.id },
+    dataset: { rail: tab.id }, tip: tab.tip,
     onClick: () => setRailTab(tab.id),
   }, h('span', { 'aria-hidden': 'true' }, tab.icon), tab.label));
 
   el.railPanes = {
     search: buildSearchPane(),
+    charts: buildChartsPane(),
     queue: buildQueuePane(),
     library: buildLibraryPane(),
   };
@@ -1562,8 +1948,11 @@ function setRailTab(id) {
   }
   for (const tab of el.railTabs) tab.setAttribute('aria-selected', String(tab.dataset.rail === id));
   for (const [key, pane] of Object.entries(el.railPanes)) pane.hidden = key !== id;
-  if (id === 'search') el.searchInput?.focus();
   if (narrowScreen()) document.body.dataset.pane = 'rail';
+  else if (railDrawerActive()) openRailDrawer(true);
+  if (id === 'search') el.searchInput?.focus();
+  if (id === 'charts') loadCharts();
+  syncMobileTabs();
   marquee.scan(el.rail);
 }
 
@@ -1754,11 +2143,17 @@ function iso8601Seconds(text) {
   return (Number(match[1]) || 0) * 3600 + (Number(match[2]) || 0) * 60 + (Number(match[3]) || 0);
 }
 
-/** 검색결과·최근·보관함이 공유하는 트랙 행 */
-function trackRow(track, source, extra) {
-  const add = bindAct(h('button', { class: 'iconbtn', type: 'button', tip: '대기열에 담기', 'aria-label': '대기열에 담기' }, '＋'),
-    () => enqueue(track));
-  setLock(add, !can('search'), lockReason('search'));
+/** 검색결과·차트·최근·보관함이 공유하는 트랙 행 */
+function trackRow(track, source, extra, opts) {
+  const inQueue = store.get().queue.some((item) => trackKey(item.track) === trackKey(track));
+  const add = inQueue
+    ? h('span', { class: 'chip', tip: '이미 대기열에 있는 곡이에요' }, '담김')
+    : setLock(bindAct(h('button', { class: 'iconbtn', type: 'button', tip: '대기열에 담기', 'aria-label': '대기열에 담기' }, '＋'),
+      () => enqueue(track)), !can('search'), lockReason('search'));
+
+  const toList = bindAct(h('button', {
+    class: 'iconbtn', type: 'button', tip: '재생목록에 넣기', 'aria-label': '재생목록에 넣기',
+  }, '📃'), (event) => openPlaylistPicker(track, event.currentTarget));
 
   const save = bindAct(h('button', {
     class: 'iconbtn', type: 'button',
@@ -1767,12 +2162,15 @@ function trackRow(track, source, extra) {
   }, source === 'saved' ? '🗑' : '🔖'), () => toggleSaved(track, source !== 'saved'));
   setLock(save, !can('library'), lockReason('library'));
 
-  return h('div', { class: 'row', dataset: { mqRow: '1' } },
+  const row = h('div', { class: 'row', dataset: { mqRow: '1' } },
+    opts && opts.rank ? h('span', { class: 'row__rank', tip: `이 차트에서 ${opts.rank}위예요` }, String(opts.rank)) : null,
     h('img', { class: 'row__art', src: artUrl(track) || '', alt: '', loading: 'lazy' }),
     h('div', { class: 'row__main' },
       mqText(trackTitle(track), 'row__title'),
       h('div', { class: 'row__sub' }, extra || trackSub(track))),
-    h('div', { class: 'row__acts' }, add, seedButton(track), save));
+    h('div', { class: 'row__acts' }, add, seedButton(track), toList, save));
+  bindContextTarget(row, () => trackMenu(track, { source }));
+  return row;
 }
 
 async function enqueue(track) {
@@ -1803,31 +2201,139 @@ function buildQueuePane() {
   el.modeBadge = h('span', { class: 'modebadge' });
   el.sortTick = h('span', {
     class: 'sorttick', hidden: true, role: 'timer',
-    tip: '서버가 5초마다 대기열을 다시 정렬해요. 0이 되면 순서가 움직여요.',
+    tip: '5초마다 순서를 다시 정해요',
   });
+
+  // 5곡 이상일 때만 뜬다. 4곡 이하면 눈으로 봐도 알아서 굳이 안 띄운다 (§10.4)
+  el.whyOrder = h('button', {
+    class: 'whyorder', type: 'button', hidden: true,
+    tip: '지금 순서가 왜 이렇게 정해졌는지 보여드려요',
+    onClick: openModeSheet,
+  }, '왜 이 순서인가요? ⓘ');
+
+  el.queueClear = bindAct(h('button', {
+    class: 'iconbtn iconbtn--danger', type: 'button', hidden: true,
+    tip: '대기열을 통째로 비워요', 'aria-label': '대기열 비우기',
+  }, '🧹'), clearQueue);
+
   el.queueList = h('div', { class: 'queue__list scroll', 'data-testid': 'queue-list' });
+  el.queueSpacerTop = h('div', { class: 'queue__spacerpad', 'aria-hidden': 'true' });
+  el.queueSpacerBottom = h('div', { class: 'queue__spacerpad', 'aria-hidden': 'true' });
+  el.queueList.addEventListener('scroll', onQueueScroll, { passive: true });
+
+  const head = h('div', { class: 'queue__head' },
+    h('h2', null, '대기열'),
+    el.queueCount,
+    h('span', { class: 'queue__spacer' }),
+    el.queueClear,
+    el.sortTick,
+    el.modeBadge);
+  bindContextTarget(head, () => queueHeadMenu());
 
   return h('div', { class: 'tabpane', role: 'tabpanel', 'aria-labelledby': 'railtab-queue' },
-    h('div', { class: 'queue__head' },
-      h('h2', null, '대기열'),
-      el.queueCount,
-      h('span', { class: 'queue__spacer' }),
-      el.sortTick,
-      el.modeBadge),
+    head,
+    el.whyOrder,
     buildSeedBox(),
     el.queueList);
 }
 
 function renderQueueHead(state) {
-  el.queueCount.textContent = `${state.queue.length}곡`;
+  const shown = state.queue.length;
+  const total = queueTotal || shown;
+  // 500곡을 넘으면 서버가 정렬 주기를 늘린다. 왜 갑자기 느려졌는지 알 수 있어야 한다 (§18.3)
+  el.queueCount.textContent = total > 500
+    ? `${total}곡 · 정렬은 15초마다`
+    : (queueTruncated ? `${total}곡 (앞 ${shown}곡 표시)` : `${total}곡`);
+  el.queueCount.setAttribute('data-tip', queueTruncated
+    ? `대기열이 길어서 앞 ${shown}곡만 받아 왔어요. 아래로 내리면 더 불러와요`
+    : `지금 대기열에 ${total}곡이 있어요`);
+
   const mode = MODES[state.queueMode] || MODES.score;
   clear(el.modeBadge);
   el.modeBadge.appendChild(document.createTextNode(`${mode.icon} ${mode.label}`));
+  el.modeBadge.setAttribute('data-tip', mode.desc);
   el.modeBadge.appendChild(h('button', {
     class: 'modebadge__i', type: 'button', tip: '정렬 방식 3종 비교',
     'aria-label': '정렬 방식 설명', onClick: openModeSheet,
   }, 'ⓘ'));
+
+  el.whyOrder.hidden = total < 5;
+  el.queueClear.hidden = !can('queueEdit') || tierOf() === 'member' || !total;
+  setLock(el.queueClear, !can('queueEdit'), lockReason('queueEdit'));
   renderSortTick();
+}
+
+async function clearQueue() {
+  const total = queueTotal || store.get().queue.length;
+  const ok = await confirmSheet({
+    title: '대기열을 비울까요',
+    desc: `${total}곡이 전부 지워져요. 되돌릴 수 없어요.`,
+    danger: true, confirmText: `${total}곡 비우기`,
+  });
+  if (!ok) return;
+  await call(() => api('/queue/action', { body: { action: 'clear' } }), '대기열을 비웠어요.');
+}
+
+/* ── 가상 스크롤 (§18.2) ──
+ * 5000곡을 전부 그리면 브라우저가 죽는다. 보이는 만큼만 노드를 만들고
+ * 위아래를 빈 상자로 채워 스크롤 길이를 맞춘다. FLIP도 화면에 보이는 항목에만 걸린다.
+ */
+const VIRT_THRESHOLD = 80;      // 이 아래로는 통째로 그리는 게 더 빠르다
+const VIRT_ROW = 74;            // 항목 하나의 대략 높이(px)
+const VIRT_OVERSCAN = 8;
+
+let virtWindow = { from: 0, to: 0 };
+
+function virtualizing() {
+  return store.get().queue.length > VIRT_THRESHOLD;
+}
+
+function computeVirtWindow(items) {
+  if (!virtualizing()) return { from: 0, to: items.length };
+  const top = el.queueList.scrollTop;
+  const height = el.queueList.clientHeight || 480;
+  const from = Math.max(0, Math.floor(top / VIRT_ROW) - VIRT_OVERSCAN);
+  const to = Math.min(items.length, Math.ceil((top + height) / VIRT_ROW) + VIRT_OVERSCAN);
+  return { from, to };
+}
+
+let virtRaf = 0;
+function onQueueScroll() {
+  if (!virtualizing() || virtRaf) return;
+  virtRaf = requestAnimationFrame(() => {
+    virtRaf = 0;
+    const next = computeVirtWindow(store.get().queue);
+    if (next.from === virtWindow.from && next.to === virtWindow.to) {
+      maybeLoadMoreQueue();
+      return;
+    }
+    renderQueue(store.get());
+    maybeLoadMoreQueue();
+  });
+}
+
+/** 서버가 앞 200곡만 보냈으면 바닥 근처에서 다음 쪽을 불러온다. 평소에는 아예 안 일어난다. */
+let queueLoadingMore = false;
+async function maybeLoadMoreQueue() {
+  if (!queueTruncated || queueLoadingMore) return;
+  const list_ = el.queueList;
+  if (list_.scrollHeight - list_.scrollTop - list_.clientHeight > 400) return;
+  queueLoadingMore = true;
+  try {
+    const state = store.get();
+    const data = await api(`/queue?offset=${state.queue.length}&limit=200`);
+    const more = data?.items || data?.queue || [];
+    if (more.length) {
+      store.patch({ queue: state.queue.concat(more) });
+      if (Number.isFinite(data?.queueTotal)) queueTotal = data.queueTotal;
+      queueTruncated = state.queue.length + more.length < queueTotal;
+    } else {
+      queueTruncated = false;
+    }
+  } catch {
+    queueTruncated = false;      // 서버가 이 경로를 모르면 더 조르지 않는다
+  }
+  queueLoadingMore = false;
 }
 
 function renderQueue(state) {
@@ -1835,13 +2341,33 @@ function renderQueue(state) {
   const items = state.queue;
   if (!items.length) {
     list.reset(el.queueList);
-    el.queueList.appendChild(state.hotAt
+    clear(el.queueList).appendChild(state.hotAt
       ? emptyState('🎧', '대기열이 비었어요', '검색해서 다음 곡을 담아 보세요.')
       : skeletonRows(4));
     return;
   }
+
   const rounds = computeRounds(items);
-  list(el.queueList, items, (item) => item.id, createQueueItem, (node, item, index) => updateQueueItem(node, item, index, rounds));
+  // 2단처럼 바깥이 스크롤하는 배치에서는 목록이 자기 스크롤을 가져야 가상화가 먹는다
+  el.queueList.dataset.virt = virtualizing() ? '1' : '0';
+  const win = computeVirtWindow(items);
+  virtWindow = win;
+  const slice = win.from === 0 && win.to === items.length ? items : items.slice(win.from, win.to);
+
+  // 위아래 빈 상자로 스크롤 길이를 맞춘다. list()가 관리하지 않는 자식이라 매번 다시 붙인다.
+  const padTop = win.from * VIRT_ROW;
+  const padBottom = Math.max(0, (items.length - win.to) * VIRT_ROW);
+  el.queueSpacerTop.style.height = `${padTop}px`;
+  el.queueSpacerBottom.style.height = `${padBottom}px`;
+
+  list(el.queueList, slice, (item) => item.id, createQueueItem,
+    (node, item, index) => updateQueueItem(node, item, win.from + index, rounds));
+
+  if (padTop > 0) el.queueList.insertBefore(el.queueSpacerTop, el.queueList.firstChild);
+  else el.queueSpacerTop.remove();
+  if (padBottom > 0) el.queueList.appendChild(el.queueSpacerBottom);
+  else el.queueSpacerBottom.remove();
+
   marquee.scan(el.queueList);
 }
 
@@ -1894,7 +2420,15 @@ function renderSortTick() {
 }
 
 function startSortTick() {
-  setInterval(() => { if (!document.hidden) renderSortTick(); }, 250);
+  // 백그라운드 탭에서는 아무것도 그리지 않는다 (§23.2)
+  let superTick = 0;
+  setInterval(() => {
+    if (document.hidden) return;
+    renderSortTick();
+    // 슈퍼 좋아요 쿨타임은 1초에 한 번만 다시 그린다
+    superTick += 1;
+    if (superTick % 4 === 0 && superLikeInfo().coolLeft > 0) renderQueue(store.get());
+  }, 250);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) renderSortTick(); });
 }
 
@@ -1919,6 +2453,31 @@ function buildSeedBox() {
 }
 
 async function loadSeeds() {
+  // 새 API(/autoplay)가 있으면 방식·정책까지 한 번에 받고, 없으면 예전 시드 목록만 받는다.
+  try {
+    const data = await api('/autoplay');
+    autoplayState = {
+      mode: data?.mode || 'recent',
+      recentCount: Number(data?.recentCount) || 5,
+      genres: Array.isArray(data?.genres) ? data.genres : [],
+      genreOptions: Array.isArray(data?.genreOptions) ? data.genreOptions : [],
+      policy: data?.policy || 'balanced',
+      canEdit: !!data?.canEdit,
+    };
+    seedState = {
+      seeds: Array.isArray(data?.seeds) ? data.seeds : [],
+      max: Number(data?.max) || 10,
+      canEdit: !!data?.canEdit,
+    };
+    renderSeeds();
+    return;
+  } catch (error) {
+    if (!(error && (error.status === 404 || error.status === 501))) {
+      // 권한·네트워크 문제면 아래 예전 경로로 한 번 더 시도한다
+    }
+    autoplayState = null;
+  }
+
   try {
     const data = await api('/autoplay/seeds');
     seedState = {
@@ -1931,6 +2490,83 @@ async function loadSeeds() {
     if (!error || error.status === 404 || error.status === 501) seedState = null;
   }
   renderSeeds();
+}
+
+const AUTOPLAY_MODES = [
+  ['seed', '📻 기준 곡', '내가 고른 곡들과 비슷한 노래를 골라 와요'],
+  ['recent', '🕘 최근 튼 곡', '최근에 튼 곡 몇 개를 참고해서 골라 와요'],
+  ['genre', '🎸 장르', '고른 장르 차트에서 골라 와요'],
+];
+
+const AUTOPLAY_POLICIES = [
+  ['similar', '비슷하게', '분위기를 유지해요'],
+  ['balanced', '적당히', '비슷하되 매번 달라요'],
+  ['explore', '새롭게', '예상 못 한 곡이 나와요'],
+  ['popular', '무난하게', '많이 들은 곡 위주예요'],
+];
+
+async function saveAutoplay(patch) {
+  const result = await call(() => api('/autoplay', { method: 'PUT', body: patch }), '자동 재생 설정을 바꿨어요.');
+  if (result) loadSeeds();
+}
+
+/** 방식·정책·최근 N곡·장르 — 권한이 있으면 유저 UI에서도 바꾼다 (§8.3). */
+function autoplayControls() {
+  if (!autoplayState) return null;
+  const editable = !!autoplayState.canEdit && canAutoplay();
+  const reason = lockReason('autoplay');
+
+  const segRow = (label, tip, options, current, onPick) => {
+    const row = h('div', { class: 'lib__seg lib__seg--wrap', style: { padding: '0' }, role: 'group', 'aria-label': label },
+      ...options.map(([id, text, hint]) => {
+        const button = h('button', {
+          class: 'seg', type: 'button', 'aria-pressed': String(id === current), dataset: { seg: id },
+          tip: hint || text,
+          onClick: () => onPick(id),
+        }, text);
+        return setLock(button, !editable, reason);
+      }));
+    return h('div', { class: 'autoplay__row' }, h('div', { class: 'hint', tip }, label), row);
+  };
+
+  const recentInput = h('input', {
+    class: 'field field--num', type: 'number', min: '0', max: '20',
+    value: String(autoplayState.recentCount ?? 5),
+    'aria-label': '최근 몇 곡을 참고할지',
+    onChange: () => saveAutoplay({ recentCount: Number(recentInput.value) || 0 }),
+  });
+  setLock(recentInput, !editable, reason);
+
+  const genreBox = h('div', { class: 'lib__seg lib__seg--wrap', style: { padding: '0' } },
+    ...(autoplayState.genreOptions || []).map((option) => {
+      const on = autoplayState.genres.includes(option.key);
+      const button = h('button', {
+        class: 'seg', type: 'button', 'aria-pressed': String(on), dataset: { seg: option.key },
+        tip: `${option.label} 차트에서 곡을 골라 와요`,
+        onClick: () => {
+          const next = on
+            ? autoplayState.genres.filter((key) => key !== option.key)
+            : autoplayState.genres.concat(option.key);
+          saveAutoplay({ genres: next });
+        },
+      }, option.label);
+      return setLock(button, !editable, reason);
+    }));
+
+  return h('div', { class: 'autoplay' },
+    segRow('무엇을 기준으로 고를까요', '자동 재생이 무엇을 기준으로 곡을 고를지 정해요',
+      AUTOPLAY_MODES, autoplayState.mode, (id) => saveAutoplay({ mode: id })),
+    autoplayState.mode === 'recent'
+      ? h('div', { class: 'autoplay__row' },
+        h('div', { class: 'hint', tip: '0을 넣으면 최근에 튼 곡 전부를 참고해요' }, '최근 몇 곡을 참고할까요'),
+        h('div', { class: 'autoplay__num' }, recentInput,
+          h('span', { class: 'hint' }, fmtLimit(autoplayState.recentCount, '곡'))))
+      : null,
+    autoplayState.mode === 'genre' && (autoplayState.genreOptions || []).length
+      ? h('div', { class: 'autoplay__row' }, h('div', { class: 'hint' }, '어떤 장르로 고를까요'), genreBox)
+      : null,
+    segRow('어떤 느낌으로 고를까요', '같은 기준에서도 얼마나 비슷한 곡을 집을지 정해요',
+      AUTOPLAY_POLICIES, autoplayState.policy, (id) => saveAutoplay({ policy: id })));
 }
 
 function renderSeeds() {
@@ -1946,11 +2582,17 @@ function renderSeeds() {
   el.seedBox.hidden = false;
   el.seedToggle.setAttribute('aria-expanded', String(seedOpen));
   el.seedToggle.dataset.open = seedOpen ? '1' : '0';
-  el.seedCount.textContent = `${seedState.seeds.length} / ${seedState.max}곡`;
+  el.seedCount.textContent = `${seedState.seeds.length} / ${fmtLimit(seedState.max, '곡')}`;
+  el.seedCount.setAttribute('data-tip', seedState.max > 0
+    ? `기준 곡은 ${seedState.max}곡까지 넣을 수 있어요`
+    : '기준 곡은 몇 곡이든 넣을 수 있어요');
   el.seedBody.hidden = !seedOpen;
   if (!seedOpen) return;
 
   clear(el.seedBody);
+  const controls = autoplayControls();
+  if (controls) el.seedBody.appendChild(controls);
+
   if (!seedState.seeds.length) {
     el.seedBody.appendChild(h('p', { class: 'hint' },
       '기준 곡이 없어서 최근에 튼 곡을 참고해요. 곡 옆의 📻를 누르면 여기에 쌓여요.'));
@@ -1972,7 +2614,9 @@ function renderSeeds() {
       remove));
   }
   el.seedBody.appendChild(h('p', { class: 'hint' },
-    `기준 곡을 돌아가며 참고해서 다음 곡을 골라요. ${seedState.max}곡까지 넣을 수 있어요.`));
+    seedState.max > 0
+      ? `기준 곡을 돌아가며 참고해서 다음 곡을 골라요. ${seedState.max}곡까지 넣을 수 있어요.`
+      : '기준 곡을 돌아가며 참고해서 다음 곡을 골라요. 개수 제한은 없어요.'));
   marquee.scan(el.seedBody);
 }
 
@@ -2010,6 +2654,59 @@ function computeRounds(items) {
   return rounds;
 }
 
+/* ── 점수 계산식은 서버 설정을 따라야 한다 (§10.1) ──
+ * 좋아요를 2점으로 바꿔 뒀는데 화면이 1점으로 계산하면 화면이 거짓말을 하는 것이다. */
+function votePoints() {
+  const settings = store.get().settings || {};
+  const pick = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  return {
+    like: pick(settings.likePoints, 1),
+    dislike: pick(settings.dislikePoints, -1),
+    superLike: pick(settings.superLikePoints, 2),
+    wait: pick(settings.waitPoints, 1),
+  };
+}
+
+/** 서버가 준 사용자 ID를 화면에 쓸 이름으로. 모르는 ID는 `누군가`다 (§10.4). */
+function nameOf(userId) {
+  const id = String(userId);
+  const state = store.get();
+  if (id === String(state.user?.id || '')) return state.user?.displayName || '나';
+  const member = state.members.find((row) => String(row.userId ?? row.id) === id);
+  if (member?.displayName) return member.displayName;
+  const message = state.chat.find((row) => String(row.userId) === id);
+  if (message?.displayName) return message.displayName;
+  const queued = state.queue.find((row) => String(row.requestedByUserId) === id);
+  if (queued?.requestedByDisplay) return queued.requestedByDisplay;
+  return '누군가';
+}
+
+function avatarOf(userId) {
+  const id = String(userId);
+  const state = store.get();
+  if (id === String(state.user?.id || '')) return state.user?.avatarUrl || '';
+  const member = state.members.find((row) => String(row.userId ?? row.id) === id);
+  if (member?.avatarUrl) return member.avatarUrl;
+  const message = state.chat.find((row) => String(row.userId) === id);
+  return message?.avatarUrl || '';
+}
+
+/** 슈퍼 좋아요 남은 횟수·쿨타임 (§10.6). 서버가 안 주면 제한이 없다는 뜻이다. */
+function superLikeInfo() {
+  const info = store.get().superLike;
+  if (!info) return { limited: false, left: null, coolLeft: 0 };
+  const daily = Number(info.dailyLimit) || 0;
+  const used = Number(info.usedToday) || 0;
+  const availableAt = parseUtc(info.availableAtUtc);
+  const coolLeft = availableAt ? Math.max(0, Math.ceil((availableAt - serverNow()) / 1000)) : 0;
+  return {
+    limited: daily > 0 || Number(info.cooldownSec) > 0,
+    left: daily > 0 ? Math.max(0, daily - used) : null,
+    coolLeft,
+    cooldownSec: Number(info.cooldownSec) || 0,
+  };
+}
+
 function createQueueItem(item) {
   const node = h('article', { class: 'qitem', 'data-testid': 'queue-item', dataset: { mqRow: '1', id: item.id } });
   node.__parts = {
@@ -2024,7 +2721,8 @@ function createQueueItem(item) {
   node.append(p.rank, p.art, h('div', { class: 'qitem__main' }, p.title, p.who, p.score), p.acts);
 
   p.like = bindAct(h('button', { class: 'vote', type: 'button', tip: '좋아요' }), () => vote(node.dataset.id, 'like'));
-  p.superLike = bindAct(h('button', { class: 'vote', type: 'button', tip: '슈퍼 좋아요 (2배)' }), () => vote(node.dataset.id, 'superLike'));
+  p.superLike = bindAct(h('button', { class: 'vote', type: 'button', tip: '슈퍼 좋아요' }), () => vote(node.dataset.id, 'superLike'));
+  p.dislike = bindAct(h('button', { class: 'vote vote--down', type: 'button', tip: '싫어요' }), () => vote(node.dataset.id, 'dislike'));
   p.save = bindAct(h('button', { class: 'vote', type: 'button', tip: '보관함에 담기', 'aria-label': '보관함에 담기' }, '🔖'),
     () => toggleSaved(node.__item.track, true));
   p.seed = bindAct(h('button', {
@@ -2040,7 +2738,12 @@ function createQueueItem(item) {
       });
       if (ok) call(() => api('/queue/action', { body: { action: 'remove', itemId: node.dataset.id } }), '대기열에서 뺐어요.');
     });
-  p.acts.append(p.like, p.superLike, p.save, p.seed, p.pin, p.remove);
+  p.acts.append(p.like, p.superLike, p.dislike, p.save, p.seed, p.pin, p.remove);
+
+  // 우클릭 / 롱프레스 — 곡 하나에 할 수 있는 걸 전부 한자리에 (§24.1)
+  bindContextTarget(node, () => trackMenu(node.__item.track, {
+    itemId: node.dataset.id, item: node.__item, source: 'queue',
+  }));
   return node;
 }
 
@@ -2065,68 +2768,190 @@ function updateQueueItem(node, item, index, rounds) {
 
   const round = rounds.get(item.id) || 1;
   put(clear(p.who),
-    h('b', null, item.requestedByDisplay || '알 수 없음'),
+    personButton(item.requestedByUserId, item.requestedByDisplay || '알 수 없음'),
     `의 ${round}번째 곡`,
     item.isMine ? h('span', { class: 'chip chip--accent', style: { marginLeft: 'var(--sp-2)' } }, '내 곡') : null);
+  p.who.setAttribute('data-tip', `${item.requestedByDisplay || '누군가'}님이 이 서버에서 담은 ${round}번째 곡이에요`);
 
   renderScore(p.score, score, mode);
 
   const like = score.likeCount || 0;
   const superLike = score.superLikeCount || 0;
+  const dislike = score.dislikeCount || 0;
   p.like.setAttribute('aria-pressed', String(item.myVote === 'like'));
   p.superLike.setAttribute('aria-pressed', String(item.myVote === 'superLike'));
+  p.dislike.setAttribute('aria-pressed', String(item.myVote === 'dislike'));
   p.like.textContent = `👍 ${like}`;
-  p.superLike.textContent = `⭐ ${superLike}`;
+  p.dislike.textContent = `👎 ${dislike}`;
 
+  // 슈퍼 좋아요는 남은 횟수와 쿨타임을 숫자로 보여준다. 회색으로만 두면 고장인 줄 안다 (§10.6)
+  const superInfo = superLikeInfo();
+  p.superLike.textContent = superInfo.coolLeft > 0
+    ? `⭐ ${fmtTime(superInfo.coolLeft)}`
+    : `⭐ ${superLike}`;
+
+  const points = votePoints();
   const canVote = can('vote') && !item.isMine;
-  setLock(p.like, !canVote, item.isMine ? '내가 신청한 곡에는 좋아요를 누를 수 없어요.' : lockReason('vote'));
-  setLock(p.superLike, !canVote, item.isMine ? '내가 신청한 곡에는 좋아요를 누를 수 없어요.' : lockReason('vote'));
+  const mineReason = '내가 신청한 곡에는 투표할 수 없어요';
+  setLock(p.like, !canVote, item.isMine ? mineReason : lockReason('vote'));
+  setLock(p.dislike, !canVote, item.isMine ? mineReason : lockReason('vote'));
+  p.like.setAttribute('data-tip', canVote
+    ? `좋아요 · ${points.like}점 올라가요`
+    : p.like.getAttribute('data-tip'));
+  p.dislike.setAttribute('data-tip', canVote
+    ? `싫어요 · ${points.dislike}점이에요${boomttaNote(dislike)}`
+    : p.dislike.getAttribute('data-tip'));
+
+  const superBlocked = !canVote || superInfo.coolLeft > 0 || superInfo.left === 0;
+  setLock(p.superLike, superBlocked,
+    item.isMine ? mineReason
+      : superInfo.coolLeft > 0 ? `슈퍼 좋아요는 ${fmtTime(superInfo.coolLeft)} 뒤에 다시 쓸 수 있어요`
+        : superInfo.left === 0 ? '오늘 슈퍼 좋아요를 다 썼어요 (UTC 자정에 초기화돼요)'
+          : lockReason('vote'));
+  if (!superBlocked) {
+    p.superLike.setAttribute('data-tip', superInfo.left === null
+      ? `슈퍼 좋아요 · ${points.superLike}점 올라가요`
+      : `슈퍼 좋아요 · ${points.superLike}점 · 오늘 ${superInfo.left}번 남았어요`);
+  }
+
   setLock(p.save, !can('library'), lockReason('library'));
 
   p.pin.hidden = !can('queueEdit') || tierOf() === 'member';
   p.pin.setAttribute('aria-pressed', String(score.manualPriority !== null && score.manualPriority !== undefined));
   const canRemove = item.isMine ? can('queueEdit') || can('search') : can('queueEdit');
-  setLock(p.remove, !canRemove, lockReason('queueEdit'));
+  setLock(p.remove, !canRemove, item.isMine ? '' : lockReason('queueEdit'));
 }
 
-/** 시그니처 — 점수를 숫자 하나로 숨기지 않고 계산식과 막대로 보여준다. */
+/** 붐따가 켜져 있으면 몇 개 더 모이면 내려가는지 알려 준다 (§10.3). */
+function boomttaNote(dislike) {
+  const settings = store.get().settings || {};
+  if (!settings.boomttaEnabled) return '';
+  const threshold = Number(settings.boomttaThreshold) || 0;
+  if (threshold <= 0) return '';
+  const left = Math.max(0, threshold - (dislike || 0));
+  const action = settings.boomttaAction === 'remove' ? '대기열에서 빠져요' : '맨 뒤로 내려가요';
+  return left > 0 ? ` · ${left}개 더 모이면 ${action}` : ` · 곧 ${action}`;
+}
+
+/** 시그니처 — 점수를 숫자 하나로 숨기지 않고 계산식과 막대로 보여준다.
+ *  점수 배점은 서버 설정을 그대로 반영한다 (§10.1). 안 그러면 화면이 거짓말을 한다. */
 function renderScore(host, score, mode) {
+  const points = votePoints();
   const like = score.likeCount || 0;
   const superLike = score.superLikeCount || 0;
+  const dislike = score.dislikeCount || 0;
   const wait = score.waitScore || 0;
-  const total = score.totalScore ?? (wait + like + superLike * 2);
+  const total = score.totalScore
+    ?? (wait * points.wait + like * points.like + superLike * points.superLike + dislike * points.dislike);
 
   clear(host);
   host.classList.toggle('score--muted', mode === 'fifo');
 
   const bar = h('div', { class: 'score__bar', 'aria-hidden': 'true' });
-  const sum = Math.max(1, like + superLike * 2 + wait);
-  for (const [kind, value] of [['like', like], ['super', superLike * 2], ['wait', wait]]) {
+  const weights = [
+    ['like', like * points.like],
+    ['super', superLike * points.superLike],
+    ['wait', wait * points.wait],
+    ['down', Math.abs(dislike * points.dislike)],
+  ];
+  const sum = Math.max(1, weights.reduce((acc, [, value]) => acc + Math.max(0, value), 0));
+  for (const [kind, value] of weights) {
     if (value <= 0) continue;
     bar.appendChild(h('span', { class: `score__seg score__seg--${kind}`, style: { flex: String(value / sum) } }));
   }
   if (!bar.children.length) bar.appendChild(h('span', { class: 'score__seg score__seg--wait', style: { flex: '1', opacity: '0.3' } }));
 
+  // 배점이 1이면 곱셈을 안 쓴다. 음수 배점은 부호를 항목이 아니라 연산자로 낸다 —
+  // `− 👎1×-1` 같은 이중 부정은 읽을 수가 없다.
+  const term = (icon, count, per) => (Math.abs(per) === 1 ? `${icon}${count}` : `${icon}${count}×${Math.abs(per)}`);
   const parts = [];
-  if (like) parts.push(`👍${like}`);
-  if (superLike) parts.push(`⭐${superLike}×2`);
-  if (wait) parts.push(`대기${wait}`);
+  const push = (value, per, text) => { if (value) parts.push({ minus: per < 0, text }); };
+  push(like, points.like, term('👍', like, points.like));
+  push(superLike, points.superLike, term('⭐', superLike, points.superLike));
+  push(wait, points.wait, term('대기', wait, points.wait));
+  push(dislike, points.dislike, term('👎', dislike, points.dislike));
+
+  const formula = parts.map((part, index) => (index === 0
+    ? (part.minus ? `−${part.text}` : part.text)
+    : `${part.minus ? ' − ' : ' + '}${part.text}`)).join('');
 
   const text = h('span', { class: 'score__text' });
   // 합계는 절대 잘리면 안 된다. 계산식만 줄어들고 '= 7'은 따로 고정한다.
   if (mode === 'fifo') {
-    text.textContent = parts.length ? `${parts.join(' ')} · 순서에는 영향 없어요` : '신청한 순서대로 나가요';
+    // 점수가 보이는데 순서와 무관하면 그게 제일 헷갈린다. 흐리게 하고 한 줄 덧붙인다 (§10.4)
+    text.textContent = parts.length ? `${formula} · 지금은 신청 순서대로 나가요` : '지금은 신청 순서대로 나가요';
     put(host, bar, text);
   } else if (parts.length) {
-    text.textContent = parts.join(' + ');
+    text.textContent = formula;
     put(host, bar, text, h('b', { class: 'score__total' }, `= ${total}`));
   } else {
     text.textContent = '0점 · 방금 담겼어요';
     put(host, bar, text);
   }
+
   host.setAttribute('data-tip', mode === 'fifo'
-    ? '시간제에서는 좋아요가 순서를 바꾸지 않아요.'
-    : `총 ${total}점 — 대기 ${wait} + 좋아요 ${like} + 슈퍼 ${superLike}×2`);
+    ? '시간제에서는 좋아요가 순서를 바꾸지 않아요'
+    : `총 ${total}점 · 마우스를 올리면 누가 눌렀는지 보여요`);
+  host.tabIndex = 0;
+  host.__score = score;
+  bindVoterCard(host);
+}
+
+/* ── 누가 눌렀는지 (§10.4) ──
+ * 서버는 ID만 준다. 이름은 클라이언트가 이미 갖고 있는 목록으로 붙인다 —
+ * 서버가 이름을 조회하면 대기열 길이만큼 쿼리가 는다.
+ */
+function voterList(score) {
+  const rows = [];
+  const add = (icon, label, ids, count) => {
+    const list_ = (ids || []).map(String);
+    if (!list_.length && !count) return;
+    rows.push({ icon, label, ids: list_, extra: Math.max(0, (count || list_.length) - list_.length) });
+  };
+  add('👍', '좋아요', score.likeBy, score.likeCount);
+  add('⭐', '슈퍼 좋아요', score.superBy, score.superLikeCount);
+  add('👎', '싫어요', score.dislikeBy, score.dislikeCount);
+  return rows;
+}
+
+function voterPanel(score) {
+  const rows = voterList(score);
+  if (!rows.length) {
+    return h('div', { class: 'voters' }, h('p', { class: 'hint' }, '아직 아무도 안 눌렀어요.'));
+  }
+  return h('div', { class: 'voters' }, ...rows.map((row) => h('div', { class: 'voters__row' },
+    h('span', { class: 'voters__kind' }, row.icon, ' ', row.label),
+    h('div', { class: 'voters__who' },
+      ...row.ids.map((id) => h('span', { class: 'voters__one' },
+        avatar(avatarOf(id), nameOf(id), 'sm'),
+        h('span', null, nameOf(id)))),
+      row.extra > 0 ? h('span', { class: 'chip' }, `+${row.extra}명`) : null,
+      !row.ids.length ? h('span', { class: 'hint' }, `${row.extra}명`) : null))));
+}
+
+let voterPop = null;
+function bindVoterCard(host) {
+  if (host.__voterBound) return;
+  host.__voterBound = true;
+  const show = () => {
+    hideVoterCard();
+    const score = host.__score || {};
+    if (!voterList(score).length) return;
+    voterPop = h('div', { class: 'pop voterpop' }, voterPanel(score));
+    document.body.appendChild(voterPop);
+    const rect = host.getBoundingClientRect();
+    const box = voterPop.getBoundingClientRect();
+    voterPop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - box.width - 8))}px`;
+    voterPop.style.top = `${rect.top - box.height - 8 < 8 ? rect.bottom + 8 : rect.top - box.height - 8}px`;
+  };
+  host.addEventListener('pointerenter', show);
+  host.addEventListener('focus', show);
+  host.addEventListener('pointerleave', hideVoterCard);
+  host.addEventListener('blur', hideVoterCard);
+}
+
+function hideVoterCard() {
+  if (voterPop) { voterPop.remove(); voterPop = null; }
 }
 
 async function vote(itemId, kind) {
@@ -2156,10 +2981,18 @@ function buildLibraryPane() {
     class: 'field', type: 'search', 'data-testid': 'library-filter', placeholder: '보관함에서 찾기',
     onInput: debounce(() => { libraryQuery = el.libFilter.value.trim(); renderLibrary(store.get()); }, 140),
   });
-  el.libSeg = h('div', { class: 'lib__seg' },
-    ...[['liked', '좋아요'], ['saved', '보관'], ['playlists', '재생목록']].map(([id, label]) =>
+  // 4 세그먼트 (§12.2). 개인 재생목록과 서버 재생목록은 확실히 갈라 둔다 —
+  // 실수로 서버 것을 지우면 곤란하다.
+  const segments = [
+    ['liked', '👍 좋아요', '내가 좋아요를 누른 곡이에요'],
+    ['saved', '🔖 담아둔 곡', '나중에 들으려고 담아 둔 곡이에요'],
+    ['mine', '📃 내 재생목록', '나만 쓰는 재생목록이에요. 어느 서버에서든 보여요'],
+    ['server', '🌐 서버 재생목록', '이 서버가 같이 쓰는 재생목록이에요'],
+  ];
+  el.libSeg = h('div', { class: 'lib__seg lib__seg--wrap' },
+    ...segments.map(([id, label, tip]) =>
       h('button', {
-        class: 'seg', type: 'button', 'aria-pressed': String(id === libraryTab), dataset: { seg: id },
+        class: 'seg', type: 'button', 'aria-pressed': String(id === libraryTab), dataset: { seg: id }, tip,
         onClick: () => {
           libraryTab = id;
           for (const btn of el.libSeg.children) btn.setAttribute('aria-pressed', String(btn.dataset.seg === id));
@@ -2174,17 +3007,33 @@ function buildLibraryPane() {
     el.libBody);
 }
 
+/** 내 것인지 서버 것인지. scope 를 안 주는 서버는 owner 로 판단한다. */
+function isMyPlaylist(playlist) {
+  const me = String(store.get().user?.id || '');
+  const scope = String(playlist.scope || '').toLowerCase();
+  if (scope === 'user') return true;
+  if (scope === 'guild' || scope === 'global') return false;
+  return !!playlist.ownerUserId && String(playlist.ownerUserId) === me;
+}
+
 function renderLibrary(state) {
   clear(el.libBody);
   const needle = libraryQuery.toLowerCase();
   const match = (track) => !needle || [track.title, track.artist, track.provider].join(' ').toLowerCase().includes(needle);
 
-  if (libraryTab === 'playlists') {
-    if (!state.playlists.length) {
-      el.libBody.appendChild(emptyState('📁', '재생목록이 없어요', '자주 듣는 곡을 묶어두면 한 번에 담을 수 있어요.'));
+  if (libraryTab === 'mine' || libraryTab === 'server') {
+    const mine = libraryTab === 'mine';
+    const rows = state.playlists.filter((playlist) => isMyPlaylist(playlist) === mine
+      && (!needle || String(playlist.name || '').toLowerCase().includes(needle)));
+
+    if (mine) el.libBody.appendChild(newPlaylistRow());
+    if (!rows.length) {
+      el.libBody.appendChild(emptyState('📁',
+        mine ? '내 재생목록이 없어요' : '서버 재생목록이 없어요',
+        mine ? '자주 듣는 곡을 묶어 두면 한 번에 담을 수 있어요.' : '서버 관리자가 만들어 둔 목록이 여기 나와요.'));
       return;
     }
-    for (const playlist of state.playlists) el.libBody.appendChild(playlistCard(playlist));
+    for (const playlist of rows) el.libBody.appendChild(playlistCard(playlist, mine));
     marquee.scan(el.libBody);
     return;
   }
@@ -2200,20 +3049,175 @@ function renderLibrary(state) {
   marquee.scan(el.libBody);
 }
 
-function playlistCard(playlist) {
-  const entries = (playlist.entries || []).filter((entry) => entry.track);
-  const enqueueAll = bindAct(h('button', { class: 'btn btn--sm', type: 'button', tip: '이 목록을 통째로 대기열에 담아요' }, '전체 담기'),
-    () => call(() => api('/playlists/action', { body: { action: 'enqueue', playlistId: playlist.id } }), '재생목록을 대기열에 담았어요.'));
-  setLock(enqueueAll, !can('search'), lockReason('search'));
+/** 모달 없이 인라인으로. 이름만 넣으면 끝이다 (§12.2). */
+function newPlaylistRow() {
+  const input = h('input', {
+    class: 'field', placeholder: '새 재생목록 이름', maxlength: '60',
+    onKeydown: (event) => { if (event.key === 'Enter') { event.preventDefault(); submit(); } },
+  });
+  const button = bindAct(h('button', { class: 'btn btn--sm btn--primary', type: 'button', tip: '이름만 넣으면 바로 만들어져요' }, '+ 만들기'),
+    () => submit());
 
-  return h('div', { class: 'card plcard', 'data-testid': 'playlist-card', dataset: { mqRow: '1' } },
+  async function submit() {
+    const name = input.value.trim();
+    if (!name) { input.focus(); return; }
+    const created = await call(() => api('/playlists/action', { body: { action: 'create', name, scope: 'user' } }),
+      `재생목록 '${name}'을 만들었어요.`);
+    if (created) { input.value = ''; refetchCold(); }
+  }
+
+  return h('div', { class: 'plnew' }, input, button);
+}
+
+function playlistDuration(entries) {
+  const seconds = entries.reduce((acc, entry) => acc + trackSeconds(entry.track), 0);
+  if (!seconds) return '';
+  const minutes = Math.round(seconds / 60);
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}시간 ${minutes % 60}분` : `${minutes}분`;
+}
+
+function playlistCard(playlist, mine) {
+  const entries = (playlist.entries || []).filter((entry) => entry.track);
+  const count = playlist.entryCount ?? entries.length;
+  const length = playlistDuration(entries);
+
+  const enqueueAll = bindAct(h('button', {
+    class: 'btn btn--sm', type: 'button', tip: '이 목록을 통째로 대기열에 담아요',
+  }, '▶ 전부 담기'), () => enqueuePlaylist(playlist));
+  setLock(enqueueAll, !canBulk(), lockReason('bulkEnqueue'));
+
+  const more = h('button', {
+    class: 'iconbtn', type: 'button', tip: '이름 바꾸기 · 삭제', 'aria-label': '재생목록 메뉴',
+    onClick: (event) => openContextMenu(playlistMenu(playlist, mine), { anchor: event.currentTarget }),
+  }, '⋯');
+  setLock(more, !mine && !can('console'), mine ? '' : '서버 재생목록은 서버 관리자만 고칠 수 있어요');
+
+  const card = h('div', {
+    class: `card plcard plcard--${mine ? 'mine' : 'server'}`,
+    'data-testid': 'playlist-card', dataset: { mqRow: '1' },
+  },
     h('div', { class: 'plcard__head' },
+      h('span', { class: 'plcard__icon', 'aria-hidden': 'true' }, mine ? '📃' : '🌐'),
       h('strong', null, playlist.name),
-      h('span', { class: 'chip' }, `${playlist.entryCount ?? entries.length}곡`),
-      enqueueAll),
+      h('span', { class: 'chip', tip: length ? `${count}곡 · 다 들으면 ${length}쯤 걸려요` : `${count}곡이에요` },
+        length ? `${count}곡 · ${length}` : `${count}곡`),
+      enqueueAll, more),
     h('div', { class: 'plcard__entries' },
-      entries.slice(0, 5).map((entry) => h('div', { class: 'row__sub' }, `· ${trackTitle(entry.track)}`)),
-      entries.length > 5 ? h('div', { class: 'row__sub' }, `· 외 ${entries.length - 5}곡`) : null));
+      entries.slice(0, 5).map((entry) => h('div', { class: 'plcard__entry' },
+        h('span', { class: 'row__sub' }, trackTitle(entry.track)),
+        setLock(bindAct(h('button', {
+          class: 'iconbtn', type: 'button', tip: '이 곡만 대기열에 담기', 'aria-label': '대기열에 담기',
+        }, '＋'), () => enqueue(entry.track)), !can('search'), lockReason('search')),
+        mine ? bindAct(h('button', {
+          class: 'iconbtn iconbtn--danger', type: 'button', tip: '재생목록에서 빼기', 'aria-label': '재생목록에서 빼기',
+        }, '✕'), () => removeFromPlaylist(playlist, entry)) : null)),
+      count > 5 ? h('div', { class: 'row__sub' }, `· 외 ${count - 5}곡`) : null));
+
+  bindContextTarget(card, () => playlistMenu(playlist, mine));
+  return card;
+}
+
+/** 전부 담기는 별도 권한이다 (§15.4). 서버가 아직 이 키를 모르면 검색 권한으로 판단한다. */
+function canBulk() {
+  const permissions = store.get().permissions?.can || {};
+  if (permissions.bulkEnqueue !== undefined) return can('bulkEnqueue');
+  return can('search');
+}
+
+async function enqueuePlaylist(playlist) {
+  const result = await call(() => api('/playlists/action', { body: { action: 'enqueue', playlistId: playlist.id } }));
+  if (!result) return;
+  // 조용히 자르면 안 된다. 몇 곡만 담겼는지 반드시 말한다 (§12.3)
+  if (result.limited) toast(`대기열 한도까지 ${result.added ?? 0}곡만 담았어요.`, 'warn');
+  else toast(`${result.added ?? playlist.entryCount ?? ''}곡을 담았어요.`.replace('  ', ' '), 'ok');
+}
+
+async function removeFromPlaylist(playlist, entry) {
+  const ok = await confirmSheet({
+    title: '이 곡을 뺄까요', desc: `${playlist.name} · ${trackTitle(entry.track)}`,
+    danger: true, confirmText: '빼기',
+  });
+  if (!ok) return;
+  await call(() => api('/playlists/action', {
+    body: { action: 'removeTrack', playlistId: playlist.id, entryId: entry.id, cacheKey: trackKey(entry.track) },
+  }), '재생목록에서 뺐어요.');
+  refetchCold();
+}
+
+function playlistMenu(playlist, mine) {
+  const editable = mine || can('console');
+  const reason = mine ? '' : '서버 재생목록은 서버 관리자만 고칠 수 있어요';
+  return [
+    { icon: '▶', label: '전부 대기열에 담기', disabled: !canBulk(), reason: lockReason('bulkEnqueue'), onPick: () => enqueuePlaylist(playlist) },
+    { icon: '✏', label: '이름 바꾸기', disabled: !editable, reason, onPick: () => renamePlaylist(playlist) },
+    { icon: '🗑', label: '재생목록 삭제', danger: true, disabled: !editable, reason, onPick: () => deletePlaylist(playlist) },
+  ];
+}
+
+async function renamePlaylist(playlist) {
+  const input = h('input', { class: 'field', value: playlist.name || '', maxlength: '60' });
+  const ok = await sheet({
+    title: '이름 바꾸기', desc: '이 재생목록을 뭐라고 부를까요', body: input,
+    dismissValue: false,
+    actions: [{ label: '취소', kind: 'ghost', value: false }, { label: '저장', kind: 'primary', value: true, autofocus: true }],
+  }).result;
+  if (!ok) return;
+  const name = input.value.trim();
+  if (!name) return;
+  await call(() => api('/playlists/action', { body: { action: 'rename', playlistId: playlist.id, name } }), '이름을 바꿨어요.');
+  refetchCold();
+}
+
+async function deletePlaylist(playlist) {
+  const ok = await confirmSheet({
+    title: `'${playlist.name}'을 지울까요`,
+    desc: `${playlist.entryCount ?? (playlist.entries || []).length}곡이 같이 사라져요. 되돌릴 수 없어요.`,
+    danger: true, confirmText: '삭제',
+  });
+  if (!ok) return;
+  await call(() => api('/playlists/action', { body: { action: 'delete', playlistId: playlist.id } }), '재생목록을 지웠어요.');
+  refetchCold();
+}
+
+/* ── 재생목록 선택 팝오버 (§12.2) ──
+ * 어디서든 ＋를 누르면 뜬다. 자주 쓴 순으로 놓고, 맨 위에 "새로 만들기"를 둔다.
+ */
+function openPlaylistPicker(track, anchor) {
+  const state = store.get();
+  const mine = state.playlists.filter(isMyPlaylist)
+    .slice()
+    .sort((a, b) => (b.usedCount || 0) - (a.usedCount || 0) || parseUtc(b.updatedUtc) - parseUtc(a.updatedUtc));
+
+  const items = [{
+    icon: '＋', label: '새로 만들어서 담기',
+    onPick: async () => {
+      const input = h('input', { class: 'field', placeholder: '재생목록 이름', maxlength: '60' });
+      const ok = await sheet({
+        title: '새 재생목록', desc: trackTitle(track), body: input, dismissValue: false,
+        actions: [{ label: '취소', kind: 'ghost', value: false }, { label: '만들고 담기', kind: 'primary', value: true, autofocus: true }],
+      }).result;
+      if (!ok || !input.value.trim()) return;
+      const created = await call(() => api('/playlists/action', {
+        body: { action: 'create', name: input.value.trim(), scope: 'user', track },
+      }), '새 재생목록에 담았어요.');
+      if (created) refetchCold();
+    },
+  }];
+
+  for (const playlist of mine.slice(0, 8)) {
+    items.push({
+      icon: '📃', label: playlist.name,
+      hint: `${playlist.entryCount ?? (playlist.entries || []).length}곡`,
+      onPick: async () => {
+        await call(() => api('/playlists/action', { body: { action: 'addTrack', playlistId: playlist.id, track } }),
+          `'${playlist.name}'에 담았어요.`);
+        refetchCold();
+      },
+    });
+  }
+  if (!mine.length) items.push({ icon: '·', label: '아직 내 재생목록이 없어요', disabled: true, reason: '위에서 하나 만들면 여기 나와요' });
+
+  openContextMenu(items, { anchor });
 }
 
 /* ═══════════════════════ 중앙 스테이지 ═══════════════════════ */
@@ -2252,7 +3256,7 @@ function buildStage() {
 
   el.skipBtn = bindAct(h('button', {
     class: 'pbtn', type: 'button', 'data-testid': 'skip', tip: '다음 곡', 'aria-label': '다음 곡',
-  }, '⏭'), () => control('skip'));
+  }, '⏭'), doSkip);
 
   el.restartBtn = bindAct(h('button', {
     class: 'pbtn', type: 'button', tip: '처음부터 다시', 'aria-label': '처음부터 다시',
@@ -2267,6 +3271,15 @@ function buildStage() {
 
   el.shuffleBtn = bindAct(h('button', { class: 'pbtn', type: 'button', tip: '무작위 섞기', 'aria-label': '무작위 섞기' }, '🎲'),
     () => control('shuffle', store.get().player?.shuffleEnabled ? 0 : 1));
+
+  // 자동 재생 켜고 끄기 — 관리자 전용이 아니라 autoplay 권한을 본다 (§24.3)
+  el.autoplayBtn = bindAct(h('button', {
+    class: 'pbtn', type: 'button', tip: '자동 재생 켜기/끄기', 'aria-label': '자동 재생',
+  }, '📻'), () => {
+    const on = !!store.get().player?.autoplayEnabled;
+    control('autoplay', on ? 0 : 1);
+    toast(on ? '자동 재생을 껐어요. 대기열이 비면 조용해져요.' : '자동 재생을 켰어요. 대기열이 비면 알아서 골라 와요.', 'ok');
+  });
 
   el.volume = h('input', {
     class: 'vol__range', type: 'range', 'data-testid': 'volume', min: '0', max: '200', value: '100',
@@ -2297,25 +3310,159 @@ function buildStage() {
       h('button', { class: 'iconbtn', type: 'button', tip: '접기', 'aria-label': '가사 접기', onClick: toggleLyrics }, '✕')),
     el.lyricsView);
 
+  // 지금 재생 중인 곡에 누가 좋아요를 눌렀는지는 카드에 바로 보여준다 (§10.4)
+  el.nowVoters = h('div', { class: 'nowvoters', hidden: true });
+
+  // 다음 곡 한 줄 (§14.3). 카드를 하나 더 만들면 화면만 무거워진다.
+  el.nextRow = h('div', { class: 'nextrow', hidden: true, dataset: { mqRow: '1' } });
+
   el.nowCard = h('section', { class: 'now', 'data-testid': 'now-playing', dataset: { mqRow: '1' } },
     h('div', { class: 'now__artwrap' }, el.nowArt),
     h('div', { class: 'now__side' },
       el.nowEyebrow,
       el.nowTitle,
       el.nowBy,
+      el.nowVoters,
       el.viz,
       h('div', { class: 'seek' }, el.seekTrack, h('div', { class: 'seek__times' }, el.timeNow, el.timeEnd)),
       h('div', { class: 'ctrl' },
         el.restartBtn, el.playBtn, el.skipBtn,
-        el.repeatBtn, el.shuffleBtn,
+        el.repeatBtn, el.shuffleBtn, el.autoplayBtn,
         h('span', { class: 'ctrl__spacer' }),
         el.lyricsToggle,
         el.webBtn),
-      h('div', { class: 'vols' }, el.volumeWrap, el.webVolWrap, el.webNote)));
+      h('div', { class: 'vols' }, el.volumeWrap, el.webVolWrap, el.webNote)),
+    el.nextRow);
 
   bindSeek();
+  bindContextTarget(el.nowCard, () => {
+    const current = store.get().current;
+    return current ? trackMenu(current.track, { itemId: current.id, item: current, source: 'now' }) : null;
+  });
   el.stageScroll = h('div', { class: 'stage__scroll scroll' }, el.nowCard, el.lyricsBox);
   return el.stageScroll;
+}
+
+/* ── 스킵 (§10.5) ──
+ * 투표 모드면 버튼이 `⏭ 스킵 2/3`이 되고, 다시 누르면 내 표를 뺀다.
+ */
+async function doSkip() {
+  const vote = store.get().skipVote;
+  if (vote && vote.mine) {
+    await call(() => api('/control', { body: { action: 'skipVoteCancel' } }), '스킵 투표를 취소했어요.');
+    return;
+  }
+  const result = await call(() => api('/control', {
+    body: { action: 'skip', value: null, expectedItemId: store.get().current?.id || null },
+  }));
+  if (!result) return;
+  if (result.skipped === false && result.vote) {
+    store.patch({ skipVote: result.vote });
+    const left = Math.max(0, (result.vote.need || 0) - (result.vote.have || 0));
+    toast(left > 0 ? `스킵에 한 표 넣었어요. ${left}표 더 모이면 넘어가요.` : '스킵 투표를 넣었어요.', 'ok');
+  }
+}
+
+const SKIP_BASIS = {
+  listeners: '듣는 사람',
+  viewers: '리모컨을 보는 사람',
+  either: '듣는 사람이나 보는 사람',
+  both: '듣는 사람과 보는 사람',
+};
+
+function renderSkipButton(offline, offlineReason) {
+  const state = store.get();
+  const vote = state.skipVote;
+  const canSkip = can('skip') || can('playback');
+  const instant = tierOf() !== 'member' || !!state.current?.isMine;
+
+  let tip;
+  if (vote && vote.need) {
+    el.skipBtn.classList.add('pbtn--wide');
+    el.skipBtn.textContent = `⏭ 스킵 ${vote.have || 0}/${vote.need}`;
+    el.skipBtn.setAttribute('aria-pressed', String(!!vote.mine));
+    // 한 표 남았다는 걸 알면 누를 마음이 생긴다
+    el.skipBtn.classList.toggle('pbtn--almost', (vote.need - (vote.have || 0)) === 1);
+    el.skipBtn.setAttribute('aria-label', `스킵 투표 ${vote.have || 0} / ${vote.need}`);
+    tip = vote.mine
+      ? '내 표가 들어가 있어요 · 다시 누르면 빼요'
+      : `${SKIP_BASIS[vote.basis] || '듣는 사람'} ${vote.pool ?? vote.need}명 중 ${vote.need}명이 동의하면 넘어가요`;
+  } else {
+    el.skipBtn.classList.remove('pbtn--wide', 'pbtn--almost');
+    el.skipBtn.removeAttribute('aria-pressed');
+    const voteMode = !!(state.settings && state.settings.voteSkipEnabled);
+    el.skipBtn.textContent = '⏭';
+    el.skipBtn.setAttribute('aria-label', '다음 곡');
+    tip = voteMode
+      ? (instant ? '바로 넘기기 — 관리자라서 투표 없이 넘어가요' : '스킵 투표를 열어요')
+      : '다음 곡으로 넘겨요';
+  }
+  // setLock 은 잠금이 풀릴 때 처음 붙어 있던 툴팁으로 되돌린다. 그래서 순서가 중요하다 — 잠금 먼저.
+  setLock(el.skipBtn, offline || !canSkip, offline ? offlineReason : lockReason('skip'));
+  if (!offline && canSkip) el.skipBtn.setAttribute('data-tip', tip);
+}
+
+/* ── 다음 곡 (§14.3) ── */
+function renderNextRow(state) {
+  const next = state.next;
+  if (!next || !next.item || !next.item.track) { el.nextRow.hidden = true; return; }
+  const fromAutoplay = next.source === 'autoplay';
+  const track = next.item.track;
+
+  el.nextRow.hidden = false;
+  el.nextRow.dataset.kind = fromAutoplay ? 'autoplay' : 'queue';
+
+  const key = `${next.source}:${trackKey(track)}`;
+  if (el.nextRow.__key === key) return;      // 안 바뀌었으면 다시 그리지 않는다
+  const changed = !!el.nextRow.__key && el.nextRow.__key !== key;
+  el.nextRow.__key = key;
+
+  clear(el.nextRow);
+  put(el.nextRow,
+    h('span', { class: 'nextrow__tag' }, fromAutoplay ? '📻 다음 (자동)' : '다음'),
+    mqText(trackTitle(track), 'nextrow__title'),
+    fromAutoplay
+      ? h('span', { class: 'nextrow__sub' }, '대기열이 비면 이 곡이 나와요')
+      : h('span', { class: 'nextrow__sub' }, `· ${next.item.requestedByDisplay || '알 수 없음'}`),
+    h('span', { class: 'ctrl__spacer' }),
+    fromAutoplay ? nextRowActions(track) : null);
+
+  el.nextRow.setAttribute('data-tip', fromAutoplay
+    ? '자동 재생이 골라 둔 후보예요. 누가 곡을 담으면 밀려요'
+    : `다음에 나갈 곡이에요 · ${next.item.requestedByDisplay || '알 수 없음'}님이 담았어요`);
+
+  bindContextTarget(el.nextRow, () => trackMenu(track, { source: 'next' }));
+  if (changed) flashNode(el.nextRow);
+  marquee.scan(el.nextRow);
+}
+
+function nextRowActions(track) {
+  const reroll = bindAct(h('button', {
+    class: 'btn btn--sm btn--ghost', type: 'button',
+    tip: '이 후보를 빼고 다시 골라요',
+  }, '📻 이 곡 말고'), rerollAutoplay);
+  setLock(reroll, !canAutoplay(), lockReason('autoplay'));
+
+  const add = bindAct(h('button', {
+    class: 'btn btn--sm', type: 'button', tip: '이 곡을 대기열에 확정으로 담아요',
+  }, '＋ 담기'), () => enqueue(track));
+  setLock(add, !can('search'), lockReason('search'));
+
+  return h('span', { class: 'nextrow__acts' }, reroll, add);
+}
+
+function canAutoplay() {
+  const permissions = store.get().permissions?.can || {};
+  // autoplay 권한이 아직 없는 서버는 예전 키(autoplaySeed)로 판단한다
+  if (permissions.autoplay !== undefined) return can('autoplay');
+  return can('autoplaySeed');
+}
+
+async function rerollAutoplay() {
+  const key = trackKey(store.get().next?.item?.track);
+  const result = await call(() => api('/autoplay/reroll', { body: { cacheKey: key } }),
+    '다른 곡으로 다시 골랐어요.');
+  if (result) refetchHot();
 }
 
 async function control(action, value, extra) {
@@ -2651,10 +3798,20 @@ function renderNow(state) {
     put(clear(el.nowBy),
       current.track?.artist ? h('span', null, current.track.artist) : null,
       current.track?.artist ? h('span', { class: 'row__sub' }, '·') : null,
-      h('span', null, '신청 '), h('b', null, current.requestedByDisplay || '알 수 없음'),
+      h('span', null, '신청 '),
+      personButton(current.requestedByUserId, current.requestedByDisplay || '알 수 없음'),
       current.requestedByUserId && String(current.requestedByUserId) === String(state.user?.id)
         ? h('span', { class: 'chip chip--accent' }, '내 곡') : null);
     el.timeEnd.textContent = fmtTime(current.durationSeconds || trackSeconds(current.track));
+  }
+
+  // 지금 재생 중인 곡은 제일 궁금한 곡이라 툴팁이 아니라 카드에 바로 보여준다 (§10.4)
+  const nowScore = current?.score;
+  if (nowScore && voterList(nowScore).length) {
+    clear(el.nowVoters).appendChild(voterPanel(nowScore));
+    el.nowVoters.hidden = false;
+  } else {
+    el.nowVoters.hidden = true;
   }
 
   el.playBtn.textContent = player.isPaused ? '▶' : '⏸';
@@ -2673,15 +3830,29 @@ function renderNow(state) {
     el.volumeLabel.textContent = `${player.effectiveVolume}%`;
   }
 
+  // 자동 재생 토글 (§24.3)
+  const autoplayOn = player.autoplayEnabled !== false;
+  el.autoplayBtn.setAttribute('aria-pressed', String(autoplayOn));
+
   const offline = !online || !connected;
-  const offlineReason = !online ? '봇이 꺼져 있어요.' : '봇이 음성 채널에 없어요.';
-  for (const [node, key] of [[el.playBtn, 'playback'], [el.skipBtn, 'playback'], [el.restartBtn, 'seek'],
+  const offlineReason = !online ? '봇이 꺼져 있어요' : '봇이 음성 채널에 없어요';
+  for (const [node, key] of [[el.playBtn, 'playback'], [el.restartBtn, 'seek'],
     [el.repeatBtn, 'playback'], [el.shuffleBtn, 'queueEdit']]) {
     setLock(node, offline || !can(key), offline ? offlineReason : lockReason(key));
   }
+  setLock(el.autoplayBtn, offline || !canAutoplay(), offline ? offlineReason : lockReason('autoplay'));
+  if (!offline && canAutoplay()) {
+    el.autoplayBtn.setAttribute('data-tip', autoplayOn
+      ? '자동 재생이 켜져 있어요 · 대기열이 비면 알아서 골라 와요'
+      : '자동 재생이 꺼져 있어요 · 대기열이 비면 조용해져요');
+  }
+  renderSkipButton(offline, offlineReason);
+  renderNextRow(state);
   setLock(el.seekTrack, offline || !can('seek') || !clock.duration, offline ? offlineReason : lockReason('seek'));
   el.volume.disabled = offline || !can('volume');
-  el.volumeWrap.setAttribute('data-tip', el.volume.disabled ? (offline ? offlineReason : lockReason('volume')) : '볼륨');
+  el.volumeWrap.setAttribute('data-tip', el.volume.disabled
+    ? (offline ? offlineReason : lockReason('volume'))
+    : '서버 볼륨이에요. 바꾸면 Discord로 듣는 모든 사람에게 같이 적용돼요');
   el.volumeWrap.classList.toggle('is-locked', el.volume.disabled);
 
   // 곡이 바뀌면 스크린리더에 알리고, 내 신청곡이면 알림도 띄운다
@@ -2692,7 +3863,7 @@ function renderNow(state) {
     if (current) {
       el.live.textContent = `지금 재생: ${trackTitle(current.track)} · 신청 ${current.requestedByDisplay || ''}`;
       if (String(current.requestedByUserId || '') === String(state.user?.id || '')) {
-        notify.push({ title: '내 신청곡이 시작됐어요', body: trackTitle(current.track), icon: artUrl(current.track) });
+        pushNotify('song', { title: '내 신청곡이 시작됐어요', body: trackTitle(current.track), icon: artUrl(current.track) });
       }
       if (lyricsOpen) loadLyrics();
     }
@@ -2932,10 +4103,12 @@ function buildSide() {
     return node;
   });
 
+  // 제안은 탭이 아니라 헤더 버튼 + 모달이다 (§11). 알맹이는 여기서 한 번만 만들어 두고 모달이 빌려 쓴다.
+  el.suggestPane = buildSuggestPane();
+
   el.sidePanes = {
     chat: buildChatPane(),
     members: buildMembersPane(),
-    suggest: buildSuggestPane(),
     recent: buildRecentPane(),
     audit: buildAuditPane(),
   };
@@ -2959,7 +4132,6 @@ function openSide(id) {
   else if (drawerActive()) openDrawer(true);
 
   if (id === 'chat') markChatRead();
-  if (id === 'suggest') loadSuggestions();
   if (id === 'audit') loadAudit();
   syncMobileTabs();
   marquee.scan(el.side);
@@ -2967,8 +4139,18 @@ function openSide(id) {
 
 function openDrawer(open) {
   el.side.dataset.open = open ? '1' : '0';
+  el.drawerBtn?.setAttribute('aria-expanded', String(!!open));
+  syncScrim();
+}
+
+/** 좌우 어느 쪽이든 열려 있으면 뒷막이 하나만 깔린다. */
+function syncScrim() {
+  const open = el.side?.dataset.open === '1' || el.rail?.dataset.open === '1';
   if (open && !el.scrim) {
-    el.scrim = h('div', { class: 'side-scrim', onClick: () => openDrawer(false) });
+    el.scrim = h('div', {
+      class: 'side-scrim',
+      onClick: () => { openDrawer(false); openRailDrawer(false); },
+    });
     document.body.appendChild(el.scrim);
   } else if (!open && el.scrim) {
     el.scrim.remove();
@@ -3066,11 +4248,12 @@ function renderChat(state) {
 function createMessage(message) {
   const node = h('article', { class: 'msg', dataset: { id: message.id } });
   node.__parts = {
-    ava: avatar(message.avatarUrl, message.displayName),
-    main: h('div', null),
+    ava: personAvatar(message.userId, message.displayName, message.avatarUrl),
+    main: h('div', { class: 'msg__col' }),
     tools: h('div', { class: 'msg__tools' }),
   };
   node.append(node.__parts.ava, node.__parts.main, node.__parts.tools);
+  bindContextTarget(node, () => (node.__message ? messageMenu(node.__message) : null));
   return node;
 }
 
@@ -3098,7 +4281,7 @@ function updateMessage(node, message, previous) {
   if (wantGutter !== isGutter) {
     const next = wantGutter
       ? h('div', { class: 'msg__gutter' }, fmtClock(message.createdUtc))
-      : avatar(message.avatarUrl, message.displayName);
+      : personAvatar(message.userId, message.displayName, message.avatarUrl);
     p.ava.replaceWith(next);
     p.ava = next;
   } else if (wantGutter) {
@@ -3108,13 +4291,13 @@ function updateMessage(node, message, previous) {
   clear(p.main);
   if (message.replyTo) {
     p.main.appendChild(h('button', {
-      class: 'quote', type: 'button', tip: '원문으로 이동',
+      class: 'quote', type: 'button', tip: '답장한 원문으로 이동해요',
       onClick: () => jumpToMessage(message.replyTo.id),
     }, h('b', null, message.replyTo.displayName || '알 수 없음'), h('span', null, message.replyTo.preview || '삭제된 메시지')));
   }
   if (!grouped) {
     p.main.appendChild(h('div', { class: 'msg__head' },
-      h('span', { class: 'msg__name' }, message.displayName || '알 수 없음'),
+      personButton(message.userId, message.displayName || '알 수 없음'),
       h('time', { class: 'msg__time', datetime: message.createdUtc || '', tip: fmtAgo(message.createdUtc) }, fmtClock(message.createdUtc))));
   }
 
@@ -3420,7 +4603,8 @@ function updateUnreadBadges() {
   el.drawerBadge.hidden = unread === 0;
   const mobile = el.mobileTabs?.find((node) => node.dataset.pane === 'side');
   if (mobile) { mobile.__badge.textContent = String(unread); mobile.__badge.hidden = unread === 0; }
-  notify.badge(unread);
+  // 알림을 껐으면 탭 제목 숫자도 안 띄운다 (§16 B3)
+  notify.badge(notifySettings().on ? unread : 0);
 }
 
 function onChatArrived(message) {
@@ -3433,8 +4617,14 @@ function onChatArrived(message) {
   }
   const mentioned = (message.mentions || []).some((id) => String(id) === String(state.user?.id));
   if (mentioned && !mine) {
-    notify.push({ title: `${message.displayName}님이 불렀어요`, body: message.content, icon: message.avatarUrl });
+    pushNotify('mention', { title: `${message.displayName}님이 불렀어요`, body: message.content, icon: message.avatarUrl });
     if (!active) toast(`${message.displayName}님이 나를 불렀어요`, 'info');
+  }
+  // 내 메시지에 답장이 달렸을 때도 알려 준다 (§16 B3의 종류 3번)
+  const repliedToMe = message.replyTo && state.chat.some((row) => row.id === message.replyTo.id
+    && String(row.userId) === String(state.user?.id));
+  if (repliedToMe && !mine && !mentioned) {
+    pushNotify('reply', { title: `${message.displayName}님이 답장했어요`, body: message.content, icon: message.avatarUrl });
   }
 }
 
@@ -3518,20 +4708,32 @@ function synthesizeMembers(state, listening, otherVoice, viewing) {
   return [...map.values()];
 }
 
+const STATUS_TIP = {
+  listening: '봇과 같은 음성 채널에 있어요',
+  othervoice: '다른 음성 채널에 있어요',
+  viewing: '리모컨을 보고 있어요',
+  online: '디스코드에 접속해 있어요',
+  idle: '자리를 비웠어요',
+  dnd: '다른 용무 중이에요',
+  offline: '지금은 접속해 있지 않아요',
+};
+
 function memberRow(member, status) {
   const id = String(member.userId ?? member.id);
+  const name = member.displayName || '알 수 없음';
   const row = h('div', { class: `member member--${status}` },
-    avatar(member.avatarUrl, member.displayName, 'sm'),
-    h('span', { class: `dot dot--${status}` }),
-    h('span', { class: 'member__name' }, member.displayName || '알 수 없음'),
+    personAvatar(id, name, member.avatarUrl, 'sm'),
+    h('span', { class: `dot dot--${status}`, tip: STATUS_TIP[status] || '접속 상태예요' }),
+    h('span', { class: 'member__name' }, personButton(id, name)),
     member.tier && member.tier !== 'member'
-      ? h('span', { class: `tier tier--${member.tier}` }, TIERS[member.tier]?.icon || '') : null);
+      ? h('span', { class: `tier tier--${member.tier}`, tip: TIERS[member.tier]?.desc || '' }, TIERS[member.tier]?.icon || '') : null);
 
   if (can('suspend') && id !== String(store.get().user?.id)) {
     row.appendChild(h('div', { class: 'member__acts' },
-      bindAct(h('button', { class: 'iconbtn iconbtn--danger', type: 'button', tip: '이 사람 정지', 'aria-label': '정지' }, '⛔'),
+      bindAct(h('button', { class: 'iconbtn iconbtn--danger', type: 'button', tip: '이 사람의 조작을 잠시 막아요', 'aria-label': '정지' }, '⛔'),
         () => openSuspendSheet(member))));
   }
+  bindContextTarget(row, () => personMenu(id, name));
   return row;
 }
 
@@ -3592,7 +4794,22 @@ function buildSuggestPane() {
     title, body, h('div', { style: { textAlign: 'right' } }, submit));
   el.suggestSubmit = submit;
 
-  return h('div', { class: 'tabpane', role: 'tabpanel', 'aria-labelledby': 'sidetab-suggest' }, el.suggestForm, el.suggestBody);
+  return h('div', { class: 'tabpane sugpane' }, el.suggestForm, el.suggestBody);
+}
+
+/** 자주 쓰는 기능이 아니라 탭 자리가 아깝다. 헤더 버튼 → 모달로 연다 (§11). */
+function openSuggestModal() {
+  suggestUnread = false;
+  el.suggestDot.hidden = true;
+  loadSuggestions();
+  sheet({
+    title: '💡 제안',
+    desc: '불편한 걸 적어 두면 반영될 수도 있어요. 다른 사람 제안에 공감할 수도 있고요.',
+    wide: true,
+    body: el.suggestPane,
+    dismissValue: false,
+    actions: [{ label: '닫기', kind: 'primary', value: false }],
+  });
 }
 
 async function loadSuggestions() {
@@ -3642,8 +4859,8 @@ function renderSuggestions(state) {
         h('h3', { class: 'sug__title' }, item.title)),
       item.body ? h('p', { class: 'sug__body' }, item.body) : null,
       h('div', { class: 'sug__foot' },
-        avatar(item.avatarUrl, item.displayName, 'sm'),
-        h('span', null, item.displayName || '알 수 없음'),
+        personAvatar(item.userId, item.displayName, item.avatarUrl, 'sm'),
+        personButton(item.userId, item.displayName || '알 수 없음'),
         h('span', null, fmtDate(item.createdUtc)),
         h('span', { class: 'grow' }),
         voteBtn, statusBtn),
@@ -3694,7 +4911,7 @@ function buildRecentPane() {
 }
 
 function renderRecent(state) {
-  setLock(el.recentAll, !can('search'), lockReason('search'));
+  setLock(el.recentAll, !canBulk(), lockReason('bulkEnqueue'));
   clear(el.recentBody);
   if (!state.recent.length) {
     el.recentBody.appendChild(emptyState('🕘', '최근 재생 기록이 없어요', null));
@@ -3710,46 +4927,148 @@ function renderRecent(state) {
 
 /* ── 활동 로그 ── */
 
+/* ── 활동 로그 (§13) ──
+ * 사람이 읽는 피드다. `settings.update` 같은 기계용 액션명과 전후값 JSON은 관리 콘솔 몫이다.
+ * 문장(text)은 서버가 완성해서 내려준다 — 클라이언트가 액션명을 문장으로 바꾸는 로직을 갖지 않는다.
+ */
+
+function auditKinds() {
+  const raw = prefGet('auditFilter');
+  let parsed = null;
+  try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = null; }
+  const list_ = Array.isArray(parsed) ? parsed.filter((key) => AUDIT_KINDS[key]) : null;
+  return list_ && list_.length ? list_ : AUDIT_DEFAULT.slice();
+}
+
+function toggleAuditKind(key) {
+  const current = new Set(auditKinds());
+  if (current.has(key)) current.delete(key); else current.add(key);
+  const next = [...current];
+  prefSet('auditFilter', JSON.stringify(next.length ? next : AUDIT_DEFAULT));
+  store.patch({ audit: [] });
+  syncAuditChips();
+  loadAudit(true);
+}
+
 function buildAuditPane() {
+  el.auditChips = h('div', { class: 'chiprow', role: 'group', 'aria-label': '로그 분류' },
+    ...Object.entries(AUDIT_KINDS).map(([key, meta]) => h('button', {
+      class: 'chipbtn', type: 'button', dataset: { kind: key },
+      'aria-pressed': 'false',
+      tip: `${meta.label} 기록을 보여줄지 정해요`,
+      onClick: () => toggleAuditKind(key),
+    }, `${meta.icon} ${meta.label}`)));
+
   el.auditFilter = h('input', {
-    class: 'field', type: 'search', 'data-testid': 'audit-filter', placeholder: '사람 · 동작 · 곡 제목으로 거르기',
+    class: 'field', type: 'search', 'data-testid': 'audit-filter', placeholder: '사람 · 곡 제목으로 거르기',
     onInput: debounce(() => { auditQuery = el.auditFilter.value.trim().toLowerCase(); renderAudit(store.get()); }, 140),
   });
+  el.auditHidden = h('button', {
+    class: 'audit__more', type: 'button', hidden: true,
+    tip: '켜지 않은 분류에 몇 줄이 숨어 있는지 알려드려요',
+    onClick: () => {
+      prefSet('auditFilter', JSON.stringify(Object.keys(AUDIT_KINDS)));
+      store.patch({ audit: [] });
+      syncAuditChips();
+      loadAudit(true);
+    },
+  });
   el.auditBody = h('div', { class: 'scroll', style: { flex: '1', minHeight: '0' } });
+  syncAuditChips();
+
   return h('div', { class: 'tabpane', role: 'tabpanel', 'aria-labelledby': 'sidetab-audit' },
-    h('div', { class: 'filterbar' }, el.auditFilter),
+    h('div', { class: 'filterbar' }, el.auditFilter, el.auditChips, el.auditHidden),
     el.auditBody);
 }
 
-async function loadAudit() {
-  if (store.get().audit.length) return;
+function syncAuditChips() {
+  if (!el.auditChips) return;
+  const on = new Set(auditKinds());
+  for (const chip of el.auditChips.children) {
+    chip.setAttribute('aria-pressed', String(on.has(chip.dataset.kind)));
+  }
+}
+
+async function loadAudit(force) {
+  if (!force && store.get().audit.length) return;
   clear(el.auditBody).appendChild(skeletonRows(4));
   try {
-    const data = await api('/audit');
+    const data = await api(`/audit?kinds=${encodeURIComponent(auditKinds().join(','))}`);
     store.patch({ audit: data?.entries || data || [] });
+    if (Number.isFinite(data?.hiddenCount) && data.hiddenCount > 0) {
+      el.auditHidden.textContent = `+ ${data.hiddenCount}개 더 (안 켠 분류에 있어요)`;
+      el.auditHidden.hidden = false;
+    } else {
+      el.auditHidden.hidden = true;
+    }
   } catch (error) {
     clear(el.auditBody).appendChild(emptyState('📜', '활동 로그를 못 불러왔어요', error.message));
   }
 }
 
+/** 서버가 아직 text 를 안 주면 예전 모양이라도 읽히게 최소한만 만든다. */
+function auditText(entry) {
+  if (entry.text) return entry.text;
+  const who = entry.actorName || entry.displayName || '시스템';
+  return `${who}님 · ${entry.action || '알 수 없는 동작'}`;
+}
+
 function renderAudit(state) {
   clear(el.auditBody);
-  const rows = state.audit.filter((entry) => !auditQuery
-    || [entry.displayName, entry.action, entry.target, entry.afterValue, entry.failureReason]
-      .join(' ').toLowerCase().includes(auditQuery));
+  const on = new Set(auditKinds());
+  const rows = state.audit.filter((entry) => {
+    if (entry.kind && !on.has(entry.kind)) return false;
+    if (!auditQuery) return true;
+    return [auditText(entry), entry.actorName, entry.displayName, entry.trackTitle]
+      .join(' ').toLowerCase().includes(auditQuery);
+  });
+
   if (!rows.length) {
-    el.auditBody.appendChild(emptyState('📜', auditQuery ? '조건에 맞는 기록이 없어요' : '기록이 없어요', null));
+    el.auditBody.appendChild(emptyState('📜',
+      auditQuery ? '조건에 맞는 기록이 없어요' : '아직 기록이 없어요',
+      auditQuery ? '다른 단어로 찾아 보세요.' : '위 칩을 눌러 보고 싶은 분류를 골라 보세요.'));
     return;
   }
+
   for (const entry of rows) {
-    el.auditBody.appendChild(h('div', { class: `logrow${entry.success === false ? ' logrow--fail' : ''}` },
-      h('time', { datetime: entry.createdUtc || '', tip: entry.createdUtc || '' }, fmtClock(entry.createdUtc)),
-      h('div', null,
-        h('b', null, entry.displayName || '시스템'),
-        document.createTextNode(' '),
-        h('span', null, entry.action || ''),
-        h('p', null, entry.failureReason || entry.target || entry.afterValue || ''))));
+    const kind = AUDIT_KINDS[entry.kind] || { icon: '·', label: '기타' };
+    const merged = Number(entry.mergedCount) || 0;
+    const row = h('div', { class: `logrow${entry.success === false ? ' logrow--fail' : ''}` },
+      h('time', { datetime: entry.createdUtc || '', tip: fmtAgo(entry.createdUtc) }, fmtClock(entry.createdUtc)),
+      h('div', { class: 'logrow__main' },
+        h('span', { class: 'logrow__kind', 'aria-hidden': 'true', tip: kind.label }, kind.icon),
+        auditLine(entry, merged)));
+    el.auditBody.appendChild(row);
   }
+}
+
+/** 합쳐진 줄은 펼칠 수 있어야 한다. 숫자만 보여주면 "뭘 넣은 거지?"가 남는다 (§13.3). */
+function auditLine(entry, merged) {
+  const text = auditText(entry);
+  const actor = entry.actorId
+    ? frag(personButton(entry.actorId, entry.actorName || '알 수 없음'), document.createTextNode(' '))
+    : null;
+  const bodyText = entry.actorId && entry.actorName && text.startsWith(entry.actorName)
+    ? text.slice(entry.actorName.length)
+    : text;
+
+  if (merged <= 1 || !(entry.items || []).length) {
+    return h('div', { class: 'logrow__text' }, actor, h('span', null, bodyText));
+  }
+
+  const items = h('div', { class: 'logrow__items', hidden: true },
+    ...entry.items.map((row) => h('div', { class: 'row__sub' }, `· ${row.title || trackTitle(row.track)}`)));
+  const toggle = h('button', {
+    class: 'logrow__toggle', type: 'button', 'aria-expanded': 'false',
+    tip: '무엇이 담겼는지 펼쳐 봐요',
+    onClick: () => {
+      items.hidden = !items.hidden;
+      toggle.setAttribute('aria-expanded', String(!items.hidden));
+      toggle.textContent = items.hidden ? `▸ ${merged}곡 보기` : '▾ 접기';
+    },
+  }, `▸ ${merged}곡 보기`);
+
+  return h('div', { class: 'logrow__text' }, actor, h('span', null, bodyText), toggle, items);
 }
 
 /* ═══════════════════════ 모바일 하단 탭바 ═══════════════════════ */
@@ -3795,32 +5114,71 @@ function syncMobileTabs() {
 
 async function openMoreSheet() {
   let handle = null;
+  const railExtra = [
+    { id: 'rail:charts', icon: '📈', label: '차트' },
+    { id: 'rail:library', icon: '📚', label: '보관함' },
+  ];
   const body = h('div', { style: { display: 'grid', gap: 'var(--sp-1)' } },
-    ...SIDE_TABS.filter((tab) => tab.id !== 'chat').map((tab) => h('button', {
-      class: 'dd__item', type: 'button',
+    ...railExtra.map((tab) => h('button', {
+      class: 'dd__item', type: 'button', tip: `${tab.label} 화면으로 가요`,
       onClick: () => handle?.close(tab.id),
-    }, h('span', null, tab.icon), h('span', null, tab.label))));
+    }, h('span', null, tab.icon), h('span', null, tab.label))),
+    ...SIDE_TABS.filter((tab) => tab.id !== 'chat').map((tab) => h('button', {
+      class: 'dd__item', type: 'button', tip: `${tab.label} 화면으로 가요`,
+      onClick: () => handle?.close(tab.id),
+    }, h('span', null, tab.icon), h('span', null, tab.label))),
+    h('button', {
+      class: 'dd__item', type: 'button', tip: '제안 게시판을 열어요',
+      onClick: () => handle?.close('modal:suggest'),
+    }, h('span', null, '💡'), h('span', null, '제안')),
+    h('button', {
+      class: 'dd__item', type: 'button', tip: '내 기록을 봐요',
+      onClick: () => handle?.close('modal:stats'),
+    }, h('span', null, '📊'), h('span', null, '내 기록')));
 
   handle = sheet({ title: '더 보기', body, dismissValue: null, actions: [] });
   const id = await handle.result;
-  if (id) { document.body.dataset.pane = 'side'; openSide(id); syncMobileTabs(); }
+  if (!id) return;
+  if (id === 'modal:suggest') { openSuggestModal(); return; }
+  if (id === 'modal:stats') { openStatsModal(null); return; }
+  if (id.startsWith('rail:')) {
+    document.body.dataset.pane = 'rail';
+    setRailTab(id.slice(5));
+    syncMobileTabs();
+    return;
+  }
+  document.body.dataset.pane = 'side';
+  openSide(id);
+  syncMobileTabs();
 }
 
 /* ═══════════════════════ 시트들 ═══════════════════════ */
 
 function openModeSheet() {
   const current = store.get().queueMode;
+  const points = votePoints();
+  // 배점이 설정으로 바뀌었으면 설명도 같이 바뀌어야 한다 (§10.1)
+  const formulaOf = (id) => (id === 'score'
+    ? `관리자 우선 → (대기×${points.wait} + 👍×${points.like} + ⭐×${points.superLike} + 👎×${points.dislike}) 높은 순 → 신청 순`
+    : MODES[id].formula);
+
   sheet({
-    title: '대기열 정렬 방식',
+    title: '왜 이 순서인가요',
     desc: '지금 이 서버는 아래 방식으로 순서를 정해요. 바꾸는 건 서버 관리자만 할 수 있어요.',
     wide: true,
-    body: h('div', { class: 'modecmp' }, ...Object.entries(MODES).map(([id, mode]) => h('div', {
-      class: 'modecmp__card', dataset: { active: id === current ? '1' : '0' },
-    },
-      h('h3', null, h('span', { 'aria-hidden': 'true' }, mode.icon), mode.label,
-        id === current ? h('span', { class: 'chip chip--accent' }, '지금 이 방식') : null),
-      h('p', null, mode.desc),
-      h('code', null, mode.formula)))),
+    body: h('div', null,
+      h('div', { class: 'modecmp' }, ...Object.entries(MODES).map(([id, mode]) => h('div', {
+        class: 'modecmp__card', dataset: { active: id === current ? '1' : '0' },
+      },
+        h('h3', null, h('span', { 'aria-hidden': 'true' }, mode.icon), mode.label,
+          id === current ? h('span', { class: 'chip chip--accent' }, '지금 이 방식') : null),
+        h('p', null, mode.desc),
+        h('code', null, formulaOf(id))))),
+      h('div', { class: 'modecmp__note' },
+        h('h3', null, '동점이면 어떻게 되나요'),
+        h('p', null, '관리자가 맨 앞으로 올린 곡이 언제나 먼저 나가요. 그다음은 점수가 높은 순, 점수까지 같으면 먼저 신청한 곡이 앞이에요.'),
+        h('h3', null, '순서가 저절로 움직여요'),
+        h('p', null, '서버가 5초마다 순서를 다시 정해요. 대기열이 500곡을 넘으면 15초마다로 늦춰져요. 대기열 헤더의 숫자가 다음 재정렬까지 남은 초예요.'))),
     actions: can('sortMode')
       ? [{ label: '닫기', kind: 'ghost', value: false },
         { label: '관리 콘솔에서 바꾸기', kind: 'primary', value: 'admin', autofocus: true }]
@@ -3959,10 +5317,18 @@ function renderProfile() {
       h('strong', null, state.user?.displayName || '나'),
       h('span', { class: `tier tier--${state.tier}` }, `${tier.icon} ${tier.label}`)));
 
-  setLock(el.consoleBtn, !can('console'), '서버 관리자만 열 수 있어요.');
+  setLock(el.consoleBtn, !can('console'), lockReason('console'));
   el.opsLink.hidden = !can('ops');
-  el.notifyBtn.hidden = notify.granted() || !notify.supported();
+  renderNotifyBox();
   syncLayoutOptions();
+
+  // 마참 점수는 프로필에서도 조용히 보여준다 (§22.4). 등수는 매기지 않는다.
+  if (Number.isFinite(myScore)) {
+    el.meHead.appendChild(h('span', {
+      class: 'chip chip--accent machamscore',
+      tip: '받은 좋아요·슈퍼 좋아요와 재생 기록이 쌓인 점수예요. 대기열 순서에는 영향이 없어요',
+    }, `마참 점수 ${myScore}`));
+  }
 }
 
 function renderGuild(state) {
@@ -4021,6 +5387,766 @@ function renderPresenceSummary(state) {
     : '지금 누가 듣고 있는지 보기');
 }
 
+/* ═══════════════════════ 우클릭 메뉴 (§24.1) ═══════════════════════
+ * 대상마다 따로 구현하면 동작이 미묘하게 달라지고 툴팁·키보드 처리가 빠진다.
+ * 그래서 **컴포넌트 하나**로 만들고 대상마다 항목 배열만 넘긴다.
+ *
+ * 규칙
+ *  - Ctrl / Alt / Shift + 우클릭이면 브라우저 기본 메뉴를 그대로 띄운다(preventDefault 안 한다).
+ *  - 모바일은 롱프레스 500ms.
+ *  - 항목은 6개 이하. 넘으면 하위 메뉴(▸)로 접는다.
+ *  - 권한 없는 항목은 숨기지 않고 비활성 + 이유. 뭐가 있는지는 알아야 한다.
+ */
+
+const MENU_MAX = 6;
+let openMenu = null;
+
+function closeContextMenu() {
+  if (!openMenu) return;
+  openMenu.node.remove();
+  document.removeEventListener('pointerdown', openMenu.onOutside, true);
+  document.removeEventListener('keydown', openMenu.onKey, true);
+  window.removeEventListener('scroll', closeContextMenu, true);
+  openMenu.restore?.();
+  openMenu = null;
+}
+
+/**
+ * items: [{ icon, label, hint, danger, disabled, reason, onPick, children }]
+ * where: { x, y } 또는 { anchor }
+ */
+function openContextMenu(items, where) {
+  closeContextMenu();
+  if (!items || !items.length) return;
+
+  const rows = items.length > MENU_MAX
+    ? items.slice(0, MENU_MAX - 1).concat([{ icon: '⋯', label: '더 보기', children: items.slice(MENU_MAX - 1) }])
+    : items;
+
+  const node = h('div', { class: 'pop pop--menu ctxmenu', role: 'menu' });
+  for (const item of rows) node.appendChild(menuRow(item, node));
+  document.body.appendChild(node);
+  placePopover(node, where);
+
+  const previous = document.activeElement;
+  const onOutside = (event) => { if (!node.contains(event.target)) closeContextMenu(); };
+  const onKey = (event) => {
+    if (event.key === 'Escape') { event.stopPropagation(); closeContextMenu(); return; }
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    const buttons = [...node.querySelectorAll('button:not([aria-disabled="true"])')];
+    if (!buttons.length) return;
+    const index = buttons.indexOf(document.activeElement);
+    const next = event.key === 'ArrowDown' ? index + 1 : index - 1;
+    buttons[(next + buttons.length) % buttons.length].focus();
+  };
+
+  openMenu = {
+    node, onOutside, onKey,
+    restore: () => { if (previous && previous.isConnected) previous.focus?.(); },
+  };
+  setTimeout(() => {
+    document.addEventListener('pointerdown', onOutside, true);
+    document.addEventListener('keydown', onKey, true);
+    window.addEventListener('scroll', closeContextMenu, true);
+  }, 0);
+  node.querySelector('button:not([aria-disabled="true"])')?.focus();
+}
+
+function menuRow(item, menu) {
+  if (item.children) {
+    const sub = h('div', { class: 'ctxmenu__sub', hidden: true },
+      ...item.children.map((child) => menuRow(child, menu)));
+    const button = h('button', {
+      class: 'dd__item', type: 'button', role: 'menuitem', 'aria-expanded': 'false',
+      tip: '하위 메뉴를 펼쳐요',
+      onClick: () => {
+        sub.hidden = !sub.hidden;
+        button.setAttribute('aria-expanded', String(!sub.hidden));
+      },
+    }, h('span', null, item.icon || '▸'), h('span', { class: 'dd__grow' }, item.label), h('span', null, '▸'));
+    return h('div', null, button, sub);
+  }
+
+  const button = h('button', {
+    class: ['dd__item', item.danger && 'dd__item--danger'],
+    type: 'button', role: 'menuitem',
+    tip: item.tip || (item.disabled ? item.reason : ''),
+    onClick: () => {
+      if (button.getAttribute('aria-disabled') === 'true') {
+        toast(item.reason || '지금은 할 수 없어요.', 'warn');
+        return;
+      }
+      closeContextMenu();
+      item.onPick?.();
+    },
+  },
+    h('span', null, item.icon || '·'),
+    h('span', { class: 'dd__grow' }, item.label),
+    item.hint ? h('span', { class: 'dd__hint' }, item.hint) : null);
+  if (item.disabled) setLock(button, true, item.reason || '지금은 할 수 없어요');
+  return button;
+}
+
+function placePopover(node, where) {
+  const box = node.getBoundingClientRect();
+  let left;
+  let top;
+  if (where && where.anchor) {
+    const rect = where.anchor.getBoundingClientRect();
+    left = rect.left;
+    top = rect.bottom + 4;
+  } else {
+    left = (where && where.x) || 0;
+    top = (where && where.y) || 0;
+  }
+  node.style.left = `${Math.max(8, Math.min(left, window.innerWidth - box.width - 8))}px`;
+  node.style.top = `${Math.max(8, Math.min(top, window.innerHeight - box.height - 8))}px`;
+}
+
+/** 우클릭 · 롱프레스 · Shift+F10 을 한 번에 붙인다. */
+function bindContextTarget(node, build) {
+  node.addEventListener('contextmenu', (event) => {
+    // 브라우저 기본 메뉴(링크 복사·이미지 저장)를 뺏으면 안 된다
+    if (event.ctrlKey || event.altKey || event.shiftKey || event.metaKey) return;
+    const items = build(event);
+    if (!items || !items.length) return;
+    event.preventDefault();
+    openContextMenu(items, { x: event.clientX, y: event.clientY });
+  });
+
+  let timer = 0;
+  let startX = 0;
+  let startY = 0;
+  node.addEventListener('pointerdown', (event) => {
+    if (event.pointerType !== 'touch') return;
+    startX = event.clientX;
+    startY = event.clientY;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const items = build(event);
+      if (items && items.length) openContextMenu(items, { x: startX, y: startY });
+    }, 500);
+  }, { passive: true });
+  const cancel = (event) => {
+    if (event && event.clientX !== undefined
+      && Math.abs(event.clientX - startX) + Math.abs(event.clientY - startY) < 8
+      && event.type === 'pointermove') return;
+    clearTimeout(timer);
+  };
+  node.addEventListener('pointerup', cancel, { passive: true });
+  node.addEventListener('pointermove', cancel, { passive: true });
+  node.addEventListener('pointercancel', cancel, { passive: true });
+
+  node.addEventListener('keydown', (event) => {
+    if (event.key !== 'ContextMenu' && !(event.key === 'F10' && event.shiftKey)) return;
+    const items = build(event);
+    if (!items || !items.length) return;
+    event.preventDefault();
+    openContextMenu(items, { anchor: event.currentTarget });
+  });
+}
+
+/* ── 대상별 메뉴 ── */
+
+function trackMenu(track, opts = {}) {
+  if (!track) return null;
+  const state = store.get();
+  const itemId = opts.itemId;
+  const item = opts.item;
+  const mine = !!item?.isMine;
+  const voteReason = mine ? '내가 신청한 곡에는 투표할 수 없어요' : lockReason('vote');
+  const url = trackUrl(track);
+
+  const items = [
+    { icon: '＋', label: '대기열에 담기', disabled: !can('search'), reason: lockReason('search'), onPick: () => enqueue(track) },
+    { icon: '🔖', label: '보관함에 담기', disabled: !can('library'), reason: lockReason('library'), onPick: () => toggleSaved(track, true) },
+    { icon: '📃', label: '재생목록에 추가', onPick: () => openPlaylistPicker(track, null) },
+    {
+      icon: '👍',
+      label: '투표',
+      children: [
+        { icon: '👍', label: '좋아요', disabled: !itemId || !can('vote') || mine, reason: voteReason, onPick: () => vote(itemId, 'like') },
+        { icon: '⭐', label: '슈퍼 좋아요', disabled: !itemId || !can('vote') || mine, reason: voteReason, onPick: () => vote(itemId, 'superLike') },
+        { icon: '👎', label: '싫어요', disabled: !itemId || !can('vote') || mine, reason: voteReason, onPick: () => vote(itemId, 'dislike') },
+      ],
+    },
+  ];
+
+  if (opts.source === 'now') {
+    items.push({ icon: '⏭', label: '스킵', disabled: !can('skip') && !can('playback'), reason: lockReason('skip'), onPick: doSkip });
+    items.push({ icon: '🎤', label: '가사 보기', onPick: () => { if (!lyricsOpen) toggleLyrics(); } });
+  } else if (itemId) {
+    items.push({
+      icon: '📌', label: '맨 앞으로 올리기',
+      disabled: !can('queueEdit') || tierOf() === 'member', reason: lockReason('queueEdit'),
+      onPick: () => call(() => api('/queue/action', { body: { action: 'togglePin', itemId } })),
+    });
+    items.push({
+      icon: '✕', label: '대기열에서 빼기', danger: true,
+      disabled: !(mine ? can('queueEdit') || can('search') : can('queueEdit')), reason: lockReason('queueEdit'),
+      onPick: () => call(() => api('/queue/action', { body: { action: 'remove', itemId } }), '대기열에서 뺐어요.'),
+    });
+  }
+
+  items.push({
+    icon: '📻', label: '자동 재생 기준으로 삼기',
+    disabled: !seedState || !canAutoplay(), reason: lockReason('autoplay'),
+    onPick: () => addSeed(track),
+  });
+  items.push({
+    icon: '🚫', label: '차단 목록에 넣기',
+    disabled: tierOf() === 'member' || tierOf() === 'viewer', reason: '서버 관리자만 차단할 수 있어요',
+    onPick: () => openBlacklistSheet(track),
+  });
+  if (url) {
+    items.push({ icon: '🔗', label: '링크 복사', onPick: () => copyText(url, '링크를 복사했어요.') });
+    items.push({ icon: '↗', label: '원본에서 열기', onPick: () => window.open(url, '_blank', 'noreferrer') });
+  }
+  if (state.tier === 'viewer') return items;
+  return items;
+}
+
+function trackUrl(track) {
+  if (!track) return '';
+  if (track.url) return track.url;
+  const provider = String(track.provider || '');
+  if (provider.startsWith('YouTube') && track.contentId) return `https://www.youtube.com/watch?v=${encodeURIComponent(track.contentId)}`;
+  return '';
+}
+
+async function copyText(text, okMessage) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(okMessage || '복사했어요.', 'ok');
+  } catch {
+    toast('클립보드에 못 넣었어요. 주소를 직접 복사해 주세요.', 'warn');
+  }
+}
+
+function personMenu(userId, displayName) {
+  const me = String(store.get().user?.id || '');
+  const id = String(userId || '');
+  return [
+    { icon: '📊', label: '기록 보기', onPick: () => openStatsModal(id) },
+    {
+      icon: '@', label: '멘션하기',
+      disabled: !can('chat'), reason: lockReason('chat'),
+      onPick: () => {
+        openSide('chat');
+        el.chatInput.value = `${el.chatInput.value}@${displayName} `.trimStart();
+        el.chatInput.focus();
+        autoGrow(el.chatInput);
+      },
+    },
+    {
+      icon: '🔍', label: '이 사람이 담은 곡만 보기',
+      onPick: () => { setRailTab('queue'); highlightRequester(id, displayName); },
+    },
+    {
+      icon: '⛔', label: '정지', danger: true,
+      disabled: !can('suspend') || id === me,
+      reason: id === me ? '자기를 정지할 수는 없어요' : lockReason('suspend'),
+      onPick: () => openSuspendSheet({ userId: id, displayName }),
+    },
+  ];
+}
+
+/** 대기열에서 그 사람 곡만 잠깐 강조한다. 새 화면을 만들 만큼 무거운 기능이 아니다. */
+function highlightRequester(userId, displayName) {
+  const nodes = [...el.queueList.querySelectorAll('.qitem')]
+    .filter((node) => String(node.__item?.requestedByUserId) === String(userId));
+  if (!nodes.length) { toast(`${displayName}님이 담은 곡이 지금 대기열에 없어요.`, 'info'); return; }
+  for (const node of nodes) { node.classList.remove('flash'); void node.offsetWidth; node.classList.add('flash'); }
+  nodes[0].scrollIntoView({ block: 'center', behavior: prefersReduced() ? 'auto' : 'smooth' });
+  setTimeout(() => { for (const node of nodes) node.classList.remove('flash'); }, 1600);
+  toast(`${displayName}님이 담은 곡 ${nodes.length}개를 표시했어요.`, 'ok');
+}
+
+function messageMenu(message) {
+  const mine = String(message.userId) === String(store.get().user?.id);
+  return [
+    { icon: '↩', label: '답장', disabled: !can('chat'), reason: lockReason('chat'), onPick: () => setReply(message) },
+    { icon: '🙂', label: '반응 남기기', disabled: !can('chat'), reason: lockReason('chat'), onPick: () => openEmojiPicker(message.id, el.chatLog.querySelector(`[data-id="${CSS.escape(String(message.id))}"]`) || el.chatLog) },
+    { icon: '📋', label: '내용 복사', onPick: () => copyText(message.content || '', '메시지를 복사했어요.') },
+    {
+      icon: '🗑', label: '삭제', danger: true,
+      disabled: !(mine || can('chatDelete')), reason: '내 메시지이거나 관리 권한이 있어야 지울 수 있어요',
+      onPick: async () => {
+        if (await confirmSheet({ title: '메시지를 지울까요', desc: message.content?.slice(0, 80), danger: true, confirmText: '삭제' })) {
+          call(() => api('/chat/delete', { body: { messageId: message.id } }));
+        }
+      },
+    },
+    {
+      icon: '🚩', label: '신고',
+      disabled: mine, reason: '내 메시지는 신고할 수 없어요',
+      onPick: () => call(() => api('/chat/report', { body: { messageId: message.id } }), '신고했어요. 관리자가 확인할 거예요.'),
+    },
+  ];
+}
+
+function queueHeadMenu() {
+  const manager = tierOf() !== 'member' && tierOf() !== 'viewer';
+  return [
+    { icon: '🔀', label: '정렬 방식 보기', onPick: openModeSheet },
+    { icon: '🧹', label: '대기열 비우기', danger: true, disabled: !manager || !can('queueEdit'), reason: lockReason('queueEdit'), onPick: clearQueue },
+    { icon: '↻', label: '새로고침', onPick: () => { loadHot().catch(() => {}); toast('대기열을 다시 받아 왔어요.', 'ok'); } },
+  ];
+}
+
+function backgroundMenu() {
+  return [
+    { icon: '🎨', label: '테마', children: Object.entries(THEMES).map(([id, meta]) => ({
+      icon: '·', label: meta.label, onPick: () => commitTheme(id),
+    })) },
+    { icon: '▦', label: '화면 배치', children: Object.entries(LAYOUTS).map(([id, def]) => ({
+      icon: '·', label: def.label, onPick: () => setLayout(id),
+    })) },
+    { icon: '📊', label: '내 기록', onPick: () => openStatsModal(null) },
+  ];
+}
+
+/** 관리자가 곡을 보고 있을 때가 실제로 차단하고 싶어지는 순간이다 (§19.3). */
+async function openBlacklistSheet(track) {
+  let kind = 'title';
+  const pattern = h('input', { class: 'field', value: trackTitle(track), maxlength: '200' });
+  const row = h('div', { class: 'lib__seg', style: { padding: '0' } },
+    ...[['title', '제목 그대로'], ['channel', '채널·아티스트 단위'], ['link', '링크']].map(([id, label]) =>
+      h('button', {
+        class: 'seg', type: 'button', 'aria-pressed': String(id === kind), dataset: { seg: id },
+        onClick: () => {
+          kind = id;
+          for (const node of row.children) node.setAttribute('aria-pressed', String(node.dataset.seg === id));
+          pattern.value = id === 'channel' ? (track.artist || '') : id === 'link' ? trackUrl(track) : trackTitle(track);
+        },
+      }, label)));
+
+  const ok = await sheet({
+    title: '차단 목록에 넣을까요',
+    desc: '여기 걸리는 곡은 이 서버에서 담을 수 없게 돼요.',
+    body: h('div', { style: { display: 'grid', gap: 'var(--sp-3)' } }, row, pattern),
+    danger: true, dismissValue: false,
+    actions: [{ label: '취소', kind: 'ghost', value: false }, { label: '차단하기', kind: 'danger', value: true }],
+  }).result;
+  if (!ok || !pattern.value.trim()) return;
+  await call(() => api('/admin/blacklist', { body: { kind, pattern: pattern.value.trim(), note: null } }),
+    '차단 목록에 넣었어요.');
+}
+
+/* ═══════════════════════ 사람 카드 (§24.2) ═══════════════════════
+ * 닉네임·아바타를 **좌클릭**하면 어디서든 열린다.
+ * 데이터는 §22의 stats API 하나로 끝난다 — 새 API를 늘리지 않는다.
+ */
+
+function personButton(userId, displayName) {
+  const name = displayName || '알 수 없음';
+  if (!userId) return h('b', null, name);
+  const button = h('button', {
+    class: 'person', type: 'button', tip: `${name}님이 어떤 사람인지 봐요`,
+    onClick: (event) => { event.stopPropagation(); openPersonCard(userId, name); },
+  }, name);
+  bindContextTarget(button, () => personMenu(userId, name));
+  return button;
+}
+
+function personAvatar(userId, displayName, url, size) {
+  const node = avatar(url, displayName, size);
+  node.classList.add('ava--click');
+  node.setAttribute('data-tip', `${displayName || '알 수 없음'}님이 어떤 사람인지 봐요`);
+  node.addEventListener('click', (event) => { event.stopPropagation(); openPersonCard(userId, displayName); });
+  bindContextTarget(node, () => personMenu(userId, displayName));
+  return node;
+}
+
+async function openPersonCard(userId, displayName) {
+  const me = String(store.get().user?.id || '');
+  const isMe = String(userId) === me;
+  const body = h('div', { class: 'pcard' }, skeletonRows(3));      // 빈 카드가 떴다 채워지면 깜빡여 보인다
+
+  const handle = sheet({
+    title: displayName || '알 수 없음',
+    body,
+    dismissValue: false,
+    actions: [
+      { label: '닫기', kind: 'ghost', value: false },
+      { label: isMe ? '⚙ 내 설정' : '📊 전체 기록', kind: 'primary', value: 'stats' },
+    ],
+  });
+  handle.result.then((value) => {
+    if (value === 'stats' && !isMe) openStatsModal(String(userId));
+    else if (value === 'stats') toggleMenu(el.meMenu, el.meBtn);
+  });
+
+  let stats = null;
+  try {
+    stats = await api(`/stats/user/${encodeURIComponent(userId)}`);
+  } catch (error) {
+    clear(body).appendChild(emptyState('📊', '기록을 못 불러왔어요',
+      error && error.status === 404 ? '이 서버는 아직 기록을 모으지 않아요.' : error.message));
+    return;
+  }
+  if (!body.isConnected) return;
+  clear(body);
+  renderPersonCard(body, userId, displayName, stats, isMe);
+}
+
+function renderPersonCard(host, userId, displayName, stats, isMe) {
+  const presence = store.get().presence || {};
+  const listening = (presence.listening || []).map(String).includes(String(userId));
+  const member = store.get().members.find((row) => String(row.userId ?? row.id) === String(userId));
+  const tier = TIERS[member?.tier] || null;
+
+  put(host,
+    h('div', { class: 'pcard__head' },
+      avatar(avatarOf(userId), displayName, 'lg'),
+      h('div', null,
+        h('strong', null, displayName || '알 수 없음'),
+        h('div', { class: 'pcard__tags' },
+          tier ? h('span', { class: `tier tier--${member.tier}`, tip: tier.desc }, `${tier.icon} ${tier.label}`) : null,
+          listening ? h('span', { class: 'chip chip--ok', tip: '봇과 같은 음성 채널에 있어요' }, '🎧 듣는 중') : null),
+        Number.isFinite(stats.machamScore)
+          ? h('div', { class: 'pcard__score', tip: '받은 좋아요·슈퍼 좋아요와 재생 기록이 쌓인 점수예요. 순서에는 영향이 없어요' },
+            `마참 점수 ${stats.machamScore}`)
+          : null)),
+    h('div', { class: 'pcard__nums' },
+      statTile('담은 곡', stats.queued ?? 0, '이 사람이 담은 곡 수예요'),
+      statTile('재생', stats.played ?? 0, '끝까지 재생된 곡 수예요'),
+      statTile('받은 👍', stats.likesRecv ?? 0, '이 사람 곡이 받은 좋아요예요')),
+    ratioBar(stats),
+    recentList('최근 담은 곡', (stats.recent || []).slice(0, 5), (row) => fmtAgo(row.playedUtc || row.addedUtc)),
+    recentList('자주 담는 곡', (stats.topRequested || []).slice(0, 3), (row) => `${row.count || 0}회`));
+
+  if (isMe) return;
+  host.appendChild(h('div', { class: 'pcard__acts' },
+    setLock(bindAct(h('button', { class: 'btn btn--sm', type: 'button', tip: '채팅에 이 사람을 불러요' }, '@ 멘션'),
+      () => {
+        openSide('chat');
+        el.chatInput.value = `${el.chatInput.value}@${displayName} `.trimStart();
+        el.chatInput.focus();
+      }), !can('chat'), lockReason('chat')),
+    setLock(bindAct(h('button', { class: 'btn btn--sm btn--danger', type: 'button', tip: '이 사람의 조작을 잠시 막아요' }, '⛔ 정지'),
+      () => openSuspendSheet({ userId, displayName })), !can('suspend'), lockReason('suspend'))));
+}
+
+function statTile(label, value, tip) {
+  return h('div', { class: 'stile', tip }, h('b', null, String(value)), h('span', null, label));
+}
+
+/** 끝까지 / 스킵 / 붐따 비율을 막대 하나로. */
+function ratioBar(stats) {
+  const played = Number(stats.played) || 0;
+  const skipped = Number(stats.skipped) || 0;
+  const boomtta = Number(stats.boomtta) || 0;
+  const total = played + skipped + boomtta;
+  if (!total) return null;
+  const pct = (value) => Math.round((value / total) * 100);
+  return h('div', { class: 'ratio', tip: `끝까지 ${pct(played)}% · 스킵 ${pct(skipped)}% · 붐따 ${pct(boomtta)}%` },
+    h('div', { class: 'ratio__bar' },
+      played ? h('span', { class: 'ratio__seg ratio__seg--ok', style: { flex: String(played) } }) : null,
+      skipped ? h('span', { class: 'ratio__seg ratio__seg--warn', style: { flex: String(skipped) } }) : null,
+      boomtta ? h('span', { class: 'ratio__seg ratio__seg--down', style: { flex: String(boomtta) } }) : null),
+    h('div', { class: 'hint' }, `끝까지 ${pct(played)}% · 스킵 ${pct(skipped)}%${boomtta ? ` · 붐따 ${pct(boomtta)}%` : ''}`));
+}
+
+function recentList(title, rows, sub) {
+  if (!rows.length) return null;
+  return h('div', { class: 'pcard__list' },
+    h('h3', null, title),
+    ...rows.map((row) => {
+      const track = row.track || row;
+      const node = h('div', { class: 'row row--tight', dataset: { mqRow: '1' } },
+        h('img', { class: 'row__art', src: artUrl(track) || '', alt: '', loading: 'lazy' }),
+        h('div', { class: 'row__main' }, mqText(trackTitle(track), 'row__title')),
+        h('span', { class: 'row__sub' }, sub(row)));
+      bindContextTarget(node, () => trackMenu(track, { source: 'person' }));
+      return node;
+    }));
+}
+
+/* ═══════════════════════ 내 기록 모달 (§22.5) ═══════════════════════ */
+
+async function openStatsModal(userId) {
+  const body = h('div', { class: 'stats' }, skeletonRows(4));
+  const mine = !userId;
+  sheet({
+    title: mine ? '📊 내 기록' : '📊 기록',
+    desc: mine ? '담은 곡·재생·받은 반응이 여기 쌓여요.' : '받은 것만 보여드려요.',
+    wide: true, body, dismissValue: false,
+    actions: [{ label: '닫기', kind: 'primary', value: false }],
+  });
+
+  let stats = null;
+  try {
+    stats = await api(mine ? '/stats/me' : `/stats/user/${encodeURIComponent(userId)}`);
+  } catch (error) {
+    clear(body).appendChild(emptyState('📊', '기록을 못 불러왔어요',
+      error && error.status === 404 ? '이 서버는 아직 기록을 모으지 않아요.' : error.message));
+    return;
+  }
+  if (!body.isConnected) return;
+  if (mine && Number.isFinite(stats.machamScore)) myScore = stats.machamScore;
+  clear(body);
+  renderStats(body, stats, mine);
+}
+
+function renderStats(host, stats, mine) {
+  const received = stats.received || stats;
+  put(host,
+    h('div', { class: 'stats__tiles' },
+      statTile('담은 곡', stats.queued ?? 0, '한 곡씩 담은 것과 한 번에 담은 것을 모두 세요'),
+      statTile('재생된 곡', stats.played ?? 0, '내 곡이 끝까지 재생된 수예요'),
+      statTile('받은 좋아요', received.likesRecv ?? 0, '내 곡이 받은 좋아요예요'),
+      statTile('마참 점수', stats.machamScore ?? 0, '받은 반응이 쌓인 점수예요. 대기열 순서에는 영향이 없어요')),
+    ratioBar(stats),
+    mine && Number.isFinite(stats.queuedSingle) ? h('p', { class: 'hint' },
+      `한 곡씩 ${stats.queuedSingle}곡 · 한 번에 ${stats.queuedBulk ?? 0}곡 (${stats.bulkTimes ?? 0}번)`) : null,
+    h('p', { class: 'hint' },
+      `받은 반응: 👍${received.likesRecv ?? 0} ⭐${received.supersRecv ?? 0} 👎${received.dislikesRecv ?? 0}`),
+    recentList('가장 많이 신청한 곡', (stats.topRequested || []).slice(0, 5), (row) => `${row.count || 0}회`),
+    mine ? recentList('내가 가장 많이 좋아요한 곡', (stats.topLiked || []).slice(0, 5), (row) => `${row.count || 0}회`) : null,
+    recentList('가장 많이 사랑받은 내 곡', (stats.topLoved || []).slice(0, 5), (row) => `👍${row.likes || 0}`),
+    dailyChart(stats.daily || []));
+}
+
+/** 30일 꺾은선. 라이브러리 없이 SVG 하나로 그린다 — 서버도 브라우저도 가볍게. */
+function dailyChart(daily) {
+  if (daily.length < 3) {
+    return h('p', { class: 'hint' }, '기록이 쌓이면 여기에 그래프가 나와요.');
+  }
+  const width = 520;
+  const height = 120;
+  const max = Math.max(1, ...daily.map((row) => Math.max(row.queued || 0, row.played || 0)));
+  const path = (key) => daily.map((row, index) => {
+    const x = (index / Math.max(1, daily.length - 1)) * width;
+    const y = height - ((row[key] || 0) / max) * (height - 8) - 4;
+    return `${index === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`;
+  }).join(' ');
+
+  const svg = h('svg', {
+    class: 'sparkline', viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: 'none',
+    role: 'img', 'aria-label': `최근 ${daily.length}일 동안 담은 곡과 재생된 곡`,
+  },
+    h('path', { d: path('queued'), fill: 'none', stroke: 'var(--accent)', 'stroke-width': '2' }),
+    h('path', { d: path('played'), fill: 'none', stroke: 'var(--ok)', 'stroke-width': '2' }));
+
+  return h('div', { class: 'stats__chart' },
+    h('h3', null, `최근 ${daily.length}일`),
+    svg,
+    h('div', { class: 'hint' }, '보라 = 담은 곡 · 초록 = 재생된 곡'));
+}
+
+/* ═══════════════════════ 차트 (§15) ═══════════════════════
+ * "너무 다다다닥"을 피하는 게 이 화면의 요구사항이다. 그래서 2단계로 들어간다.
+ * 1단계 분류 카드 6장 → 2단계 그 분류의 차트 목록 → 곡 목록.
+ * 뒤로 가기는 ← 버튼과 브라우저 뒤로가기 둘 다 먹는다.
+ */
+
+let chartView = { level: 'categories', category: null, chart: null, period: 'month' };
+
+function buildChartsPane() {
+  el.chartBack = h('button', {
+    class: 'iconbtn', type: 'button', hidden: true, tip: '한 단계 뒤로', 'aria-label': '뒤로',
+    onClick: () => chartBack(),
+  }, '←');
+  el.chartTitle = h('h2', null, '차트');
+  el.chartRefresh = bindAct(h('button', {
+    class: 'iconbtn', type: 'button', hidden: true,
+    tip: '캐시를 무시하고 지금 다시 가져와요', 'aria-label': '차트 새로고침',
+  }, '↻'), () => refreshChart());
+  el.chartBulk = bindAct(h('button', {
+    class: 'btn btn--sm', type: 'button', hidden: true, tip: '이 차트를 통째로 대기열에 담아요',
+  }, '전부 담기'), () => enqueueChart());
+  el.chartPeriod = h('div', { class: 'lib__seg', hidden: true },
+    ...CHART_PERIODS.map(([id, label]) => h('button', {
+      class: 'seg', type: 'button', 'aria-pressed': String(id === chartView.period), dataset: { seg: id },
+      tip: `${label} 기준으로 순위를 매겨요`,
+      onClick: () => {
+        chartView.period = id;
+        for (const node of el.chartPeriod.children) node.setAttribute('aria-pressed', String(node.dataset.seg === id));
+        if (chartView.level === 'tracks') openChart(chartView.chart, true);
+      },
+    }, label)));
+
+  el.chartBody = h('div', { class: 'scroll charts__body' });
+  el.chartsPane = h('div', { class: 'tabpane charts', role: 'tabpanel', 'aria-labelledby': 'railtab-charts' },
+    h('div', { class: 'charts__head' }, el.chartBack, el.chartTitle, h('span', { class: 'queue__spacer' }), el.chartBulk, el.chartRefresh),
+    el.chartPeriod,
+    el.chartBody);
+  return el.chartsPane;
+}
+
+async function loadCharts() {
+  if (chartState) { renderCharts(); return; }
+  clear(el.chartBody).appendChild(skeletonRows(4));
+  try {
+    const data = await api('/charts');
+    chartState = { categories: data?.categories || [] };
+  } catch (error) {
+    // 서버가 아직 차트를 모르면 탭을 통째로 숨긴다. 빈 탭이 남아 있는 게 제일 나쁘다.
+    if (error && (error.status === 404 || error.status === 501)) {
+      chartState = null;
+      hideChartsTab();
+      return;
+    }
+    clear(el.chartBody).appendChild(emptyState('📈', '차트를 못 불러왔어요', error.message));
+    return;
+  }
+  renderCharts();
+}
+
+function hideChartsTab() {
+  const tab = (el.railTabs || []).find((node) => node.dataset.rail === 'charts');
+  if (tab) tab.hidden = true;
+  if (el.railPanes?.charts) el.railPanes.charts.hidden = true;
+  if (activeRailTab === 'charts') setRailTab('search');
+}
+
+function chartBack() {
+  if (chartView.level === 'tracks') chartView = { ...chartView, level: 'charts', chart: null };
+  else chartView = { ...chartView, level: 'categories', category: null };
+  renderCharts();
+}
+
+function renderCharts() {
+  if (!chartState) return;
+  clear(el.chartBody);
+  const inCategories = chartView.level === 'categories';
+  el.chartBack.hidden = inCategories;
+  el.chartRefresh.hidden = chartView.level !== 'tracks' || tierOf() === 'member' || tierOf() === 'viewer';
+  el.chartBulk.hidden = chartView.level !== 'tracks';
+  el.chartPeriod.hidden = !(chartView.level === 'tracks' && chartView.category === 'ours');
+
+  if (inCategories) {
+    el.chartTitle.textContent = '차트';
+    const cards = chartState.categories.map((category) => {
+      const meta = CHART_CATEGORIES[category.key] || { icon: category.icon || '📈', label: category.label, desc: '' };
+      return h('button', {
+        class: 'chartcat', type: 'button', tip: `${meta.label} 차트를 열어요`,
+        onClick: () => { chartView = { ...chartView, level: 'charts', category: category.key }; renderCharts(); },
+      },
+        h('span', { class: 'chartcat__icon', 'aria-hidden': 'true' }, meta.icon),
+        h('strong', null, meta.label),
+        h('small', null, meta.desc || `${(category.charts || []).length}개 차트`));
+    });
+    el.chartBody.appendChild(cards.length
+      ? h('div', { class: 'chartcats' }, ...cards)
+      : emptyState('📈', '쓸 수 있는 차트가 없어요', '서버 관리자가 관리 콘솔에서 차트를 켤 수 있어요.'));
+    return;
+  }
+
+  if (chartView.level === 'charts') {
+    const category = chartState.categories.find((row) => row.key === chartView.category);
+    const meta = CHART_CATEGORIES[chartView.category] || { label: category?.label || '차트' };
+    el.chartTitle.textContent = meta.label;
+    // 작동하지 않는 차트는 유저 화면에서 뺀다. 눌렀는데 아무 일도 안 일어나는 게 제일 나쁘다 (§15.2)
+    const charts = (category?.charts || []).filter((chart) => chart.ok !== false);
+    if (!charts.length) {
+      el.chartBody.appendChild(emptyState('📈', '이 분류에 쓸 수 있는 차트가 없어요', null));
+      return;
+    }
+    for (const chart of charts) {
+      el.chartBody.appendChild(h('button', {
+        class: 'row row--btn', type: 'button', tip: `${chart.name} 곡 목록을 열어요`,
+        onClick: () => openChart(chart),
+      },
+        h('span', { class: 'chartcat__icon', 'aria-hidden': 'true' }, meta.icon || '📈'),
+        h('div', { class: 'row__main' },
+          h('div', { class: 'row__title' }, chart.name),
+          h('div', { class: 'row__sub' }, [chart.provider, chart.lastFetchedUtc ? `${fmtAgo(chart.lastFetchedUtc)} 갱신` : null]
+            .filter(Boolean).join(' · ')))));
+    }
+    return;
+  }
+
+  renderChartTracks();
+}
+
+async function openChart(chart, keepLevel) {
+  chartView = { ...chartView, level: 'tracks', chart };
+  if (!keepLevel) pushChartHistory();
+  renderCharts();
+  clear(el.chartBody).appendChild(skeletonRows(6));      // yt-dlp가 도는 몇 초 동안 빈 화면이면 고장으로 보인다
+  try {
+    const query = chartView.category === 'ours' ? `?period=${encodeURIComponent(chartView.period)}` : '';
+    const data = await api(`/charts/${encodeURIComponent(chart.id)}${query}`);
+    chartView.tracks = data?.tracks || [];
+    chartView.fetchedUtc = data?.fetchedUtc || null;
+  } catch (error) {
+    clear(el.chartBody).appendChild(emptyState('📈', '이 차트를 못 가져왔어요', error.message));
+    return;
+  }
+  renderChartTracks();
+}
+
+function pushChartHistory() {
+  try {
+    history.pushState({ chart: chartView.chart?.id, category: chartView.category }, '', location.href);
+  } catch { /* 히스토리를 못 쓰면 ← 버튼만 쓴다 */ }
+}
+
+window.addEventListener('popstate', () => {
+  if (chartView.level !== 'categories') chartBack();
+});
+
+function renderChartTracks() {
+  const chart = chartView.chart;
+  el.chartTitle.textContent = chart?.name || '차트';
+  clear(el.chartBody);
+  const tracks = chartView.tracks || [];
+  if (!tracks.length) {
+    el.chartBody.appendChild(emptyState('📈', '이 차트에 곡이 없어요', '잠시 뒤에 다시 열어 보세요.'));
+    return;
+  }
+
+  el.chartBody.appendChild(h('div', { class: 'charts__meta' },
+    chartView.fetchedUtc ? h('span', null, `마지막 갱신 ${fmtAgo(chartView.fetchedUtc)}`) : null,
+    h('span', { class: 'queue__spacer' }),
+    h('span', null, `${tracks.length}곡`)));
+
+  el.chartBulk.textContent = `전부 담기 (${tracks.length}곡)`;
+  setLock(el.chartBulk, !canBulk(), lockReason('bulkEnqueue'));
+
+  tracks.forEach((row, index) => {
+    const track = row.track || row;
+    const extra = [];
+    if (Number.isFinite(row.plays)) extra.push(`${row.plays}회 재생`);
+    if (Number.isFinite(row.requesters)) extra.push(`${row.requesters}명이 신청`);
+    if (Number.isFinite(row.loveScore)) {
+      extra.push(`👍${row.likes || 0} + ⭐${row.supers || 0}×${row.superWeight ?? 2} = ${row.loveScore}`);
+    }
+    const node = trackRow(track, 'chart', extra.length ? extra.join(' · ') : trackSub(track), { rank: index + 1 });
+    if (Number.isFinite(row.playsAutoplay) && row.playsAutoplay > 0) {
+      node.setAttribute('data-tip', `자동재생으로 ${row.playsAutoplay}회 더 나갔어요 (순위에는 안 세요)`);
+    }
+    el.chartBody.appendChild(node);
+  });
+  marquee.scan(el.chartBody);
+}
+
+async function enqueueChart() {
+  const chart = chartView.chart;
+  if (!chart) return;
+  const count = (chartView.tracks || []).length;
+  const ok = await confirmSheet({
+    title: `${count}곡을 담을까요`,
+    desc: `'${chart.name}'의 곡을 순서대로 대기열에 넣어요. 한 번에 담는 양에는 상한이 있어요.`,
+    confirmText: '담기',
+  });
+  if (!ok) return;
+  const result = await call(() => api(`/charts/${encodeURIComponent(chart.id)}/enqueue`, { body: {} }));
+  if (!result) return;
+  if (result.limited) toast(`대기열 한도까지 ${result.added ?? 0}곡만 담았어요.`, 'warn');
+  else toast(`${result.added ?? count}곡을 담았어요.`, 'ok');
+}
+
+async function refreshChart() {
+  const chart = chartView.chart;
+  if (!chart) return;
+  const result = await call(() => api(`/charts/${encodeURIComponent(chart.id)}/refresh`, { body: {} }), '차트를 다시 가져왔어요.');
+  if (result) openChart(chart, true);
+}
+
 /* ═══════════════════════ 데이터 로드 ═══════════════════════ */
 
 async function loadCold() {
@@ -4044,8 +6170,10 @@ async function loadCold() {
     saved: data.saved || [],
     recent: data.recent || [],
     members: data.members || [],
+    superLike: data.superLike || null,
     coldAt: Date.now(),
   });
+  if (Number.isFinite(data.machamScore)) myScore = data.machamScore;
 }
 
 async function loadHot() {
@@ -4053,6 +6181,9 @@ async function loadHot() {
   // 카운트다운은 서버 시각 기준으로 센다. 표본 시각으로 시계 차이를 맞춰 둔다.
   noteServerTime(data.sampledAtUtc || data.sortedAt);
   if (data.presence && data.presence.bot !== undefined) lastBotState = data.presence.bot;
+  // 대기열이 길면 서버가 앞 200곡만 보낸다 (§18.2)
+  queueTotal = Number.isFinite(data.queueTotal) ? data.queueTotal : (data.queue || []).length;
+  queueTruncated = !!data.queueTruncated;
   store.patch({
     player: data.player || null,
     current: data.current || null,
@@ -4060,6 +6191,8 @@ async function loadHot() {
     queueMode: data.queueMode || data.mode || 'score',
     sortedAt: data.sortedAt || null,
     nextSortAt: data.nextSortAt || null,
+    next: data.next || null,
+    skipVote: data.skipVote || null,
     presence: data.presence || store.get().presence,
     hotAt: Date.now(),
   });
@@ -4085,10 +6218,15 @@ const refetchHot = debounce(() => { loadHot().catch(() => {}); }, 400);
 /* ═══════════════════════ 부팅 ═══════════════════════ */
 
 async function boot() {
-  theme.init(prefGet('theme') || ctx.themeDefault || 'dark');
+  paintTheme(themeChoice());
   buildShell();
   tooltip();
   marqueeRows();
+  el.railDrawerBtn.hidden = !railDrawerActive();
+  // 빈 배경 우클릭 — 테마·배치·내 기록 (§24.1)
+  bindContextTarget(el.portal, (event) => (event.target.closest?.(
+    '.qitem, .row, .msg, .member, .plcard, .now, .nextrow, .queue__head, button, a, input, textarea, select',
+  ) ? null : backgroundMenu()));
   if (panelMode()) mountDock();
 
   // 초기 그리기 — 데이터가 오기 전에도 뼈대는 보인다
@@ -4097,8 +6235,8 @@ async function boot() {
   store.subscribe(['guild', 'guilds'], renderGuild);
   store.subscribe(['presence'], renderPresenceSummary);
   store.subscribe(['presence', 'members', 'intentStatus'], renderMembers);
-  store.subscribe(['queue', 'queueMode', 'permissions', 'suspension', 'tier', 'conn', 'hotAt'], renderQueue);
-  store.subscribe(['current', 'player', 'permissions', 'suspension', 'tier', 'settings', 'conn'], renderNow);
+  store.subscribe(['queue', 'queueMode', 'permissions', 'suspension', 'tier', 'conn', 'hotAt', 'settings', 'superLike'], renderQueue);
+  store.subscribe(['current', 'player', 'permissions', 'suspension', 'tier', 'settings', 'conn', 'next', 'skipVote'], renderNow);
   store.subscribe(['chat', 'chatDelta', 'permissions', 'suspension', 'tier', 'conn', 'settings', 'coldAt'], renderChat);
   store.subscribe(['liked', 'saved', 'playlists', 'permissions', 'suspension', 'tier'], renderLibrary);
   store.subscribe(['recent', 'permissions', 'suspension', 'tier'], renderRecent);
@@ -4108,6 +6246,10 @@ async function boot() {
   store.subscribe(['buildId'], checkVersion);
   store.subscribe(['permissions', 'suspension', 'tier'], renderSeeds);
   store.subscribe(['queueMode', 'sortedAt', 'nextSortAt', 'queue'], renderSortTick);
+  store.subscribe(['suggestions'], (state) => {
+    // 새 제안이 올라오면 헤더 버튼에 점만 찍는다. 숫자까지는 필요 없다 (§11)
+    if (suggestUnread) el.suggestDot.hidden = !state.suggestions.length;
+  });
 
   if (!panelMode()) el.lyricsBox.hidden = !lyricsOpen;
   el.lyricsToggle.setAttribute('aria-expanded', String(lyricsOpen));
@@ -4133,6 +6275,10 @@ async function boot() {
   }
   if (lyricsOpen) loadLyrics();
   loadSeeds();
+  // 지난번에 보던 탭이 그대로 열려 있으면 그 탭 데이터도 챙긴다.
+  // (탭을 다시 누르지 않으면 영영 안 불러오는 구멍이 있었다)
+  if (activeRailTab === 'charts') loadCharts();
+  if (activeSideTab === 'audit') loadAudit();
 
   // 한 번도 배치를 고른 적이 없으면 여기서 물어본다. 두 번째 진입부터는 안 뜬다.
   if (!layoutChosen) openLayoutSheet();
@@ -4141,11 +6287,15 @@ async function boot() {
     onResync: () => { loadHot().catch(() => {}); loadCold().catch(() => {}); loadSeeds(); },
     onRefetch: (what) => {
       if (what === 'library' || what === 'settings' || what === 'permissions') refetchCold();
-      if (what === 'suggestions' && activeSideTab === 'suggest') loadSuggestions();
-      if (what === 'audit') { store.patch({ audit: [] }); if (activeSideTab === 'audit') loadAudit(); }
+      if (what === 'suggestions') { suggestUnread = true; el.suggestDot.hidden = false; }
+      if (what === 'audit') { store.patch({ audit: [] }); if (activeSideTab === 'audit') loadAudit(true); }
     },
     onChat: onChatArrived,
-    onEvent: (type) => { if (type === 'autoplay') loadSeeds(); },
+    onEvent: (type, data) => {
+      if (type === 'autoplay') loadSeeds();
+      if (type === 'skipvote') store.patch({ skipVote: data && data.need ? data : null });
+      if (type === 'charts') { chartState = null; if (activeRailTab === 'charts') loadCharts(); }
+    },
     // core.js의 merge()는 계약에 없던 필드를 흘려보낸다. 여기서 원본 payload를 다시 주워 담는다.
     onAny: (type, data) => {
       if (type === 'presence' && data) {
@@ -4166,9 +6316,16 @@ async function boot() {
       }
       if (type === 'queue.set' && data) {
         noteServerTime(data.sortedAt);
-        store.patch({ nextSortAt: data.nextSortAt || null });
+        queueTotal = Number.isFinite(data.queueTotal) ? data.queueTotal : (data.items || []).length;
+        queueTruncated = !!data.queueTruncated;
+        store.patch({ nextSortAt: data.nextSortAt || null, next: data.next !== undefined ? data.next : store.get().next });
       }
-      if (type === 'playback' && data) noteServerTime(data.sampledAtUtc);
+      if (type === 'playback' && data) {
+        noteServerTime(data.sampledAtUtc);
+        // 곡이 바뀌면 다음 곡도 같이 바뀌고, 스킵 투표는 리셋된다 (§10.5·§14.2)
+        if (data.next !== undefined) store.patch({ next: data.next });
+        if (data.currentId !== undefined && data.currentId !== store.get().current?.id) store.patch({ skipVote: null });
+      }
     },
     onDenied: (reason) => {
       store.patch({ tier: 'viewer', viewerReason: reason || '접근 권한이 사라졌어요.' });
@@ -4189,6 +6346,31 @@ async function boot() {
     renderBanners(store.get());
   }, 30000);
 }
+
+/* ── 툴팁 전수 검사 (§20.3) ──
+ * 눈으로 세지 말고 자동으로. 콘솔에서 __machamTipAudit() 를 부르면 0이 나와야 한다.
+ * 아이콘만 있는 버튼에 설명이 없으면 그건 수수께끼다.
+ */
+function tipAudit() {
+  const all = [...document.querySelectorAll('button,[role=button],a.iconbtn')];
+  const visible = (node) => !node.closest('[hidden]') && node.offsetParent !== null;
+  const iconOnly = (node) => !node.textContent.trim().replace(/[\p{Emoji}\p{Emoji_Presentation}\s＋✕←↻▸▾▪·]/gu, '');
+
+  const missing = all.filter((node) => visible(node) && iconOnly(node)
+    && !node.dataset.tip && !node.getAttribute('aria-label'));
+  const ariaOnly = all.filter((node) => visible(node) && !node.dataset.tip && node.getAttribute('aria-label'));
+  const nativeTitle = [...document.querySelectorAll('[title]')];
+
+  const report = {
+    missing: missing.map((node) => node.className || node.tagName),
+    ariaOnly: ariaOnly.map((node) => node.className || node.tagName),
+    nativeTitle: nativeTitle.map((node) => node.className || node.tagName),
+  };
+  console.info('[툴팁 감사] 설명 없는 아이콘 버튼', report.missing.length,
+    '· aria-label만 있는 것', report.ariaOnly.length, '· title= 남은 것', report.nativeTitle.length, report);
+  return report;
+}
+window.__machamTipAudit = tipAudit;
 
 /** 키보드만으로 주요 조작이 가능해야 한다. 입력 중일 때는 가로채지 않는다. */
 function bindShortcuts() {
