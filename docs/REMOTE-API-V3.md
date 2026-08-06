@@ -32,6 +32,7 @@
 | 14 | 싫어요 투표 추가 | §10.2 | ⬜ |
 | 15 | 붐따 (싫어요 모이면 대기열에서 내리기) + 토글 | §10.3 | ⬜ |
 | 16 | 누가 좋아요·슈퍼 눌렀는지 표시 + 계산식 설정값 반영 | §10.4 | ⬜ |
+| 16b | 스킵 권한 분리(기본 모든 사람) + 투표 스킵(듣는사람/보는사람 비율) | §10.5 | ⬜ |
 | 17 | 제안 게시판 → 탭 제거, 헤더 버튼 + 모달 | §11 | ⬜ |
 | 18 | 개인 재생목록 (`PlaylistScope::User`) + UX | §12 | ⬜ |
 | 19 | 활동 로그를 사람이 읽는 피드로 + 필터 | §13 | ⬜ |
@@ -48,9 +49,12 @@
 | 29 | UI 문구 전부 ~해요체 | 전역 | ⬜ |
 | 30 | **툴팁을 모든 조작 요소에 빠짐없이** | §20 | ⬜ |
 | 31 | 끝나면 관련 MD 전부 최신화 | §21 | ⬜ |
+| 32 | **개인 통계** (담은 곡·재생·받은 반응·비율·상위 목록·30일 그래프) | §22 | ⬜ |
+| 33 | 통계 전용 DB 분리 (`musicbot-stats.sqlite`) + 비동기 쓰기 | §22.1~22.2 | ⬜ |
+| 34 | 마참 점수 (받은 추천 누적, 순서에는 영향 없음) | §22.4 | ⬜ |
 
 **권한 10종** (§1의 `rule_role_ids` 키):
-`search` `vote` `chat` `playback` `seek` `volume` `queueEdit` `autoplaySeed` `bulkEnqueue` + 관리자(`managerRoleIds`)
+`search` `vote` `chat` `playback` `skip` `seek` `volume` `queueEdit` `autoplay` `bulkEnqueue` + 관리자(`managerRoleIds`) — **11종**
 
 ---
 
@@ -582,6 +586,70 @@ pub enum BoomttaAction { Bottom, Remove }   // 맨 뒤로 / 아예 빼기
 
 `fifo` 모드에서는 점수가 순서에 영향을 안 주니 계산식을 **회색으로 흐리게** 하고
 `지금은 신청 순서대로 나가요` 를 덧붙여요. 점수가 보이는데 순서와 무관하면 그게 제일 헷갈려요.
+
+### 10.5 스킵 — 권한 분리 + 투표 스킵
+
+**지금**: 스킵이 `playback_rule` 에 묶여 있어요. 기본이 `같은 음성 채널` 이라
+리모컨만 보는 사람은 곡을 못 넘겨요. 그런데 스킵은 재생/일시정지와 성격이 달라요.
+
+#### 스킵 권한 분리
+
+```rust
+#[serde(default = "default_skip_rule")]
+pub skip_rule: PermissionRule,   // 기본 GuildMember — 모든 사람이 할 수 있게
+```
+
+권한 키 `skip`. §1의 `rule_role_ids` 에도 들어가요. **권한은 총 11개**가 돼요.
+기본을 `GuildMember` 로 둬서 **누구나 스킵**할 수 있고, 필요하면 관리자가 조여요.
+
+#### 투표 스킵
+
+혼자 계속 넘기면 남의 곡이 다 날아가요. 그래서 **투표로 넘기는 모드**를 둬요.
+
+```rust
+#[serde(default)]                             pub vote_skip_enabled: bool,        // 기본 false
+#[serde(default)]                             pub vote_skip_basis: VoteSkipBasis, // 기본 Listeners
+#[serde(default = "default_vote_skip_ratio")] pub vote_skip_ratio: u32,           // 50 (%) · 10~100
+#[serde(default = "default_vote_skip_min")]   pub vote_skip_min: u32,             // 2 (명) · 1~20
+
+pub enum VoteSkipBasis { Listeners, Viewers, Either, Both }
+```
+
+| 기준 | 모수 | 언제 쓰나 |
+|---|---|---|
+| `listeners` | **봇과 같은 음성 채널에 있는 사람** (기본) | 실제로 듣는 사람만 결정. 제일 자연스러워요 |
+| `viewers` | **리모컨을 보고 있는 사람** | 음성은 안 들어와도 같이 고르는 분위기 |
+| `either` | 둘 중 **하나라도** 넘으면 통과 | 느슨하게. 잘 넘어가요 |
+| `both` | **둘 다** 넘어야 통과 | 엄격하게. 잘 안 넘어가요 |
+
+필요 표 수 = `ceil(모수 × ratio / 100)` 이되 **최소 `vote_skip_min` 명**이에요.
+모수가 1명이면 그 사람 혼자 눌러도 넘어가요 — 혼자 듣는데 투표를 시키면 그냥 괴롭힘이에요.
+
+**즉시 스킵이 되는 경우** (투표를 안 거쳐요)
+- 서버 관리자·봇 주인
+- **그 곡을 신청한 본인** — 내가 넣은 곡을 내가 빼는 건 남에게 피해가 없어요
+- 모수가 **0명** 일 때 (아무도 안 듣고 아무도 안 보면 투표가 무의미해요)
+
+**동작**
+- 스킵을 누르면 투표가 열려요. 이미 열려 있으면 내 표가 더해져요. 다시 누르면 취소돼요.
+- 필요 표에 도달하는 즉시 스킵돼요.
+- **곡이 바뀌면 투표는 리셋**돼요. 다음 곡으로 표가 넘어가면 안 돼요.
+- 투표는 **메모리에만** 둬요(`WebState`). DB 를 쓰지 마요 — 곡 하나 수명짜리 데이터예요.
+- 아무도 추가로 안 누르면 **90초 뒤 자동 취소**돼요. 실패한 투표가 화면에 계속 붙어 있으면 지저분해요.
+
+**API**
+- `POST /control` 의 `{action:"skip"}` 응답이 달라져요:
+  `{ok:true, skipped:true}` (즉시) 또는 `{ok:true, skipped:false, vote:{have:2,need:3,mine:true,basis:"listeners"}}`
+- `POST /control` 에 `{action:"skipVoteCancel"}` 추가 — 내 표 취소
+- `/state/hot` 에 `skipVote: {have,need,mine,basis,expiresUtc} | null`
+- WS 토픽 `skipvote` 로 실시간 갱신
+
+**UI**
+- ⏭ 버튼이 투표 모드면 **`⏭ 스킵 2/3`** 으로 바뀌어요. 내가 눌렀으면 채워진 상태로.
+- 툴팁: `듣는 사람 3명 중 2명이 동의하면 넘어가요`
+- 도달하기 직전이면 버튼이 살짝 강조돼요. 한 표 남았다는 걸 알면 누를 마음이 생겨요.
+- 즉시 스킵 권한이 있는 사람에게는 **`⏭ 바로 넘기기`** 로 보이고 툴팁에 `관리자라서 투표 없이 넘어가요`.
+- 활동 로그: `playback.skip` → `{누구}님이 곡을 넘겼어요` / 투표면 `{N}명이 동의해서 곡을 넘겼어요`
 
 ---
 
@@ -1221,7 +1289,149 @@ FLIP 애니메이션은 **화면에 보이는 항목에만** 적용해요.
 
 ---
 
-## 22. 공통 주의
+## 22. 개인 통계
+
+### 22.1 DB 를 분리해요
+
+통계는 **행이 제일 빨리 불어나는 데이터**예요. 곡 하나 담을 때마다, 좋아요 하나 누를 때마다 쌓여요.
+그걸 `musicbot.sqlite` 에 넣으면 두 가지가 나빠져요.
+
+1. 그 파일은 **C# 엔진과 공유**하고 재생 경로가 같은 뮤텍스로 물고 있어요.
+   통계 쓰기가 재생 쿼리와 락을 다퉈요.
+2. 파일이 커지면 백업·이동이 무거워져요.
+
+그래서 **별도 파일**로 빼요.
+
+```
+<dataRoot>/musicbot.sqlite         기존 (봇 설정·큐·캐시·리모컨)
+<dataRoot>/musicbot-stats.sqlite   신규 (통계 전용)
+```
+
+- 자체 `Stats` 구조체 + 자체 커넥션 + 자체 `PRAGMA user_version` 마이그레이션.
+- `journal_mode=WAL`, `busy_timeout=5000` 은 동일하게.
+- **통계 DB가 깨져도 봇은 정상 동작해야 해요.** 열기에 실패하면 로그만 남기고 통계 기능만 끄고 계속 가요.
+  통계 때문에 음악이 멈추면 본말전도예요.
+- 포터블 업데이트가 지우지 않도록 `data/` 안에 둬요(기존 DB와 같은 자리).
+
+### 22.2 쓰기는 재생 경로를 막지 않아요
+
+**절대 인라인으로 쓰지 마요.** `mpsc` 채널로 이벤트를 던지고 전용 태스크가 배치로 반영해요.
+
+```rust
+pub enum StatEvent {
+    Queued { guild_id, user_id, cache_key, track_json, bulk: bool },
+    BulkQueued { guild_id, user_id, count: u32 },
+    Played { guild_id, user_id, cache_key, completed: bool },
+    Vote { guild_id, voter_id, owner_id, cache_key, kind: QueueVoteKind, added: bool },
+    Boomtta { guild_id, owner_id, cache_key },
+    Chat { guild_id, user_id },
+}
+```
+
+- 채널이 꽉 차면 **가장 오래된 걸 버려요.** 통계 한 줄 때문에 재생이 밀리면 안 돼요.
+- 전용 태스크가 **1초 또는 200건마다** 트랜잭션 하나로 묶어 반영해요.
+- 종료 시 남은 것을 비우고 나가요.
+
+### 22.3 스키마 (통계 DB, v1)
+
+```sql
+-- 사람별 누적 (읽기가 빨라야 해서 롤업으로 둔다)
+CREATE TABLE stat_user (
+  guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+  queued_single INTEGER NOT NULL DEFAULT 0,   -- 한 곡씩 담은 수
+  queued_bulk   INTEGER NOT NULL DEFAULT 0,   -- 한 번에 담기로 들어간 곡 수
+  bulk_times    INTEGER NOT NULL DEFAULT 0,   -- 한 번에 담기를 쓴 횟수
+  played        INTEGER NOT NULL DEFAULT 0,   -- 내 곡이 끝까지 재생된 수
+  skipped       INTEGER NOT NULL DEFAULT 0,   -- 내 곡이 스킵된 수
+  boomtta       INTEGER NOT NULL DEFAULT 0,   -- 내 곡이 붐따당한 수
+  likes_recv INTEGER NOT NULL DEFAULT 0, supers_recv INTEGER NOT NULL DEFAULT 0, dislikes_recv INTEGER NOT NULL DEFAULT 0,
+  likes_give INTEGER NOT NULL DEFAULT 0, supers_give INTEGER NOT NULL DEFAULT 0, dislikes_give INTEGER NOT NULL DEFAULT 0,
+  chats INTEGER NOT NULL DEFAULT 0,
+  first_utc TEXT, last_utc TEXT,
+  PRIMARY KEY (guild_id, user_id));
+
+-- 사람×곡 (가장 많이 신청한 곡 / 가장 많이 좋아요한 곡)
+CREATE TABLE stat_user_track (
+  guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, cache_key TEXT NOT NULL,
+  track_json TEXT NOT NULL,
+  requested INTEGER NOT NULL DEFAULT 0,
+  liked     INTEGER NOT NULL DEFAULT 0,   -- 내가 이 곡에 좋아요를 누른 횟수
+  played    INTEGER NOT NULL DEFAULT 0,
+  likes_recv INTEGER NOT NULL DEFAULT 0,  -- 내가 신청한 이 곡이 받은 좋아요
+  last_utc TEXT NOT NULL,
+  PRIMARY KEY (guild_id, user_id, cache_key));
+CREATE INDEX idx_stat_track_req ON stat_user_track(guild_id, user_id, requested DESC);
+CREATE INDEX idx_stat_track_liked ON stat_user_track(guild_id, user_id, liked DESC);
+
+-- 일별 (그래프용). 90일만 남기고 정리한다
+CREATE TABLE stat_daily (
+  guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, day TEXT NOT NULL,
+  queued INTEGER NOT NULL DEFAULT 0, played INTEGER NOT NULL DEFAULT 0,
+  likes_recv INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, user_id, day));
+```
+
+### 22.4 마참 점수 — 받은 추천이 쌓여요
+
+> "다른 사람이 내 곡에 추천해주면 점수 쌓이면 좋을듯"
+
+대기열 정렬에 쓰는 점수(§10.1)와 **완전히 별개**예요. 그건 곡 하나의 순서용이고,
+이건 **사람에게 누적되는 기록**이에요. 섞으면 안 돼요 — 잘 쌓은 사람이 새치기하게 되면
+§32의 "사람마다 공평하게"가 무너져요.
+
+```
+마참 점수 = likes_recv × 1 + supers_recv × 3 + played × 1 − boomtta × 2
+```
+
+- **음수로 내려가지 않아요.** 0에서 멈춰요. 숫자가 마이너스면 보기만 나빠요.
+- 대기열 순서·권한에 **일절 영향을 주지 않아요.** 순수하게 보는 재미예요.
+- 프로필 드롭다운과 멤버 목록에 조용히 표시해요. 등수를 매기지는 않아요
+  (서버 분위기를 경쟁으로 만들 이유가 없어요. 원하면 나중에 켜는 옵션으로).
+
+### 22.5 보여줄 것
+
+프로필 드롭다운 → **`📊 내 기록`** → 모달.
+
+**요약 카드 4장**
+`담은 곡 128` · `재생된 곡 96` · `받은 좋아요 340` · `마참 점수 512`
+
+**비율 (막대 하나로)**
+- `내 곡 중 끝까지 재생 75% · 스킵 20% · 붐따 5%`
+- `한 곡씩 82곡 (64%) · 한 번에 46곡 (36%, 3번)`
+- `받은 반응: 👍284 ⭐52 👎12`
+
+**목록 3개** (각각 상위 5개, 앨범아트 + 제목 + 숫자)
+- `가장 많이 신청한 곡`
+- `내가 가장 많이 좋아요한 곡`
+- `가장 많이 사랑받은 내 곡` (받은 좋아요 순)
+
+**최근 30일 그래프** — `stat_daily` 로 담은 곡 / 재생된 곡 꺾은선 하나.
+데이터가 3일치도 없으면 그래프 대신 `기록이 쌓이면 여기에 그래프가 나와요` 를 보여줘요.
+
+**남의 기록도 볼 수 있어요.** 멤버 목록에서 사람을 누르면 그 사람 기록이 같은 모달로 열려요.
+단, **받은 것만** 보여주고 준 것(누구에게 좋아요를 눌렀는지)은 안 보여줘요.
+누가 누구에게 눌렀는지가 드러나면 채팅방 분위기가 이상해져요.
+
+### 22.6 API
+
+| 경로 | 내용 |
+|---|---|
+| `GET .../stats/me` | 내 전체 통계 + 목록 3종 + 30일 그래프 |
+| `GET .../stats/user/{userId}` | 남의 공개 통계 (받은 것만) |
+| `GET .../stats/server` | 서버 전체 요약 (관리 콘솔용) |
+
+- 응답은 **60초 캐시**해요. 통계는 실시간일 이유가 없어요.
+- 권한: 통계 보기는 길드 멤버면 누구나. 별도 권한을 만들지 않아요 — 권한이 11개면 충분해요.
+
+### 22.7 보존
+
+- `stat_daily` 는 **90일**만. 나머지 롤업은 계속 유지해요(행 수가 사람×곡 이라 안 터져요).
+- `stat_user_track` 이 한 사람당 수천 행이 되면 `requested + liked = 0` 인 행을 정리해요.
+- `prune_all`(§13.6)과 같은 태스크에서 하루 한 번 같이 돌려요.
+
+---
+
+## 23. 공통 주의
 
 - `data-testid` 24개는 **모든 배치에서** 살아 있어야 해요.
 - 새 기능이 실패해도 리모컨 기본 동작(재생·대기열·채팅)은 살아 있어야 해요.

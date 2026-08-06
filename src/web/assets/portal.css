@@ -655,8 +655,9 @@ body[data-dragging="tab"] { user-select: none; }
 .seedrow:hover { background: var(--surface-3); }
 .seedrow .row__art { width: 32px; height: 32px; }
 
-/* 시드곡 API가 없거나 권한이 없으면 버튼 자체를 내보내지 않는다 */
-.seedbtn { display: none; }
+/* 시드곡 API가 없거나 권한이 없으면 버튼 자체를 내보내지 않는다.
+ * .vote / .iconbtn 이 뒤에서 display를 다시 잡으므로 특이도를 한 칸 올려 둔다. */
+.portal .seedbtn { display: none; }
 .portal[data-seeds="1"] .seedbtn { display: inline-flex; }
 
 .queue__list { flex: 1; min-height: 0; padding: 0 var(--sp-2) var(--sp-3); }
@@ -1543,8 +1544,12 @@ body[data-dragging="tab"] { user-select: none; }
 
   :root[data-layout="two"] .portal__grid {
     grid-template-columns: minmax(0, 1fr) var(--gutter-w) var(--side-w);
-    grid-template-rows: auto auto;
+    /* auto 로 두면 사이드가 두 행을 걸치는 순간 행 높이가 반반으로 갈려
+     * 스테이지가 레일 위로 겹쳐 그려진다(가사를 펼치면 바로 보인다).
+     * 내용 높이로 못 박고 위에서부터 쌓아야 한다. */
+    grid-template-rows: max-content max-content;
     align-items: start;
+    align-content: start;
     overflow-y: auto;
     overscroll-behavior: contain;
   }
