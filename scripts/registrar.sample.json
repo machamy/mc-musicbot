@@ -1,0 +1,10 @@
+{
+  "_comment": "봇 호스트 PC에서 data\\registrar.json 으로 복사해 쓴다. 이 복사본은 절대 커밋하거나 포터블 매니페스트에 넣지 않는다.",
+  "registrarUrl": "http://<registrar-ip>:8780",
+  "secret": "PASTE_REGISTRAR_SECRET_HERE",
+  "port": 8693,
+  "hosts": [
+    "musicbot.example.com",
+    "music.example.com"
+  ]
+}
