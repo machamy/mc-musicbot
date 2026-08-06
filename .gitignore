@@ -4,6 +4,7 @@
 botsettings.json
 musicbot.runtime.json
 remote.env.cmd
+remote-oauth.json
 .env.cmd
 .musicbot-data/
 .env

@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use serenity::all::{GuildId, UserId};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_cookies::{Cookie, Cookies};
@@ -27,8 +28,17 @@ const REMOTE_SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 const ADMINISTRATOR_PERMISSION: u64 = 1 << 3;
 const MANAGE_GUILD_PERMISSION: u64 = 1 << 5;
+const REMOTE_AUTH_FILE: &str = "remote-oauth.json";
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct StoredRemoteAuthConfig {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    public_base_url: Option<String>,
+}
+
+#[derive(Clone)]
 pub struct RemoteAuthConfig {
     pub client_id: Option<String>,
     client_secret: Option<String>,
@@ -36,28 +46,108 @@ pub struct RemoteAuthConfig {
     pub dev_login: bool,
 }
 
+impl std::fmt::Debug for RemoteAuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteAuthConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret_configured", &self.client_secret.is_some())
+            .field("public_base_url", &self.public_base_url)
+            .field("dev_login", &self.dev_login)
+            .finish()
+    }
+}
+
 impl RemoteAuthConfig {
-    pub fn from_env() -> Self {
+    /// 운영자 UI 저장값이 있으면 환경변수보다 우선한다. 환경변수는 기존 배포 호환용이다.
+    pub fn load(data_root: &FsPath) -> Self {
+        let stored: Option<StoredRemoteAuthConfig> =
+            std::fs::read_to_string(Self::storage_path(data_root))
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok());
+        let clean = |value: Option<String>| {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let env = |name: &str| clean(std::env::var(name).ok());
+        let (client_id, client_secret, public_base_url) = match stored {
+            Some(stored) => (
+                clean(stored.client_id),
+                clean(stored.client_secret),
+                clean(stored.public_base_url).unwrap_or_else(|| "http://localhost:8693".into()),
+            ),
+            None => (
+                env("MUSICBOT_DISCORD_CLIENT_ID"),
+                env("MUSICBOT_DISCORD_CLIENT_SECRET"),
+                env("MUSICBOT_PUBLIC_BASE_URL").unwrap_or_else(|| "http://localhost:8693".into()),
+            ),
+        };
         Self {
-            client_id: std::env::var("MUSICBOT_DISCORD_CLIENT_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            client_secret: std::env::var("MUSICBOT_DISCORD_CLIENT_SECRET")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            public_base_url: std::env::var("MUSICBOT_PUBLIC_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:8693".into())
-                .trim_end_matches('/')
-                .to_string(),
+            client_id,
+            client_secret,
+            public_base_url: public_base_url.trim_end_matches('/').to_string(),
             dev_login: std::env::var("MUSICBOT_DEV_LOGIN").ok().as_deref() == Some("1"),
         }
+    }
+
+    pub fn storage_path(data_root: &FsPath) -> PathBuf {
+        data_root.join(REMOTE_AUTH_FILE)
+    }
+
+    /// 새 Secret이 비어 있으면 기존 Secret을 유지하고, clear_secret일 때만 제거한다.
+    pub fn updated(
+        &self,
+        client_id: String,
+        client_secret_update: Option<String>,
+        clear_secret: bool,
+        public_base_url: String,
+    ) -> Self {
+        let client_secret = if clear_secret {
+            None
+        } else {
+            client_secret_update.or_else(|| self.client_secret.clone())
+        };
+        Self {
+            client_id: Some(client_id),
+            client_secret,
+            public_base_url: public_base_url.trim_end_matches('/').to_string(),
+            dev_login: self.dev_login,
+        }
+    }
+
+    pub fn save(&self, data_root: &FsPath) -> Result<(), String> {
+        std::fs::create_dir_all(data_root)
+            .map_err(|error| format!("OAuth 설정 폴더 생성 실패: {error}"))?;
+        let stored = StoredRemoteAuthConfig {
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            public_base_url: Some(self.public_base_url.clone()),
+        };
+        let payload = serde_json::to_vec_pretty(&stored)
+            .map_err(|error| format!("OAuth 설정 직렬화 실패: {error}"))?;
+        let path = Self::storage_path(data_root);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| format!("OAuth 설정 파일 열기 실패: {error}"))?;
+        use std::io::Write;
+        file.write_all(&payload)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("OAuth 설정 저장 실패: {error}"))
     }
 
     pub fn configured(&self) -> bool {
         self.client_id.is_some() && self.client_secret.is_some()
     }
 
-    fn redirect_uri(&self) -> String {
+    pub fn has_client_secret(&self) -> bool {
+        self.client_secret.is_some()
+    }
+
+    pub fn redirect_uri(&self) -> String {
         format!("{}/music/oauth/callback", self.public_base_url)
     }
 }
@@ -172,6 +262,10 @@ fn percent_encode(value: &str) -> String {
         .collect()
 }
 
+fn auth_config(state: &WebState) -> RemoteAuthConfig {
+    state.remote_auth.read().unwrap().clone()
+}
+
 fn current_session(state: &WebState, cookies: &Cookies) -> Option<RemoteSession> {
     let token = cookies.get(REMOTE_COOKIE)?.value().to_string();
     let mut sessions = state.remote_sessions.lock().unwrap();
@@ -191,6 +285,7 @@ fn current_session(state: &WebState, cookies: &Cookies) -> Option<RemoteSession>
 }
 
 fn begin_remote_session(state: &WebState, cookies: &Cookies, session: RemoteSession) {
+    let auth = auth_config(state);
     let token = crate::models::uuid_like();
     state
         .remote_sessions
@@ -201,7 +296,7 @@ fn begin_remote_session(state: &WebState, cookies: &Cookies, session: RemoteSess
     cookie.set_path("/music");
     cookie.set_http_only(true);
     cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
-    cookie.set_secure(state.remote_auth.public_base_url.starts_with("https://"));
+    cookie.set_secure(auth.public_base_url.starts_with("https://"));
     cookies.add(cookie);
 }
 
@@ -233,9 +328,10 @@ async fn login_page(
     State(state): State<Arc<WebState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Html<String> {
+    let auth = auth_config(&state);
     Html(remote_page::login(
-        state.remote_auth.configured(),
-        state.remote_auth.dev_login,
+        auth.configured(),
+        auth.dev_login,
         query.get("error").map(String::as_str),
     ))
 }
@@ -290,10 +386,11 @@ async fn guild_page(
 }
 
 async fn oauth_start(State(state): State<Arc<WebState>>) -> Response {
-    let Some(client_id) = state.remote_auth.client_id.as_deref() else {
+    let auth = auth_config(&state);
+    let Some(client_id) = auth.client_id.as_deref() else {
         return Redirect::to("/music/login?error=OAuth%20설정이%20필요합니다").into_response();
     };
-    if state.remote_auth.client_secret.is_none() {
+    if !auth.has_client_secret() {
         return Redirect::to("/music/login?error=OAuth%20설정이%20필요합니다").into_response();
     }
     let oauth_state = crate::models::uuid_like();
@@ -307,7 +404,7 @@ async fn oauth_start(State(state): State<Arc<WebState>>) -> Response {
         percent_encode(client_id),
         percent_encode("identify guilds guilds.members.read"),
         percent_encode(&oauth_state),
-        percent_encode(&state.remote_auth.redirect_uri()),
+        percent_encode(&auth.redirect_uri()),
     );
     Redirect::temporary(&url).into_response()
 }
@@ -349,10 +446,11 @@ async fn oauth_callback(
     cookies: Cookies,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Response {
+    let auth = auth_config(&state);
     if let Some(error) = query.error {
         return Html(remote_page::login(
-            state.remote_auth.configured(),
-            state.remote_auth.dev_login,
+            auth.configured(),
+            auth.dev_login,
             Some(&format!("Discord 로그인이 취소되었습니다: {error}")),
         ))
         .into_response();
@@ -365,10 +463,10 @@ async fn oauth_callback(
     if !matches!(issued, Some(instant) if instant.elapsed() < OAUTH_STATE_TTL) {
         return Redirect::to("/music/login?error=OAuth%20state가%20만료되었습니다").into_response();
     }
-    let Some(client_id) = state.remote_auth.client_id.clone() else {
+    let Some(client_id) = auth.client_id.clone() else {
         return Redirect::to("/music/login?error=OAuth%20설정이%20필요합니다").into_response();
     };
-    let Some(client_secret) = state.remote_auth.client_secret.clone() else {
+    let Some(client_secret) = auth.client_secret.clone() else {
         return Redirect::to("/music/login?error=OAuth%20설정이%20필요합니다").into_response();
     };
     let client = reqwest::Client::new();
@@ -379,7 +477,7 @@ async fn oauth_callback(
             ("client_secret", client_secret),
             ("grant_type", "authorization_code".to_string()),
             ("code", code),
-            ("redirect_uri", state.remote_auth.redirect_uri()),
+            ("redirect_uri", auth.redirect_uri()),
         ])
         .send()
         .await
@@ -508,7 +606,7 @@ async fn dev_login(
     cookies: Cookies,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
 ) -> Response {
-    if !state.remote_auth.dev_login || !address.ip().is_loopback() {
+    if !auth_config(&state).dev_login || !address.ip().is_loopback() {
         return StatusCode::NOT_FOUND.into_response();
     }
     let metadata = state.app.db.list_guild_metadata();
@@ -2469,5 +2567,42 @@ mod tests {
             &settings,
             &same_voice
         ));
+    }
+
+    #[test]
+    fn oauth_config_persists_and_redacts_the_secret() {
+        let root = std::env::temp_dir().join(format!(
+            "mc-musicbot-oauth-config-{}",
+            crate::models::uuid_like()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = RemoteAuthConfig {
+            client_id: Some("100000000000000001".into()),
+            client_secret: Some("unit-test-secret-never-log".into()),
+            public_base_url: "https://musicbot.example.test".into(),
+            dev_login: false,
+        };
+        config.save(&root).unwrap();
+        let loaded = RemoteAuthConfig::load(&root);
+        assert_eq!(loaded.client_id, config.client_id);
+        assert_eq!(loaded.client_secret, config.client_secret);
+        assert_eq!(loaded.public_base_url, config.public_base_url);
+        assert!(!format!("{loaded:?}").contains("unit-test-secret-never-log"));
+
+        let retained = loaded.updated(
+            "100000000000000001".into(),
+            None,
+            false,
+            "https://musicbot.example.test/".into(),
+        );
+        assert!(retained.has_client_secret());
+        let cleared = retained.updated(
+            "100000000000000001".into(),
+            None,
+            true,
+            "https://musicbot.example.test".into(),
+        );
+        assert!(!cleared.has_client_secret());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

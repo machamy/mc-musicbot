@@ -15,7 +15,7 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::sync::broadcast;
 use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
@@ -28,13 +28,16 @@ pub struct WebState {
     /// 웹 비밀번호 SHA-256 해시. None 이면 미설정(최초 설정 필요) 상태.
     pub password_hash: Mutex<Option<[u8; 32]>>,
     pub sessions: Mutex<HashMap<String, Instant>>,
+    /// 운영자 세션별 CSRF 토큰. OAuth 비밀 설정처럼 민감한 POST에 사용한다.
+    pub admin_csrf: Mutex<HashMap<String, String>>,
     /// 사용자용 마참뮤직 Discord OAuth 세션.
     pub remote_sessions: Mutex<HashMap<String, remote::RemoteSession>>,
     /// OAuth state 일회용 토큰과 발급 시각.
     pub oauth_states: Mutex<HashMap<String, Instant>>,
     /// 길드별 상태 변경을 WebSocket 접속자에게 알리는 브로드캐스트 채널.
     pub remote_events: broadcast::Sender<remote::RemoteEvent>,
-    pub remote_auth: remote::RemoteAuthConfig,
+    /// 운영자 UI에서 저장하면 프로세스 재시작 없이 교체되는 OAuth 구성.
+    pub remote_auth: RwLock<remote::RemoteAuthConfig>,
     /// 길드·사용자별 마지막 채팅 전송 시각(간단한 도배 방지).
     pub remote_chat_rate: Mutex<HashMap<(u64, u64), Instant>>,
     /// Discord 멤버 역할 조회 캐시. 읽기 화면의 2초 동기화가 Discord API를 과호출하지 않게 한다.
@@ -93,10 +96,11 @@ pub async fn serve(app: Arc<App>) {
         app: app.clone(),
         password_hash: Mutex::new(initial_hash),
         sessions: Mutex::new(HashMap::new()),
+        admin_csrf: Mutex::new(HashMap::new()),
         remote_sessions: Mutex::new(HashMap::new()),
         oauth_states: Mutex::new(HashMap::new()),
         remote_events,
-        remote_auth: remote::RemoteAuthConfig::from_env(),
+        remote_auth: RwLock::new(remote::RemoteAuthConfig::load(&app.config.data_root)),
         remote_chat_rate: Mutex::new(HashMap::new()),
         remote_member_roles: Mutex::new(HashMap::new()),
         remote_action_rate: Mutex::new(HashMap::new()),
@@ -112,6 +116,7 @@ pub async fn serve(app: Arc<App>) {
             get(pages::settings_page).post(pages::settings_post),
         )
         .route("/botsettings", get(pages::botsettings_page))
+        .route("/botsettings/oauth", post(pages::botsettings_oauth_post))
         .route("/sharedconfig", get(pages::sharedconfig_page))
         .route("/guilds", get(pages::guilds_page).post(pages::guilds_post))
         .route("/tools", get(pages::tools_page).post(pages::tools_post))
@@ -182,22 +187,53 @@ pub fn is_authed(state: &WebState, cookies: &Cookies) -> bool {
 
 pub fn begin_session(state: &WebState, cookies: &Cookies) {
     let token = crate::models::uuid_like();
+    let csrf = crate::models::uuid_like();
     state
         .sessions
         .lock()
         .unwrap()
         .insert(token.clone(), Instant::now());
+    state.admin_csrf.lock().unwrap().insert(token.clone(), csrf);
     let mut cookie = Cookie::new(SESSION_COOKIE, token);
     cookie.set_http_only(true);
     cookie.set_path("/");
+    cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
     cookies.add(cookie);
 }
 
 pub fn end_session(state: &WebState, cookies: &Cookies) {
     if let Some(c) = cookies.get(SESSION_COOKIE) {
         state.sessions.lock().unwrap().remove(c.value());
+        state.admin_csrf.lock().unwrap().remove(c.value());
     }
     cookies.remove(Cookie::new(SESSION_COOKIE, ""));
+}
+
+/// 현재 운영자 세션의 CSRF 토큰. 인증된 폼에만 삽입하며 Secret과 무관한 난수다.
+pub fn admin_csrf_token(state: &WebState, cookies: &Cookies) -> Option<String> {
+    if !is_authed(state, cookies) {
+        return None;
+    }
+    let session = cookies.get(SESSION_COOKIE)?.value().to_string();
+    let mut tokens = state.admin_csrf.lock().unwrap();
+    Some(
+        tokens
+            .entry(session)
+            .or_insert_with(crate::models::uuid_like)
+            .clone(),
+    )
+}
+
+pub fn verify_admin_csrf(state: &WebState, cookies: &Cookies, supplied: &str) -> bool {
+    let Some(session) = cookies.get(SESSION_COOKIE) else {
+        return false;
+    };
+    state
+        .admin_csrf
+        .lock()
+        .unwrap()
+        .get(session.value())
+        .is_some_and(|expected| expected == supplied)
 }
 
 /// 인증 가드 — 비밀번호 미설정이면 최초 설정으로, 미인증이면 로그인으로 리다이렉트.

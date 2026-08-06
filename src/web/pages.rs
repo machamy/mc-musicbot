@@ -2,7 +2,8 @@
 
 use crate::models::*;
 use crate::web::{
-    Ctx, begin_session, end_session, hash_password, html_escape, layout, require_auth, store_hash,
+    Ctx, admin_csrf_token, begin_session, end_session, hash_password, html_escape, layout,
+    require_auth, store_hash, verify_admin_csrf,
 };
 use axum::Form;
 use axum::extract::{ConnectInfo, Query};
@@ -622,6 +623,18 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
         return r;
     }
     let app = &state.app;
+    let auth = state.remote_auth.read().unwrap().clone();
+    let csrf = admin_csrf_token(&state, &cookies).unwrap_or_default();
+    let oauth_status = if auth.configured() {
+        r#"<span class="pill run">설정 완료</span>"#
+    } else {
+        r#"<span class="pill stop">설정 필요</span>"#
+    };
+    let secret_status = if auth.has_client_secret() {
+        "설정됨 — 값은 다시 표시하지 않습니다."
+    } else {
+        "미설정"
+    };
     let meta = app.db.list_guild_metadata();
     let known: String = meta
         .iter()
@@ -644,6 +657,24 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
 </div>
 {known_html}
 </div>
+<div class="card"><h2>마참뮤직 Discord OAuth {oauth_status}</h2>
+<p class="sub">사용자 리모컨 로그인 설정입니다. 저장 즉시 반영되며 봇 재시작이 필요 없습니다. Secret은 저장 후 다시 표시하지 않습니다.</p>
+<form method="post" action="/botsettings/oauth" autocomplete="off">
+<input type="hidden" name="csrf_token" value="{csrf}"/>
+<label class="field" for="oauth-client-id">Discord Client ID</label>
+<input id="oauth-client-id" type="text" name="client_id" inputmode="numeric" pattern="[0-9]+" required value="{client_id}"/>
+<label class="field" for="oauth-client-secret">Discord Client Secret</label>
+<input id="oauth-client-secret" type="password" name="client_secret" autocomplete="new-password" placeholder="변경할 때만 새 Secret 입력"/>
+<p class="kv">현재 상태: {secret_status}</p>
+<label class="field" for="oauth-public-url">공개 기본 URL</label>
+<input id="oauth-public-url" type="text" name="public_base_url" required value="{public_base_url}"/>
+<p class="kv">Discord Redirect URI: <code>{redirect_uri}</code></p>
+<p class="kv">요청 스코프: <code>identify guilds guilds.members.read</code></p>
+<p class="kv">저장 파일: <code>{oauth_path}</code> (Git/NAS 패키지 제외)</p>
+<label class="checkbox"><input type="checkbox" name="clear_secret"/> 저장된 Client Secret 제거</label>
+<div class="actions"><button class="btn btn-primary" type="submit">OAuth 설정 저장</button>
+<a class="btn btn-secondary" href="/music/login" target="_blank" rel="noopener">로그인 화면 열기</a></div>
+</form></div>
 <div class="card"><h2>전용 override (선택)</h2>
 <p class="sub">비워 두면 공용 설정을 그대로 따릅니다. 현재 적용 값:</p>
 <div class="diag-grid">
@@ -670,8 +701,130 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
         tools_root = html_escape(&app.config.tools_root.to_string_lossy()),
         ytdlp = html_escape(&app.config.yt_dlp_path),
         ffmpeg = html_escape(&app.config.ffmpeg_path),
+        oauth_status = oauth_status,
+        csrf = html_escape(&csrf),
+        client_id = html_escape(auth.client_id.as_deref().unwrap_or("")),
+        secret_status = secret_status,
+        public_base_url = html_escape(&auth.public_base_url),
+        redirect_uri = html_escape(&auth.redirect_uri()),
+        oauth_path = html_escape(
+            &crate::web::remote::RemoteAuthConfig::storage_path(&app.config.data_root)
+                .to_string_lossy()
+        ),
     );
     layout(&state, "봇 설정", "/botsettings", &body).into_response()
+}
+
+#[derive(Deserialize, Default)]
+pub struct OAuthSettingsForm {
+    csrf_token: String,
+    client_id: String,
+    client_secret: Option<String>,
+    public_base_url: String,
+    clear_secret: Option<String>,
+}
+
+pub async fn botsettings_oauth_post(
+    State(state): Ctx,
+    cookies: Cookies,
+    Form(form): Form<OAuthSettingsForm>,
+) -> Response {
+    if let Some(response) = require_auth(&state, &cookies) {
+        return response;
+    }
+    if !verify_admin_csrf(&state, &cookies, &form.csrf_token) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "CSRF 검증에 실패했습니다.",
+        )
+            .into_response();
+    }
+
+    let client_id = form.client_id.trim().to_string();
+    if client_id
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id != 0)
+        .is_none()
+    {
+        return redirect_flash(
+            "/botsettings",
+            "Discord Client ID는 0이 아닌 숫자여야 합니다.",
+            true,
+        );
+    }
+
+    let public_base_url = form
+        .public_base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let parsed = match reqwest::Url::parse(&public_base_url) {
+        Ok(url) => url,
+        Err(_) => {
+            return redirect_flash(
+                "/botsettings",
+                "공개 기본 URL 형식이 올바르지 않습니다.",
+                true,
+            );
+        }
+    };
+    let loopback_http = parsed.scheme() == "http"
+        && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    if (parsed.scheme() != "https" && !loopback_http)
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return redirect_flash(
+            "/botsettings",
+            "공개 기본 URL은 경로·쿼리 없는 HTTPS 주소여야 합니다. localhost만 HTTP를 허용합니다.",
+            true,
+        );
+    }
+
+    let secret_update = form
+        .client_secret
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let current = state.remote_auth.read().unwrap().clone();
+    let next = current.updated(
+        client_id,
+        secret_update,
+        form.clear_secret.is_some(),
+        public_base_url,
+    );
+    if let Err(error) = next.save(&state.app.config.data_root) {
+        state
+            .app
+            .log
+            .error("Web", &format!("OAuth 설정 저장 실패: {error}"));
+        return redirect_flash("/botsettings", &error, true);
+    }
+    let configured = next.configured();
+    *state.remote_auth.write().unwrap() = next;
+    state.oauth_states.lock().unwrap().clear();
+    state.remote_sessions.lock().unwrap().clear();
+    state.app.log.info(
+        "Web",
+        if configured {
+            "운영자 UI에서 Discord OAuth 설정 저장됨."
+        } else {
+            "운영자 UI에서 Discord OAuth Secret 제거됨."
+        },
+    );
+    redirect_flash(
+        "/botsettings",
+        if configured {
+            "Discord OAuth 설정이 저장되어 즉시 반영되었습니다."
+        } else {
+            "OAuth 설정은 저장됐지만 Client Secret이 없어 사용자 로그인이 비활성화됩니다."
+        },
+        !configured,
+    )
 }
 
 pub async fn sharedconfig_page(State(state): Ctx, cookies: Cookies) -> Response {
