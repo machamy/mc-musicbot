@@ -7,6 +7,9 @@ pub mod remote;
 pub mod remote_page;
 
 use crate::app::App;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::Router;
 use axum::extract::State;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -22,6 +25,60 @@ use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
 
 /// 세션 유효 기간 — 12시간 쿠키.
 const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+const ADMIN_HOST: &str = "musicbot.example.com";
+const REMOTE_HOST: &str = "music.example.com";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSurface {
+    Admin,
+    Remote,
+    Internal,
+}
+
+fn web_surface(host: Option<&str>) -> WebSurface {
+    let host = host
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match host.as_str() {
+        ADMIN_HOST => WebSurface::Admin,
+        REMOTE_HOST => WebSurface::Remote,
+        _ => WebSurface::Internal,
+    }
+}
+
+fn is_remote_path(path: &str) -> bool {
+    path == "/music" || path.starts_with("/music/")
+}
+
+async fn host_scope_guard(request: Request<Body>, next: Next) -> Response {
+    let surface = web_surface(
+        request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok()),
+    );
+    let path = request.uri().path();
+    match surface {
+        WebSurface::Remote if path == "/" => Redirect::temporary("/music").into_response(),
+        WebSurface::Remote if !is_remote_path(path) && path != "/healthz" => {
+            (StatusCode::NOT_FOUND, "리모컨 도메인에서는 이 경로를 제공하지 않습니다.")
+                .into_response()
+        }
+        WebSurface::Admin if is_remote_path(path) => {
+            let suffix = request
+                .uri()
+                .path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or(path);
+            Redirect::temporary(&format!("https://{REMOTE_HOST}{suffix}")).into_response()
+        }
+        _ => next.run(request).await,
+    }
+}
 
 pub struct WebState {
     pub app: Arc<App>,
@@ -147,6 +204,7 @@ pub async fn serve(app: Arc<App>) {
         .route("/healthz", get(|| async { "ok" }))
         .merge(remote::router())
         .layer(CookieManagerLayer::new())
+        .layer(middleware::from_fn(host_scope_guard))
         .with_state(state);
 
     let urls = std::env::var("MUSICBOT_WEB_URLS").unwrap_or_else(|_| "http://0.0.0.0:8693".into());
@@ -168,6 +226,21 @@ pub async fn serve(app: Arc<App>) {
         Err(e) => app
             .log
             .error("Web", &format!("web bind failed ({addr}): {e}")),
+    }
+}
+
+#[cfg(test)]
+mod host_scope_tests {
+    use super::*;
+
+    #[test]
+    fn separates_admin_remote_and_internal_hosts() {
+        assert_eq!(web_surface(Some("musicbot.example.com")), WebSurface::Admin);
+        assert_eq!(web_surface(Some("MUSIC.MACHAM.NET:443")), WebSurface::Remote);
+        assert_eq!(web_surface(Some("localhost:8693")), WebSurface::Internal);
+        assert!(is_remote_path("/music"));
+        assert!(is_remote_path("/music/oauth/callback"));
+        assert!(!is_remote_path("/botsettings"));
     }
 }
 
