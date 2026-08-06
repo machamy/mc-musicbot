@@ -187,44 +187,74 @@ fn seeds_for_mode(
             .into_iter()
             .map(|seed| seed.track)
             .collect(),
-        AutoplayMode::Recent => {
-            // 지금 나오는 곡을 맨 앞에 둔다 — 첫 회전은 지금까지와 똑같이 동작한다.
-            let mut seeds: Vec<TrackRef> = state
-                .current_item
-                .as_ref()
-                .map(|item| item.track.clone())
-                .into_iter()
-                .collect();
-            for track in &state.recent_tracks {
-                if seeds.len() >= settings.autoplay_recent_count.max(1) as usize {
-                    break;
-                }
-                if !seeds
-                    .iter()
-                    .any(|seed| seed.cache_key().eq_ignore_ascii_case(&track.cache_key()))
-                {
-                    seeds.push(track.clone());
-                }
-            }
-            seeds
-        }
+        AutoplayMode::Recent => recent_seeds(
+            state.current_item.as_ref().map(|item| &item.track),
+            &state.recent_tracks,
+            settings.recent_count_limit(),
+        ),
         AutoplayMode::Genre => {
             // §15 의 차트 인프라를 그대로 쓴다. **캐시만 본다** — 재생 경로에서 yt-dlp 를 돌리면
             // 곡 경계가 몇 초씩 밀린다. 캐시가 비어 있으면 폴백 사슬이 알아서 내려간다.
-            let mut seeds = Vec::new();
-            for key in &settings.autoplay_genres {
-                let Ok(chart_id) = key.parse::<i64>() else {
-                    continue;
-                };
-                let Some(snapshot) = app.remote.chart_cache(chart_id) else {
-                    continue;
-                };
-                // 장르를 여러 개 고르면 장르도 라운드로빈이 되도록 앞에서 몇 곡씩만 섞어 넣는다.
-                seeds.extend(snapshot.tracks.into_iter().take(5));
-            }
-            seeds
+            let per_genre: Vec<Vec<TrackRef>> = settings
+                .autoplay_genres
+                .iter()
+                .filter_map(|key| key.parse::<i64>().ok())
+                .filter_map(|chart_id| app.remote.chart_cache(chart_id))
+                .map(|snapshot| snapshot.tracks.into_iter().take(GENRE_SEEDS_PER_CHART).collect())
+                .collect();
+            genre_seeds(per_genre)
         }
     }
+}
+
+/// 장르 하나에서 가져올 시드 곡 수. 여러 장르를 골랐을 때 한 장르가 목록을 다 잡아먹지 않게 한다.
+const GENRE_SEEDS_PER_CHART: usize = 5;
+
+/// `recent` 모드의 시드 (§8.2). 지금 나오는 곡을 맨 앞에 두고 최근 곡을 `limit` 만큼 잇는다.
+///
+/// `limit` 이 `None` 이면 **무제한** — 최근 목록 전부를 본다 (§23.1 `0 = 무제한`).
+/// `.max(1)` 로 0을 1로 둔갑시키면 "무제한"이 "가장 빡빡함"이 된다.
+fn recent_seeds(
+    current: Option<&TrackRef>,
+    recent: &[TrackRef],
+    limit: Option<u32>,
+) -> Vec<TrackRef> {
+    let cap = limit.map(|value| value as usize).unwrap_or(usize::MAX);
+    let mut seeds: Vec<TrackRef> = current.cloned().into_iter().collect();
+    for track in recent {
+        if seeds.len() >= cap {
+            break;
+        }
+        if !seeds
+            .iter()
+            .any(|seed| seed.cache_key().eq_ignore_ascii_case(&track.cache_key()))
+        {
+            seeds.push(track.clone());
+        }
+    }
+    seeds
+}
+
+/// 장르가 여러 개면 **장르도 라운드로빈**이다 (§8.2).
+///
+/// 그냥 이어 붙이면 목록이 `[장르A×5, 장르B×5]` 가 되고, 엔진의 시드 커서는 한 칸씩만 움직이므로
+/// 앞의 다섯 번은 전부 장르A 로 쏠린다. 장르별 목록을 번갈아 하나씩 꺼내 섞어 둔다.
+fn genre_seeds(per_genre: Vec<Vec<TrackRef>>) -> Vec<TrackRef> {
+    let depth = per_genre.iter().map(Vec::len).max().unwrap_or(0);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut seeds = Vec::new();
+    for index in 0..depth {
+        for genre in &per_genre {
+            let Some(track) = genre.get(index) else {
+                continue;
+            };
+            // 같은 곡이 두 장르에 겹치면 시드가 그 곡으로 쏠린다.
+            if seen.insert(track.cache_key().to_lowercase()) {
+                seeds.push(track.clone());
+            }
+        }
+    }
+    seeds
 }
 
 /// 큐가 빌 예정일 때 autoplay 미리보기를 풀어 둔다 (C# ResolveAutoplayPreviewAsync).
@@ -451,5 +481,86 @@ async fn announce_now_playing(app: Arc<App>, guild_id: u64, item: QueueItem) {
             }
         }
         Err(e) => app.log.warn("Bot", &format!("Now-playing 알림 실패: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ProviderKind;
+
+    fn track(id: &str) -> TrackRef {
+        TrackRef {
+            provider: ProviderKind::YouTube,
+            content_id: id.into(),
+            source_url: format!("https://example.test/{id}"),
+            title: Some(id.into()),
+            artist: None,
+            duration: None,
+            variant_key: None,
+        }
+    }
+
+    fn ids(tracks: &[TrackRef]) -> Vec<&str> {
+        tracks.iter().map(|t| t.content_id.as_str()).collect()
+    }
+
+    /// 최근 N곡: 지금 나오는 곡이 맨 앞이고 중복은 안 들어간다 (§8.2).
+    #[test]
+    fn recent_seeds_start_from_the_current_song() {
+        let current = track("지금곡");
+        let recent = [track("지금곡"), track("최근1"), track("최근2"), track("최근3")];
+        assert_eq!(
+            ids(&recent_seeds(Some(&current), &recent, Some(3))),
+            vec!["지금곡", "최근1", "최근2"]
+        );
+        // 지금 나오는 곡이 없어도(스킵 직후) 최근 곡만으로 시드를 만든다.
+        assert_eq!(ids(&recent_seeds(None, &recent, Some(2))), vec!["지금곡", "최근1"]);
+    }
+
+    /// `0 = 무제한` (§23.1). 여기에 `.max(1)` 이 남아 있으면 최근 1곡만 보게 된다.
+    #[test]
+    fn recent_seeds_treat_zero_as_unlimited() {
+        let current = track("지금곡");
+        let recent: Vec<TrackRef> = (0..25).map(|i| track(&format!("최근{i}"))).collect();
+
+        let unlimited = recent_seeds(Some(&current), &recent, None);
+        assert_eq!(unlimited.len(), 26, "무제한인데 최근 목록이 잘렸다");
+        assert_eq!(unlimited[0].content_id, "지금곡");
+
+        // 값이 있으면 그 값이 그대로 상한이다.
+        assert_eq!(recent_seeds(Some(&current), &recent, Some(1)).len(), 1);
+        assert_eq!(recent_seeds(Some(&current), &recent, Some(5)).len(), 5);
+        // 최근 목록이 상한보다 짧으면 있는 만큼만.
+        assert_eq!(recent_seeds(None, &recent[..2], Some(20)).len(), 2);
+    }
+
+    /// 장르가 여러 개면 장르도 라운드로빈이다 (§8.2).
+    /// 이어 붙이기만 하면 시드 커서가 앞 장르에서만 돈다.
+    #[test]
+    fn genre_seeds_interleave_between_charts() {
+        let kpop = vec![track("K1"), track("K2"), track("K3")];
+        let rock = vec![track("R1"), track("R2")];
+        assert_eq!(
+            ids(&genre_seeds(vec![kpop, rock])),
+            vec!["K1", "R1", "K2", "R2", "K3"]
+        );
+
+        // 장르가 하나면 순서 그대로.
+        assert_eq!(
+            ids(&genre_seeds(vec![vec![track("K1"), track("K2")]])),
+            vec!["K1", "K2"]
+        );
+        // 캐시가 하나도 없으면 빈 목록 → 폴백 사슬이 내려간다.
+        assert!(genre_seeds(Vec::new()).is_empty());
+        assert!(genre_seeds(vec![Vec::new(), Vec::new()]).is_empty());
+    }
+
+    /// 두 장르에 같은 곡이 있으면 시드가 그 곡으로 쏠린다 — 한 번만 넣는다.
+    #[test]
+    fn genre_seeds_drop_duplicates_across_charts() {
+        let a = vec![track("겹침"), track("A2")];
+        let b = vec![track("겹침"), track("B2")];
+        assert_eq!(ids(&genre_seeds(vec![a, b])), vec!["겹침", "A2", "B2"]);
     }
 }

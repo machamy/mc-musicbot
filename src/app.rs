@@ -47,14 +47,39 @@ pub struct SearchSession {
     pub created: Instant,
 }
 
-/// 길드별 재정렬 스케줄. 대기열이 길면 주기를 늘리기 때문에(v3 §18.2)
-/// "언제 마지막으로 돌았나"와 "그 길드 대기열이 얼마나 긴가"를 같이 들고 있어야 한다.
-#[derive(Debug, Clone, Copy, Default)]
-struct QueueSortSlot {
-    /// 이 길드를 마지막으로 재정렬 검사한 시각. 아직 한 번도 안 돌았으면 `None`.
+/// 마지막 재정렬 시각과 주기로 "지금 이 길드를 돌릴 차례인가"를 판정한다.
+///
+/// 시계를 인자로 받는 순수 함수라 테스트가 실제 시간을 기다리지 않아도 된다.
+/// 밀린 tick 을 정확히 맞추려 들면 15초 길드가 5초마다 조금씩 앞당겨지므로
+/// 여유를 반 tick 두어 "거의 다 됐으면 이번에 같이 돈다"로 처리한다.
+fn queue_sort_due_at(
     last: Option<chrono::DateTime<chrono::Utc>>,
-    /// 마지막으로 관측된 대기열 길이. 아무도 알려 주지 않았으면 0 = 기본 주기.
-    queue_len: usize,
+    interval: Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(last) = last else {
+        return true; // 한 번도 안 돌았으면 바로 차례다.
+    };
+    let millis = (interval.as_secs() as i64).max(1) * 1000;
+    now - last >= chrono::Duration::milliseconds(millis - 250)
+}
+
+/// 다음 재정렬 예정 시각. 루프가 밀렸으면 이미 지난 시각을 주지 않고 다음 주기로 넘긴다.
+///
+/// `allow(dead_code)`: 유일한 소비자인 [`App::next_queue_sort_at`] 를 아직 웹이 안 부른다.
+/// `remote.rs` 의 `sort_clock` 이 전역 tick 대신 이걸 쓰게 되면 둘 다 살아난다(v3 §5 · §18.2).
+#[allow(dead_code)]
+fn next_queue_sort_after(
+    last: Option<chrono::DateTime<chrono::Utc>>,
+    interval: Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let period = chrono::Duration::seconds((interval.as_secs() as i64).max(1));
+    let mut next = last.unwrap_or(now) + period;
+    while next <= now {
+        next += period;
+    }
+    next
 }
 
 /// 특권 게이트웨이 인텐트 가용 여부 — 웹(멤버 목록·온라인 상태)이 표시를 축소할 근거.
@@ -122,9 +147,13 @@ pub struct App {
     /// **길드마다 주기가 다를 수 있으므로**(v3 §18.2) 정확한 카운트다운은
     /// [`App::next_queue_sort_at`] 를 쓴다. 이 필드는 그 길드를 모를 때의 근사값이다.
     pub last_queue_sort: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
-    /// 길드별 재정렬 스케줄 (마지막 시각 + 마지막으로 관측된 대기열 길이).
-    /// 웹이 `note_queue_len` 으로 길이를 알려 주면 다음 tick 부터 주기가 자동으로 갈린다.
-    queue_sort_slots: Mutex<HashMap<u64, QueueSortSlot>>,
+    /// 길드별 "마지막으로 재정렬을 검사한 시각".
+    ///
+    /// **대기열 길이는 여기 두지 않는다.** App 이 길이 사본을 따로 들면 아무도 안 채워 주는
+    /// 두 번째 진실이 생긴다 — 실제로 그렇게 됐었다(`App::note_queue_len` 호출부가 0개라
+    /// `queue_len` 이 영원히 0이었고, 그래서 **모든 길드가 항상 5초 주기**였다. v3 §18.2 (3) 미작동).
+    /// 길이는 상태를 읽을 때마다 자동으로 갱신되는 [`PlayerManager::queue_len`] 하나만 본다.
+    queue_sort_last: Mutex<HashMap<u64, chrono::DateTime<chrono::Utc>>>,
     /// 길드별 마지막 명령 채널 (현재 재생 중 알림 대상).
     pub announce_channels: Mutex<HashMap<u64, u64>>,
     /// 길드별 직전 Now-Playing 메시지 (채널, 메시지) — 새 카드 전송 시 이전 카드 버튼 제거용.
@@ -184,6 +213,12 @@ impl App {
         } else {
             None
         };
+        // 기록기를 **플레이어에 붙인다.** 이 한 줄이 빠지면 `PlayerManager::stats()` 가 영원히
+        // `None` 이라 `record_play`/`record_boomtta` 가 전부 no-op 이 된다 — 통계 모듈이 멀쩡하고
+        // 테스트도 통과하는데 `📊 내 기록`과 `⭐ 우리 차트` 는 영원히 0인 상태가 된다 (v3 §22 · §15.2b).
+        if let Some(stats) = &stats {
+            player.attach_stats(stats.clone());
+        }
 
         let app = Arc::new(App {
             config,
@@ -204,7 +239,7 @@ impl App {
             owner_user_ids: RwLock::new(Vec::new()),
             on_queue_sorted: OnceLock::new(),
             last_queue_sort: RwLock::new(None),
-            queue_sort_slots: Mutex::new(HashMap::new()),
+            queue_sort_last: Mutex::new(HashMap::new()),
             announce_channels: Mutex::new(HashMap::new()),
             last_np_message: Mutex::new(HashMap::new()),
             pending_leaves: Mutex::new(HashMap::new()),
@@ -227,70 +262,48 @@ impl App {
 
     // ───────── 대기열 재정렬 스케줄 (v3 §5 · §18.2) ─────────
 
-    /// 이 길드의 대기열 길이를 알려 준다. **웹이 대기열을 만들 때마다 부르면 된다** —
-    /// 이미 계산해 둔 숫자를 넘기는 것뿐이라 추가 쿼리가 0이다.
+    /// 이 길드의 지금 재정렬 주기. 500곡을 넘으면 5초가 아니라 15초다 (v3 §18.2 (3)).
     ///
-    /// 재정렬 루프는 이 값만 보고 주기를 5초/15초로 가른다. 아무도 안 알려 주면 계속 5초다
-    /// (지금까지의 동작 그대로라 조용히 달라지는 게 없다).
-    pub fn note_queue_len(&self, guild_id: u64, queue_len: usize) {
-        if let Ok(mut slots) = self.queue_sort_slots.lock() {
-            slots.entry(guild_id).or_default().queue_len = queue_len;
-        }
-    }
-
-    /// 이 길드의 지금 재정렬 주기. 화면의 `4820곡 · 정렬은 15초마다` 표시(v3 §18.3)가 이 값을 쓴다.
+    /// 길이는 [`PlayerManager::queue_len`] 하나만 본다 — 플레이어가 길드 상태를 읽을 때마다
+    /// 적어 두는 값이라 **추가 쿼리가 0**이고, 누가 따로 알려 주지 않아도 저절로 맞는다.
+    /// 화면의 `4820곡 · 정렬은 15초마다`(§18.3)와 카운트다운(§5)도 반드시 이 함수를 거쳐야
+    /// 화면과 실제가 어긋나지 않는다.
     pub fn queue_sort_interval(&self, guild_id: u64) -> Duration {
-        let len = self
-            .queue_sort_slots
-            .lock()
-            .ok()
-            .and_then(|slots| slots.get(&guild_id).map(|slot| slot.queue_len))
-            .unwrap_or(0);
-        queue_sort_interval_for_len(len)
+        self.player.sort_interval(guild_id)
     }
 
     /// 이 길드의 다음 재정렬 예정 시각 — 대기열 카운트다운(v3 §5)의 기준.
     ///
     /// 클라이언트 타이머만 쓰면 탭이 백그라운드에 갔다 오는 순간 어긋나므로 기준 시각은 서버가 준다.
-    /// 루프가 밀렸으면 이미 지난 시각을 주지 않고 다음 주기로 넘긴다.
+    /// **길드마다 주기가 다르므로**(§18.2) `last_queue_sort`(전역 tick) 가 아니라 이 함수를 써야 한다.
     pub fn next_queue_sort_at(&self, guild_id: u64) -> chrono::DateTime<chrono::Utc> {
-        let now = chrono::Utc::now();
-        let (last, len) = self
-            .queue_sort_slots
+        next_queue_sort_after(
+            self.queue_sort_last(guild_id),
+            self.queue_sort_interval(guild_id),
+            chrono::Utc::now(),
+        )
+    }
+
+    /// 이 길드를 마지막으로 재정렬 검사한 시각. 아직 한 번도 안 돌았으면 `None`.
+    fn queue_sort_last(&self, guild_id: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.queue_sort_last
             .lock()
             .ok()
             .and_then(|slots| slots.get(&guild_id).copied())
-            .map(|slot| (slot.last, slot.queue_len))
-            .unwrap_or((None, 0));
-        let seconds = queue_sort_interval_for_len(len).as_secs() as i64;
-        let period = chrono::Duration::seconds(seconds.max(1));
-        let mut next = last.unwrap_or(now) + period;
-        while next <= now {
-            next += period;
-        }
-        next
     }
 
     /// 지금 이 길드를 재정렬할 차례인가. 한 번도 안 돌았으면 바로 차례다.
     fn queue_sort_due(&self, guild_id: u64, now: chrono::DateTime<chrono::Utc>) -> bool {
-        let Ok(slots) = self.queue_sort_slots.lock() else {
-            return true;
-        };
-        let Some(slot) = slots.get(&guild_id) else {
-            return true;
-        };
-        let Some(last) = slot.last else {
-            return true;
-        };
-        let seconds = queue_sort_interval_for_len(slot.queue_len).as_secs() as i64;
-        // 밀린 tick 을 정확히 맞추려 들면 15초 길드가 5초마다 조금씩 앞당겨진다.
-        // 여유를 반 tick 두어 "거의 다 됐으면 이번에 같이 돈다"로 처리한다.
-        now - last >= chrono::Duration::milliseconds(seconds * 1000 - 250)
+        queue_sort_due_at(
+            self.queue_sort_last(guild_id),
+            self.queue_sort_interval(guild_id),
+            now,
+        )
     }
 
     fn mark_queue_sorted(&self, guild_id: u64, now: chrono::DateTime<chrono::Utc>) {
-        if let Ok(mut slots) = self.queue_sort_slots.lock() {
-            slots.entry(guild_id).or_default().last = Some(now);
+        if let Ok(mut slots) = self.queue_sort_last.lock() {
+            slots.insert(guild_id, now);
         }
     }
 
@@ -310,6 +323,8 @@ impl App {
 ///
 /// tick 자체는 늘 5초지만, **대기열이 500곡을 넘는 길드는 15초에 한 번만** 실제로 정렬한다(v3 §18.2).
 /// 5000곡을 5초마다 정렬하면 정렬 비용도, 그때마다 접속자 전원에게 나가는 `queue.set` 도 감당이 안 된다.
+/// 그 판정에 쓰는 길이는 [`App::queue_sort_interval`] → [`PlayerManager::queue_len`] 하나뿐이다.
+/// 길이 사본을 여기서 따로 들지 않는다 — 사본을 두면 그걸 채우는 걸 잊어 15초가 죽는다(실제 회귀).
 async fn queue_sort_loop(app: Arc<App>) {
     let mut ticker = tokio::time::interval(QUEUE_SORT_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -393,4 +408,140 @@ pub fn remote_url_for(guild_id: u64) -> Option<String> {
     PUBLIC_BASE_URL
         .get()
         .map(|base| format!("{base}/music/guilds/{guild_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_800_000_000 + seconds, 0).unwrap()
+    }
+
+    /// 회귀: 재정렬 주기 판정이 **세 벌**로 갈라져 있었고 그중 App 쪽 사본만 아무도 안 채웠다.
+    /// 그래서 500곡을 넘겨도 15초로 갈아타지 않았다(§18.2 (3)).
+    /// 이제 경계값 정의는 이 함수 하나뿐이다 — `PlayerManager::sort_interval` 도 이걸 부른다.
+    #[test]
+    fn the_long_queue_boundary_lives_in_exactly_one_place() {
+        assert_eq!(QUEUE_SORT_LONG_THRESHOLD, 500);
+        assert_eq!(queue_sort_interval_for_len(0), QUEUE_SORT_INTERVAL);
+        assert_eq!(
+            queue_sort_interval_for_len(QUEUE_SORT_LONG_THRESHOLD),
+            QUEUE_SORT_INTERVAL
+        );
+        assert_eq!(
+            queue_sort_interval_for_len(QUEUE_SORT_LONG_THRESHOLD + 1),
+            QUEUE_SORT_INTERVAL_LONG
+        );
+        assert_eq!(queue_sort_interval_for_len(5000), QUEUE_SORT_INTERVAL_LONG);
+    }
+
+    #[test]
+    fn a_guild_that_never_sorted_is_due_right_away() {
+        assert!(queue_sort_due_at(None, QUEUE_SORT_INTERVAL, at(0)));
+        assert!(queue_sort_due_at(None, QUEUE_SORT_INTERVAL_LONG, at(0)));
+    }
+
+    /// 짧은 대기열은 5초 tick 마다 그대로 돈다.
+    #[test]
+    fn short_queues_still_sort_every_tick() {
+        let last = Some(at(0));
+        assert!(!queue_sort_due_at(last, QUEUE_SORT_INTERVAL, at(3)));
+        assert!(queue_sort_due_at(last, QUEUE_SORT_INTERVAL, at(5)));
+    }
+
+    /// 회귀: 500곡을 넘은 길드가 5초마다 계속 재정렬되면 §18.2 가 막으려던 부하가 그대로 난다.
+    /// 5초·10초 tick 은 건너뛰고 15초에만 돌아야 한다.
+    #[test]
+    fn long_queues_skip_two_ticks_out_of_three() {
+        let last = Some(at(0));
+        assert!(!queue_sort_due_at(last, QUEUE_SORT_INTERVAL_LONG, at(5)));
+        assert!(!queue_sort_due_at(last, QUEUE_SORT_INTERVAL_LONG, at(10)));
+        assert!(queue_sort_due_at(last, QUEUE_SORT_INTERVAL_LONG, at(15)));
+    }
+
+    /// 루프가 조금 일찍 깨도(반 tick 여유) 같이 돈다 — 안 그러면 15초 길드가 20초로 밀린다.
+    #[test]
+    fn a_tick_that_arrives_a_hair_early_still_counts() {
+        let last = Some(at(0));
+        let almost = at(15) - chrono::Duration::milliseconds(200);
+        assert!(queue_sort_due_at(last, QUEUE_SORT_INTERVAL_LONG, almost));
+    }
+
+    /// 카운트다운은 절대 과거를 가리키면 안 된다 — 0에 멈춘 `갱신 0` 이 그렇게 생겼다(§5).
+    #[test]
+    fn next_sort_never_points_at_the_past() {
+        let long_ago = Some(at(-1000));
+        let next = next_queue_sort_after(long_ago, QUEUE_SORT_INTERVAL, at(0));
+        assert!(next > at(0));
+        assert!(next <= at(5));
+    }
+
+    /// 긴 대기열은 카운트다운도 15초 주기를 따라간다. 5초를 세면 세 번 헛돈다.
+    #[test]
+    fn next_sort_follows_the_guilds_own_period() {
+        let next = next_queue_sort_after(Some(at(0)), QUEUE_SORT_INTERVAL_LONG, at(1));
+        assert_eq!(next, at(15));
+    }
+
+    /// 회귀 (v3 §22 · §15.2b): `App::new` 가 통계 기록기를 **플레이어에 붙여야** 한다.
+    /// 안 붙이면 `PlayerManager::stats()` 가 영원히 `None` 이라 재생·붐따가 한 줄도 안 쌓이고,
+    /// `📊 내 기록`과 `⭐ 우리 차트` 4장이 전부 빈 화면이 된다. 그런데 통계 모듈 자체 테스트는
+    /// 전부 통과해서 초록불로 보인다 — 그래서 배선을 직접 확인한다.
+    #[tokio::test]
+    async fn app_new_attaches_the_stats_recorder_to_the_player() {
+        use crate::models::{PlaybackRequestKind, ProviderKind, QueueItem, TrackRef};
+
+        let unique = format!(
+            "mc-musicbot-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&root).expect("임시 데이터 폴더 생성 실패");
+
+        let config = Config {
+            token: String::new(),
+            register_guild_id: None,
+            bot_owner_user_id: 0,
+            data_root: root.clone(),
+            tools_root: root.join("tools"),
+            yt_dlp_path: "yt-dlp".into(),
+            ffmpeg_path: "ffmpeg".into(),
+            config_dir: root.clone(),
+            portable_root: root.clone(),
+        };
+        let app = App::new(config);
+        let stats = app
+            .stats
+            .clone()
+            .expect("런타임 안에서 만들었으니 통계 DB가 열려 있어야 한다");
+
+        let mut item = QueueItem::new_user(
+            TrackRef {
+                provider: ProviderKind::YouTube,
+                content_id: "boomtta-1".into(),
+                source_url: "https://example.test/boomtta-1".into(),
+                title: Some("싫어요가 모인 곡".into()),
+                artist: None,
+                duration: None,
+                variant_key: None,
+            },
+            "민수".into(),
+            Some(7),
+        );
+        item.request_kind = PlaybackRequestKind::User;
+        app.player.record_boomtta(1, &item);
+
+        // 쓰기는 배치라 즉시 반영되지 않는다. 실패를 시간 초과로 확인한다(성공하면 1초 안에 끝난다).
+        for _ in 0..60 {
+            if stats.user_stats(1, 7).boomtta > 0 {
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        panic!("붐따가 통계에 한 줄도 안 쌓였다 — App::new 가 attach_stats 를 안 불렀다");
+    }
 }

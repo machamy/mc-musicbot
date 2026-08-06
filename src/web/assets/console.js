@@ -181,8 +181,8 @@ const REPEAT_MODES = [
  */
 const NUM_SPECS = {
   minVolume:          { label: '최소 볼륨',      min: 0,  max: 100,    step: 5,  unit: '%',  desc: '이 아래로는 볼륨을 못 내려요. 0이면 음소거까지 허용해요. 볼륨은 범위가 있어야 의미가 있어서 무제한이 없어요.' },
-  maxVolume:          { label: '최대 볼륨',      min: 10, max: 200,    step: 5,  unit: '%',  desc: '멤버가 올릴 수 있는 볼륨 상한이에요. 관리자도 이 값을 넘기지 못해요.' },
-  defaultVolume:      { label: '기본 볼륨',      min: 0,  max: 200,    step: 5,  unit: '%',  desc: '봇이 음성 채널에 새로 들어갈 때 시작하는 볼륨이에요.' },
+  maxVolume:          { label: '최대 볼륨',      min: 10, max: 200,    step: 5,  unit: '%',  desc: '멤버가 올릴 수 있는 볼륨 상한이에요. 관리자도 이 값을 넘기지 못해요. 볼륨은 범위가 있어야 의미가 있어서 무제한이 없어요.' },
+  defaultVolume:      { label: '기본 볼륨',      min: 0,  max: 200,    step: 5,  unit: '%',  desc: '봇이 음성 채널에 새로 들어갈 때 시작하는 볼륨이에요. 최소~최대 볼륨 사이에서만 고를 수 있어서 무제한이 없어요.' },
 
   maxQueuePerUser: {
     label: '1인 대기열 수', min: 1, max: 1000, step: 1, unit: '곡', unlimited: true,
@@ -223,11 +223,13 @@ const NUM_SPECS = {
     desc: '재생목록이나 차트를 통째로 담을 때 한 번에 들어올 수 있는 곡 수예요. 클릭 한 번이 대기열을 몇천 곡으로 만들면 되돌리기가 너무 어려워요.',
   },
 
-  /* ── 투표 점수 (v3 §10.1) ── 음수가 의미 있는 값이라 무제한이 없다. */
-  likePoints:      { label: '좋아요 점수',      min: -10, max: 10, step: 1, unit: '점', desc: '좋아요 하나가 몇 점인지예요. 기본 1점이에요.' },
-  dislikePoints:   { label: '싫어요 점수',      min: -10, max: 10, step: 1, unit: '점', desc: '싫어요 하나가 몇 점인지예요. 기본 -1점이라 순서가 뒤로 밀려요.' },
-  superLikePoints: { label: '슈퍼 좋아요 점수', min: -10, max: 10, step: 1, unit: '점', desc: '슈퍼 좋아요 하나가 몇 점인지예요. 기본 2점이에요.' },
-  waitPoints:      { label: '대기 점수',        min: -10, max: 10, step: 1, unit: '점', desc: '앞 곡이 하나 지날 때마다 붙는 점수예요. 오래 기다린 곡에 언젠가 차례가 오게 해요.' },
+  /* ── 투표 점수 (v3 §10.1) ──
+   * 여기 `0` 은 "무제한"이 아니라 **"그 투표를 점수에 안 센다"** 는 뜻이다. 음수도 뜻이 있는 값이라
+   * §23.1 의 `0 = 무제한` 규약을 적용하면 오히려 의미가 뒤집힌다. 그래서 무제한 칸을 두지 않는다. */
+  likePoints:      { label: '좋아요 점수',      min: -10, max: 10, step: 1, unit: '점', desc: '좋아요 하나가 몇 점인지예요. 기본 1점이에요. 0을 넣으면 좋아요를 점수에 안 세요 — 여기서 0은 무제한이 아니에요.' },
+  dislikePoints:   { label: '싫어요 점수',      min: -10, max: 10, step: 1, unit: '점', desc: '싫어요 하나가 몇 점인지예요. 기본 -1점이라 순서가 뒤로 밀려요. 0을 넣으면 싫어요를 점수에 안 세요 — 여기서 0은 무제한이 아니에요.' },
+  superLikePoints: { label: '슈퍼 좋아요 점수', min: -10, max: 10, step: 1, unit: '점', desc: '슈퍼 좋아요 하나가 몇 점인지예요. 기본 2점이에요. 0을 넣으면 슈퍼 좋아요를 점수에 안 세요 — 여기서 0은 무제한이 아니에요.' },
+  waitPoints:      { label: '대기 점수',        min: -10, max: 10, step: 1, unit: '점', desc: '앞 곡이 하나 지날 때마다 붙는 점수예요. 오래 기다린 곡에 언젠가 차례가 오게 해요. 0을 넣으면 기다린 시간을 안 세요 — 여기서 0은 무제한이 아니에요.' },
 
   boomttaThreshold: {
     label: '붐따 기준', min: 1, max: 20, step: 1, unit: '개', unlimited: true,
@@ -262,7 +264,7 @@ const NUM_SPECS = {
   /* ── 자동 재생 (v3 §8) ── */
   autoplayRecentCount: {
     label: '참고할 최근 곡 수', min: 1, max: 20, step: 1, unit: '곡',
-    desc: '"최근 튼 곡" 방식일 때 최근 몇 곡 중에서 기준을 고를지예요.',
+    desc: '"최근 튼 곡" 방식일 때 최근 몇 곡 중에서 기준을 고를지예요. 적어도 한 곡은 봐야 기준을 뽑을 수 있어서 무제한이 없어요.',
   },
   autoplayArtistCooldown: {
     label: '같은 가수 쿨다운', min: 1, max: 20, step: 1, unit: '곡', unlimited: true,
@@ -283,7 +285,7 @@ const NUM_SPECS = {
   /* ── 우리 차트 (v3 §15.2b) ── 0 은 "슈퍼 좋아요를 아예 안 센다"는 뜻이라 무제한이 아니다. */
   chartSuperWeight: {
     label: '슈퍼 좋아요 가중치', min: 0, max: 5, step: 1, unit: '배',
-    desc: '"많이 사랑받은 곡" 차트에서 슈퍼 좋아요를 몇 배로 칠지예요. 0이면 슈퍼 좋아요를 아예 안 세요.',
+    desc: '"많이 사랑받은 곡" 차트에서 슈퍼 좋아요를 몇 배로 칠지예요. 배수라서 무제한이 없고, 0은 무제한이 아니라 "슈퍼 좋아요를 아예 안 센다"는 뜻이에요.',
   },
 };
 
@@ -359,6 +361,8 @@ const S = {
   draft: null,      // 편집 중인 사본
   roles: [],        // 길드 역할 목록
   saving: false,
+  /** 대기열 비우기(§18.2 (5))가 진행 중인가 — 두 번 눌러 두 번 지우는 일을 막는다. */
+  clearingQueue: false,
   /** 섹션별 지연 로드 데이터 */
   queuePreview: { mode: null, data: null, loading: false },
   permPreview: {},  // 설정 키 → { passCount, memberCount, ... }
@@ -374,6 +378,8 @@ const S = {
     failedOnly: false,
   },
   diag: null,
+  /** 서버 통계 (§22.6 `GET /stats/server`). `{available:false}` 도 그대로 담는다. */
+  serverStats: null,
   /** 차트 관리 (§15.5). */
   charts: { items: null, error: null, loading: false },
   /** 차단 목록 (§19.3). */
@@ -689,8 +695,11 @@ function zeroText(spec) {
  */
 function numberField(key, bounds) {
   const spec = NUM_SPECS[key];
-  const min = bounds && bounds.min != null ? bounds.min : spec.min;
-  const max = bounds && bounds.max != null ? bounds.max : spec.max;
+  // bounds 는 다른 설정값에서 온다(기본 볼륨의 범위 = 최소~최대 볼륨). 그 값이 아직 안 왔으면 NaN 인데,
+  // NaN 이 클램프에 섞이면 저장값 자체가 NaN 이 된다. 숫자일 때만 spec 을 덮어쓴다.
+  const bound = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  const min = bounds ? bound(bounds.min, spec.min) : spec.min;
+  const max = Math.max(min, bounds ? bound(bounds.max, spec.max) : spec.max);
   const unlimited = Boolean(spec.unlimited);
   const infinitySlot = max + spec.step;          // 최댓값 다음 칸 = ∞
   const value = Number(S.draft[key]);
@@ -702,10 +711,10 @@ function numberField(key, bounds) {
   const hintNode = h('span', { class: 'num__hint' });
   const number = h('input', {
     class: 'field num__input', type: 'number', inputmode: 'numeric',
-    min: String(unlimited ? 0 : spec.min), max: String(spec.max), step: String(spec.step),
+    min: String(unlimited ? 0 : min), max: String(max), step: String(spec.step),
     value: String(value),
     'aria-label': spec.label,
-    'data-tip': unlimited ? '0을 넣으면 무제한이에요' : `${spec.min}~${spec.max}${spec.unit} 사이로 넣어요`,
+    'data-tip': unlimited ? '0을 넣으면 무제한이에요' : `${min}~${max}${spec.unit} 사이로 넣어요`,
   });
   const range = h('input', {
     class: 'num__range', type: 'range',
@@ -727,7 +736,9 @@ function numberField(key, bounds) {
     let next = Number(raw);
     if (raw === '' || !Number.isFinite(next)) next = unlimited ? 0 : Number(S.saved[key]);
     next = Math.round(next);
-    if (!(unlimited && next === 0)) next = Math.min(spec.max, Math.max(spec.min, next));
+    // 슬라이더는 bounds(예: 기본 볼륨 = 최소~최대 볼륨)를 따르는데 직접입력만 spec 범위로 잘라서,
+    // 최대 볼륨이 100인데도 150을 타이핑하면 그대로 저장되고 서버에서 튕겼다. 두 입력이 같은 범위를 쓴다.
+    if (!(unlimited && next === 0)) next = Math.min(max, Math.max(min, next));
     if (syncRange) range.value = String(toSlider(next));
     if (syncNumber) number.value = String(next);
     paint(next);
@@ -739,8 +750,8 @@ function numberField(key, bounds) {
   paint(value);
 
   const rangeLabel = unlimited
-    ? `${spec.min}~${spec.max}${spec.unit} · 맨 끝은 ∞(무제한)이에요`
-    : `${spec.min}~${spec.max}${spec.unit} 안에서 고를 수 있어요`;
+    ? `${min}~${max}${spec.unit} · 맨 끝은 ∞(무제한)이에요`
+    : `${min}~${max}${spec.unit} 안에서 고를 수 있어요`;
 
   const control = h('div', { class: 'num' + (unlimited ? ' num--inf' : '') },
     range,
@@ -788,11 +799,88 @@ function sectionOrder() {
     playbackGroup(),
     autoplayGroup(),
     chartsGroup(),
+    clearQueueGroup(),
   );
 
   renderQueuePreview(previewBox);
   loadQueuePreview();
   return body;
+}
+
+/* ── 대기열 비우기 (v3 §18.2 (5)) ──
+ * 상한을 1000/10000곡으로 100배 열었으면 되돌릴 수단이 반드시 같이 있어야 한다.
+ * 없으면 누가 차트 100곡을 여러 번 담았을 때 관리자가 손쓸 방법이 Discord 명령뿐이다.
+ */
+
+function clearQueueGroup() {
+  const box = h('div', { class: 'clearq' });
+  paintClearQueue(box);
+  return h('div', { class: 'grp grp--danger' },
+    h('h3', { class: 'grp__title' }, '🧹 대기열 비우기'),
+    h('p', { class: 'grp__desc' },
+      '대기열에 쌓인 곡을 한 번에 전부 지워요. 지금 재생 중인 곡은 그대로 두고 뒤에 줄 서 있는 곡만 지워요. ' +
+      '되돌릴 수 없으니 확인 창에서 곡 수를 한 번 더 보여드려요.'),
+    box,
+  );
+}
+
+/** 버튼에 지금 곡 수를 박는다. 숫자는 대기열 미리보기가 이미 받아 온 `totalCount` 를 그대로 쓴다. */
+function paintClearQueue(box) {
+  const preview = S.queuePreview.data;
+  const total = preview && !preview.error ? Number(preview.totalCount) : NaN;
+  const known = Number.isFinite(total);
+  const empty = known && total === 0;
+
+  const button = h('button', {
+    class: 'btn btn--danger', type: 'button',
+    disabled: empty || S.clearingQueue ? true : undefined,
+    'data-tip': empty
+      ? '지금은 대기열이 비어 있어서 지울 게 없어요'
+      : '대기열에 줄 서 있는 곡을 전부 지워요',
+    onclick: () => clearQueue(total),
+  }, S.clearingQueue ? '비우는 중이에요…' : (known ? `🧹 ${total}곡 비우기` : '🧹 대기열 비우기'));
+
+  box.replaceChildren(
+    button,
+    h('p', { class: 'hint' }, known
+      ? (empty ? '지금 대기열에 곡이 없어요.' : `지금 ${total}곡이 줄 서 있어요.`)
+      : '지금 몇 곡인지 아직 못 받았어요. 곡 수는 확인 창에서 다시 보여드릴게요.'),
+  );
+  tooltip(box);
+}
+
+async function clearQueue(total) {
+  const known = Number.isFinite(total);
+  const ok = await confirmSheet({
+    title: '대기열을 비울까요',
+    desc: known
+      ? `${total}곡이 전부 지워져요. 되돌릴 수 없어요. 지금 재생 중인 곡은 그대로 둬요.`
+      : '대기열에 줄 서 있는 곡이 전부 지워져요. 되돌릴 수 없어요. 지금 재생 중인 곡은 그대로 둬요.',
+    danger: true,
+    confirmText: known ? `${total}곡 비우기` : '대기열 비우기',
+    cancelText: '그만둘게요',
+  });
+  if (!ok) return;
+
+  S.clearingQueue = true;
+  const box = sectionBox && sectionBox.querySelector('.clearq');
+  if (box) paintClearQueue(box);
+  try {
+    await api('/queue/action', { body: { action: 'clear' } });
+    toast('대기열을 비웠어요.', 'ok');
+    S.queuePreview = { mode: null, data: null, loading: false };
+  } catch (error) {
+    // 이 봇이 아직 `clear` 를 모르는 빌드일 수 있다. 원인 불명 에러로 두지 않는다 (§23.3).
+    const status = Number(error && error.status);
+    toast(status === 400 || status === 404 || status === 422
+      ? '이 봇은 아직 대기열 비우기를 지원하지 않아요. 봇을 새 빌드로 올리면 바로 돼요.'
+      : `대기열을 비우지 못했어요 — ${error.message}`, 'danger');
+  } finally {
+    S.clearingQueue = false;
+    loadQueuePreview();
+    const live = sectionBox && sectionBox.querySelector('.clearq');
+    if (live) paintClearQueue(live);
+  }
 }
 
 /* ── 재생 (반복·기본 볼륨) ── */
@@ -837,7 +925,12 @@ function votePointsGroup(previewBox) {
         '지금은 시간제라 점수가 순서를 바꾸지 않아요. 화면에는 계속 보이지만 신청한 순서대로 나가요.'),
     ));
   }
-  if (previewBox) group.append(h('p', { class: 'hint' }, '점수를 바꾸면 위쪽 미리보기가 새 점수로 다시 계산돼요.'));
+  if (previewBox) {
+    // 이 줄은 서버가 실제로 무엇을 했는지에 따라 문구가 바뀐다 — paintPreviewNote 가 채운다.
+    const note = h('p', { class: 'hint prevnote' });
+    paintPreviewNote(note);
+    group.append(note);
+  }
   return group;
 }
 
@@ -928,10 +1021,15 @@ function paintSkipConvert(box) {
   const minimum = Number(S.draft.voteSkipMin) || 0;
   const listeners = S.basis.listeners;
   const viewers = S.basis.viewers;
+  // 서버(`models.rs` `VoteSkipBasis::votes_needed`)와 **같은 식**이어야 한다.
+  // 모수 상한(`.min(population)`)이 빠져 있어서, 듣는 사람 1명 · 최소 동의 2명이면
+  // 콘솔은 `1명 중 2명이 눌러야 넘어가요` 라고 말하는데 서버는 1명으로 통과시켰다.
+  // 바로 아래 힌트("모수가 1명이면 혼자 눌러도 넘어가요")와도 자기모순이었다.
   const need = (population) => {
     if (population <= 0) return 0;
-    const byRatio = Math.ceil((population * ratio) / 100);
-    return Math.max(1, Math.max(minimum, byRatio));
+    const bounded = Math.min(100, Math.max(10, ratio));   // 서버도 비율을 10~100으로 clamp 한다
+    const byRatio = Math.max(1, Math.ceil((population * bounded) / 100));
+    return Math.min(population, Math.max(minimum, byRatio));
   };
   const line = (label, population) => {
     if (population == null) {
@@ -1395,12 +1493,43 @@ function scheduleQueuePreview() {
   queuePreviewTimer = setTimeout(() => loadQueuePreview(), 260);
 }
 
+/** 지금 화면의 투표 점수 4종 — 서버 `vote_points()` 와 같은 키 이름을 쓴다. */
+function draftVotePoints() {
+  return {
+    like: Number(S.draft.likePoints) || 0,
+    dislike: Number(S.draft.dislikePoints) || 0,
+    superLike: Number(S.draft.superLikePoints) || 0,
+    wait: Number(S.draft.waitPoints) || 0,
+  };
+}
+
+/**
+ * 서버가 미리보기에서 **우리가 보낸 점수를 실제로 썼는가** (v3 §10.1).
+ * `null` = 아직 모름 · `true` = 반영됨 · `false` = 저장된 점수로만 계산됨.
+ *
+ * 옛 서버의 `ModeQuery` 는 `mode` 하나만 역직렬화하고 나머지 쿼리 키를 조용히 버렸다.
+ * 그래서 점수를 아무리 끌어도 미리보기 순서가 그대로였는데 화면은 "새 점수로 다시 계산돼요"
+ * 라고 말했다. 서버가 쓴 점수를 응답에 되돌려 주면(`points`) 여기서 사실을 확인한다.
+ */
+let previewHonorsPoints = null;
+
+function previewEchoMatches(data, sent) {
+  const echo = data && (data.points || data.votePoints);
+  if (!echo || typeof echo !== 'object') return false;
+  return ['like', 'dislike', 'superLike', 'wait']
+    .every((field) => Number(echo[field]) === Number(sent[field]));
+}
+
 /** 지금 대기열에 이 모드·이 점수를 적용하면 순서가 어떻게 되는지 (구림 해소 #4 + v3 §10.1). */
 function queuePreviewKey() {
-  return [
-    S.draft.sortMode,
-    S.draft.likePoints, S.draft.dislikePoints, S.draft.superLikePoints, S.draft.waitPoints,
-  ].join('|');
+  const parts = [S.draft.sortMode];
+  // 서버가 점수를 안 본다는 걸 확인했으면 점수를 키에서 뺀다.
+  // 안 그러면 슬라이더를 끌 때마다 **똑같은 응답**을 받으려고 요청이 계속 나간다(§23.2 위반).
+  if (previewHonorsPoints !== false) {
+    const points = draftVotePoints();
+    parts.push(points.like, points.dislike, points.superLike, points.wait);
+  }
+  return parts.join('|');
 }
 
 async function loadQueuePreview() {
@@ -1410,23 +1539,37 @@ async function loadQueuePreview() {
   const box = sectionBox && sectionBox.querySelector('.prev');
   if (box) renderQueuePreview(box);
   // 점수도 같이 보낸다 — 서버가 이 값들로 계산해야 "저장하면 이렇게 돼요"가 사실이 된다.
+  const sent = draftVotePoints();
   const params = new URLSearchParams({
     mode: String(S.draft.sortMode),
-    likePoints: String(S.draft.likePoints),
-    dislikePoints: String(S.draft.dislikePoints),
-    superLikePoints: String(S.draft.superLikePoints),
-    waitPoints: String(S.draft.waitPoints),
+    likePoints: String(sent.like),
+    dislikePoints: String(sent.dislike),
+    superLikePoints: String(sent.superLike),
+    waitPoints: String(sent.wait),
   });
   try {
     const data = await api(`/admin/queue-preview?${params.toString()}`);
     if (S.queuePreview.mode !== key) return;   // 그 사이 값이 또 바뀌었으면 버린다
-    S.queuePreview = { mode: key, data, loading: false };
+    previewHonorsPoints = previewEchoMatches(data, sent);
+    S.queuePreview = { mode: queuePreviewKey(), data, loading: false };
   } catch (error) {
     if (S.queuePreview.mode !== key) return;
     S.queuePreview = { mode: key, data: { error: error.message }, loading: false };
   }
   const target = sectionBox && sectionBox.querySelector('.prev');
   if (target) renderQueuePreview(target);
+  const note = sectionBox && sectionBox.querySelector('.prevnote');
+  if (note) paintPreviewNote(note);
+  const clearBox = sectionBox && sectionBox.querySelector('.clearq');
+  if (clearBox) paintClearQueue(clearBox);
+}
+
+/** 미리보기가 지금 무엇을 기준으로 계산된 건지 한 줄로 말한다. 모르면 아무 말도 안 한다. */
+function paintPreviewNote(node) {
+  node.classList.toggle('is-warn', previewHonorsPoints === false);
+  node.textContent = previewHonorsPoints === false
+    ? '지금 이 봇은 미리보기를 저장된 점수로만 계산해요. 바꾸신 점수는 저장한 뒤에 순서에 반영돼요.'
+    : '점수를 바꾸면 위쪽 미리보기가 새 점수로 다시 계산돼요.';
 }
 
 function renderQueuePreview(box) {
@@ -1435,6 +1578,15 @@ function renderQueuePreview(box) {
     h('strong', null, '지금 대기열에 적용하면'),
     h('span', { class: 'hint' }, '저장해야 실제로 바뀌어요'),
   ));
+  // 서버가 점수를 안 보고 계산했다면 그 사실을 미리보기 안에서 말한다.
+  // 아무 말 없이 옛 순서를 보여 주면 "점수를 바꿨는데 순서가 그대로네"가 되고, 그게 §10.1 이 금지한 거짓말이다.
+  if (previewHonorsPoints === false) {
+    box.append(h('div', { class: 'warnbox warnbox--info' },
+      h('span', null, 'ℹ'),
+      h('span', null,
+        '이 순서는 지금 저장돼 있는 점수로 계산한 거예요. 바꾸신 점수는 저장한 뒤에 순서에 반영돼요.'),
+    ));
+  }
 
   const preview = S.queuePreview;
   if (preview.loading) {
@@ -1868,14 +2020,14 @@ function loadPermPreview(field, rule, box) {
       });
       const data = await api(`/admin/permission-preview?${params.toString()}`);
       S.permPreview[field.key] = data;
-      paintPermPreview(box, data, rule);
+      paintPermPreview(box, data, rule, field);
     } catch (error) {
       box.replaceChildren(h('span', { class: 'permprev__fail' }, `통과 인원을 못 셌어요 — ${error.message}`));
     }
   }, 180);
 }
 
-function paintPermPreview(box, data, rule) {
+function paintPermPreview(box, data, rule, field) {
   const pass = Number(data.passCount || 0);
   const total = Number(data.memberCount || 0);
   const tone = rule === 'disabled' ? 'is-none' : pass === 0 ? 'is-none' : pass === total ? 'is-all' : 'is-some';
@@ -1891,10 +2043,18 @@ function paintPermPreview(box, data, rule) {
     kids.push(h('span', { class: 'permprev__note' }, `그중 ${data.managerBypassCount}명은 관리자라서 통과해요`));
   }
   // §23.3 — 막힌 사람에게 보여줄 "누가 되는지" 문구를 관리자도 미리 확인한다.
-  const allowedRoles = data.allowedRoleNames || [];
+  // 서버가 `allowedRoleNames` 를 안 주는 빌드면 콘솔이 이미 들고 있는 역할 이름으로 채운다.
+  // 그게 없으면 "지정 역할" 규칙일 때 이 줄이 통째로 안 나와서, 관리자가 멤버에게 뭐라고 보이는지
+  // 미리 확인할 방법이 사라진다.
+  const fromServer = Array.isArray(data.allowedRoleNames) ? data.allowedRoleNames : [];
+  const allowedRoles = fromServer.length
+    ? fromServer.map((name) => `@${name}`)
+    : (rule === 'configuredRole' && field
+      ? roleNames((S.draft.ruleRoleIds || {})[field.permKey] || [])
+      : []);
   if (allowedRoles.length) {
     kids.push(h('span', { class: 'permprev__note' },
-      `멤버에게는 "지금은 ${allowedRoles.map((name) => `@${name}`).join(' · ')}이 쓸 수 있어요 (${data.allowedCount != null ? data.allowedCount : pass}명)"로 보여요`));
+      `멤버에게는 "지금은 ${allowedRoles.join(' · ')}이 쓸 수 있어요 (${data.allowedCount != null ? data.allowedCount : pass}명)"로 보여요`));
   } else if (rule === 'administrator') {
     kids.push(h('span', { class: 'permprev__note' },
       `멤버에게는 "서버 관리자 ${data.allowedCount != null ? data.allowedCount : pass}명이 쓸 수 있어요"로 보여요`));
@@ -2740,9 +2900,88 @@ function sectionDiag() {
     }, '다시 확인할게요'),
   ));
 
+  body.append(serverStatsGroup());
+
   paintDiag(box);
   if (!S.diag) loadDiag().then(() => paintDiag(box));
   return body;
+}
+
+/* ── 서버 통계 (v3 §22.6 `GET /stats/server` — "관리 콘솔용") ──
+ * 만들어만 두고 아무도 안 쓰던 엔드포인트다. 관리자가 "우리 서버에서 뭐가 많이 나갔나"를
+ * 볼 유일한 자리라 여기에 붙인다. 통계가 꺼져 있으면 **0으로 꾸미지 않고** 그대로 말한다.
+ */
+
+function serverStatsGroup() {
+  const box = h('div', { class: 'srvstats' });
+  paintServerStats(box);
+  if (!S.serverStats) loadServerStats().then(() => paintServerStats(box));
+  return h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '📊 이번 달 서버 기록'),
+    h('p', { class: 'grp__desc' },
+      '최근 30일 동안 이 서버에서 사람이 신청해 실제로 나간 곡이에요. 자동 재생으로 나간 건 순위에 안 세요. ' +
+      '값은 60초 동안 캐시돼요.'),
+    box,
+  );
+}
+
+async function loadServerStats() {
+  try {
+    S.serverStats = await api('/stats/server');
+  } catch (error) {
+    S.serverStats = { error: error.message };
+  }
+}
+
+function paintServerStats(box) {
+  const data = S.serverStats;
+  if (!data) {
+    box.replaceChildren(h('div', { class: 'skel', style: 'height:96px' }));
+    return;
+  }
+  if (data.error) {
+    box.replaceChildren(h('p', { class: 'hint' }, `서버 기록을 못 불러왔어요 — ${data.error}`));
+    return;
+  }
+  // 통계가 꺼져 있는 것과 "기록이 0" 은 완전히 다른 이야기다 (§22.6).
+  if (data.available === false) {
+    box.replaceChildren(h('div', { class: 'warnbox warnbox--info' },
+      h('span', null, 'ℹ'),
+      h('span', null, data.message || '통계 기록이 꺼져 있어서 보여 드릴 게 없어요.'),
+    ));
+    return;
+  }
+
+  const trackTitle = (row) => {
+    const track = row.track || {};
+    const title = track.title || row.cacheKey || '(제목이 없어요)';
+    return track.artist ? `${track.artist} - ${title}` : title;
+  };
+  const table = (heading, rows, valueOf, tipOfRow) => {
+    const list = h('ol', { class: 'srvstats__rows' });
+    (rows || []).slice(0, 10).forEach((row) => {
+      list.append(h('li', { class: 'srvstats__row', 'data-tip': tipOfRow(row) },
+        h('span', { class: 'srvstats__rank' }, `${row.rank}`),
+        h('span', { class: 'srvstats__title' }, trackTitle(row)),
+        h('span', { class: 'srvstats__value' }, valueOf(row)),
+      ));
+    });
+    return h('div', { class: 'srvstats__col' },
+      h('h4', { class: 'srvstats__head' }, heading),
+      (rows || []).length ? list
+        : h('p', { class: 'hint' }, '이번 달에는 아직 기록이 없어요.'),
+    );
+  };
+
+  box.replaceChildren(
+    table('많이 나간 곡', data.topPlayed,
+      (row) => `${Number(row.plays) || 0}회`,
+      (row) => `${Number(row.requesters) || 0}명이 신청했고 자동 재생으로 ${Number(row.playsAutoplay) || 0}회 더 나갔어요`),
+    table('많이 사랑받은 곡', data.topLoved,
+      (row) => `${Number(row.loveScore) || 0}점`,
+      (row) => row.loveFormula || `슈퍼 좋아요를 ${data.superWeight}배로 셌어요`),
+  );
+  tooltip(box);
 }
 
 /** 특권 인텐트가 꺼져 있으면 켜는 방법까지 안내한다 (사양서 §2.3). */

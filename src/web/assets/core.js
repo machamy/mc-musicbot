@@ -263,16 +263,16 @@ function flush() {
  * - 429는 재시도 안내
  */
 const STATUS_TEXT = {
-  400: '요청 형식이 잘못됐다.',
-  401: '로그인이 풀렸다. 새로고침해서 다시 로그인.',
-  403: '권한이 없다.',
-  404: '대상을 찾을 수 없다.',
-  409: '그 사이 상태가 바뀌었다. 다시 시도.',
-  413: '내용이 너무 길다.',
-  422: '입력값을 확인해라.',
-  500: '서버에서 처리하지 못했다.',
-  502: '봇에 연결하지 못했다.',
-  503: '봇이 잠깐 바쁘다. 잠시 후 다시.',
+  400: '요청 형식이 잘못됐어요.',
+  401: '로그인이 풀렸어요. 새로고침하고 다시 로그인해 주세요.',
+  403: '권한이 없어요.',
+  404: '대상을 찾을 수 없어요.',
+  409: '그 사이에 상태가 바뀌었어요. 다시 해 보세요.',
+  413: '내용이 너무 길어요.',
+  422: '입력값을 확인해 주세요.',
+  500: '서버가 처리하지 못했어요.',
+  502: '봇에 연결하지 못했어요.',
+  503: '봇이 잠깐 바빠요. 조금 뒤에 다시 해 주세요.',
 };
 
 export class ApiError extends Error {
@@ -315,7 +315,7 @@ export async function api(path, opts = {}) {
   const retryAfter = Number(response.headers.get('retry-after')) || Number(data?.retryAfter) || 0;
   let message = (data && (data.error || data.message)) || STATUS_TEXT[response.status] || `요청 실패 (${response.status})`;
   if (response.status === 429) {
-    message = retryAfter > 0 ? `${message} ${Math.ceil(retryAfter)}초 뒤에 다시 눌러라.` : `${message}`;
+    message = retryAfter > 0 ? `${message} ${Math.ceil(retryAfter)}초 뒤에 다시 눌러 주세요.` : `${message}`;
   }
   throw new ApiError(message, response.status, retryAfter);
 }
@@ -1010,13 +1010,39 @@ function merge(type, data, handlers) {
       });
       break;
     }
-    case 'queue.set':
+    case 'queue.set': {
+      // 이 프레임은 모든 사람이 같이 받으므로 서버가 개인화 필드(isMine·myVote)를 비워서 보낸다.
+      // 그대로 덮어쓰면 5초마다 "내 곡" 표시와 내 투표가 사라지고, 자기 곡에 투표 버튼이
+      // 열려 서버가 403 을 주는 상태가 된다. 그래서 **id 기준으로 병합**한다.
+      //
+      // 또 서버는 앞 200곡만 보낸다(§18.2). 통째로 갈아치우면 더 불러온 뒤쪽 페이지가 날아가므로,
+      // 잘린 프레임이면 앞부분만 교체하고 뒤는 남긴다.
+      const incoming = Array.isArray(data.items) ? data.items : [];
+      const mine = new Map();
+      for (const item of state.queue || []) mine.set(item.id, item);
+      const merged = incoming.map((item) => {
+        const previous = mine.get(item.id);
+        if (!previous) return item;
+        return Object.assign({}, item, {
+          // null 은 "서버가 안 보냈다"는 뜻이라 예전 값을 지키고,
+          // false/문자열처럼 실제 값이 오면 그건 서버 판단이라 따른다.
+          isMine: item.isMine ?? previous.isMine,
+          myVote: item.myVote === undefined || item.myVote === null ? previous.myVote : item.myVote,
+        });
+      });
+      const tail = data.truncated && (state.queue || []).length > merged.length
+        ? state.queue.slice(merged.length).filter((item) => !incoming.some((next) => next.id === item.id))
+        : [];
       store.patch({
-        queue: Array.isArray(data.items) ? data.items : [],
+        queue: merged.concat(tail),
         queueMode: data.mode || state.queueMode,
         sortedAt: data.sortedAt || null,
+        nextSortAt: data.nextSortAt || state.nextSortAt || null,
+        sortPeriodSeconds: data.sortPeriodSeconds || state.sortPeriodSeconds || null,
+        queueTotal: data.total ?? data.queueTotal ?? state.queueTotal,
       });
       break;
+    }
     case 'vote': {
       const queue = state.queue.map((item) => (item.id === data.itemId
         ? Object.assign({}, item, {
@@ -1081,7 +1107,10 @@ function merge(type, data, handlers) {
       handlers.onRefetch?.('suggestions');
       break;
     case 'audit':
-      handlers.onRefetch?.('audit');
+      // 서버가 새 항목 하나를 실어 보낸다(§13.5). 그걸 버리고 전체를 다시 불러오면
+      // 투표·담기까지 기록 대상이 된 지금은 로그 탭이 열려 있는 내내 재조회가 쏟아진다.
+      if (data && data.entry) handlers.onEvent?.('audit', data);
+      else handlers.onRefetch?.('audit');
       break;
     case 'lyrics':
       store.patch({ lyrics: data || null });

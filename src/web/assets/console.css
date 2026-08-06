@@ -518,6 +518,33 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
 /* 관리자 지정 역할은 기능 권한과 다른 무게라 카드부터 구분한다 */
 .grp--manager { border-color: color-mix(in srgb, var(--warn) 45%, var(--line-1)); }
 
+/* 되돌릴 수 없는 조작(대기열 비우기 §18.2 (5))은 카드 테두리부터 다르게 보인다.
+   저장 버튼을 거치지 않고 누르는 즉시 나가므로, 다른 설정 카드와 같은 얼굴이면 안 된다. */
+.grp--danger { border-color: color-mix(in srgb, var(--danger) 45%, var(--line-1)); }
+.clearq { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); }
+.clearq .hint { flex: 1 1 220px; margin: 0; }
+
+/* 안내 줄이 "지금 화면이 사실과 다르다"를 말할 때는 색으로도 구분한다 (§10.1 미리보기). */
+.hint.is-warn { color: var(--warn); }
+
+/* ── 서버 통계 (§22.6) — 두 목록을 나란히, 좁아지면 위아래로 ── */
+.srvstats { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--sp-4); }
+.srvstats__col { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.srvstats__head { color: var(--text-2); font-size: var(--fs-sm); font-weight: var(--fw-semi); }
+.srvstats__rows { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.srvstats__row {
+  display: grid;
+  grid-template-columns: 1.6rem minmax(0, 1fr) auto;
+  gap: var(--sp-2);
+  align-items: baseline;
+  padding: 4px var(--sp-2);
+  border-radius: var(--r-sm);
+}
+.srvstats__row:nth-child(odd) { background: var(--surface-2); }
+.srvstats__rank { color: var(--text-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.srvstats__title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); }
+.srvstats__value { color: var(--text-2); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+
 /* ── 역할 선택 ── */
 
 .roles { display: flex; flex-wrap: wrap; gap: var(--sp-2); }

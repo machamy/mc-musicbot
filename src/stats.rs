@@ -7,7 +7,8 @@
 //!   2. 파일이 커지면 백업·이동이 무거워진다.
 //!
 //! **쓰기는 재생 경로를 절대 막지 않는다.** 호출부는 `Stats::record()` 로 이벤트를 던지고 즉시 돌아간다.
-//! 전용 태스크가 배치로 반영한다. 채널이 꽉 차면 **그냥 버린다** — 통계 한 줄 때문에 음악이 밀리면 본말전도다.
+//! 전용 태스크가 배치로 반영한다. 대기줄이 꽉 차면 **가장 오래된 것부터 버린다**(§22.2) —
+//! 통계 한 줄 때문에 음악이 밀리면 본말전도다.
 //!
 //! **통계 DB가 깨져도 봇은 정상 동작해야 한다.** 열기에 실패하면 로그만 남기고
 //! 통계 기능만 꺼진 채 계속 간다.
@@ -15,12 +16,14 @@
 use crate::logging::LogService;
 use crate::models::{PlaybackRequestKind, QueueItem, TrackRef};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Notify;
 
-/// 채널 용량. 넘치면 오래된 것부터 버린다.
+/// 대기줄 용량. 넘치면 오래된 것부터 버린다.
 const EVENT_CHANNEL_CAP: usize = 4096;
 /// 이만큼 모이거나 아래 시간이 지나면 한 트랜잭션으로 반영한다.
 const FLUSH_BATCH: usize = 200;
@@ -242,11 +245,69 @@ impl ChartWindow {
             _ => ChartWindow::Month,
         }
     }
+
+    /// 응답에 "어느 기간으로 계산했는지" 를 되돌려 줄 때 쓰는 이름.
+    /// **`parse` 와 반드시 왕복해야 한다** — 여기서 이름이 어긋나면 화면이 `이번 주` 를 눌렀는데
+    /// 서버는 `이번 달` 을 계산하는, 눈으로는 못 잡는 어긋남이 생긴다(§15.2b 기간 선택).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChartWindow::Week => "week",
+            ChartWindow::Month => "month",
+            ChartWindow::All => "all",
+        }
+    }
+}
+
+/// 반영을 기다리는 이벤트 대기줄.
+///
+/// **꽉 차면 가장 오래된 것부터 버린다**(§22.2). `tokio::mpsc` + `try_send` 로는 이걸 못 한다 —
+/// 보내는 쪽에서 오래된 걸 꺼낼 방법이 없어서 정반대로 **방금 생긴 이벤트**가 버려진다.
+/// 대기줄이 넘치는 건 폭주 구간이고, 그 구간이야말로 기록이 필요한 구간이라 그건 곤란하다.
+#[derive(Default)]
+struct EventQueue {
+    buf: Mutex<VecDeque<StatEvent>>,
+    /// "배치 하나가 찼다"는 신호. 이벤트 한 건마다 깨우면 트랜잭션이 이벤트 수만큼 생겨
+    /// 배치로 묶는 의미가 없어진다. 나머지는 1초 tick 이 데려간다.
+    ready: Notify,
+    /// 넘쳐서 버린 이벤트 수. 통계가 왜 비는지 알 수 있어야 해서 세어 둔다.
+    dropped: AtomicU64,
+}
+
+impl EventQueue {
+    /// 대기줄에 넣는다. 반환값은 "지금 깨울 만큼 쌓였나".
+    /// 락을 잡는 구간은 `push_back` 하나뿐이라 재생 경로가 여기서 멈출 일이 없다.
+    fn push(&self, event: StatEvent) -> bool {
+        let mut buf = self.lock();
+        if buf.len() >= EVENT_CHANNEL_CAP {
+            buf.pop_front();
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        buf.push_back(event);
+        buf.len() >= FLUSH_BATCH
+    }
+
+    /// 앞에서 최대 `limit` 건을 꺼낸다.
+    fn take(&self, limit: usize) -> Vec<StatEvent> {
+        let mut buf = self.lock();
+        let take = buf.len().min(limit);
+        buf.drain(..take).collect()
+    }
+
+    /// 마지막으로 물어본 뒤 버려진 건수(읽으면 0으로 되돌린다).
+    fn take_dropped(&self) -> u64 {
+        self.dropped.swap(0, Ordering::Relaxed)
+    }
+
+    /// 통계 때문에 재생이 멈추면 안 되므로 poison 을 무시하고 계속 쓴다.
+    /// 안에 든 건 `VecDeque` 뿐이라 중간에 패닉해도 깨질 불변식이 없다.
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<StatEvent>> {
+        self.buf.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 pub struct Stats {
     conn: Mutex<Connection>,
-    tx: mpsc::Sender<StatEvent>,
+    queue: EventQueue,
 }
 
 impl Stats {
@@ -269,19 +330,20 @@ impl Stats {
             );
             return None;
         }
-        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         let stats = Arc::new(Stats {
             conn: Mutex::new(conn),
-            tx,
+            queue: EventQueue::default(),
         });
-        spawn_writer(stats.clone(), rx, log);
+        spawn_writer(stats.clone(), log);
         Some(stats)
     }
 
     /// 이벤트를 던진다. **절대 블로킹하지 않는다.**
-    /// 채널이 꽉 차면 조용히 버린다 — 통계 한 줄보다 재생이 중요하다.
+    /// 대기줄이 꽉 차면 가장 오래된 것을 버린다(§22.2) — 통계 한 줄보다 재생이 중요하다.
     pub fn record(&self, event: StatEvent) {
-        let _ = self.tx.try_send(event);
+        if self.queue.push(event) {
+            self.queue.ready.notify_one();
+        }
     }
 
     // ───────────────────────── 조회 ─────────────────────────
@@ -582,39 +644,50 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
 // ───────────────────────── 쓰기 태스크 ─────────────────────────
 
-fn spawn_writer(stats: Arc<Stats>, mut rx: mpsc::Receiver<StatEvent>, log: Arc<LogService>) {
+/// 배치 반영 태스크. **1초 또는 200건마다** 한 트랜잭션으로 묶는다(§22.2).
+///
+/// 태스크가 `Arc<Stats>` 를 들고 있어 프로세스가 사는 동안 같이 산다. 예전 구현에는
+/// "채널이 닫히면 비우고 나간다"는 분기가 있었지만, 채널의 송신단도 같은 `Stats` 안에 있어서
+/// **닫힐 수가 없었다** — 절대 실행되지 않는 종료 처리였다. 남은 것을 비우려면 종료 신호가
+/// 따로 있어야 하므로, 있는 척하지 않고 뺐다(마지막 1초치가 유실될 수 있다).
+fn spawn_writer(stats: Arc<Stats>, log: Arc<LogService>) {
     tokio::spawn(async move {
-        let mut batch: Vec<StatEvent> = Vec::with_capacity(FLUSH_BATCH);
         let mut ticker =
             tokio::time::interval(std::time::Duration::from_millis(FLUSH_INTERVAL_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                received = rx.recv() => {
-                    match received {
-                        Some(event) => {
-                            batch.push(event);
-                            if batch.len() >= FLUSH_BATCH {
-                                flush(&stats, &mut batch, &log);
-                            }
-                        }
-                        // 채널이 닫혔다 — 남은 것을 비우고 나간다.
-                        None => { flush(&stats, &mut batch, &log); break; }
-                    }
+                _ = ticker.tick() => {}
+                _ = stats.queue.ready.notified() => {}
+            }
+            // 한 번 깨면 쌓인 걸 다 비운다. 배치가 여러 개 밀려 있는데 하나만 반영하고
+            // 다시 1초를 기다리면 폭주 구간에서 대기줄이 그대로 넘친다.
+            loop {
+                let batch = stats.queue.take(FLUSH_BATCH);
+                let full = batch.len() >= FLUSH_BATCH;
+                if batch.is_empty() {
+                    break;
                 }
-                _ = ticker.tick() => {
-                    if !batch.is_empty() { flush(&stats, &mut batch, &log); }
+                flush(&stats, batch, &log);
+                if !full {
+                    break;
                 }
+            }
+            let dropped = stats.queue.take_dropped();
+            if dropped > 0 {
+                log.warn(
+                    "Stats",
+                    &format!("대기줄이 넘쳐 오래된 통계 {dropped}건을 버렸습니다. 재생에는 영향이 없습니다."),
+                );
             }
         }
     });
 }
 
-fn flush(stats: &Stats, batch: &mut Vec<StatEvent>, log: &LogService) {
-    if batch.is_empty() {
+fn flush(stats: &Stats, events: Vec<StatEvent>, log: &LogService) {
+    if events.is_empty() {
         return;
     }
-    let events = std::mem::take(batch);
     let mut conn = stats.conn.lock().unwrap();
     let tx = match conn.transaction() {
         Ok(tx) => tx,
@@ -944,11 +1017,72 @@ mod tests {
     fn open_temp() -> Stats {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        let (tx, _rx) = mpsc::channel(16);
         Stats {
             conn: Mutex::new(conn),
-            tx,
+            queue: EventQueue::default(),
         }
+    }
+
+    /// 기간 이름은 `parse` ↔ `as_str` 로 왕복한다. 한쪽만 고치면 화면이 고른 기간과
+    /// 서버가 계산한 기간이 조용히 갈라진다(§15.2b).
+    #[test]
+    fn chart_window_names_round_trip() {
+        for window in [ChartWindow::Week, ChartWindow::Month, ChartWindow::All] {
+            assert_eq!(ChartWindow::parse(window.as_str()), window);
+        }
+        // 모르는 값은 기본값(이번 달)이다 — 400 을 내는 것보다 화면이 덜 놀란다.
+        assert_eq!(ChartWindow::parse("여름"), ChartWindow::Month);
+    }
+
+    /// 대기줄이 넘치면 **가장 오래된 것**이 밀려난다 (§22.2).
+    ///
+    /// 예전 구현은 `tokio::mpsc::try_send` 라 정반대로 **새 이벤트**를 버렸다. 방향이 뒤집혀도
+    /// 화면에는 "숫자가 조금 적다"로만 보여서, 폭주 구간의 기록이 통째로 날아가는 걸
+    /// 아무도 눈치채지 못한다. 그래서 방향 자체를 단언한다.
+    #[test]
+    fn a_full_queue_drops_the_oldest_event_not_the_newest() {
+        let queue = EventQueue::default();
+        let over = 5u64;
+        for n in 0..(EVENT_CHANNEL_CAP as u64 + over) {
+            queue.push(StatEvent::Chat {
+                guild_id: 1,
+                user_id: n,
+            });
+        }
+        assert_eq!(queue.take_dropped(), over, "넘친 만큼만 버린다");
+        assert_eq!(queue.take_dropped(), 0, "한 번 보고하면 0으로 되돌린다");
+
+        let drained = queue.take(EVENT_CHANNEL_CAP * 2);
+        assert_eq!(drained.len(), EVENT_CHANNEL_CAP, "용량만큼만 들고 있는다");
+        let user_of = |event: &StatEvent| match event {
+            StatEvent::Chat { user_id, .. } => *user_id,
+            other => panic!("Chat 이 아닌 이벤트가 들어왔다: {other:?}"),
+        };
+        assert_eq!(user_of(&drained[0]), over, "앞의 5건(0~4)이 밀려났다");
+        assert_eq!(
+            user_of(drained.last().unwrap()),
+            EVENT_CHANNEL_CAP as u64 + over - 1,
+            "제일 최근 이벤트는 반드시 살아남는다"
+        );
+    }
+
+    /// 배치가 차기 전에는 태스크를 깨우지 않는다 — 한 건마다 깨우면 트랜잭션이 이벤트 수만큼 생긴다.
+    #[test]
+    fn the_writer_is_only_woken_once_a_batch_is_full() {
+        let queue = EventQueue::default();
+        for n in 0..(FLUSH_BATCH as u64 - 1) {
+            assert!(
+                !queue.push(StatEvent::Chat {
+                    guild_id: 1,
+                    user_id: n
+                }),
+                "{n}건에서 깨우면 배치로 묶는 의미가 없다"
+            );
+        }
+        assert!(queue.push(StatEvent::Chat {
+            guild_id: 1,
+            user_id: 999
+        }));
     }
 
     /// 이벤트를 태스크 없이 바로 반영해 테스트한다.

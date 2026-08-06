@@ -325,6 +325,17 @@ async fn bot_live_voice_channel(app: &Arc<App>, guild_id: u64) -> Option<u64> {
     chan.map(|c| c.0.get())
 }
 
+/// 이 사람이 **지금 봇과 같은 방에** 있는가 — 조작 권한의 공통 판정 (v3 §16 B1).
+///
+/// 근거는 `bot_live_voice_channel` 이 준 **라이브 연결 하나뿐**이다. 저장된
+/// `player.voice_channel_id` 로 폴백하면 안 된다. 봇이 강제 퇴장·재시작·네트워크 끊김으로
+/// 빠져나가도 그 값은 남아서, (1) 봇이 없는 방에 남아 있던 사람만 계속 버튼을 쥐고,
+/// (2) 봇이 아무 방에도 없는데 "봇과 같은 음성 채널에 있어야 해요" 라고 거절하게 된다.
+/// 둘 다 화면이 거짓말하는 쪽이다.
+fn in_bot_voice_channel(bot_live: Option<u64>, requester_vc: Option<u64>) -> bool {
+    bot_live.is_some() && bot_live == requester_vc
+}
+
 fn is_admin(cmd: &CommandInteraction) -> bool {
     cmd.member
         .as_ref()
@@ -367,9 +378,10 @@ async fn ensure_playback_allowed(
         return Ok(());
     }
 
-    let state = app.player.get_state(guild_id).await;
-    let effective = bot_live.or(state.voice_channel_id);
-    let same_channel = requester_vc.is_some() && requester_vc == effective;
+    // "봇과 같은 방인가" 는 **라이브 연결로만** 판단한다 (v3 §16 B1). 저장값으로 폴백하면
+    // 봇이 강제 퇴장·재접속으로 빠진 뒤에도 그 방에 남아 있던 사람만 계속 조작할 수 있고,
+    // 반대로 봇이 아무 방에도 없는데 "봇과 같은 음성 채널에 있어야 해요" 라고 거절하게 된다.
+    let same_channel = in_bot_voice_channel(bot_live, requester_vc);
     if same_channel || admin {
         Ok(())
     } else {
@@ -400,7 +412,7 @@ async fn member_context(
     let requester_vc = requester_voice_channel(ctx, guild_id, user_id);
     MemberContext {
         is_admin: admin,
-        same_voice_channel: bot_live.is_some() && bot_live == requester_vc,
+        same_voice_channel: in_bot_voice_channel(bot_live, requester_vc),
         role_ids,
     }
 }
@@ -810,8 +822,15 @@ async fn dispatch(
         "status" => {
             let state = app.player.get_state(guild_id).await;
             let g = app.db.load_global_settings();
-            let embed =
-                embeds::status_embed(&state, &g, &app.build_id, env!("CARGO_PKG_VERSION"));
+            // "🔊 음성" 은 저장값이 아니라 songbird 라이브 연결로 판정한다 (v3 §16 B1).
+            let voice_connected = bot_live_voice_channel(app, guild_id).await.is_some();
+            let embed = embeds::status_embed(
+                &state,
+                &g,
+                &app.build_id,
+                env!("CARGO_PKG_VERSION"),
+                voice_connected,
+            );
             let _ = cmd
                 .create_followup(
                     &ctx.http,
@@ -1635,9 +1654,8 @@ async fn component_control_allowed(
         .and_then(|m| m.permissions)
         .map(|p| p.contains(Permissions::ADMINISTRATOR) || p.contains(Permissions::MANAGE_GUILD))
         .unwrap_or(false);
-    let state = app.player.get_state(guild_id).await;
-    let effective = bot_live.or(state.voice_channel_id);
-    admin || (requester_vc.is_some() && requester_vc == effective)
+    // 저장값으로 폴백하지 않는다 — 봇이 이미 나간 방 사람이 버튼을 계속 쥐게 된다 (v3 §16 B1).
+    admin || in_bot_voice_channel(bot_live, requester_vc)
 }
 
 /// 검색 후보 선택(mbsel) — 고른 곡을 대기열에 추가하고 취소 버튼을 단다.
@@ -1874,7 +1892,7 @@ pub async fn handle_button(app: Arc<App>, ctx: Context, comp: ComponentInteracti
         .map(|p| p.contains(Permissions::ADMINISTRATOR) || p.contains(Permissions::MANAGE_GUILD))
         .unwrap_or(false);
     let state_before = app.player.get_state(guild_id).await;
-    let effective = bot_live.or(state_before.voice_channel_id);
+    // 저장값으로 폴백하지 않는다 (v3 §16 B1) — 봇이 나간 뒤에도 그 방 사람만 조작할 수 있게 된다.
     // 🎲 자동 재생만 규칙이 다르다 — 재생 제어가 아니라 자동 재생 권한을 본다(v3 §24.3).
     let denial = if action == "autoplay" {
         ensure_autoplay_allowed(
@@ -1887,7 +1905,7 @@ pub async fn handle_button(app: Arc<App>, ctx: Context, comp: ComponentInteracti
         )
         .await
         .err()
-    } else if admin || (requester_vc.is_some() && requester_vc == effective) {
+    } else if admin || in_bot_voice_channel(bot_live, requester_vc) {
         None
     } else {
         Some("봇과 같은 음성 채널에 있어야 조작할 수 있어요.".to_string())
@@ -2030,5 +2048,31 @@ pub async fn handle_button(app: Arc<App>, ctx: Context, comp: ComponentInteracti
             }
             app2.coordinator.sync_guild(&app2, guild_id).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_bot_voice_channel;
+
+    /// "봇과 같은 방인가" 는 라이브 연결로만 판단한다 (v3 §16 B1).
+    ///
+    /// 예전에는 세 군데(`ensure_playback_allowed` · `component_control_allowed` · 컨트롤 버튼)가
+    /// `bot_live.or(state.voice_channel_id)` 로 저장값에 폴백했다. 봇이 튕겨 나가면 그 값이
+    /// 그대로 남아서, 봇이 없는 방 사람만 조작이 되고 다른 사람은 "봇과 같은 음성 채널에
+    /// 있어야 해요" 로 막혔다. 판정을 한 함수로 모았으니 여기가 유일한 관문이다.
+    #[test]
+    fn same_channel_is_decided_by_the_live_connection_only() {
+        assert!(in_bot_voice_channel(Some(10), Some(10)), "같은 방");
+        assert!(!in_bot_voice_channel(Some(10), Some(20)), "다른 방");
+        assert!(
+            !in_bot_voice_channel(None, Some(10)),
+            "봇이 아무 방에도 없으면 누구도 '같은 방'이 아니다 — 저장값이 남아 있어도"
+        );
+        assert!(
+            !in_bot_voice_channel(None, None),
+            "둘 다 없을 때 None == None 으로 통과시키면 음성 밖 사람이 전부 통과한다"
+        );
+        assert!(!in_bot_voice_channel(Some(10), None), "듣는 사람이 음성에 없다");
     }
 }

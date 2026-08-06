@@ -112,14 +112,23 @@ fn compare_fair(
         .then_with(|| compare_tail(left, right, scores))
 }
 
+/// 우선순위 없음(`None`)은 **0점**이다. `Option<i32>` 를 그대로 비교하면 Rust 의
+/// `None < Some(_)` 때문에 붐따가 준 음수 우선순위(`Some(-1_000_000)`, §10.3 `Bottom`)가
+/// 우선순위 없는 곡보다 **위**로 올라온다 — "맨 뒤로"가 "맨 앞으로"가 되는 사고다.
+/// 핀(양수) > 보통(0) > 붐따(음수) 순이 되도록 여기서 한 번에 푼다.
+fn manual_rank(item: &QueueItem, scores: &HashMap<String, QueueScore>) -> i32 {
+    scores
+        .get(&item.id)
+        .and_then(|score| score.manual_priority)
+        .unwrap_or(0)
+}
+
 fn compare_manual(
     left: &QueueItem,
     right: &QueueItem,
     scores: &HashMap<String, QueueScore>,
 ) -> Ordering {
-    let left_manual = scores.get(&left.id).and_then(|score| score.manual_priority);
-    let right_manual = scores.get(&right.id).and_then(|score| score.manual_priority);
-    right_manual.cmp(&left_manual)
+    manual_rank(right, scores).cmp(&manual_rank(left, scores))
 }
 
 /// 모든 모드가 공유하는 마지막 결정자: 등록순 → id.
@@ -301,5 +310,49 @@ mod tests {
             sort_queue(&mut items, &scores, mode, &points());
             assert_eq!(items[0].id, "forced", "{mode:?} 모드에서 수동 우선순위가 무시됨");
         }
+    }
+
+    /// 붐따 `Bottom`(§10.3)이 준 **음수** 우선순위는 꼬리로 가야 한다.
+    /// `Option<i32>` 를 그대로 비교하면 `None < Some(-1_000_000)` 이라 미움받은 곡이
+    /// 1번으로 올라오는 정반대 동작이 된다 — 세 모드 전부에서 막는다.
+    #[test]
+    fn boomtta_negative_priority_sinks_to_the_bottom_in_every_mode() {
+        let mut pinned = score("pinned", 0, 0, 0, 0);
+        pinned.manual_priority = Some(1_000_000);
+        let normal = score("normal", 0, 0, 0, 1);
+        let mut boomtta = score("boomtta", 30, 9, 9, 2); // 점수는 제일 높지만 붐따당했다.
+        boomtta.manual_priority = Some(-1_000_000);
+        let scores = HashMap::from([
+            ("pinned".into(), pinned),
+            ("normal".into(), normal),
+            ("boomtta".into(), boomtta),
+        ]);
+        for mode in [QueueSortMode::Score, QueueSortMode::Fifo, QueueSortMode::Fair] {
+            let mut items = vec![item("boomtta", 1), item("pinned", 2), item("normal", 3)];
+            sort_queue(&mut items, &scores, mode, &points());
+            assert_eq!(
+                ids(&items),
+                vec!["pinned", "normal", "boomtta"],
+                "{mode:?} 모드에서 붐따 곡이 꼬리로 안 갔다"
+            );
+        }
+    }
+
+    /// 우선순위 없음은 0점이다 — 핀(양수) > 보통(없음) > 붐따(음수).
+    #[test]
+    fn missing_manual_priority_ranks_as_zero() {
+        let mut sunk = score("sunk", 0, 0, 0, 0);
+        sunk.manual_priority = Some(-1);
+        let plain = score("plain", 0, 0, 0, 1);
+        let mut lifted = score("lifted", 0, 0, 0, 2);
+        lifted.manual_priority = Some(1);
+        let scores = HashMap::from([
+            ("sunk".into(), sunk),
+            ("plain".into(), plain),
+            ("lifted".into(), lifted),
+        ]);
+        let mut items = vec![item("sunk", 1), item("plain", 2), item("lifted", 3)];
+        sort_queue(&mut items, &scores, QueueSortMode::Fifo, &points());
+        assert_eq!(ids(&items), vec!["lifted", "plain", "sunk"]);
     }
 }

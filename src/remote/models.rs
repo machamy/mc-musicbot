@@ -977,6 +977,23 @@ pub const AUDIT_MERGE_WINDOW_SECS: i64 = 60;
 /// 로직을 갖지 않게 하려는 것이라, 여기 없는 액션도 반드시 말이 되는 문장을 돌려준다.
 ///
 /// - `actor` 는 누가 했는지, `target` 은 곡·항목 이름, `count` 는 합쳐진 개수(1이면 단수 문장).
+/// `POST /control` 은 결과를 `"volume:150"` · `"autoplay:true"` 처럼 `키:값` 으로 남긴다.
+/// 사람 피드에 그대로 박으면 `서버 볼륨을 volume:150으로 바꿨어요` 가 나간다 —
+/// 문장을 만들 때 접두사를 벗겨서 값만 쓴다. 접두사가 없으면 값을 그대로 돌려준다.
+fn audit_value<'a>(after: Option<&'a str>, prefix: &str) -> Option<&'a str> {
+    let raw = after?.trim();
+    Some(
+        raw.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .unwrap_or(raw),
+    )
+}
+
+/// 켜짐/꺼짐 계열 값을 한 곳에서 읽는다 (`true`/`on`/`1`).
+fn audit_flag(value: Option<&str>) -> bool {
+    matches!(value, Some("on" | "true" | "1"))
+}
+
 pub fn audit_text(
     action: &str,
     actor: &str,
@@ -999,9 +1016,13 @@ pub fn audit_text(
             (Some(title), false) => format!("{actor}님이 **{title}** 을 뺐어요"),
             (None, false) => format!("{actor}님이 곡을 뺐어요"),
         },
-        "queue.pin" => match item {
-            Some(title) => format!("{actor}님이 **{title}** 을 맨 앞으로 올렸어요"),
-            None => format!("{actor}님이 곡을 맨 앞으로 올렸어요"),
+        // `queue.force_move` 는 핸들러가 쓰는 옛 액션명이다. 문장을 못 찾으면
+        // 사람 피드에 `민수님이 queue.force_move 을 했어요` 라는 기계 문자열이 그대로 나간다.
+        "queue.pin" | "queue.force_move" => match (item, after == Some("unpinned")) {
+            (Some(title), false) => format!("{actor}님이 **{title}** 을 맨 앞으로 올렸어요"),
+            (Some(title), true) => format!("{actor}님이 **{title}** 을 맨 앞에서 내렸어요"),
+            (None, false) => format!("{actor}님이 곡을 맨 앞으로 올렸어요"),
+            (None, true) => format!("{actor}님이 곡을 맨 앞에서 내렸어요"),
         },
         "queue.boomtta" => match item {
             Some(title) => format!("**{title}** 이 싫어요 {count}개로 대기열에서 내려갔어요"),
@@ -1033,14 +1054,31 @@ pub fn audit_text(
         "playback.skip" => format!("{actor}님이 곡을 넘겼어요"),
         "playback.skip.vote" => format!("{count}명이 동의해서 곡을 넘겼어요"),
         "playback.seek" => format!("{actor}님이 재생 위치를 옮겼어요"),
-        "playback.volume" => match after {
+        "playback.volume" => match audit_value(after, "volume") {
             Some(value) => format!("{actor}님이 서버 볼륨을 {value}으로 바꿨어요"),
             None => format!("{actor}님이 서버 볼륨을 바꿨어요"),
         },
-        "autoplay.toggle" => match after {
-            Some("on") | Some("true") | Some("1") => format!("{actor}님이 자동 재생을 켰어요"),
-            _ => format!("{actor}님이 자동 재생을 껐어요"),
+        // 🔁 / 🎲 도 문장이 있어야 한다 — 없으면 `playback.repeat 을 했어요` 로 떨어진다.
+        "playback.repeat" => match audit_value(after, "repeat") {
+            Some("track") => format!("{actor}님이 한 곡 반복을 켰어요"),
+            Some("queue") => format!("{actor}님이 대기열 반복을 켰어요"),
+            _ => format!("{actor}님이 반복을 껐어요"),
         },
+        "playback.shuffle" => {
+            if audit_flag(audit_value(after, "shuffle")) {
+                format!("{actor}님이 셔플을 켰어요")
+            } else {
+                format!("{actor}님이 셔플을 껐어요")
+            }
+        }
+        // `playback.autoplay` 는 핸들러가 쓰는 옛 액션명이다 (§24.3 은 `autoplay.toggle`).
+        "autoplay.toggle" | "playback.autoplay" => {
+            if audit_flag(audit_value(after, "autoplay")) {
+                format!("{actor}님이 자동 재생을 켰어요")
+            } else {
+                format!("{actor}님이 자동 재생을 껐어요")
+            }
+        }
         "playlist.create" => match item {
             Some(name) => format!("{actor}님이 재생목록 **{name}** 을 만들었어요"),
             None => format!("{actor}님이 재생목록을 만들었어요"),
@@ -1599,6 +1637,14 @@ impl RemoteGuildSettings {
         as_limit_u32(self.autoplay_seed_max)
     }
 
+    /// `recent` 모드가 참고할 최근 곡 수 (§8.2). `0`이면 무제한 — 최근 목록 전부를 본다(§23.1).
+    ///
+    /// 유저 UI 가 이미 `0을 넣으면 최근에 튼 곡 전부를 참고해요` 라고 안내하므로,
+    /// 저장·엔진 어느 쪽에서도 `0`을 `1`로 둔갑시키지 않는다.
+    pub fn recent_count_limit(&self) -> Option<u32> {
+        as_limit_u32(self.autoplay_recent_count)
+    }
+
     /// **`0 = 무제한` 규약을 여기서 강제한다** (§23.1). 저장 직전에 한 번 부르면
     /// 어떤 라우트를 거쳐 들어와도 서버가 실제로 그 규약대로 동작한다.
     /// `.max(1)` 같은 클램프가 남아 있으면 `0`이 `1`이 돼 "무제한"이 "가장 빡빡함"이 된다.
@@ -1631,7 +1677,9 @@ impl RemoteGuildSettings {
         self.super_like_cooldown_sec = self.super_like_cooldown_sec.min(3_600);
         self.super_like_daily_limit = self.super_like_daily_limit.min(100);
 
-        self.autoplay_recent_count = self.autoplay_recent_count.clamp(1, 20);
+        // 0 = 무제한(최근 목록 전부). 여기서 `.max(1)`/`clamp(1, ..)` 을 하면
+        // 유저 UI 의 `0을 넣으면 최근에 튼 곡 전부를 참고해요` 가 거짓말이 된다.
+        self.autoplay_recent_count = self.autoplay_recent_count.min(20);
         self.autoplay_artist_cooldown = self.autoplay_artist_cooldown.min(20);
         self.autoplay_recent_decay_hours = self.autoplay_recent_decay_hours.min(168);
         self.autoplay_seed_max = self.autoplay_seed_max.min(100);
@@ -1951,6 +1999,9 @@ mod tests {
         assert_eq!(settings.super_like_daily_limit, 0);
         assert_eq!(settings.autoplay_seed_max, 0);
         assert!(settings.seed_limit().is_none());
+        // 최근 N곡도 예외가 아니다 — 0 이 1 로 둔갑하면 "무제한"이 "가장 빡빡함"이 된다.
+        assert_eq!(settings.autoplay_recent_count, 0);
+        assert!(settings.recent_count_limit().is_none());
         assert!(as_limit(settings.max_queue_per_user).is_none());
         assert_eq!(as_limit(5), Some(5));
 
@@ -1958,8 +2009,16 @@ mod tests {
         assert_eq!(settings.max_queue_per_guild, 10_000);
         assert_eq!(settings.vote_skip_ratio, 10);
         assert_eq!(settings.like_points, VOTE_POINT_MAX);
-        assert_eq!(settings.autoplay_recent_count, 1);
         assert_eq!(settings.default_volume, settings.max_volume);
+
+        // 위쪽 상한은 그대로 산다.
+        let mut too_many = RemoteGuildSettings {
+            autoplay_recent_count: 999,
+            ..Default::default()
+        };
+        too_many.sanitize();
+        assert_eq!(too_many.autoplay_recent_count, 20);
+        assert_eq!(too_many.recent_count_limit(), Some(20));
     }
 
     #[test]
@@ -2025,6 +2084,82 @@ mod tests {
         let text = audit_text("queue.add", "민수", Some(&long), None, None, 1);
         assert!(text.contains('…'));
         assert!(text.chars().count() < long.chars().count() + 20);
+    }
+
+    /// `POST /control` 이 남기는 `키:값` 결과와 옛 액션명이 사람 피드에 그대로 새면 안 된다.
+    /// (`민수님이 playback.autoplay 을 했어요` · `서버 볼륨을 volume:150으로 바꿨어요`)
+    #[test]
+    fn machine_strings_never_reach_the_human_feed() {
+        // 값 접두사를 벗긴다.
+        assert_eq!(
+            audit_text("playback.volume", "지훈", None, None, Some("volume:150"), 1),
+            "지훈님이 서버 볼륨을 150으로 바꿨어요"
+        );
+        // 접두사가 없는 옛 기록도 그대로 읽힌다.
+        assert_eq!(
+            audit_text("playback.volume", "지훈", None, None, Some("150"), 1),
+            "지훈님이 서버 볼륨을 150으로 바꿨어요"
+        );
+
+        // 🎲 자동 재생 — 핸들러의 옛 액션명과 §24.3 의 새 이름 둘 다 문장이 된다.
+        for action in ["playback.autoplay", "autoplay.toggle"] {
+            assert_eq!(
+                audit_text(action, "민수", None, None, Some("autoplay:true"), 1),
+                "민수님이 자동 재생을 켰어요"
+            );
+            assert_eq!(
+                audit_text(action, "민수", None, None, Some("autoplay:false"), 1),
+                "민수님이 자동 재생을 껐어요"
+            );
+        }
+        assert_eq!(
+            audit_text("autoplay.toggle", "민수", None, None, Some("on"), 1),
+            "민수님이 자동 재생을 켰어요"
+        );
+
+        // 🔁 반복 · 셔플.
+        assert_eq!(
+            audit_text("playback.repeat", "수연", None, None, Some("repeat:track"), 1),
+            "수연님이 한 곡 반복을 켰어요"
+        );
+        assert_eq!(
+            audit_text("playback.repeat", "수연", None, None, Some("repeat:off"), 1),
+            "수연님이 반복을 껐어요"
+        );
+        assert_eq!(
+            audit_text("playback.shuffle", "수연", None, None, Some("shuffle:true"), 1),
+            "수연님이 셔플을 켰어요"
+        );
+        assert_eq!(
+            audit_text("playback.shuffle", "수연", None, None, Some("shuffle:false"), 1),
+            "수연님이 셔플을 껐어요"
+        );
+
+        // 📌 맨 앞으로 — 핸들러가 쓰는 `queue.force_move` 도 §13.3 문장으로 나간다.
+        assert_eq!(
+            audit_text("queue.force_move", "민수", Some("I AM"), None, Some("pinned"), 1),
+            "민수님이 **I AM** 을 맨 앞으로 올렸어요"
+        );
+        assert_eq!(
+            audit_text("queue.force_move", "민수", Some("I AM"), None, Some("unpinned"), 1),
+            "민수님이 **I AM** 을 맨 앞에서 내렸어요"
+        );
+        assert_eq!(
+            audit_text("queue.pin", "민수", Some("I AM"), None, None, 1),
+            "민수님이 **I AM** 을 맨 앞으로 올렸어요"
+        );
+
+        // 사람 피드에 액션명이 남는 문장이 하나도 없어야 한다.
+        for action in [
+            "queue.force_move",
+            "playback.autoplay",
+            "playback.repeat",
+            "playback.shuffle",
+            "playback.volume",
+        ] {
+            let text = audit_text(action, "민수", Some("I AM"), None, Some("x"), 1);
+            assert!(!text.contains(action), "'{action}' 이 문장에 그대로 남았다: {text}");
+        }
     }
 
     /// 정책은 시드를 갈아탈 때마다 한 단계씩 느슨해진다 (§8.5-4).

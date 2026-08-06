@@ -468,7 +468,17 @@ pub async fn diagnostics(State(state): Ctx, cookies: Cookies) -> Response {
             shuffle = if s.shuffle_enabled { "셔플 On" } else { "셔플 Off" },
             paused = if s.is_paused { "예" } else { "아니오" },
             volume = s.effective_volume,
-            voice = s.voice_channel_id.map(|v| v.to_string()).unwrap_or_else(|| "미연결".into()),
+            // **저장값이 아니라 Discord 캐시가 "지금 어디 있나"의 유일한 근거다** (V3 §16 B1).
+            // `s.voice_channel_id` 는 "다음에 어디로 들어갈까"용이라, 봇이 강제 퇴장당해도
+            // 값이 남아 진단 카드가 계속 "연결됨"이라고 거짓말을 했다.
+            voice = {
+                let bot = crate::web::remote::bot_voice_status(&state, gid);
+                match (bot.channel_name.as_deref(), bot.channel_id) {
+                    (Some(name), Some(id)) => format!("{} ({id})", html_escape(name)),
+                    (None, Some(id)) => id.to_string(),
+                    _ => "미연결".into(),
+                }
+            },
         ));
     }
     if cards.is_empty() {

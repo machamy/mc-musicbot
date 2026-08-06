@@ -527,12 +527,18 @@ impl AutoplayEngine {
 
 /// 최근 재생 이력 회피 강도 (§8.5-2). `1.0`이면 회피 없음, `0.0`이면 사실상 금지.
 /// 하루 지난 곡은 다시 나와도 괜찮으니 `decay_hours` 를 넘으면 회피가 완전히 풀린다.
+///
+/// **`decay_hours == 0` 은 "회피 창이 무제한"이다** (§23.1 `0 = 무제한`).
+/// 이 값은 회피가 *풀리는 데 걸리는 시간*이라, 무제한이면 영원히 안 풀린다 —
+/// `auditRetentionDays = 0` 이 "영원히 안 지움"인 것과 같은 방향이고,
+/// 관리 콘솔도 `무제한 · 한 번 튼 곡은 계속 피해요` 라고 같은 말을 한다.
+/// (횟수 계열인 `autoplay_artist_cooldown` 의 `0` 은 반대로 "끔"이다 — 그쪽은 *막을 곡 수*라
+/// 0이면 아무도 안 막는다. 두 값의 `0` 이 다른 방향인 건 세는 대상이 달라서다.)
 fn decay_factor(age_hours: Option<f64>, decay_hours: u32) -> f64 {
     let Some(age) = age_hours else {
         return 1.0; // 최근에 튼 적이 없는 곡.
     };
     if decay_hours == 0 {
-        // 감쇠를 끄면 옛 동작 그대로 — 최근 목록에 있으면 그냥 안 뽑는다.
         return 0.0;
     }
     (age / decay_hours as f64).clamp(0.0, 1.0)

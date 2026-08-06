@@ -288,22 +288,24 @@ fn buttons_with_prefix(state: &GuildPlayerState, p: &str) -> Vec<CreateActionRow
 }
 
 /// `/상태` — 봇 버전 + 사용자에게 보여줄 만한 재생/전역 설정 요약(시크릿 제외).
+///
+/// `voice_connected` 는 **songbird 라이브 연결**로 판정한 값을 호출부가 넣어 준다 (v3 §16 B1).
+/// 저장된 `state.voice_channel_id` 는 봇이 강제 퇴장·재시작·네트워크 끊김으로 빠져나가도
+/// 그대로 남아 있어서 "지금 어디 있나"의 근거가 될 수 없다. 그 값은 "다음에 어디로 들어갈까"
+/// 에만 쓴다. 여기서 인자를 받는 이유가 그것이므로 `state` 를 다시 보지 않는다.
 pub fn status_embed(
     state: &GuildPlayerState,
     g: &GlobalSettings,
     build_id: &str,
     version: &str,
+    voice_connected: bool,
 ) -> CreateEmbed {
     let on = |b: bool| if b { "켜짐" } else { "꺼짐" };
     let now = match &state.current_item {
         Some(i) => truncate(i.track.display_title(), 60),
         None => "없어요".to_string(),
     };
-    let voice = if state.voice_channel_id.is_some() {
-        "연결됨"
-    } else {
-        "미연결"
-    };
+    let voice = if voice_connected { "연결됨" } else { "미연결" };
     let empty_policy = match g.empty_voice_policy {
         EmptyVoiceChannelPolicy::AutoLeave => "비면 나가기",
         EmptyVoiceChannelPolicy::StopPlayback => "비면 정지",
@@ -448,4 +450,42 @@ pub fn queue_page_buttons(page: usize, total_pages: usize) -> Vec<CreateActionRo
             .label("다음 ▶")
             .disabled(page + 1 >= total_pages),
     ])]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 임베드 본문 전체를 한 덩어리 문자열로 — 필드 이름이 바뀌어도 검사가 안 깨지게.
+    fn embed_text(embed: &CreateEmbed) -> String {
+        serde_json::to_string(embed).expect("임베드 직렬화")
+    }
+
+    /// `/상태` 의 `🔊 음성` 은 **저장값이 아니라 라이브 연결**을 말한다 (v3 §16 B1).
+    ///
+    /// 봇이 강제 퇴장·재시작으로 음성에서 빠져도 `guild_states.voice_channel_id` 는 남는다.
+    /// 예전에는 그 값만 보고 "연결됨" 을 찍어서, 봇이 없는데 있다고 말하는 화면이
+    /// 리모컨 말고 Discord 임베드에도 하나 더 있었다. 저장값이 있어도 라이브가 끊겼으면
+    /// 반드시 "미연결" 이어야 한다.
+    #[test]
+    fn status_embed_reports_voice_from_the_live_connection_not_the_stored_channel() {
+        let mut state = GuildPlayerState::default();
+        // 저장값은 남아 있다 — "다음에 어디로 들어갈까" 용으로는 이게 맞다.
+        state.voice_channel_id = Some(1234);
+        let g = GlobalSettings::default();
+
+        let left = status_embed(&state, &g, "build", "0.0.0", false);
+        assert!(
+            embed_text(&left).contains("🔊 음성: **미연결**"),
+            "라이브 연결이 없으면 저장값이 남아 있어도 미연결이다"
+        );
+
+        let joined = status_embed(&state, &g, "build", "0.0.0", true);
+        assert!(embed_text(&joined).contains("🔊 음성: **연결됨**"));
+
+        // 저장값이 비어 있어도 라이브가 붙어 있으면 연결됨이다(재시작 직후 등).
+        state.voice_channel_id = None;
+        let live_only = status_embed(&state, &g, "build", "0.0.0", true);
+        assert!(embed_text(&live_only).contains("🔊 음성: **연결됨**"));
+    }
 }

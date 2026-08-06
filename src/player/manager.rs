@@ -1,7 +1,7 @@
 //! 길드 재생 상태기계 — C# GuildPlayerManager 1:1 포팅.
 //! 반복/셔플/CycleHistory/자동추천 시드 규칙/최근기록(25개 상한) 의미론을 그대로 유지한다.
 
-use crate::app::QUEUE_SORT_INTERVAL;
+use crate::app::queue_sort_interval_for_len;
 use crate::db::Db;
 use crate::logging::LogService;
 use crate::models::*;
@@ -14,14 +14,16 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-/// 대기열이 이보다 길면 재정렬을 느리게 돌린다 (v3 §18.2).
-/// 그 정도 길이면 순서가 급하지 않고, 5초마다 전체를 정렬하면 그게 그대로 부하가 된다.
-pub const LONG_QUEUE_THRESHOLD: usize = 500;
-/// 긴 대기열의 재정렬 주기. 화면 카운트다운(§5)도 이 값을 따라와야 한다.
-pub const LONG_QUEUE_SORT_INTERVAL: Duration = Duration::from_secs(15);
+/// 재정렬 주기를 "거의 다 됐으면 이번 tick 에 같이 돈다"로 보는 여유 (v3 §18.2).
+///
+/// 5초 tick 세 번을 정확히 15.000초로 요구하면 tick 하나가 몇 ms 만 밀려도 3틱째가 탈락해
+/// 실제 주기가 20초가 된다. **반 tick** 으로 넉넉히 잡는 이유가 하나 더 있다 — 재정렬 루프도
+/// 자기 쪽에서 같은 판정을 한다. 이쪽이 더 빡빡하면 루프가 통과시킨 tick 을 여기서 되돌려
+/// 15초 길드가 20초가 된다. 안쪽 관문은 바깥보다 느슨해야 서로 싸우지 않는다.
+const SORT_DUE_SLACK: Duration = Duration::from_millis(crate::app::QUEUE_SORT_INTERVAL.as_millis() as u64 / 2);
 
 pub struct PlayerManager {
     db: Arc<Db>,
@@ -43,6 +45,11 @@ pub struct PlayerManager {
     /// 길드별 마지막으로 확인된 대기열 길이. 재정렬 주기 결정(v3 §18.2)에 쓰는데,
     /// 그것 때문에 5초마다 길드마다 DB를 읽으면 §18.2 를 고치려다 §23.2 를 깨뜨린다.
     queue_lens: StdMutex<HashMap<u64, usize>>,
+    /// 길드별 마지막 실제 재정렬 시각. 긴 대기열의 주기를 늘리는(v3 §18.2 (3)) 판단 근거다.
+    ///
+    /// **몇 번째 tick 인지가 아니라 시각으로 재야 한다.** tick 번호로 세면 길드가 중간에
+    /// 늘어나거나 루프가 밀렸을 때 주기가 통째로 어긋난다.
+    last_sorted: StdMutex<HashMap<u64, Instant>>,
     /// 통계 기록기 (v3 §22). 통계 DB가 안 열렸거나 아직 안 붙었으면 `None` 이고
     /// 그때는 **조용히 건너뛴다** — 통계 한 줄 때문에 음악이 멈추면 본말전도다.
     stats: StdMutex<Option<Arc<Stats>>>,
@@ -70,6 +77,7 @@ impl PlayerManager {
             settings: StdMutex::new(HashMap::new()),
             shuffle_seeds: StdMutex::new(HashMap::new()),
             queue_lens: StdMutex::new(HashMap::new()),
+            last_sorted: StdMutex::new(HashMap::new()),
             stats: StdMutex::new(None),
         }
     }
@@ -220,6 +228,13 @@ impl PlayerManager {
             "Queue",
             &format!("PlayNow {title} for guild {guild_id}."),
             move |s| {
+                // 바로재생은 지금 나가던 곡을 잘라 낸다 — `cancel_by_id` 가 현재 곡을 자를 때와
+                // 같은 전이라 통계도 같은 이름(스킵)으로 남긴다. 안 남기면 `/바로재생` 으로만
+                // 곡을 바꾸는 사람의 `skipped` 가 영원히 0이라 §22.5 비율 막대가 거짓말을 한다.
+                // 밀려나는 대기열 곡들은 재생된 적이 없으니 세지 않는다.
+                if let Some(cur) = &s.current_item {
+                    self.record_play(guild_id, cur, PlayOutcome::Skipped);
+                }
                 if s.repeat_mode == RepeatMode::Queue {
                     // 큐 반복일 때만 사이클에 보존 (Track/Off 는 cycle_history 를 읽지 않음).
                     if let Some(cur) = s.current_item.take() {
@@ -818,13 +833,29 @@ impl PlayerManager {
 
     /// 5초 주기 재정렬 태스크용(사양서 §3.3). 순서가 실제로 바뀐 길드만 저장하고 그 사실을 알린다.
     /// 유휴 길드에서 쓰기 쿼리와 브로드캐스트가 발생하지 않아야 하므로(§5.2 H) 항상 저장하지 않는다.
+    ///
+    /// **주기 판단도 여기서 한다** (v3 §18.2 (3)). 500곡을 넘는 길드는 5초 tick 을 세 번 받아도
+    /// 한 번만 실제로 정렬한다. 호출하는 루프가 따로 세도록 두면, 실제로 그랬듯 루프 쪽 카운터만
+    /// 비어 있어도 아무도 못 알아차린 채 5000곡이 5초마다 정렬된다. 길이를 아는 곳과 주기를
+    /// 정하는 곳은 같아야 한다.
     pub async fn resort_if_changed(&self, guild_id: u64) -> bool {
+        self.resort_if_changed_at(guild_id, Instant::now()).await
+    }
+
+    /// `resort_if_changed` 의 시각 주입판 — 테스트가 15초를 실제로 기다리지 않게 한다.
+    pub async fn resort_if_changed_at(&self, guild_id: u64, now: Instant) -> bool {
+        // 차례가 아니면 **상태를 읽기도 전에** 돌아간다. 긴 대기열의 DB 읽기까지 같이 줄어든다.
+        if !self.sort_due_at(guild_id, now) {
+            return false;
+        }
         let _g = self.gate.lock().await;
         let eff = self.effective_settings(guild_id);
         let mut state =
             self.db
                 .load_guild_state(guild_id, eff.effective_volume, eff.autoplay_default);
         self.note_queue_len(&state);
+        // 길이를 새로 확인한 다음에 찍는다 — 다음 차례는 방금 본 길이의 주기를 따른다.
+        self.mark_sorted(guild_id, now);
         if state.upcoming.len() < 2 {
             return false; // 바꿀 순서가 없다 — 로드만 하고 끝낸다.
         }
@@ -908,20 +939,34 @@ impl PlayerManager {
 
     /// 이 길드를 얼마 주기로 재정렬해야 하는가. 500곡을 넘으면 15초로 늘어난다.
     /// 웹의 `nextSortAt`(§5 카운트다운)도 이 값을 써야 화면과 실제가 어긋나지 않는다.
+    ///
+    /// 경계값은 `app::queue_sort_interval_for_len` **하나만** 쓴다. 여기에 500/15초를 한 벌 더
+    /// 두면 한쪽만 고쳤을 때 화면 카운트다운과 실제 주기가 조용히 갈라진다.
     pub fn sort_interval(&self, guild_id: u64) -> Duration {
-        if self.queue_len(guild_id) > LONG_QUEUE_THRESHOLD {
-            LONG_QUEUE_SORT_INTERVAL
-        } else {
-            QUEUE_SORT_INTERVAL
-        }
+        queue_sort_interval_for_len(self.queue_len(guild_id))
     }
 
-    /// 5초 tick 하나를 세는 재정렬 루프용. 긴 대기열은 3틱에 한 번만 돌린다.
-    /// `tick` 은 루프가 켜진 뒤 몇 번째 tick 인지(0부터).
-    pub fn due_for_resort(&self, guild_id: u64, tick: u64) -> bool {
-        let base = QUEUE_SORT_INTERVAL.as_secs().max(1);
-        let every = (self.sort_interval(guild_id).as_secs() / base).max(1);
-        tick % every == 0
+    /// 다음 재정렬까지 남은 시간. 한 번도 안 돌았으면 0(= 지금 차례)이다.
+    ///
+    /// 화면 카운트다운(§5)의 `nextSortAt` 은 **이 값**으로 만들어야 한다. 길드마다 주기가
+    /// 다른데 전역 "마지막 tick 시각 + 길이별 주기" 로 계산하면, tick 이 5초마다 갱신되는 통에
+    /// 15초 길드의 카운트다운이 0에 닿지 못하고 계속 뒤로 밀린다.
+    pub fn next_sort_in(&self, guild_id: u64, now: Instant) -> Duration {
+        let Some(last) = self.last_sorted.lock().unwrap().get(&guild_id).copied() else {
+            return Duration::ZERO;
+        };
+        self.sort_interval(guild_id)
+            .saturating_sub(now.saturating_duration_since(last))
+    }
+
+    /// 지금 이 길드를 재정렬할 차례인가. 한 번도 안 돌았으면 바로 차례다.
+    pub fn sort_due_at(&self, guild_id: u64, now: Instant) -> bool {
+        self.next_sort_in(guild_id, now) <= SORT_DUE_SLACK
+    }
+
+    /// 이 길드를 방금 재정렬했다고 찍는다.
+    fn mark_sorted(&self, guild_id: u64, now: Instant) {
+        self.last_sorted.lock().unwrap().insert(guild_id, now);
     }
 
     /// 상태를 읽거나 저장할 때마다 길이를 적어 둔다. 여기가 유일한 갱신 지점이다.
@@ -1267,6 +1312,47 @@ mod tests {
         cleanup(player, remote, root);
     }
 
+    /// 재생 통계를 남기는 지점이 정말 다 걸려 있는지 — **끝까지 재생**과 **중간에 잘림** 두 갈래를
+    /// 한 번에 본다. §22.5 의 비율 막대(`끝까지 75% · 스킵 20%`)는 두 숫자가 다 들어와야 말이 된다.
+    ///
+    /// `/바로재생` 은 지금 나가던 곡을 잘라 내는데 예전에는 아무것도 안 남겼다. 그러면
+    /// 바로재생만 쓰는 사람은 `skipped` 가 영원히 0이라 막대가 "전부 끝까지 들었다"로 보인다.
+    #[tokio::test]
+    async fn finished_and_interrupted_songs_both_reach_the_stats() {
+        let (player, remote, root) = temp_player("playstats");
+        let log = Arc::new(LogService::new(root.join("logs")));
+        let stats = Stats::open(&root.join("musicbot-stats.sqlite"), log).expect("통계 DB 열기");
+        player.attach_stats(stats.clone());
+        let (guild_id, user) = (1u64, 7u64);
+
+        player.enqueue(guild_id, user_item("첫곡", user), false).await;
+        player.advance(guild_id).await; // 첫곡 — 끝까지 재생
+        player.enqueue(guild_id, user_item("둘째곡", user), false).await;
+        player.play_now(guild_id, user_item("셋째곡", user)).await; // 둘째곡 — 잘림
+
+        let seen = wait_for_user(&stats, guild_id, user, |s| s.played + s.skipped >= 2).await;
+        assert_eq!(seen.played, 1, "끝까지 재생된 곡");
+        assert_eq!(seen.skipped, 1, "바로재생으로 잘린 곡도 스킵으로 남는다");
+        cleanup(player, remote, root);
+    }
+
+    /// 배치 쓰기가 조건을 만족할 때까지 기다린다. 고정 sleep 은 느리거나 불안정해서 폴링한다.
+    async fn wait_for_user(
+        stats: &Arc<Stats>,
+        guild_id: u64,
+        user_id: u64,
+        done: impl Fn(&crate::stats::UserStats) -> bool,
+    ) -> crate::stats::UserStats {
+        for _ in 0..50 {
+            let seen = stats.user_stats(guild_id, user_id);
+            if done(&seen) {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("사람 통계가 5초 안에 반영되지 않았다");
+    }
+
     /// 배치 쓰기가 `total` 건 반영될 때까지 기다린다. 고정 sleep 은 느리거나 불안정해서 폴링한다.
     /// **합계**로 기다려야 갈림(사람/자동재생)이 틀렸을 때도 멈추지 않고 그 자리에서 단언이 깨진다.
     async fn wait_for_plays(
@@ -1288,34 +1374,73 @@ mod tests {
         panic!("통계 {total}건이 5초 안에 반영되지 않았다");
     }
 
-    /// 대기열이 500곡을 넘으면 재정렬 주기가 15초로 늘어난다(v3 §18.2).
-    /// 주기 결정은 `app.rs` 가 하지만, 길이를 아는 건 여기뿐이라 판단 근거도 여기서 준다.
+    /// 대기열이 500곡을 넘으면 재정렬 주기가 15초로 늘어난다(v3 §18.2 (3)).
+    ///
+    /// **재정렬 루프가 실제로 부르는 함수(`resort_if_changed`)로 검사한다.** 예전 테스트는
+    /// 아무도 안 부르는 `due_for_resort(tick)` 만 확인해서, 실행 경로가 통째로 5초로
+    /// 돌고 있는데도 초록불이 켜져 있었다. 여기가 다시 갈라지면 이 테스트가 먼저 깨져야 한다.
     #[tokio::test]
-    async fn long_queues_get_a_slower_resort_interval() {
+    async fn long_queues_actually_resort_on_the_slow_period() {
         let (player, remote, root) = temp_player("interval");
+        let base = crate::app::QUEUE_SORT_INTERVAL;
+        let long = crate::app::QUEUE_SORT_INTERVAL_LONG;
+
         // 아직 아무것도 안 본 길드는 정렬할 것도 없으니 기본 주기다.
         assert_eq!(player.queue_len(1), 0);
-        assert_eq!(player.sort_interval(1), QUEUE_SORT_INTERVAL);
-        assert!(player.due_for_resort(1, 0) && player.due_for_resort(1, 1));
+        assert_eq!(player.sort_interval(1), base);
 
         player.enqueue(1, user_item("한곡", 1), false).await;
         assert_eq!(player.queue_len(1), 0, "현재 곡으로 올라갔으니 대기열은 비었다");
         player.enqueue(1, user_item("두곡", 1), false).await;
         assert_eq!(player.queue_len(1), 1);
-        assert_eq!(player.sort_interval(1), QUEUE_SORT_INTERVAL);
+        assert_eq!(player.sort_interval(1), base);
+
+        // 짧은 대기열은 5초 tick 마다 매번 차례다.
+        let t0 = Instant::now();
+        assert!(player.sort_due_at(1, t0), "한 번도 안 돌았으면 바로 차례다");
+        player.resort_if_changed_at(1, t0).await;
+        assert!(!player.sort_due_at(1, t0), "방금 돌았으면 차례가 아니다");
+        assert!(player.sort_due_at(1, t0 + base));
+        // 안쪽 관문은 바깥(재정렬 루프)보다 느슨해야 한다 — 더 빡빡하면 루프가 통과시킨 tick 을
+        // 여기서 되돌려 15초가 20초가 된다.
+        assert!(
+            SORT_DUE_SLACK >= Duration::from_millis(250),
+            "app.rs 의 여유(250ms)보다 좁으면 두 관문이 서로 싸운다"
+        );
 
         // 500곡을 실제로 넣으면 테스트가 느려지기만 하니 길이만 밀어 넣는다.
         player
             .queue_lens
             .lock()
             .unwrap()
-            .insert(1, LONG_QUEUE_THRESHOLD + 1);
-        assert_eq!(player.sort_interval(1), LONG_QUEUE_SORT_INTERVAL);
-        // 5초 tick 기준으로 3틱에 한 번만 돈다.
-        assert!(player.due_for_resort(1, 0));
-        assert!(!player.due_for_resort(1, 1));
-        assert!(!player.due_for_resort(1, 2));
-        assert!(player.due_for_resort(1, 3));
+            .insert(1, crate::app::QUEUE_SORT_LONG_THRESHOLD + 1);
+        assert_eq!(player.sort_interval(1), long);
+
+        let t1 = t0 + long;
+        assert!(player.sort_due_at(1, t1));
+        // 카운트다운(§5)이 읽어야 하는 값 — 길드마다 다르고, 실제로 0까지 줄어든다.
+        assert_eq!(player.next_sort_in(1, t1), Duration::ZERO);
+        player.resort_if_changed_at(1, t1).await;
+        // 재정렬은 DB 에서 진짜 길이를 다시 읽어 캐시를 고쳐 놓는다(그래서 아무도 안 알려 줘도
+        // 주기가 저절로 맞는다). 테스트에서는 "여전히 501곡" 이라는 상황을 다시 만들어 준다.
+        player
+            .queue_lens
+            .lock()
+            .unwrap()
+            .insert(1, crate::app::QUEUE_SORT_LONG_THRESHOLD + 1);
+        assert_eq!(player.next_sort_in(1, t1), long, "방금 돌았으니 한 주기가 통째로 남는다");
+        assert_eq!(player.next_sort_in(1, t1 + base), long - base);
+        // 5초 tick 이 두 번 더 와도 실제 정렬은 건너뛴다.
+        assert!(!player.resort_if_changed_at(1, t1 + base).await);
+        assert!(!player.sort_due_at(1, t1 + base));
+        assert!(!player.sort_due_at(1, t1 + base * 2));
+        // 3틱째는 여유(SORT_DUE_SLACK) 안에 들어와서 이번에 같이 돈다.
+        assert!(player.sort_due_at(1, t1 + base * 3));
+
+        // 대기열이 다시 짧아지면 곧바로 5초로 돌아온다.
+        player.queue_lens.lock().unwrap().insert(1, 3);
+        assert_eq!(player.sort_interval(1), base);
+        assert!(player.sort_due_at(1, t1 + base));
         cleanup(player, remote, root);
     }
 

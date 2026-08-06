@@ -38,21 +38,29 @@ const MODES = {
   },
 };
 
+/* 서버(remote.rs permissions_json)가 내려주는 키를 그대로 따른다.
+ * §10.5에서 `skip`이 `playback`에서 떨어져 나왔으니 라벨도 따로 가진다 —
+ * 라벨이 합쳐져 있으면 "재생 권한은 있는데 왜 스킵이 안 되지"를 화면이 설명하지 못한다. */
 const PERM_LABELS = {
   search: '곡 검색·신청',
-  vote: '좋아요·슈퍼 좋아요',
-  playback: '재생 / 일시정지 / 스킵',
+  vote: '좋아요·슈퍼 좋아요·싫어요',
+  playback: '재생 / 일시정지',
+  skip: '곡 넘기기',
   seek: '재생 위치 이동',
   volume: '볼륨 조절',
   queueEdit: '대기열 편집',
   chat: '채팅 쓰기·반응·답장',
+  autoplay: '자동 재생 켜고 끄기·기준 곡',
+  bulkEnqueue: '재생목록·차트 전부 담기',
   library: '보관함·재생목록',
   suggest: '제안 작성·공감',
   autoplaySeed: '자동 재생 기준 곡 편집',
+  stats: '기록 보기',
   chatDelete: '남의 채팅 삭제',
   suggestStatus: '제안 상태 변경',
   suspend: '유저 정지·해제',
   sortMode: '정렬 모드 변경',
+  blacklist: '차단 목록 관리',
   console: '서버 관리 콘솔',
   ops: '운영 패널',
 };
@@ -95,13 +103,21 @@ const LS = {
 const THEMES = {
   auto: { label: '시스템 따라가기', desc: '기기가 밝으면 라이트, 어두우면 다크로 따라가요', swatch: null },
   dark: { label: '다크', desc: '거의 검정 배경에 남보라 강조', swatch: ['#0d111a', '#8b5cf6', '#f2f5fa'] },
-  light: { label: '라이트', desc: '흰 배경. 밝은 방에서 잘 보여요', swatch: ['#ffffff', '#7c3aed', '#0f172a'] },
-  midnight: { label: '미드나잇', desc: '짙은 곤색에 하늘색 강조', swatch: ['#1a1b26', '#7aa2f7', '#c0caf5'] },
-  slate: { label: '그레이', desc: '채도가 낮아 눈이 가장 덜 피곤해요', swatch: ['#22272e', '#539bf5', '#adbac7'] },
-  sepia: { label: '베이지', desc: '따뜻한 종이색. 밝은 방에서 좋아요', swatch: ['#fdf6e3', '#9c5a2d', '#3b3228'] },
-  retro: { label: '레트로', desc: '옛날 CRT 터미널처럼 앰버 단색이에요', swatch: ['#12100a', '#ffb000', '#ffcc55'] },
+  light: { label: '라이트', desc: '흰 배경. 밝은 방에서 잘 보여요', swatch: ['#ffffff', '#7c3aed', '#0f1622'] },
+  midnight: { label: '미드나잇', desc: '짙은 곤색에 하늘색 강조', swatch: ['#1a1b26', '#7aa2f7', '#c8d3f5'] },
+  slate: { label: '그레이', desc: '채도가 낮아 눈이 가장 덜 피곤해요', swatch: ['#22272e', '#539bf5', '#cdd9e5'] },
+  sepia: { label: '베이지', desc: '따뜻한 종이색. 밝은 방에서 좋아요', swatch: ['#fdf6e3', '#9c5a2d', '#3a2f24'] },
+  retro: { label: '레트로', desc: '옛날 CRT 터미널처럼 앰버 단색이에요', swatch: ['#12100a', '#ffb000', '#ffc457'] },
   nord: { label: '노르드', desc: '차가운 청회색 팔레트', swatch: ['#2e3440', '#88c0d0', '#eceff4'] },
 };
+
+/** 스와치 3색. `auto`는 고정 색이 없으니 지금 시스템이 가리키는 테마 것을 빌려 온다 —
+ *  다크 색을 박아 두면 밝은 기기에서도 "시스템 따라가기"가 늘 어둡게 보인다. */
+function themeSwatch(id) {
+  const meta = THEMES[id];
+  if (meta && meta.swatch) return meta.swatch;
+  return THEMES[resolveTheme(id)]?.swatch || THEMES.dark.swatch;
+}
 
 /* 모바일 주소창 색. 각 테마의 --surface-0 이다. */
 const THEME_META = {
@@ -304,7 +320,8 @@ function adoptServerPrefs(serverPrefs) {
 
 /* ═══════════════════════ 테마 (§17) ═══════════════════════
  * tokens.css가 [data-theme="X"]로 토큰을 통째로 갈아 끼운다. 여기서는 값 하나만 박으면 된다.
- * `auto`는 값이 아니라 규칙이라 여기서 풀어 준다(remote_page.rs의 FOUC 스크립트는 아직 못 푼다).
+ * `auto`는 값이 아니라 규칙이라 여기서도 풀어 준다(remote_page.rs의 FOUC 스크립트도 auto를 푼다 —
+ * 두 곳이 같은 규칙을 따라야 첫 페인트와 이후 페인트가 안 어긋난다).
  */
 
 let themePreview = null;        // 미리보기 중 되돌릴 원래 값
@@ -479,6 +496,24 @@ let suggestUnread = false;
 let queueTotal = 0;            // 서버가 잘라 보냈을 때의 전체 곡 수 (§18.2)
 let queueTruncated = false;
 
+/* ── 재정렬 주기 (§5 · §18.2 (3)) ──
+ * **서버가 정한다.** 대기열이 길어지면 서버가 5초에서 15초로 늦추는데(`sortPeriodSeconds`),
+ * 화면이 5초를 세면 카운트다운이 세 번 헛돌고 헤더도 거짓말을 한다.
+ * 그래서 하드코딩된 5·15 는 여기 한 곳에서만 "서버가 아직 안 알려줬을 때의 기본값"으로 쓴다. */
+const SORT_PERIOD_DEFAULT = 5;
+let sortPeriodSec = SORT_PERIOD_DEFAULT;
+
+/** 서버가 알려 준 재정렬 주기(초). 이상한 값은 기본값으로 되돌린다. */
+function sortPeriodSeconds() {
+  const value = Number(sortPeriodSec);
+  if (!Number.isFinite(value) || value < 1 || value > 600) return SORT_PERIOD_DEFAULT;
+  return Math.round(value);
+}
+
+function noteSortPeriod(value) {
+  if (Number.isFinite(Number(value)) && Number(value) >= 1) sortPeriodSec = Math.round(Number(value));
+}
+
 /** 알림은 앱 스위치 → 종류 스위치 → 브라우저 권한을 다 통과해야 울린다 (§16 B3). */
 function pushNotify(kind, payload) {
   if (!notifyOn(kind)) return null;
@@ -580,7 +615,11 @@ function whyBlocked(entry, key) {
     const roles = (entry.roleNames || []).map((name) => `@${name}`).join(' · ');
     return roles ? `${roles} 역할이 있어야 눌러요` : '지정된 역할이 있어야 눌러요';
   }
-  return `${RULE_LABELS[entry.rule] || entry.ruleLabel || PERM_LABELS[key] || '관리자'}만 할 수 있어요`;
+  // `모든 멤버만 할 수 있어요` 같은 비문을 만들면 안 된다 — 규칙 라벨을 그대로 문장에 끼우지 않는다 (§23.3)
+  if (entry.rule === 'guildMember') return '이 서버의 멤버여야 눌러요';
+  const label = entry.ruleLabel || RULE_LABELS[entry.rule];
+  if (label) return `${label} 조건이라 지금은 눌러지지 않아요`;
+  return '지금은 이 기능을 쓸 조건이 아니에요';
 }
 
 /** 2) 누구는 되는지 — 역할 이름 + 인원수까지만. */
@@ -617,6 +656,10 @@ function suspensionRemain(suspension) {
   return hours < 24 ? `${hours}시간 ${minutes % 60}분 남음` : `${Math.floor(hours / 24)}일 남음`;
 }
 
+/** `권한 없음`은 답이 아니다 (§23.3). 이유를 안 넘긴 호출부가 있어도 화면이 그 말을 하면 안 되므로
+ *  최후의 문구도 조건을 가리키는 쪽으로 둔다. */
+const LOCK_FALLBACK = '지금은 이 버튼을 쓸 조건이 아니에요. 서버 관리자가 정한 규칙을 따라요.';
+
 /** 권한 없는 버튼은 숨기지 않는다. 비활성 모양 + 이유 툴팁으로 남긴다. */
 function setLock(node, locked, reason) {
   if (!node) return node;
@@ -624,8 +667,8 @@ function setLock(node, locked, reason) {
   node.setAttribute('aria-disabled', locked ? 'true' : 'false');
   node.classList.toggle('is-locked', !!locked);
   if (locked) {
-    node.dataset.lockReason = reason || '권한이 없어요.';
-    node.setAttribute('data-tip', reason || '권한이 없어요.');
+    node.dataset.lockReason = reason || LOCK_FALLBACK;
+    node.setAttribute('data-tip', reason || LOCK_FALLBACK);
   } else {
     delete node.dataset.lockReason;
     if (node.__tipBase) node.setAttribute('data-tip', node.__tipBase);
@@ -640,7 +683,7 @@ function bindAct(node, fn) {
     if (node.getAttribute('aria-disabled') === 'true') {
       event.preventDefault();
       event.stopPropagation();
-      toast(node.dataset.lockReason || '권한이 없어요.', 'warn');
+      toast(node.dataset.lockReason || LOCK_FALLBACK, 'warn');
       return;
     }
     fn(event);
@@ -833,6 +876,9 @@ function buildGutter(key, label) {
 
   node.setAttribute('aria-valuemin', String(SIZE_LIMITS[key].min));
   node.setAttribute('aria-valuemax', String(SIZE_LIMITS[key].max));
+  // 드래그하기 전에도 지금 값을 읽을 수 있어야 한다. min/max 만 있으면 스크린리더가
+  // "몇 픽셀인지"를 영영 못 말한다 (§20 · role=separator 규약).
+  node.setAttribute('aria-valuenow', String(clampSize(key, sizeFor(effectiveLayout(), key))));
   return node;
 }
 
@@ -842,6 +888,8 @@ function bindComposeResize() {
     class: 'gutter gutter--row',
     role: 'separator', 'aria-orientation': 'horizontal', tabindex: '0',
     'aria-label': '채팅 입력창 높이',
+    // 세로 손잡이도 값 범위를 말해야 한다. apply() 가 aria-valuenow 를 이어서 갱신한다.
+    'aria-valuemin': '36', 'aria-valuemax': '260', 'aria-valuenow': '36',
     tip: '끌어서 입력창 높이 조절 · 더블클릭하면 기본값이에요',
   }, h('span', { class: 'gutter__grip', 'aria-hidden': 'true' }));
   el.composeGutter = node;
@@ -981,8 +1029,7 @@ function openThemeMenu(anchor) {
       onClick: () => { done = true; commitTheme(id); close(); toast(`${meta.label} 테마로 바꿨어요.`, 'ok'); },
     },
       h('span', { class: 'themeopt__sw', 'aria-hidden': 'true' },
-        ...(meta.swatch || ['#0d111a', '#8b5cf6', '#f2f5fa'])
-          .map((color) => h('i', { style: { background: color } }))),
+        ...themeSwatch(id).map((color) => h('i', { style: { background: color } }))),
       h('span', { class: 'themeopt__main' },
         h('strong', null, meta.label),
         h('small', null, meta.desc)),
@@ -1079,7 +1126,14 @@ function notifySettings() {
 function saveNotifySettings(next) {
   prefSet('notify', JSON.stringify(next));
   renderNotifyBox();
-  notify.badge(notifyOn('mention') || notifyOn('reply') ? unread : 0);
+  notify.badge(titleBadgeOn() ? unread : 0);
+}
+
+/** 탭 제목의 숫자를 띄울지. **브라우저 알림 권한과는 무관하다** — 제목 숫자는 브라우저 알림이
+ *  아니라 이 화면이 직접 쓰는 값이라 권한이 필요 없다. 판단 기준은 앱 스위치 하나뿐이고,
+ *  두 군데가 서로 다른 기준을 쓰면 켰다 껐다에 따라 숫자가 오락가락한다 (§16 B3). */
+function titleBadgeOn() {
+  return !!notifySettings().on;
 }
 
 /** 앱 스위치 + 종류별 스위치 + 브라우저 권한을 모두 통과해야 울린다. */
@@ -1615,16 +1669,27 @@ function buildDockGroup(group) {
   return wrap;
 }
 
+/* 탭 하나는 "전환"과 "닫기" 두 조작을 가진다. `<button>` 안에 `<button>` 을 넣으면 HTML이
+ * 깨지고(브라우저가 파싱 단계에서 풀어 버린다) 보조기술에서 두 버튼이 하나로 뭉친다.
+ * 그래서 바깥은 role=tab 을 단 div 로 두고 안쪽 ✕ 만 진짜 버튼으로 남긴다.
+ * div 는 키보드가 안 먹으므로 Enter/Space 를 직접 받는다. */
 function buildDockTab(group, id) {
   const meta = PANELS[id] || { icon: '·', label: id };
-  const tab = h('button', {
-    class: 'dk-tab', type: 'button', role: 'tab',
+  const pick = () => {
+    // 끌어서 옮긴 직후에 click이 한 번 더 온다. 그건 탭 전환이 아니다.
+    if (tab.__afterDrag) { tab.__afterDrag = false; return; }
+    activateDockPanel(group, id);
+  };
+  const tab = h('div', {
+    class: 'dk-tab', role: 'tab', tabindex: '0',
     'aria-selected': String(group.active === id),
+    tip: `${meta.label} 창을 앞으로 가져와요`,
     dataset: { panel: id },
-    onClick: () => {
-      // 끌어서 옮긴 직후에 click이 한 번 더 온다. 그건 탭 전환이 아니다.
-      if (tab.__afterDrag) { tab.__afterDrag = false; return; }
-      activateDockPanel(group, id);
+    onClick: pick,
+    onKeydown: (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      pick();
     },
   },
     h('span', { 'aria-hidden': 'true' }, meta.icon),
@@ -2199,9 +2264,10 @@ async function toggleSaved(track, present) {
 function buildQueuePane() {
   el.queueCount = h('span', { class: 'queue__count' });
   el.modeBadge = h('span', { class: 'modebadge' });
+  // 툴팁 문구는 renderSortTick()이 서버 주기(sortPeriodSeconds)로 매번 다시 쓴다.
   el.sortTick = h('span', {
     class: 'sorttick', hidden: true, role: 'timer',
-    tip: '5초마다 순서를 다시 정해요',
+    tip: `${sortPeriodSeconds()}초마다 순서를 다시 정해요`,
   });
 
   // 5곡 이상일 때만 뜬다. 4곡 이하면 눈으로 봐도 알아서 굳이 안 띄운다 (§10.4)
@@ -2217,8 +2283,6 @@ function buildQueuePane() {
   }, '🧹'), clearQueue);
 
   el.queueList = h('div', { class: 'queue__list scroll', 'data-testid': 'queue-list' });
-  el.queueSpacerTop = h('div', { class: 'queue__spacerpad', 'aria-hidden': 'true' });
-  el.queueSpacerBottom = h('div', { class: 'queue__spacerpad', 'aria-hidden': 'true' });
   el.queueList.addEventListener('scroll', onQueueScroll, { passive: true });
 
   const head = h('div', { class: 'queue__head' },
@@ -2240,9 +2304,12 @@ function buildQueuePane() {
 function renderQueueHead(state) {
   const shown = state.queue.length;
   const total = queueTotal || shown;
-  // 500곡을 넘으면 서버가 정렬 주기를 늘린다. 왜 갑자기 느려졌는지 알 수 있어야 한다 (§18.3)
-  el.queueCount.textContent = total > 500
-    ? `${total}곡 · 정렬은 15초마다`
+  // 대기열이 길어지면 서버가 정렬 주기를 늘린다. 왜 갑자기 느려졌는지 알 수 있어야 한다 (§18.3).
+  // **판단 기준은 서버가 준 주기 하나뿐이다** — `> 500`·`15초` 를 화면이 따로 알고 있으면
+  // 서버가 실제로 늦추지 않았을 때 헤더만 거짓말을 한다.
+  const period = sortPeriodSeconds();
+  el.queueCount.textContent = period > SORT_PERIOD_DEFAULT
+    ? `${total}곡 · 정렬은 ${period}초마다`
     : (queueTruncated ? `${total}곡 (앞 ${shown}곡 표시)` : `${total}곡`);
   el.queueCount.setAttribute('data-tip', queueTruncated
     ? `대기열이 길어서 앞 ${shown}곡만 받아 왔어요. 아래로 내리면 더 불러와요`
@@ -2274,15 +2341,118 @@ async function clearQueue() {
   await call(() => api('/queue/action', { body: { action: 'clear' } }), '대기열을 비웠어요.');
 }
 
+/* ── 개인화 필드 보존 (§10.4 · §18.2 (1)) ──
+ * `queue.set` 브로드캐스트는 접속자 전원이 같은 프레임을 받으므로 서버가 `isMine`/`myVote` 를
+ * 일부러 `null` 로 비워 보낸다(remote.rs `broadcast_queue`). 옳은 설계다 —
+ * 대신 **클라이언트가 되붙여야** 한다. 안 붙이면 재정렬이 한 번 돌 때마다
+ *   · `내 곡` 칩이 사라지고
+ *   · 내 투표의 `aria-pressed` 가 풀려 취소를 못 하고
+ *   · `canVote = can('vote') && !item.isMine` 이 `null`(falsy)을 통과해 자기 곡 투표 버튼이 열린다(서버는 403).
+ * 그래서 "개인화된 프레임"(cold/hot/`GET /queue`)을 볼 때마다 id별로 기억해 두고 다시 얹는다.
+ */
+const QUEUE_PERSONAL_CAP = 4000;
+const queuePersonal = new Map();      // itemId → { isMine, myVote }
+
+function notePersonalFields(items) {
+  for (const item of items || []) {
+    if (!item || item.id === undefined || item.id === null) continue;
+    // `isMine` 이 채워져 있으면 그 프레임은 개인화된 것이다. 브로드캐스트 프레임은 여기서 걸러진다.
+    if (item.isMine === null || item.isMine === undefined) continue;
+    queuePersonal.set(item.id, { isMine: !!item.isMine, myVote: item.myVote ?? null });
+  }
+  if (queuePersonal.size > QUEUE_PERSONAL_CAP) {
+    // 오래된 것부터 버린다(Map은 삽입 순서를 지킨다). 대기열에서 빠진 곡의 잔재를 모아 두지 않는다.
+    const drop = queuePersonal.size - QUEUE_PERSONAL_CAP;
+    let index = 0;
+    for (const key of queuePersonal.keys()) {
+      if (index++ >= drop) break;
+      queuePersonal.delete(key);
+    }
+  }
+}
+
+/* ── 지금 재생 중인 곡의 투표자 (§10.4) ──
+ * "제일 궁금한 곡"인데 서버의 `current` 페이로드에는 `score` 가 없다(`current_json`). 재생이 시작되면
+ * 그 곡은 `upcoming` 에서 빠져 점수 조회 대상이 아니기 때문이다. 그래서 **대기열에 있던 동안의
+ * 점수를 id 로 기억해 뒀다가** 재생으로 넘어가는 순간 그대로 쓴다. 서버가 나중에 `current.score` 를
+ * 실어 주면 그쪽이 이긴다. */
+const SCORE_CACHE_CAP = 600;
+const queueScoreCache = new Map();    // itemId → score
+
+function noteQueueScores(items) {
+  for (const item of items || []) {
+    if (!item || !item.score) continue;
+    queueScoreCache.set(item.id, item.score);
+  }
+  if (queueScoreCache.size > SCORE_CACHE_CAP) {
+    const drop = queueScoreCache.size - SCORE_CACHE_CAP;
+    let index = 0;
+    for (const key of queueScoreCache.keys()) {
+      if (index++ >= drop) break;
+      queueScoreCache.delete(key);
+    }
+  }
+}
+
+function scoreForCurrent(current) {
+  if (!current) return null;
+  return current.score || queueScoreCache.get(current.id) || null;
+}
+
+function notePersonalVote(itemId, myVote) {
+  const saved = queuePersonal.get(itemId);
+  queuePersonal.set(itemId, { isMine: saved ? saved.isMine : false, myVote: myVote ?? null });
+}
+
+function applyPersonalFields(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((item) => {
+    if (!item) return item;
+    if (item.isMine !== null && item.isMine !== undefined) return item;   // 서버가 이미 채웠으면 건드리지 않는다
+    const saved = queuePersonal.get(item.id);
+    if (!saved) return item;
+    return Object.assign({}, item, { isMine: saved.isMine, myVote: saved.myVote });
+  });
+}
+
+/* ── 이미 불러온 뒤쪽 페이지 (§18.2 (1)) ──
+ * 브로드캐스트는 언제나 앞 200곡뿐이다. 스크롤해서 `GET /queue?offset=200` 으로 받아 둔 뒷부분을
+ * 매번 버리면 (1) 목록이 300곡→200곡으로 줄어 스크롤이 튀고 (2) 다시 스크롤 → 다시 요청이라
+ * 사실상 5초 주기 폴링이 된다(§23.2 위반). 그래서 앞 200곡에 없는 항목만 뒤에 이어 붙여 둔다.
+ * 뒤쪽의 **정확한 순서**는 서버만 아는 값이라 다음 전체 로드(`loadHot`) 때 버린다. */
+let queueTail = [];
+
+function keepQueueTail(head) {
+  if (!queueTail.length) return head;
+  const seen = new Set(head.map((item) => item.id));
+  const room = Math.max(0, (queueTotal || 0) - head.length);
+  queueTail = queueTail.filter((item) => item && !seen.has(item.id)).slice(0, room);
+  return queueTail.length ? head.concat(queueTail) : head;
+}
+
+/** `queue.set` 프레임 하나를 화면에 쓸 대기열로. core.js의 통째 교체를 여기서 되돌린다. */
+function mergeQueueFrame(items) {
+  return keepQueueTail(applyPersonalFields(items));
+}
+
 /* ── 가상 스크롤 (§18.2) ──
  * 5000곡을 전부 그리면 브라우저가 죽는다. 보이는 만큼만 노드를 만들고
- * 위아래를 빈 상자로 채워 스크롤 길이를 맞춘다. FLIP도 화면에 보이는 항목에만 걸린다.
+ * 위아래는 **컨테이너 패딩**으로 채워 스크롤 길이를 맞춘다. FLIP도 화면에 보이는 항목에만 걸린다.
+ *
+ * 빈 상자(자식 노드)로 채우면 안 된다 — core.js의 `list()` 는 `__mmKey` 없는 자식을 **먼저 제거**한 뒤
+ * `getBoundingClientRect()` 로 레이아웃을 강제한다. 그 순간 컨테이너 높이가 슬라이스 높이로 줄어
+ * 브라우저가 `scrollTop` 을 잘라 버리고, 상자를 다시 붙여도 스크롤 위치는 안 돌아온다(§18.2 (2)).
+ * 패딩은 자식이 아니라서 `list()` 가 손댈 수 없고, 그래서 잘림 자체가 일어나지 않는다.
  */
 const VIRT_THRESHOLD = 80;      // 이 아래로는 통째로 그리는 게 더 빠르다
-const VIRT_ROW = 74;            // 항목 하나의 대략 높이(px)
+const VIRT_ROW_DEFAULT = 74;    // 항목 하나의 대략 높이(px) — 실제 값은 그린 뒤에 재서 갱신한다
 const VIRT_OVERSCAN = 8;
 
 let virtWindow = { from: 0, to: 0 };
+// 좁은 레일에서는 `.qitem__acts { flex-wrap: wrap }` 로 행이 두 줄이 된다. 고정 74px 로 계산하면
+// 스페이서 총합과 실제 높이가 어긋나 스크롤바 길이와 위치가 같이 틀어진다. 그래서 재서 쓴다.
+let virtRow = VIRT_ROW_DEFAULT;
+let virtRemeasureQueued = false;
 
 function virtualizing() {
   return store.get().queue.length > VIRT_THRESHOLD;
@@ -2290,11 +2460,31 @@ function virtualizing() {
 
 function computeVirtWindow(items) {
   if (!virtualizing()) return { from: 0, to: items.length };
+  const row = virtRow;
   const top = el.queueList.scrollTop;
   const height = el.queueList.clientHeight || 480;
-  const from = Math.max(0, Math.floor(top / VIRT_ROW) - VIRT_OVERSCAN);
-  const to = Math.min(items.length, Math.ceil((top + height) / VIRT_ROW) + VIRT_OVERSCAN);
+  const from = Math.max(0, Math.floor(top / row) - VIRT_OVERSCAN);
+  const to = Math.min(items.length, Math.ceil((top + height) / row) + VIRT_OVERSCAN);
   return { from, to };
+}
+
+/** 그려 놓은 항목의 실제 간격을 재서 다음 계산에 쓴다. 여기서 다시 그리면 재귀가 되므로
+ *  값이 크게 달라졌을 때만 한 프레임 뒤에 딱 한 번 다시 그린다. */
+function measureVirtRow() {
+  const nodes = el.queueList.querySelectorAll('.qitem');
+  if (nodes.length < 2) return;
+  const first = nodes[0];
+  const last = nodes[nodes.length - 1];
+  const pitch = (last.offsetTop - first.offsetTop) / (nodes.length - 1);
+  if (!Number.isFinite(pitch) || pitch < 32 || pitch > 400) return;
+  if (Math.abs(pitch - virtRow) < 1) return;
+  virtRow = pitch;
+  if (virtRemeasureQueued || !virtualizing()) return;
+  virtRemeasureQueued = true;
+  requestAnimationFrame(() => {
+    virtRemeasureQueued = false;
+    if (virtualizing()) renderQueue(store.get());
+  });
 }
 
 let virtRaf = 0;
@@ -2324,6 +2514,10 @@ async function maybeLoadMoreQueue() {
     const data = await api(`/queue?offset=${state.queue.length}&limit=200`);
     const more = data?.items || data?.queue || [];
     if (more.length) {
+      // 이 응답은 개인화된 프레임이다. 브로드캐스트가 비워 보낼 값을 여기서 기억해 둔다.
+      notePersonalFields(more);
+      const seen = new Set(state.queue.map((item) => item.id));
+      queueTail = queueTail.concat(more.filter((item) => !seen.has(item.id)));
       store.patch({ queue: state.queue.concat(more) });
       if (Number.isFinite(data?.queueTotal)) queueTotal = data.queueTotal;
       queueTruncated = state.queue.length + more.length < queueTotal;
@@ -2339,8 +2533,10 @@ async function maybeLoadMoreQueue() {
 function renderQueue(state) {
   renderQueueHead(state);
   const items = state.queue;
+  noteQueueScores(items);
   if (!items.length) {
     list.reset(el.queueList);
+    setVirtPad(0, 0);
     clear(el.queueList).appendChild(state.hotAt
       ? emptyState('🎧', '대기열이 비었어요', '검색해서 다음 곡을 담아 보세요.')
       : skeletonRows(4));
@@ -2354,21 +2550,23 @@ function renderQueue(state) {
   virtWindow = win;
   const slice = win.from === 0 && win.to === items.length ? items : items.slice(win.from, win.to);
 
-  // 위아래 빈 상자로 스크롤 길이를 맞춘다. list()가 관리하지 않는 자식이라 매번 다시 붙인다.
-  const padTop = win.from * VIRT_ROW;
-  const padBottom = Math.max(0, (items.length - win.to) * VIRT_ROW);
-  el.queueSpacerTop.style.height = `${padTop}px`;
-  el.queueSpacerBottom.style.height = `${padBottom}px`;
+  // 위아래 패딩으로 스크롤 길이를 맞춘다. list()보다 **먼저** 정해 둬야 레이아웃이 한 번도 줄지 않는다.
+  setVirtPad(win.from * virtRow, Math.max(0, (items.length - win.to) * virtRow));
 
+  // 그래도 남을 수 있는 잘림에 대비해 스크롤 위치를 붙잡아 둔다 (§18.2 (2)).
+  const keepScroll = el.queueList.scrollTop;
   list(el.queueList, slice, (item) => item.id, createQueueItem,
     (node, item, index) => updateQueueItem(node, item, win.from + index, rounds));
+  if (virtualizing() && el.queueList.scrollTop !== keepScroll) el.queueList.scrollTop = keepScroll;
 
-  if (padTop > 0) el.queueList.insertBefore(el.queueSpacerTop, el.queueList.firstChild);
-  else el.queueSpacerTop.remove();
-  if (padBottom > 0) el.queueList.appendChild(el.queueSpacerBottom);
-  else el.queueSpacerBottom.remove();
-
+  measureVirtRow();
   marquee.scan(el.queueList);
+}
+
+/** 가상 스크롤의 위아래 여백. 자식 노드가 아니라 CSS 변수라서 list()가 지울 수 없다. */
+function setVirtPad(top, bottom) {
+  el.queueList.style.setProperty('--virt-pad-top', `${Math.max(0, Math.round(top))}px`);
+  el.queueList.style.setProperty('--virt-pad-bottom', `${Math.max(0, Math.round(bottom))}px`);
 }
 
 /* ── 대기열 갱신 카운트다운 (§5) ──
@@ -2389,34 +2587,53 @@ function serverNow() {
   return Date.now() + serverSkewMs;
 }
 
-/** 다음 재정렬까지 남은 초. fifo이거나 기준 시각을 모르면 null. */
-function sortRemainSeconds() {
-  const state = store.get();
-  if (state.queueMode === 'fifo') return null;
-  if (!state.queue.length) return null;
+/** 다음 재정렬까지 남은 초. fifo이거나 기준 시각을 모르면 null.
+ *
+ *  기준 시각(`nextSortAt`)은 서버가 준다. 문제는 그 시각이 **지나가도 다음 값이 안 오는 경우**가
+ *  있다는 것이다 — `queue.set` 은 순서가 실제로 바뀐 길드에만 나가고, 곡이 1~2곡이면
+ *  서버는 아예 재정렬을 시도하지 않는다. 그때 롤오버가 없으면 `갱신 0` 이 영구히 박힌다.
+ *  그래서 지난 기준 시각은 **주기 단위로 앞으로 굴린다**. 주기도 서버가 준 값(§18.2 (3))을 쓴다.
+ *
+ *  `now` 를 받는 건 회귀 테스트에서 시계를 고정하기 위해서다.
+ */
+function sortRemainFrom(state, nowMs, periodSec) {
+  if (!state || state.queueMode === 'fifo') return null;
+  if (!state.queue || !state.queue.length) return null;
 
-  let target = parseUtc(state.nextSortAt);
+  const period = Math.max(1, Math.round(periodSec || SORT_PERIOD_DEFAULT));
+  const periodMs = period * 1000;
+  let target = parseUtc(state.nextSortAt) || null;
   if (!target) {
     const sorted = parseUtc(state.sortedAt);
     if (!sorted) return null;
-    // 서버가 nextSortAt을 아직 안 보내면 5초 주기를 가정해 다음 경계를 만든다
-    target = sorted + 5000;
-    if (target <= serverNow()) target += Math.ceil((serverNow() - target) / 5000) * 5000;
+    target = sorted + periodMs;
   }
-  const left = target - serverNow();
-  if (left > 60000) return null;         // 말도 안 되는 값이면 아예 숨긴다
-  return Math.max(0, Math.min(9, Math.ceil(left / 1000)));
+  // 이미 지난 기준 시각은 주기만큼 굴려서 다음 경계로 옮긴다. 여기가 `갱신 0` 고착의 원인이었다.
+  if (target <= nowMs) target += Math.ceil((nowMs - target + 1) / periodMs) * periodMs;
+
+  const left = target - nowMs;
+  // 롤오버를 거쳤으니 남은 시간은 한 주기를 넘을 수 없다. 넘으면 기준 시각이 미래로 크게 어긋난
+  // 경우라 세는 시늉을 하지 않는다.
+  if (left > periodMs + 1000) return null;
+  return Math.max(0, Math.min(period, Math.ceil(left / 1000)));
+}
+
+function sortRemainSeconds() {
+  return sortRemainFrom(store.get(), serverNow(), sortPeriodSeconds());
 }
 
 function renderSortTick() {
   if (!el.sortTick) return;
   const left = sortRemainSeconds();
   if (left === null) { el.sortTick.hidden = true; return; }
+  const period = sortPeriodSeconds();
   el.sortTick.hidden = false;
   clear(el.sortTick).append(
     h('span', { class: 'sorttick__label' }, '갱신'),
     h('b', null, String(left)));
   el.sortTick.setAttribute('aria-label', `${left}초 뒤에 대기열이 다시 정렬돼요`);
+  // 툴팁도 서버 주기를 따라간다 — `5초마다` 로 박아 두면 15초 서버에서 화면이 거짓말을 한다 (§20)
+  el.sortTick.setAttribute('data-tip', `${period}초마다 순서를 다시 정해요`);
 }
 
 function startSortTick() {
@@ -2427,9 +2644,34 @@ function startSortTick() {
     renderSortTick();
     // 슈퍼 좋아요 쿨타임은 1초에 한 번만 다시 그린다
     superTick += 1;
-    if (superTick % 4 === 0 && superLikeInfo().coolLeft > 0) renderQueue(store.get());
+    if (superTick % 4 === 0) tickSuperButtons();
   }, 250);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) renderSortTick(); });
+}
+
+/** 쿨타임 카운트다운은 ⭐ 버튼의 글자 하나만 바뀐다. 여기서 `renderQueue(전체)` 를 부르면
+ *  쿨타임이 도는 내내 1초마다 대기열 전체가 다시 그려진다 (§23.2 "전체 재렌더 금지").
+ *  쿨타임이 **풀리는 순간** 한 번만 정식 렌더로 잠금·툴팁을 다시 계산한다. */
+let superCooling = false;
+function tickSuperButtons() {
+  if (!el.queueList) return;
+  const info = superLikeInfo();
+  if (info.coolLeft <= 0) {
+    if (superCooling) { superCooling = false; renderQueue(store.get()); }
+    return;
+  }
+  superCooling = true;
+  const label = fmtTime(info.coolLeft);
+  for (const node of el.queueList.querySelectorAll('.qitem')) {
+    const button = node.__parts?.superLike;
+    const item = node.__item;
+    if (!button || !item) continue;
+    if (item.myVote === 'superLike') continue;      // 취소용 버튼에는 쿨타임을 안 씌운다
+    button.textContent = `⭐ ${label}`;
+    if (button.getAttribute('aria-disabled') === 'true' && !item.isMine) {
+      setLock(button, true, `슈퍼 좋아요는 ${label} 뒤에 다시 쓸 수 있어요`);
+    }
+  }
 }
 
 /* ── 자동 재생 기준 곡 (§8.5) ──
@@ -2562,8 +2804,17 @@ function autoplayControls() {
         h('div', { class: 'autoplay__num' }, recentInput,
           h('span', { class: 'hint' }, fmtLimit(autoplayState.recentCount, '곡'))))
       : null,
-    autoplayState.mode === 'genre' && (autoplayState.genreOptions || []).length
-      ? h('div', { class: 'autoplay__row' }, h('div', { class: 'hint' }, '어떤 장르로 고를까요'), genreBox)
+    // 장르 목록이 비면 행을 통째로 숨기지 않는다 — `🎸 장르` 를 골랐는데 아무것도 안 나오면
+    // 고장인지 내가 뭘 잘못한 건지 알 수가 없다 (§23.3).
+    autoplayState.mode === 'genre'
+      ? h('div', { class: 'autoplay__row' },
+        h('div', { class: 'hint' }, '어떤 장르로 고를까요'),
+        (autoplayState.genreOptions || []).length
+          ? genreBox
+          : h('p', {
+            class: 'hint',
+            tip: '장르 차트가 준비되면 여기에 고를 수 있는 장르가 나와요',
+          }, '고를 수 있는 장르가 아직 없어요. 관리 콘솔에서 장르 차트를 켜면 여기에 나와요.'))
       : null,
     segRow('어떤 느낌으로 고를까요', '같은 기준에서도 얼마나 비슷한 곡을 집을지 정해요',
       AUTOPLAY_POLICIES, autoplayState.policy, (id) => saveAutoplay({ policy: id })));
@@ -2571,12 +2822,11 @@ function autoplayControls() {
 
 function renderSeeds() {
   if (!el.seedBox) return;
-  // 최종 판정은 서버의 canEdit(권한 키 autoplaySeed)이다. 여기서는 화면 상태만 덧대 막는다.
-  const state = store.get();
-  const blocked = state.conn === 'down' || state.tier === 'viewer'
-    || !!(state.suspension && (state.suspension.scope === 'all' || state.suspension.scope === 'queue'));
-  const editable = !!(seedState && seedState.canEdit && !blocked);
-  el.portal?.setAttribute('data-seeds', editable ? '1' : '0');
+  // 최종 판정은 서버의 canEdit(권한 키 autoplay)이다. 화면은 seedEditable() 로 덧대 막는다.
+  // data-seeds 는 "**서버가 이 기능을 아는가**" 하나만 뜻한다. 권한 판정까지 여기에 섞으면
+  // 권한 없는 사람에게 📻 버튼이 CSS로 사라져서 왜 없는지 물어볼 데도 없어진다 (§23.3).
+  el.portal?.setAttribute('data-seeds', seedState ? '1' : '0');
+  refreshSeedButtons();
 
   if (!seedState) { el.seedBox.hidden = true; return; }
   el.seedBox.hidden = false;
@@ -2621,13 +2871,36 @@ function renderSeeds() {
 }
 
 /** 대기열·검색 결과에 붙는 '기준으로 삼기'. 권한이 없으면 CSS가 통째로 숨긴다. */
+/** 기준 곡으로 삼을 수 있는가. **서버가 이 기능을 아는지**(seedState)와 **내 권한**은 다른 문제다.
+ *  기능이 없으면 버튼을 숨기고(있지도 않은 걸 회색으로 두면 더 헷갈린다),
+ *  기능은 있는데 권한이 없으면 숨기지 말고 비활성 + 이유로 남긴다 (§23.3 · §20). */
+function seedEditable() {
+  const state = store.get();
+  if (!seedState) return false;
+  if (state.conn === 'down' || state.tier === 'viewer') return false;
+  if (state.suspension && (state.suspension.scope === 'all' || state.suspension.scope === 'queue')) return false;
+  return !!seedState.canEdit && canAutoplay();
+}
+
+/** 시드 기능 상태(`/autoplay`)는 대기열 렌더와 따로 도착한다. 그때 대기열 전체를 다시 그리지 않고
+ *  📻 버튼의 잠금만 손본다 (§23.2 "전체 재렌더 금지"). */
+function refreshSeedButtons() {
+  if (!el.queueList) return;
+  const locked = !seedEditable();
+  const reason = lockReason('autoplay');
+  for (const node of el.queueList.querySelectorAll('.qitem')) {
+    if (node.__parts?.seed) setLock(node.__parts.seed, locked, reason);
+  }
+}
+
 function seedButton(track, wide) {
   if (!track) return null;
-  return bindAct(h('button', {
+  const button = bindAct(h('button', {
     class: wide ? 'vote seedbtn' : 'iconbtn seedbtn', type: 'button',
     tip: '📻 기준으로 삼기 — 자동 재생이 이 곡과 비슷한 노래를 골라 와요',
     'aria-label': '기준으로 삼기',
   }, wide ? '📻 기준' : '📻'), () => addSeed(track));
+  return setLock(button, !seedEditable(), lockReason('autoplay'));
 }
 
 async function addSeed(track) {
@@ -2656,15 +2929,30 @@ function computeRounds(items) {
 
 /* ── 점수 계산식은 서버 설정을 따라야 한다 (§10.1) ──
  * 좋아요를 2점으로 바꿔 뒀는데 화면이 1점으로 계산하면 화면이 거짓말을 하는 것이다. */
-function votePoints() {
-  const settings = store.get().settings || {};
-  const pick = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
-  return {
-    like: pick(settings.likePoints, 1),
-    dislike: pick(settings.dislikePoints, -1),
-    superLike: pick(settings.superLikePoints, 2),
-    wait: pick(settings.waitPoints, 1),
+function votePointsFrom(settings) {
+  const source = settings || {};
+  // 서버는 `settings.votePoints` **중첩 객체**로 준다 (remote.rs `/state/cold`·`/state/hot`).
+  // 평평한 `likePoints` 만 읽던 시절에는 값이 늘 undefined 라 화면이 항상 기본 배점(1/-1/2/1)으로
+  // 계산했다 — 관리자가 좋아요를 3점으로 바꿔도 계산식이 1점을 말하는, §10.1이 금지한 상황이다.
+  const nested = source.votePoints || {};
+  const pick = (...values) => {
+    for (const value of values) {
+      if (value === null || value === undefined || value === '') continue;
+      const number = Number(value);
+      if (Number.isFinite(number)) return number;
+    }
+    return 0;
   };
+  return {
+    like: pick(nested.like, source.likePoints, 1),
+    dislike: pick(nested.dislike, source.dislikePoints, -1),
+    superLike: pick(nested.superLike, source.superLikePoints, 2),
+    wait: pick(nested.wait, source.waitPoints, 1),
+  };
+}
+
+function votePoints() {
+  return votePointsFrom(store.get().settings);
 }
 
 /** 서버가 준 사용자 ID를 화면에 쓸 이름으로. 모르는 ID는 `누군가`다 (§10.4). */
@@ -2784,9 +3072,12 @@ function updateQueueItem(node, item, index, rounds) {
   p.like.textContent = `👍 ${like}`;
   p.dislike.textContent = `👎 ${dislike}`;
 
-  // 슈퍼 좋아요는 남은 횟수와 쿨타임을 숫자로 보여준다. 회색으로만 두면 고장인 줄 안다 (§10.6)
+  // 슈퍼 좋아요는 남은 횟수와 쿨타임을 숫자로 보여준다. 회색으로만 두면 고장인 줄 안다 (§10.6).
+  // 다만 **내가 이미 슈퍼를 눌러 둔 곡**에는 쿨타임을 띄우지 않는다 — 그 버튼이 하는 일은
+  // 새 슈퍼가 아니라 취소라서, 쿨타임을 보여주면 못 누르는 버튼처럼 보인다.
   const superInfo = superLikeInfo();
-  p.superLike.textContent = superInfo.coolLeft > 0
+  const superMine = item.myVote === 'superLike';
+  p.superLike.textContent = superInfo.coolLeft > 0 && !superMine
     ? `⭐ ${fmtTime(superInfo.coolLeft)}`
     : `⭐ ${superLike}`;
 
@@ -2802,24 +3093,34 @@ function updateQueueItem(node, item, index, rounds) {
     ? `싫어요 · ${points.dislike}점이에요${boomttaNote(dislike)}`
     : p.dislike.getAttribute('data-tip'));
 
-  const superBlocked = !canVote || superInfo.coolLeft > 0 || superInfo.left === 0;
+  // 이미 내가 슈퍼를 눌러 둔 곡이면 **취소는 언제나 열어 둔다.** 서버도 취소는 제한 검사 없이
+  // 허용하고 횟수까지 환불한다(§10.6 — "실수로 누른 걸 하루 종일 못 쓰게 하면 가혹해요").
+  // 여기서 잠그면 하루 1회 설정에서 잘못 누른 슈퍼를 되돌릴 방법이 사라진다.
+  const mySuper = superMine;
+  const superBlocked = !canVote || (!mySuper && (superInfo.coolLeft > 0 || superInfo.left === 0));
   setLock(p.superLike, superBlocked,
     item.isMine ? mineReason
       : superInfo.coolLeft > 0 ? `슈퍼 좋아요는 ${fmtTime(superInfo.coolLeft)} 뒤에 다시 쓸 수 있어요`
         : superInfo.left === 0 ? '오늘 슈퍼 좋아요를 다 썼어요 (UTC 자정에 초기화돼요)'
           : lockReason('vote'));
   if (!superBlocked) {
-    p.superLike.setAttribute('data-tip', superInfo.left === null
-      ? `슈퍼 좋아요 · ${points.superLike}점 올라가요`
-      : `슈퍼 좋아요 · ${points.superLike}점 · 오늘 ${superInfo.left}번 남았어요`);
+    p.superLike.setAttribute('data-tip', mySuper
+      ? '다시 누르면 슈퍼 좋아요를 취소해요 · 오늘 쓴 횟수도 돌려받아요'
+      : superInfo.left === null
+        ? `슈퍼 좋아요 · ${points.superLike}점 올라가요`
+        : `슈퍼 좋아요 · ${points.superLike}점 · 오늘 ${superInfo.left}번 남았어요`);
   }
 
   setLock(p.save, !can('library'), lockReason('library'));
+  // 📻 는 숨기지 않는다 — 기능이 있는 서버라면 비활성 + 이유로 남긴다 (§23.3).
+  setLock(p.seed, !seedEditable(), lockReason('autoplay'));
 
   p.pin.hidden = !can('queueEdit') || tierOf() === 'member';
   p.pin.setAttribute('aria-pressed', String(score.manualPriority !== null && score.manualPriority !== undefined));
   const canRemove = item.isMine ? can('queueEdit') || can('search') : can('queueEdit');
-  setLock(p.remove, !canRemove, item.isMine ? '' : lockReason('queueEdit'));
+  // 내 곡은 `queueEdit` 이나 `search` 중 하나만 있어도 뺄 수 있다. 둘 다 막혔을 때 빈 문자열을
+  // 넘기면 setLock 이 기본 문구로 떨어져 §23.3("왜 막혔는지")을 못 지킨다.
+  setLock(p.remove, !canRemove, item.isMine ? lockReason('search') : lockReason('queueEdit'));
 }
 
 /** 붐따가 켜져 있으면 몇 개 더 모이면 내려가는지 알려 준다 (§10.3). */
@@ -2831,6 +3132,16 @@ function boomttaNote(dislike) {
   const left = Math.max(0, threshold - (dislike || 0));
   const action = settings.boomttaAction === 'remove' ? '대기열에서 빠져요' : '맨 뒤로 내려가요';
   return left > 0 ? ` · ${left}개 더 모이면 ${action}` : ` · 곧 ${action}`;
+}
+
+/** 서버가 준 계산식에서 `= 합계` 꼬리를 떼고 항 부분만 돌려준다.
+ *  아직 점수가 없을 때 서버는 `아직 점수가 없어요 = 0` 을 주는데, 그건 우리 쪽 빈 상태 문구가 이긴다. */
+function serverFormula(score) {
+  const raw = typeof score?.formula === 'string' ? score.formula.trim() : '';
+  if (!raw || raw.startsWith('아직 점수가 없어요')) return '';
+  const cut = raw.lastIndexOf(' = ');
+  const body = cut > 0 ? raw.slice(0, cut) : raw;
+  return body.trim();
 }
 
 /** 시그니처 — 점수를 숫자 하나로 숨기지 않고 계산식과 막대로 보여준다.
@@ -2871,9 +3182,13 @@ function renderScore(host, score, mode) {
   push(wait, points.wait, term('대기', wait, points.wait));
   push(dislike, points.dislike, term('👎', dislike, points.dislike));
 
-  const formula = parts.map((part, index) => (index === 0
+  const localFormula = parts.map((part, index) => (index === 0
     ? (part.minus ? `−${part.text}` : part.text)
     : `${part.minus ? ' − ' : ' + '}${part.text}`)).join('');
+  // 계산식은 **서버가 만들어 준 것을 쓴다** (§10.4). 클라이언트가 배수를 다시 곱하면
+  // 점수 설정이 바뀐 순간 화면과 실제 합계가 갈린다. 서버 문자열은 `👍3 + ⭐1×2 = 7` 꼴이라
+  // `= N` 은 잘라 내고 우리 쪽 `score__total` 로 따로 고정한다.
+  const formula = serverFormula(score) || localFormula;
 
   const text = h('span', { class: 'score__text' });
   // 합계는 절대 잘리면 안 된다. 계산식만 줄어들고 '= 7'은 따로 고정한다.
@@ -2957,7 +3272,21 @@ function hideVoterCard() {
 async function vote(itemId, kind) {
   const item = store.get().queue.find((row) => row.id === itemId);
   const next = item && item.myVote === kind ? null : kind;
-  await call(() => api('/vote', { body: { itemId, kind: next } }));
+  const result = await call(() => api('/vote', { body: { itemId, kind: next } }));
+  if (!result) return;
+
+  // 서버 브로드캐스트(`queue.set`)는 개인화 필드를 비워 보낸다. 내가 무엇을 눌렀는지는
+  // 여기서만 알 수 있으므로 바로 기억하고 화면에도 반영한다 (§10.4).
+  notePersonalVote(itemId, next);
+  store.patch({
+    queue: store.get().queue.map((row) => (row.id === itemId
+      ? Object.assign({}, row, { myVote: next })
+      : row)),
+  });
+
+  // 슈퍼 좋아요 남은 횟수·쿨타임은 응답에 실려 온다 (§10.6). 버리면 `⭐ 2:14` 가 절대 안 뜨고,
+  // 다시 눌러 429 를 받기 전까지 화면은 아무 일도 없던 것처럼 보인다.
+  if (result.superLike) store.patch({ superLike: result.superLike });
 }
 
 function flashQueueItem(itemId) {
@@ -3370,10 +3699,20 @@ const SKIP_BASIS = {
   both: '듣는 사람과 보는 사람',
 };
 
+/** 스킵 권한은 §10.5에서 `playback` 에서 떨어져 나왔다. 서버는 오직 `skip_rule` 만 본다.
+ *  그런데도 `can('skip') || can('playback')` 로 두면, `곡 넘기기 = 관리자`인 서버에서 일반 멤버에게
+ *  ⏭ 가 **활성으로 보이고 누르면 403** 이 난다(§23.3 정면 위반). 그래서 구버전 폴백은
+ *  서버가 `skip` 키를 아예 모를 때만 쓴다 — `canAutoplay()` 가 쓰는 것과 같은 가드다. */
+function canSkipNow() {
+  const permissions = store.get().permissions?.can || {};
+  if (permissions.skip !== undefined) return can('skip');
+  return can('skip') || can('playback');
+}
+
 function renderSkipButton(offline, offlineReason) {
   const state = store.get();
   const vote = state.skipVote;
-  const canSkip = can('skip') || can('playback');
+  const canSkip = canSkipNow();
   const instant = tierOf() !== 'member' || !!state.current?.isMine;
 
   let tip;
@@ -3384,9 +3723,14 @@ function renderSkipButton(offline, offlineReason) {
     // 한 표 남았다는 걸 알면 누를 마음이 생긴다
     el.skipBtn.classList.toggle('pbtn--almost', (vote.need - (vote.have || 0)) === 1);
     el.skipBtn.setAttribute('aria-label', `스킵 투표 ${vote.have || 0} / ${vote.need}`);
+    // 모수(`pool`)는 서버가 줄 때만 말한다. `pool ?? need` 로 두면 듣는 사람 5명 중 3명 필요일 때
+    // `3명 중 3명` 이라는 거짓 문장이 뜬다.
+    const basis = SKIP_BASIS[vote.basis] || '듣는 사람';
     tip = vote.mine
       ? '내 표가 들어가 있어요 · 다시 누르면 빼요'
-      : `${SKIP_BASIS[vote.basis] || '듣는 사람'} ${vote.pool ?? vote.need}명 중 ${vote.need}명이 동의하면 넘어가요`;
+      : Number.isFinite(Number(vote.pool))
+        ? `${basis} ${Number(vote.pool)}명 중 ${vote.need}명이 동의하면 넘어가요`
+        : `${basis} ${vote.need}명이 동의하면 넘어가요`;
   } else {
     el.skipBtn.classList.remove('pbtn--wide', 'pbtn--almost');
     el.skipBtn.removeAttribute('aria-pressed');
@@ -3805,8 +4149,9 @@ function renderNow(state) {
     el.timeEnd.textContent = fmtTime(current.durationSeconds || trackSeconds(current.track));
   }
 
-  // 지금 재생 중인 곡은 제일 궁금한 곡이라 툴팁이 아니라 카드에 바로 보여준다 (§10.4)
-  const nowScore = current?.score;
+  // 지금 재생 중인 곡은 제일 궁금한 곡이라 툴팁이 아니라 카드에 바로 보여준다 (§10.4).
+  // 서버가 `current.score` 를 안 실어 주는 동안에는 대기열에 있던 시절의 점수를 쓴다.
+  const nowScore = scoreForCurrent(current);
   if (nowScore && voterList(nowScore).length) {
     clear(el.nowVoters).appendChild(voterPanel(nowScore));
     el.nowVoters.hidden = false;
@@ -4604,7 +4949,7 @@ function updateUnreadBadges() {
   const mobile = el.mobileTabs?.find((node) => node.dataset.pane === 'side');
   if (mobile) { mobile.__badge.textContent = String(unread); mobile.__badge.hidden = unread === 0; }
   // 알림을 껐으면 탭 제목 숫자도 안 띄운다 (§16 B3)
-  notify.badge(notifySettings().on ? unread : 0);
+  notify.badge(titleBadgeOn() ? unread : 0);
 }
 
 function onChatArrived(message) {
@@ -4798,11 +5143,14 @@ function buildSuggestPane() {
 }
 
 /** 자주 쓰는 기능이 아니라 탭 자리가 아깝다. 헤더 버튼 → 모달로 연다 (§11). */
+let suggestModalOpen = false;
+
 function openSuggestModal() {
   suggestUnread = false;
+  suggestModalOpen = true;
   el.suggestDot.hidden = true;
   loadSuggestions();
-  sheet({
+  const handle = sheet({
     title: '💡 제안',
     desc: '불편한 걸 적어 두면 반영될 수도 있어요. 다른 사람 제안에 공감할 수도 있고요.',
     wide: true,
@@ -4810,6 +5158,7 @@ function openSuggestModal() {
     dismissValue: false,
     actions: [{ label: '닫기', kind: 'primary', value: false }],
   });
+  handle.result.then(() => { suggestModalOpen = false; });
 }
 
 async function loadSuggestions() {
@@ -5042,6 +5391,26 @@ function renderAudit(state) {
   }
 }
 
+/** 서버 문장은 곡 제목을 `**아이브 - I AM**` 처럼 굵게 표시하라고 표시해 온다(models.rs `audit_text`).
+ *  그걸 텍스트 노드로 그대로 붙이면 화면에 별표가 나온다. innerHTML은 안 쓰므로 여기서 직접 자른다.
+ *  짝이 안 맞는 `**` 는 원문 그대로 둔다 — 제목에 별표가 들어 있을 수도 있다. */
+function markdownBold(text) {
+  const source = String(text || '');
+  const nodes = [];
+  let index = 0;
+  for (;;) {
+    const open = source.indexOf('**', index);
+    if (open < 0) break;
+    const close = source.indexOf('**', open + 2);
+    if (close < 0) break;
+    if (open > index) nodes.push(document.createTextNode(source.slice(index, open)));
+    nodes.push(h('b', null, source.slice(open + 2, close)));
+    index = close + 2;
+  }
+  if (index < source.length) nodes.push(document.createTextNode(source.slice(index)));
+  return nodes.length ? nodes : [document.createTextNode(source)];
+}
+
 /** 합쳐진 줄은 펼칠 수 있어야 한다. 숫자만 보여주면 "뭘 넣은 거지?"가 남는다 (§13.3). */
 function auditLine(entry, merged) {
   const text = auditText(entry);
@@ -5053,7 +5422,7 @@ function auditLine(entry, merged) {
     : text;
 
   if (merged <= 1 || !(entry.items || []).length) {
-    return h('div', { class: 'logrow__text' }, actor, h('span', null, bodyText));
+    return h('div', { class: 'logrow__text' }, actor, h('span', null, ...markdownBold(bodyText)));
   }
 
   const items = h('div', { class: 'logrow__items', hidden: true },
@@ -5068,7 +5437,7 @@ function auditLine(entry, merged) {
     },
   }, `▸ ${merged}곡 보기`);
 
-  return h('div', { class: 'logrow__text' }, actor, h('span', null, bodyText), toggle, items);
+  return h('div', { class: 'logrow__text' }, actor, h('span', null, ...markdownBold(bodyText)), toggle, items);
 }
 
 /* ═══════════════════════ 모바일 하단 탭바 ═══════════════════════ */
@@ -5178,7 +5547,7 @@ function openModeSheet() {
         h('h3', null, '동점이면 어떻게 되나요'),
         h('p', null, '관리자가 맨 앞으로 올린 곡이 언제나 먼저 나가요. 그다음은 점수가 높은 순, 점수까지 같으면 먼저 신청한 곡이 앞이에요.'),
         h('h3', null, '순서가 저절로 움직여요'),
-        h('p', null, '서버가 5초마다 순서를 다시 정해요. 대기열이 500곡을 넘으면 15초마다로 늦춰져요. 대기열 헤더의 숫자가 다음 재정렬까지 남은 초예요.'))),
+        h('p', null, `지금 이 서버는 ${sortPeriodSeconds()}초마다 순서를 다시 정해요. 대기열이 길어지면 주기가 더 늘어나요. 대기열 헤더의 숫자가 다음 재정렬까지 남은 초예요.`))),
     actions: can('sortMode')
       ? [{ label: '닫기', kind: 'ghost', value: false },
         { label: '관리 콘솔에서 바꾸기', kind: 'primary', value: 'admin', autofocus: true }]
@@ -5195,6 +5564,9 @@ function openPermissionSheet() {
   const allowed = entries.filter((entry) => entry.allowed);
   const denied = entries.filter((entry) => !entry.allowed);
 
+  // §23.3 마지막 문단: "'내 권한' 화면의 '할 수 없는 것' 목록에도 같은 이유와 대상을 붙여요.
+  // 거기가 이 정보를 가장 차분하게 읽을 수 있는 자리예요." 서버는 이미 allowedCount /
+  // allowedRoleNames 를 주고 있으니 클라가 붙이기만 하면 된다.
   const rowOf = (entry) => h('div', { class: `perm__row${entry.allowed ? '' : ' perm__row--no'}` },
     h('span', { 'aria-hidden': 'true' }, entry.allowed ? '✅' : '❌'),
     h('span', { class: 'label' }, entry.label || PERM_LABELS[entry.key] || entry.key),
@@ -5202,7 +5574,8 @@ function openPermissionSheet() {
       entry.ruleLabel || RULE_LABELS[entry.rule] || '',
       Array.isArray(entry.roleNames) && entry.roleNames.length ? ` (${entry.roleNames.join(', ')})` : '',
       entry.viaAdmin ? h('em', null, ' ← 관리자라 통과') : null,
-      entry.reason && !entry.allowed ? ` · ${entry.reason}` : ''));
+      entry.reason && !entry.allowed ? ` · ${entry.reason}` : '',
+      !entry.allowed && whoCan(entry) ? h('span', { class: 'perm__who' }, ` · ${whoCan(entry)}`) : null));
 
   const body = h('div', null,
     state.suspension ? h('div', { class: 'banner banner--danger', style: { borderRadius: 'var(--r-md)', marginBottom: 'var(--sp-4)' } },
@@ -5504,7 +5877,12 @@ function placePopover(node, where) {
   node.style.top = `${Math.max(8, Math.min(top, window.innerHeight - box.height - 8))}px`;
 }
 
-/** 우클릭 · 롱프레스 · Shift+F10 을 한 번에 붙인다. */
+/** 우클릭 · 롱프레스 · Shift+F10 을 한 번에 붙인다.
+ *
+ *  **메뉴를 열기로 했으면 전파를 반드시 끊는다.** `.person` 버튼은 `.qitem`·`.msg` 안에 들어 있어서,
+ *  안 끊으면 이벤트가 조상까지 올라가 조상 핸들러의 `openContextMenu` 가 맨 앞에서
+ *  `closeContextMenu()` 를 부르고 방금 뜬 사람 메뉴를 곡/메시지 메뉴로 갈아치운다.
+ *  그 결과 §24.1의 "사람" 메뉴가 멤버 탭 말고는 어디서도 안 열렸다. */
 function bindContextTarget(node, build) {
   node.addEventListener('contextmenu', (event) => {
     // 브라우저 기본 메뉴(링크 복사·이미지 저장)를 뺏으면 안 된다
@@ -5512,6 +5890,7 @@ function bindContextTarget(node, build) {
     const items = build(event);
     if (!items || !items.length) return;
     event.preventDefault();
+    event.stopPropagation();
     openContextMenu(items, { x: event.clientX, y: event.clientY });
   });
 
@@ -5525,7 +5904,11 @@ function bindContextTarget(node, build) {
     clearTimeout(timer);
     timer = setTimeout(() => {
       const items = build(event);
-      if (items && items.length) openContextMenu(items, { x: startX, y: startY });
+      if (!items || !items.length) return;
+      // 롱프레스는 조상 타이머도 같이 돌고 있다. 안쪽이 이겼다는 표시를 남겨 조상이 덮어쓰지 않게 한다.
+      if (event.__mmLongPressTaken) return;
+      event.__mmLongPressTaken = true;
+      openContextMenu(items, { x: startX, y: startY });
     }, 500);
   }, { passive: true });
   const cancel = (event) => {
@@ -5543,6 +5926,7 @@ function bindContextTarget(node, build) {
     const items = build(event);
     if (!items || !items.length) return;
     event.preventDefault();
+    event.stopPropagation();
     openContextMenu(items, { anchor: event.currentTarget });
   });
 }
@@ -5574,7 +5958,7 @@ function trackMenu(track, opts = {}) {
   ];
 
   if (opts.source === 'now') {
-    items.push({ icon: '⏭', label: '스킵', disabled: !can('skip') && !can('playback'), reason: lockReason('skip'), onPick: doSkip });
+    items.push({ icon: '⏭', label: '스킵', disabled: !canSkipNow(), reason: lockReason('skip'), onPick: doSkip });
     items.push({ icon: '🎤', label: '가사 보기', onPick: () => { if (!lyricsOpen) toggleLyrics(); } });
   } else if (itemId) {
     items.push({
@@ -5670,6 +6054,10 @@ function messageMenu(message) {
     { icon: '🙂', label: '반응 남기기', disabled: !can('chat'), reason: lockReason('chat'), onPick: () => openEmojiPicker(message.id, el.chatLog.querySelector(`[data-id="${CSS.escape(String(message.id))}"]`) || el.chatLog) },
     { icon: '📋', label: '내용 복사', onPick: () => copyText(message.content || '', '메시지를 복사했어요.') },
     {
+      icon: '🔗', label: '이 메시지 링크',
+      onPick: () => copyText(messageLink(message.id), '메시지 링크를 복사했어요. 채팅을 열어 둔 사람에게 보내면 그 줄로 바로 가요.'),
+    },
+    {
       icon: '🗑', label: '삭제', danger: true,
       disabled: !(mine || can('chatDelete')), reason: '내 메시지이거나 관리 권한이 있어야 지울 수 있어요',
       onPick: async () => {
@@ -5684,6 +6072,24 @@ function messageMenu(message) {
       onPick: () => call(() => api('/chat/report', { body: { messageId: message.id } }), '신고했어요. 관리자가 확인할 거예요.'),
     },
   ];
+}
+
+/** 메시지 한 줄을 가리키는 링크 (§24.1). 같은 서버 화면을 열면 그 줄로 데려간다. */
+function messageLink(messageId) {
+  return `${location.origin}${location.pathname}#msg-${encodeURIComponent(String(messageId))}`;
+}
+
+/** `#msg-…` 로 들어왔으면 채팅을 열고 그 줄을 잠깐 강조한다. 아직 안 불러온 메시지면 조용히 넘어간다. */
+function focusLinkedMessage() {
+  const match = /^#msg-(.+)$/.exec(location.hash || '');
+  if (!match) return;
+  const id = decodeURIComponent(match[1]);
+  openSide('chat');
+  requestAnimationFrame(() => {
+    const node = el.chatLog.querySelector(`[data-id="${CSS.escape(id)}"]`);
+    if (node) flashNode(node);
+    else toast('그 메시지는 아직 안 불러왔어요. 위로 올려서 더 불러와 주세요.', 'info');
+  });
 }
 
 function queueHeadMenu() {
@@ -5739,6 +6145,77 @@ async function openBlacklistSheet(track) {
  * 데이터는 §22의 stats API 하나로 끝난다 — 새 API를 늘리지 않는다.
  */
 
+/* ── 통계 응답 정규화 (§22.5 · §24.2) ──
+ * 서버(`/stats/me`·`/stats/user/{id}`)는 요약을 **`summary` 안에 중첩**해서 주고, 이름도 다르다.
+ *   summary.queuedTotal ↔ queued · summary.karma ↔ machamScore
+ *   topRequested[].requested ↔ count · topLiked[].liked ↔ count · topLoved[].likesRecv ↔ likes
+ * 화면이 평평한 이름만 읽던 동안 타일 4장·비율 막대·목록 숫자가 전부 0 이었다.
+ * 여기 한 곳에서 한 모양으로 편다 — 화면 코드가 두 모양을 다 알 필요는 없다.
+ */
+function normalizeStats(raw) {
+  const source = raw || {};
+  const summary = source.summary && typeof source.summary === 'object' ? source.summary : source;
+  const num = (...values) => {
+    for (const value of values) {
+      const number = Number(value);
+      if (Number.isFinite(number)) return number;
+    }
+    return null;
+  };
+  const rows = (list_, countKeys) => (Array.isArray(list_) ? list_ : []).map((row) => {
+    const count = num(...countKeys.map((key) => row?.[key]));
+    return Object.assign({}, row, {
+      count: count ?? 0,
+      likes: num(row?.likes, row?.likesRecv) ?? 0,
+    });
+  });
+
+  return {
+    available: source.available !== false,
+    message: source.message || '',
+    userId: source.userId ?? null,
+    queued: num(source.queued, summary.queuedTotal, summary.queued) ?? 0,
+    queuedSingle: num(source.queuedSingle, summary.queuedSingle),
+    queuedBulk: num(source.queuedBulk, summary.queuedBulk),
+    bulkTimes: num(source.bulkTimes, summary.bulkTimes),
+    played: num(source.played, summary.played) ?? 0,
+    skipped: num(source.skipped, summary.skipped) ?? 0,
+    boomtta: num(source.boomtta, summary.boomtta) ?? 0,
+    likesRecv: num(source.likesRecv, summary.likesRecv) ?? 0,
+    supersRecv: num(source.supersRecv, summary.supersRecv) ?? 0,
+    dislikesRecv: num(source.dislikesRecv, summary.dislikesRecv) ?? 0,
+    chats: num(source.chats, summary.chats),
+    // 서버에서는 `karma` 한 이름으로만 나온다 (remote.rs user_stats_json). 화면 이름은 마참 점수다.
+    machamScore: num(source.machamScore, summary.machamScore, summary.karma),
+    topRequested: rows(source.topRequested, ['count', 'requested']),
+    topLiked: rows(source.topLiked, ['count', 'liked']),
+    topLoved: rows(source.topLoved, ['likes', 'likesRecv']),
+    // `recent` 는 아직 서버 응답에 없다. 없으면 "최근 담은 곡" 섹션은 통째로 빠진다(0으로 꾸미지 않는다).
+    recent: Array.isArray(source.recent) ? source.recent : [],
+    daily: Array.isArray(source.daily) ? source.daily : [],
+  };
+}
+
+/** 통계가 꺼져 있으면 서버는 **HTTP 200 + `{available:false}`** 로 답한다 (§22.6).
+ *  404 만 보고 있으면 그 안내가 절대 안 뜨고, 대신 0으로 꾸민 화면이 뜬다 —
+ *  "0회 재생"과 "기록을 안 받고 있음"은 완전히 다른 이야기라 서버 주석이 스스로 금지한 동작이다. */
+function statsOffNode(stats) {
+  return emptyState('📊', '아직 기록을 모으지 않아요',
+    (stats && stats.message) || '서버에서 기록 기능이 꺼져 있어요. 관리자가 켜면 여기에 쌓여요.');
+}
+
+/** 프로필 드롭다운에 조용히 띄우는 마참 점수 (§22.4). 진입 때 한 번만 물어본다 —
+ *  `/state/cold` 에는 이 값이 없고, 서버는 60초 캐시라 이 한 번이 비싸지 않다. 폴링은 안 한다. */
+async function loadMyScore() {
+  if (Number.isFinite(myScore)) return;
+  try {
+    const stats = normalizeStats(await api('/stats/me'));
+    if (!stats.available || !Number.isFinite(stats.machamScore)) return;
+    myScore = stats.machamScore;
+    renderProfile();
+  } catch { /* 통계를 모르는 서버면 점수 줄을 그냥 안 그린다 */ }
+}
+
 function personButton(userId, displayName) {
   const name = displayName || '알 수 없음';
   if (!userId) return h('b', null, name);
@@ -5780,7 +6257,7 @@ async function openPersonCard(userId, displayName) {
 
   let stats = null;
   try {
-    stats = await api(`/stats/user/${encodeURIComponent(userId)}`);
+    stats = normalizeStats(await api(`/stats/user/${encodeURIComponent(userId)}`));
   } catch (error) {
     clear(body).appendChild(emptyState('📊', '기록을 못 불러왔어요',
       error && error.status === 404 ? '이 서버는 아직 기록을 모으지 않아요.' : error.message));
@@ -5788,6 +6265,7 @@ async function openPersonCard(userId, displayName) {
   }
   if (!body.isConnected) return;
   clear(body);
+  if (!stats.available) { body.appendChild(statsOffNode(stats)); return; }
   renderPersonCard(body, userId, displayName, stats, isMe);
 }
 
@@ -5810,12 +6288,12 @@ function renderPersonCard(host, userId, displayName, stats, isMe) {
             `마참 점수 ${stats.machamScore}`)
           : null)),
     h('div', { class: 'pcard__nums' },
-      statTile('담은 곡', stats.queued ?? 0, '이 사람이 담은 곡 수예요'),
-      statTile('재생', stats.played ?? 0, '끝까지 재생된 곡 수예요'),
-      statTile('받은 👍', stats.likesRecv ?? 0, '이 사람 곡이 받은 좋아요예요')),
+      statTile('담은 곡', stats.queued, '이 사람이 담은 곡 수예요'),
+      statTile('재생', stats.played, '끝까지 재생된 곡 수예요'),
+      statTile('받은 👍', stats.likesRecv, '이 사람 곡이 받은 좋아요예요')),
     ratioBar(stats),
-    recentList('최근 담은 곡', (stats.recent || []).slice(0, 5), (row) => fmtAgo(row.playedUtc || row.addedUtc)),
-    recentList('자주 담는 곡', (stats.topRequested || []).slice(0, 3), (row) => `${row.count || 0}회`));
+    recentList('최근 담은 곡', stats.recent.slice(0, 5), (row) => fmtAgo(row.playedUtc || row.addedUtc || row.lastUtc)),
+    recentList('자주 담는 곡', stats.topRequested.slice(0, 3), (row) => `${row.count}회`));
 
   if (isMe) return;
   host.appendChild(h('div', { class: 'pcard__acts' },
@@ -5878,35 +6356,38 @@ async function openStatsModal(userId) {
 
   let stats = null;
   try {
-    stats = await api(mine ? '/stats/me' : `/stats/user/${encodeURIComponent(userId)}`);
+    stats = normalizeStats(await api(mine ? '/stats/me' : `/stats/user/${encodeURIComponent(userId)}`));
   } catch (error) {
     clear(body).appendChild(emptyState('📊', '기록을 못 불러왔어요',
       error && error.status === 404 ? '이 서버는 아직 기록을 모으지 않아요.' : error.message));
     return;
   }
   if (!body.isConnected) return;
-  if (mine && Number.isFinite(stats.machamScore)) myScore = stats.machamScore;
   clear(body);
+  if (!stats.available) { body.appendChild(statsOffNode(stats)); return; }
+  if (mine && Number.isFinite(stats.machamScore)) { myScore = stats.machamScore; renderProfile(); }
   renderStats(body, stats, mine);
 }
 
 function renderStats(host, stats, mine) {
-  const received = stats.received || stats;
   put(host,
     h('div', { class: 'stats__tiles' },
-      statTile('담은 곡', stats.queued ?? 0, '한 곡씩 담은 것과 한 번에 담은 것을 모두 세요'),
-      statTile('재생된 곡', stats.played ?? 0, '내 곡이 끝까지 재생된 수예요'),
-      statTile('받은 좋아요', received.likesRecv ?? 0, '내 곡이 받은 좋아요예요'),
-      statTile('마참 점수', stats.machamScore ?? 0, '받은 반응이 쌓인 점수예요. 대기열 순서에는 영향이 없어요')),
+      statTile('담은 곡', stats.queued, '한 곡씩 담은 것과 한 번에 담은 것을 모두 세요'),
+      statTile('재생된 곡', stats.played, '내 곡이 끝까지 재생된 수예요'),
+      statTile('받은 좋아요', stats.likesRecv, '내 곡이 받은 좋아요예요'),
+      // 마참 점수는 아직 못 받았으면 0으로 꾸미지 않는다 — 0점과 "모름"은 다른 이야기다.
+      Number.isFinite(stats.machamScore)
+        ? statTile('마참 점수', stats.machamScore, '받은 반응이 쌓인 점수예요. 대기열 순서에는 영향이 없어요')
+        : null),
     ratioBar(stats),
     mine && Number.isFinite(stats.queuedSingle) ? h('p', { class: 'hint' },
       `한 곡씩 ${stats.queuedSingle}곡 · 한 번에 ${stats.queuedBulk ?? 0}곡 (${stats.bulkTimes ?? 0}번)`) : null,
     h('p', { class: 'hint' },
-      `받은 반응: 👍${received.likesRecv ?? 0} ⭐${received.supersRecv ?? 0} 👎${received.dislikesRecv ?? 0}`),
-    recentList('가장 많이 신청한 곡', (stats.topRequested || []).slice(0, 5), (row) => `${row.count || 0}회`),
-    mine ? recentList('내가 가장 많이 좋아요한 곡', (stats.topLiked || []).slice(0, 5), (row) => `${row.count || 0}회`) : null,
-    recentList('가장 많이 사랑받은 내 곡', (stats.topLoved || []).slice(0, 5), (row) => `👍${row.likes || 0}`),
-    dailyChart(stats.daily || []));
+      `받은 반응: 👍${stats.likesRecv} ⭐${stats.supersRecv} 👎${stats.dislikesRecv}`),
+    recentList('가장 많이 신청한 곡', stats.topRequested.slice(0, 5), (row) => `${row.count}회`),
+    mine ? recentList('내가 가장 많이 좋아요한 곡', stats.topLiked.slice(0, 5), (row) => `${row.count}회`) : null,
+    recentList('가장 많이 사랑받은 내 곡', stats.topLoved.slice(0, 5), (row) => `👍${row.likes}`),
+    dailyChart(stats.daily));
 }
 
 /** 30일 꺾은선. 라이브러리 없이 SVG 하나로 그린다 — 서버도 브라우저도 가볍게. */
@@ -6063,13 +6544,20 @@ function renderCharts() {
 }
 
 async function openChart(chart, keepLevel) {
-  chartView = { ...chartView, level: 'tracks', chart };
+  // 이전 차트의 줄이 남아 있으면 로드에 실패했을 때 남의 숫자가 그려진다.
+  chartView = { ...chartView, level: 'tracks', chart, rows: null, tracks: [] };
   if (!keepLevel) pushChartHistory();
   renderCharts();
   clear(el.chartBody).appendChild(skeletonRows(6));      // yt-dlp가 도는 몇 초 동안 빈 화면이면 고장으로 보인다
   try {
-    const query = chartView.category === 'ours' ? `?period=${encodeURIComponent(chartView.period)}` : '';
+    // 서버가 읽는 쿼리 키는 `window` 다 (remote.rs `ChartWindowQuery`). `period` 만 보내면
+    // serde 가 조용히 버려서 어느 기간을 눌러도 늘 `month` 가 나온다. 예전 빌드 호환으로 둘 다 보낸다.
+    const value = encodeURIComponent(chartView.period);
+    const query = chartView.category === 'ours' ? `?window=${value}&period=${value}` : '';
     const data = await api(`/charts/${encodeURIComponent(chart.id)}${query}`);
+    // 우리 차트는 통계가 붙은 `rows` 와 맨 트랙 배열 `tracks` 를 둘 다 준다.
+    // `tracks` 만 읽으면 §15.2b 가 요구한 숫자·계산식이 하나도 안 나온다 (그냥 곡 목록이 된다).
+    chartView.rows = Array.isArray(data?.rows) ? data.rows : null;
     chartView.tracks = data?.tracks || [];
     chartView.fetchedUtc = data?.fetchedUtc || null;
   } catch (error) {
@@ -6089,12 +6577,29 @@ window.addEventListener('popstate', () => {
   if (chartView.level !== 'categories') chartBack();
 });
 
+/** 우리 차트 한 줄의 부제 — "42회 재생 · 7명이 신청", "👍284 + ⭐52×2 = 388" (§15.2b).
+ *  순위가 왜 그런지 숫자로 보여야 차트가 차트다. 서버가 `loveFormula` 문자열까지 만들어 주므로
+ *  계산식은 그걸 그대로 쓴다 — 클라가 가중치를 다시 곱하면 설정을 바꿨을 때 화면이 갈린다. */
+function chartRowExtra(row) {
+  const extra = [];
+  const plays = Number.isFinite(Number(row.playsUser)) ? Number(row.playsUser)
+    : (Number.isFinite(Number(row.plays)) ? Number(row.plays) : null);
+  if (plays !== null) extra.push(`${plays}회 재생`);
+  if (Number.isFinite(Number(row.requesters))) extra.push(`${Number(row.requesters)}명이 신청`);
+  if (row.loveFormula) extra.push(String(row.loveFormula));
+  else if (Number.isFinite(Number(row.loveScore))) {
+    extra.push(`👍${row.likes || 0} + ⭐${row.supers || 0}×${row.superWeight ?? 2} = ${row.loveScore}`);
+  }
+  return extra;
+}
+
 function renderChartTracks() {
   const chart = chartView.chart;
   el.chartTitle.textContent = chart?.name || '차트';
   clear(el.chartBody);
-  const tracks = chartView.tracks || [];
-  if (!tracks.length) {
+  // 우리 차트면 통계가 붙은 `rows` 를, 바깥 차트면 맨 `tracks` 를 그린다.
+  const rows = chartView.rows && chartView.rows.length ? chartView.rows : (chartView.tracks || []);
+  if (!rows.length) {
     el.chartBody.appendChild(emptyState('📈', '이 차트에 곡이 없어요', '잠시 뒤에 다시 열어 보세요.'));
     return;
   }
@@ -6102,21 +6607,16 @@ function renderChartTracks() {
   el.chartBody.appendChild(h('div', { class: 'charts__meta' },
     chartView.fetchedUtc ? h('span', null, `마지막 갱신 ${fmtAgo(chartView.fetchedUtc)}`) : null,
     h('span', { class: 'queue__spacer' }),
-    h('span', null, `${tracks.length}곡`)));
+    h('span', null, `${rows.length}곡`)));
 
-  el.chartBulk.textContent = `전부 담기 (${tracks.length}곡)`;
+  el.chartBulk.textContent = `전부 담기 (${rows.length}곡)`;
   setLock(el.chartBulk, !canBulk(), lockReason('bulkEnqueue'));
 
-  tracks.forEach((row, index) => {
+  rows.forEach((row, index) => {
     const track = row.track || row;
-    const extra = [];
-    if (Number.isFinite(row.plays)) extra.push(`${row.plays}회 재생`);
-    if (Number.isFinite(row.requesters)) extra.push(`${row.requesters}명이 신청`);
-    if (Number.isFinite(row.loveScore)) {
-      extra.push(`👍${row.likes || 0} + ⭐${row.supers || 0}×${row.superWeight ?? 2} = ${row.loveScore}`);
-    }
+    const extra = chartRowExtra(row);
     const node = trackRow(track, 'chart', extra.length ? extra.join(' · ') : trackSub(track), { rank: index + 1 });
-    if (Number.isFinite(row.playsAutoplay) && row.playsAutoplay > 0) {
+    if (Number.isFinite(Number(row.playsAutoplay)) && Number(row.playsAutoplay) > 0) {
       node.setAttribute('data-tip', `자동재생으로 ${row.playsAutoplay}회 더 나갔어요 (순위에는 안 세요)`);
     }
     el.chartBody.appendChild(node);
@@ -6127,14 +6627,20 @@ function renderChartTracks() {
 async function enqueueChart() {
   const chart = chartView.chart;
   if (!chart) return;
-  const count = (chartView.tracks || []).length;
+  const shown = chartView.rows && chartView.rows.length ? chartView.rows : (chartView.tracks || []);
+  const count = shown.length;
   const ok = await confirmSheet({
     title: `${count}곡을 담을까요`,
     desc: `'${chart.name}'의 곡을 순서대로 대기열에 넣어요. 한 번에 담는 양에는 상한이 있어요.`,
     confirmText: '담기',
   });
   if (!ok) return;
-  const result = await call(() => api(`/charts/${encodeURIComponent(chart.id)}/enqueue`, { body: {} }));
+  // 화면에 보이는 기간을 같이 보낸다. 안 보내면 서버가 우리 차트를 늘 `month` 로 담아서
+  // 사용자가 본 목록과 담긴 목록이 달라진다 (§15.4).
+  // 이 값은 **쿼리 문자열**로 간다 — 서버가 `Query<ChartWindowQuery>` 로 읽고 body 는 안 본다.
+  const value = encodeURIComponent(chartView.period);
+  const query = chartView.category === 'ours' ? `?window=${value}&period=${value}` : '';
+  const result = await call(() => api(`/charts/${encodeURIComponent(chart.id)}/enqueue${query}`, { body: {} }));
   if (!result) return;
   if (result.limited) toast(`대기열 한도까지 ${result.added ?? 0}곡만 담았어요.`, 'warn');
   else toast(`${result.added ?? count}곡을 담았어요.`, 'ok');
@@ -6184,6 +6690,11 @@ async function loadHot() {
   // 대기열이 길면 서버가 앞 200곡만 보낸다 (§18.2)
   queueTotal = Number.isFinite(data.queueTotal) ? data.queueTotal : (data.queue || []).length;
   queueTruncated = !!data.queueTruncated;
+  noteSortPeriod(data.sortPeriodSeconds);
+  // 여기가 개인화 필드의 원본이다. 이후 브로드캐스트 프레임에 되붙이려고 기억해 둔다 (§10.4).
+  notePersonalFields(data.queue || []);
+  // 뒤쪽 페이지는 서버가 정한 순서를 모르면 못 이어 붙인다. 전체 로드 때는 깨끗이 버린다.
+  queueTail = [];
   store.patch({
     player: data.player || null,
     current: data.current || null,
@@ -6247,7 +6758,9 @@ async function boot() {
   store.subscribe(['permissions', 'suspension', 'tier'], renderSeeds);
   store.subscribe(['queueMode', 'sortedAt', 'nextSortAt', 'queue'], renderSortTick);
   store.subscribe(['suggestions'], (state) => {
-    // 새 제안이 올라오면 헤더 버튼에 점만 찍는다. 숫자까지는 필요 없다 (§11)
+    // 새 제안이 올라오면 헤더 버튼에 점만 찍는다. 숫자까지는 필요 없다 (§11).
+    // 모달을 보고 있는 동안에는 점을 켜지 않는다 — 눈앞에 있는 걸 또 알릴 필요가 없다.
+    if (suggestModalOpen) { el.suggestDot.hidden = true; return; }
     if (suggestUnread) el.suggestDot.hidden = !state.suggestions.length;
   });
 
@@ -6275,6 +6788,8 @@ async function boot() {
   }
   if (lyricsOpen) loadLyrics();
   loadSeeds();
+  loadMyScore();
+  focusLinkedMessage();
   // 지난번에 보던 탭이 그대로 열려 있으면 그 탭 데이터도 챙긴다.
   // (탭을 다시 누르지 않으면 영영 안 불러오는 구멍이 있었다)
   if (activeRailTab === 'charts') loadCharts();
@@ -6287,7 +6802,11 @@ async function boot() {
     onResync: () => { loadHot().catch(() => {}); loadCold().catch(() => {}); loadSeeds(); },
     onRefetch: (what) => {
       if (what === 'library' || what === 'settings' || what === 'permissions') refetchCold();
-      if (what === 'suggestions') { suggestUnread = true; el.suggestDot.hidden = false; }
+      // 모달을 열어 둔 채라면 이미 보고 있는 것이다. 점을 다시 켜지 않고 목록만 갱신한다 (§11).
+      if (what === 'suggestions') {
+        if (suggestModalOpen) loadSuggestions();
+        else { suggestUnread = true; el.suggestDot.hidden = false; }
+      }
       if (what === 'audit') { store.patch({ audit: [] }); if (activeSideTab === 'audit') loadAudit(true); }
     },
     onChat: onChatArrived,
@@ -6295,6 +6814,19 @@ async function boot() {
       if (type === 'autoplay') loadSeeds();
       if (type === 'skipvote') store.patch({ skipVote: data && data.need ? data : null });
       if (type === 'charts') { chartState = null; if (activeRailTab === 'charts') loadCharts(); }
+      // 서버가 새 로그 한 줄을 실어 보낸다(§13.5). 전체를 다시 부르지 않고 앞에 붙인다.
+      // 투표·담기까지 기록 대상이 된 지금 재조회로 돌리면 로그 탭이 열려 있는 내내 요청이 쏟아진다.
+      // 탭이 닫혀 있으면 어차피 열 때 불러오므로 그냥 버린다.
+      if (type === 'audit' && data && data.entry) {
+        if (activeSideTab !== 'audit') return;
+        const list = Array.isArray(store.get().audit) ? store.get().audit : [];
+        // 합쳐진 줄은 서버가 같은 id 로 다시 보낸다. 있으면 갈아 끼우고 없으면 앞에 붙인다.
+        const at = list.findIndex((row) => String(row.id) === String(data.entry.id));
+        const next = at >= 0
+          ? list.map((row, index) => (index === at ? data.entry : row))
+          : [data.entry].concat(list).slice(0, 200);
+        store.patch({ audit: next });
+      }
     },
     // core.js의 merge()는 계약에 없던 필드를 흘려보낸다. 여기서 원본 payload를 다시 주워 담는다.
     onAny: (type, data) => {
@@ -6318,7 +6850,15 @@ async function boot() {
         noteServerTime(data.sortedAt);
         queueTotal = Number.isFinite(data.queueTotal) ? data.queueTotal : (data.items || []).length;
         queueTruncated = !!data.queueTruncated;
-        store.patch({ nextSortAt: data.nextSortAt || null, next: data.next !== undefined ? data.next : store.get().next });
+        // 재정렬 주기는 서버가 대기열 길이를 보고 정한다 (§18.2 (3)). 카운트다운·헤더가 이 값을 센다.
+        noteSortPeriod(data.sortPeriodSeconds);
+        // core.js가 방금 대기열을 통째로 갈아 끼웠다. 개인화 필드(§10.4)와 이미 받아 둔
+        // 뒤쪽 페이지(§18.2 (1))를 여기서 되붙인다 — 안 그러면 재정렬마다 둘 다 날아간다.
+        store.patch({
+          queue: mergeQueueFrame(store.get().queue),
+          nextSortAt: data.nextSortAt || null,
+          next: data.next !== undefined ? data.next : store.get().next,
+        });
       }
       if (type === 'playback' && data) {
         noteServerTime(data.sampledAtUtc);
@@ -6371,6 +6911,140 @@ function tipAudit() {
   return report;
 }
 window.__machamTipAudit = tipAudit;
+
+/* ── 회귀 테스트 (§0) ──
+ * 여기서 고친 것들은 전부 "화면이 조용히 거짓말을 하는" 종류라 눈으로는 다시 놓치기 쉽다.
+ * 순수 함수로 뽑아 두고 콘솔에서 `__machamSelfTest()` 로 돌린다 — 0 fail 이 나와야 한다.
+ * (Node 하니스에서도 같은 함수를 부른다.)
+ */
+function selfTest() {
+  const fails = [];
+  const eq = (name, actual, expected) => {
+    const a = JSON.stringify(actual);
+    const b = JSON.stringify(expected);
+    if (a !== b) fails.push(`${name}: ${a} ≠ ${b}`);
+  };
+
+  /* §5 — 카운트다운이 `갱신 0` 에 멈추면 안 된다.
+   * nextSortAt 은 순서가 실제로 바뀐 길드에만 새로 나가고, 곡이 1~2곡이면 아예 안 나간다.
+   * 그러면 기준 시각이 과거에 박히는데, 롤오버가 없으면 화면이 영원히 0을 붙들고 있었다. */
+  const now = Date.UTC(2026, 0, 1, 0, 0, 30);
+  const at = (ms) => new Date(ms).toISOString();
+  const queued = [{ id: 'a' }];
+  eq('sortRemain: 지난 기준 시각은 주기만큼 굴러간다',
+    sortRemainFrom({ queueMode: 'score', queue: queued, nextSortAt: at(now - 12000) }, now, 5), 3);
+  eq('sortRemain: 한 주기를 갓 지난 경계도 0이 아니다',
+    sortRemainFrom({ queueMode: 'score', queue: queued, nextSortAt: at(now - 5000) }, now, 5), 5);
+  eq('sortRemain: 기준 시각이 바로 지금이면 다음 주기를 센다',
+    sortRemainFrom({ queueMode: 'score', queue: queued, nextSortAt: at(now) }, now, 5), 5);
+  eq('sortRemain: 미래 기준 시각은 그대로 센다',
+    sortRemainFrom({ queueMode: 'score', queue: queued, nextSortAt: at(now + 3200) }, now, 5), 4);
+  /* §18.2 (3) — 서버가 15초로 늦췄으면 화면도 15를 세야 한다. 예전에는 9로 잘라서
+   * 카운트다운이 9 근처에서 계속 리셋되며 0에 도달하지 못했다. */
+  eq('sortRemain: 주기는 서버 값을 따른다 (9 하드클램프 없음)',
+    sortRemainFrom({ queueMode: 'score', queue: queued, nextSortAt: at(now + 14500) }, now, 15), 15);
+  eq('sortRemain: sortedAt만 있어도 주기로 다음 경계를 만든다',
+    sortRemainFrom({ queueMode: 'score', queue: queued, sortedAt: at(now - 11000) }, now, 5), 4);
+  eq('sortRemain: fifo면 숨긴다',
+    sortRemainFrom({ queueMode: 'fifo', queue: queued, nextSortAt: at(now - 1) }, now, 5), null);
+  eq('sortRemain: 대기열이 비면 숨긴다',
+    sortRemainFrom({ queueMode: 'score', queue: [], nextSortAt: at(now + 1000) }, now, 5), null);
+  eq('sortRemain: 기준이 아예 없으면 숨긴다',
+    sortRemainFrom({ queueMode: 'score', queue: queued }, now, 5), null);
+
+  /* §10.1 — 점수표는 `settings.votePoints` 중첩 객체로 온다. 평평한 이름만 읽던 동안
+   * 화면은 관리자가 뭘 바꾸든 늘 기본 배점으로 계산식을 그렸다. */
+  eq('votePoints: 중첩 votePoints를 읽는다',
+    votePointsFrom({ votePoints: { like: 3, dislike: -2, superLike: 5, wait: 2 } }),
+    { like: 3, dislike: -2, superLike: 5, wait: 2 });
+  eq('votePoints: 0도 값이다 (기본값으로 안 떨어진다)',
+    votePointsFrom({ votePoints: { like: 0, dislike: 0, superLike: 0, wait: 0 } }),
+    { like: 0, dislike: 0, superLike: 0, wait: 0 });
+  eq('votePoints: 평평한 옛 이름도 받아 준다',
+    votePointsFrom({ likePoints: 4 }), { like: 4, dislike: -1, superLike: 2, wait: 1 });
+  eq('votePoints: 아무것도 없으면 기본 배점',
+    votePointsFrom(null), { like: 1, dislike: -1, superLike: 2, wait: 1 });
+
+  /* §10.4 — 계산식은 서버가 만든 것을 쓴다. `= 합계` 꼬리는 우리가 따로 고정한다. */
+  eq('serverFormula: 합계 꼬리를 뗀다', serverFormula({ formula: '👍3 + ⭐1×2 = 7' }), '👍3 + ⭐1×2');
+  eq('serverFormula: 빈 점수 문장은 안 쓴다', serverFormula({ formula: '아직 점수가 없어요 = 0' }), '');
+  eq('serverFormula: 없으면 빈 문자열', serverFormula({}), '');
+
+  /* §10.4 · §18.2 (1) — 브로드캐스트가 비워 보낸 개인화 필드를 되붙인다. */
+  queuePersonal.clear();
+  notePersonalFields([{ id: 'x', isMine: true, myVote: 'like' }, { id: 'y', isMine: false, myVote: null }]);
+  eq('personal: null로 온 필드를 되붙인다',
+    applyPersonalFields([{ id: 'x', isMine: null, myVote: null }]),
+    [{ id: 'x', isMine: true, myVote: 'like' }]);
+  eq('personal: 서버가 채운 값은 안 덮는다',
+    applyPersonalFields([{ id: 'x', isMine: false, myVote: null }]),
+    [{ id: 'x', isMine: false, myVote: null }]);
+  eq('personal: 모르는 항목은 그대로 둔다',
+    applyPersonalFields([{ id: 'z', isMine: null, myVote: null }]),
+    [{ id: 'z', isMine: null, myVote: null }]);
+  notePersonalVote('x', null);
+  eq('personal: 투표 취소도 기억한다',
+    applyPersonalFields([{ id: 'x', isMine: null, myVote: null }]),
+    [{ id: 'x', isMine: true, myVote: null }]);
+  // 브로드캐스트 프레임(isMine이 null)은 기억 대상이 아니다 — 그걸 삼키면 내 곡 표시가 지워진다.
+  notePersonalFields([{ id: 'x', isMine: null, myVote: null }]);
+  eq('personal: 브로드캐스트 프레임은 기억을 덮어쓰지 않는다',
+    applyPersonalFields([{ id: 'x', isMine: null, myVote: null }])[0].isMine, true);
+
+  /* §18.2 (1) — 이미 받아 둔 뒤쪽 페이지를 재정렬마다 버리면 스크롤이 튀고 재요청이 폴링이 된다. */
+  const savedTotal = queueTotal;
+  const savedTail = queueTail;
+  queueTotal = 4;
+  queueTail = [{ id: 'c' }, { id: 'd' }];
+  eq('tail: 앞 200곡 뒤로 이어 붙인다',
+    keepQueueTail([{ id: 'a' }, { id: 'b' }]).map((item) => item.id), ['a', 'b', 'c', 'd']);
+  queueTail = [{ id: 'b' }, { id: 'c' }];
+  eq('tail: 앞쪽으로 올라온 항목은 중복으로 안 남긴다',
+    keepQueueTail([{ id: 'a' }, { id: 'b' }]).map((item) => item.id), ['a', 'b', 'c']);
+  queueTotal = 2;
+  queueTail = [{ id: 'c' }, { id: 'd' }];
+  eq('tail: 전체 곡 수보다 많이 들고 있지 않는다',
+    keepQueueTail([{ id: 'a' }, { id: 'b' }]).map((item) => item.id), ['a', 'b']);
+  queueTotal = savedTotal;
+  queueTail = savedTail;
+
+  /* §15.2b — 우리 차트는 숫자가 나와야 차트다. `tracks` 만 읽으면 그냥 곡 목록이다. */
+  eq('chartRow: playsUser·requesters·loveFormula를 그대로 쓴다',
+    chartRowExtra({ playsUser: 42, requesters: 7, loveFormula: '👍284 + ⭐52×2 = 388' }),
+    ['42회 재생', '7명이 신청', '👍284 + ⭐52×2 = 388']);
+  eq('chartRow: 통계가 없는 바깥 차트는 빈 배열', chartRowExtra({ title: '아무거나' }), []);
+
+  /* §13.3 — 서버 문장의 `**굵게**` 표시가 화면에 별표로 나오면 안 된다. */
+  eq('markdown: 굵게 표시를 노드로 만든다',
+    markdownBold('민수님이 **아이브 - I AM** 을 담았어요').map((node) => `${node.nodeName}|${node.textContent}`),
+    ['#text|민수님이 ', 'B|아이브 - I AM', '#text| 을 담았어요']);
+  eq('markdown: 짝이 안 맞으면 원문 그대로',
+    markdownBold('별표 ** 하나').map((node) => node.textContent), ['별표 ** 하나']);
+
+  /* §22.5 · §24.2 — 통계 응답 모양이 어느 쪽이든 화면은 같은 숫자를 읽어야 한다. */
+  const nested = normalizeStats({
+    available: true,
+    summary: { queuedTotal: 128, played: 96, skipped: 4, boomtta: 1, likesRecv: 340, supersRecv: 12, dislikesRecv: 2, karma: 512 },
+    topRequested: [{ requested: 12 }],
+    topLiked: [{ liked: 9 }],
+    topLoved: [{ likesRecv: 30 }],
+  });
+  eq('stats: summary.queuedTotal → queued', nested.queued, 128);
+  eq('stats: summary.karma → machamScore', nested.machamScore, 512);
+  eq('stats: 비율 막대의 세 값', [nested.played, nested.skipped, nested.boomtta], [96, 4, 1]);
+  eq('stats: topRequested.requested → count', nested.topRequested[0].count, 12);
+  eq('stats: topLiked.liked → count', nested.topLiked[0].count, 9);
+  eq('stats: topLoved.likesRecv → likes', nested.topLoved[0].likes, 30);
+  eq('stats: 평평한 새 응답도 그대로 읽는다',
+    normalizeStats({ available: true, queued: 7, machamScore: 3 }).queued, 7);
+  eq('stats: available:false 를 0으로 꾸미지 않는다',
+    normalizeStats({ available: false, message: '꺼져 있어요.' }).available, false);
+  eq('stats: 점수를 모르면 null (0이 아니다)', normalizeStats({ available: true }).machamScore, null);
+
+  console.info(fails.length ? `[자가검사] ${fails.length}건 실패` : '[자가검사] 전부 통과', fails);
+  return { fail: fails.length, fails };
+}
+window.__machamSelfTest = selfTest;
 
 /** 키보드만으로 주요 조작이 가능해야 한다. 입력 중일 때는 가로채지 않는다. */
 function bindShortcuts() {

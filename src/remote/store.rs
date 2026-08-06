@@ -373,6 +373,11 @@ const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 22] = [
 /// 막힌 자동재생 후보를 며칠 기억할지 (§8.5-3).
 pub const AUTOPLAY_BLOCK_DAYS: i64 = 7;
 
+/// 차트 펼치기 표시를 버려진 것으로 보는 시간(초) (§15.1).
+/// yt-dlp 로 100곡짜리 재생목록을 펼치는 데 걸리는 시간보다 넉넉해야 하고,
+/// 사람이 다시 눌러 보는 주기보다는 짧아야 한다.
+const CHART_FETCH_STALE_SECS: i64 = 180;
+
 /// 서버가 받아 주는 개인 설정 키. 여기 없는 키는 조용히 버린다 —
 /// 아무 값이나 저장되면 개인 설정 테이블이 남의 키-밸류 저장소가 돼 버린다.
 pub const PREF_KEYS: [&str; 9] = [
@@ -440,7 +445,12 @@ pub struct RemoteStore {
     conn: Mutex<Connection>,
     /// 지금 yt-dlp 로 펼치는 중인 차트 (§15.1). 같은 차트를 여러 사람이 동시에 눌러도
     /// **하나만 돌리고 나머지는 그 결과를 기다린다** — 안 그러면 yt-dlp 가 줄줄이 선다.
-    chart_inflight: Mutex<HashSet<i64>>,
+    ///
+    /// 값은 시작 시각이다. 핸들러 future 가 도중에 drop 되면(탭을 닫거나 페이지를 옮기면
+    /// axum 이 그렇게 한다) `end_chart_fetch` 가 안 불려 그 차트가 프로세스가 죽을 때까지
+    /// "가져오는 중"에 갇힌다 — `CHART_FETCH_STALE_SECS` 가 지난 표시는 버려진 것으로 보고
+    /// 다음 사람이 이어받는다.
+    chart_inflight: Mutex<HashMap<i64, DateTime<Utc>>>,
     /// 슈퍼 좋아요 쿨타임 (§10.6). 짧고 재시작 때 풀려도 손해가 없어 메모리로 충분하다.
     /// 하루 사용량만 DB에 둔다.
     super_like_cooldowns: Mutex<HashMap<(u64, u64), DateTime<Utc>>>,
@@ -460,7 +470,7 @@ impl RemoteStore {
         migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            chart_inflight: Mutex::new(HashSet::new()),
+            chart_inflight: Mutex::new(HashMap::new()),
             super_like_cooldowns: Mutex::new(HashMap::new()),
         })
     }
@@ -2439,12 +2449,26 @@ impl RemoteStore {
     /// **동시 요청 합치기** (§15.1). `true`가 돌아온 쪽만 yt-dlp 를 돌리고,
     /// `false`를 받은 쪽은 잠깐 기다렸다 캐시를 다시 본다.
     /// `resolve_preview`의 `try_begin_preview_resolve`와 같은 방식이다.
+    ///
+    /// **버려진 표시는 스스로 풀린다.** 핸들러가 `end_chart_fetch` 까지 못 가고 취소되면
+    /// (탭 닫기·페이지 이동으로 axum 이 future 를 drop) 그 차트가 영원히 잠겨서
+    /// `차트를 가져오는 중이에요` 만 반복하고 관리자의 `↻ 새로고침`으로도 못 푼다.
     pub fn try_begin_chart_fetch(&self, chart_id: i64) -> bool {
+        self.try_begin_chart_fetch_at(chart_id, Utc::now())
+    }
+
+    fn try_begin_chart_fetch_at(&self, chart_id: i64, now: DateTime<Utc>) -> bool {
         let mut inflight = self
             .chart_inflight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inflight.insert(chart_id)
+        match inflight.get(&chart_id) {
+            Some(started) if !Self::chart_fetch_is_stale(*started, now) => false,
+            _ => {
+                inflight.insert(chart_id, now);
+                true
+            }
+        }
     }
 
     pub fn end_chart_fetch(&self, chart_id: i64) {
@@ -2456,11 +2480,21 @@ impl RemoteStore {
     }
 
     pub fn is_chart_fetching(&self, chart_id: i64) -> bool {
+        self.is_chart_fetching_at(chart_id, Utc::now())
+    }
+
+    fn is_chart_fetching_at(&self, chart_id: i64, now: DateTime<Utc>) -> bool {
         let inflight = self
             .chart_inflight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inflight.contains(&chart_id)
+        inflight
+            .get(&chart_id)
+            .is_some_and(|started| !Self::chart_fetch_is_stale(*started, now))
+    }
+
+    fn chart_fetch_is_stale(started: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+        now - started > ChronoDuration::seconds(CHART_FETCH_STALE_SECS)
     }
 
     /// 관리 콘솔의 차트 추가. 길드 것으로만 만들 수 있다.
@@ -3065,6 +3099,36 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    /// 차트 펼치기 잠금은 **스스로 풀려야 한다** (§15.1).
+    /// 핸들러 future 가 취소돼 `end_chart_fetch` 가 안 불리면 그 차트가 프로세스가 죽을 때까지
+    /// `차트를 가져오는 중이에요` 만 반복하고 관리자의 `↻ 새로고침`으로도 못 푼다.
+    #[test]
+    fn an_abandoned_chart_fetch_unlocks_itself() {
+        let (store, path) = temp_store("chart-lock");
+        let start = Utc::now();
+
+        // 처음 누른 사람만 yt-dlp 를 돌린다.
+        assert!(store.try_begin_chart_fetch_at(7, start));
+        assert!(!store.try_begin_chart_fetch_at(7, start + ChronoDuration::seconds(1)));
+        assert!(store.is_chart_fetching_at(7, start + ChronoDuration::seconds(1)));
+        // 다른 차트는 서로 안 막는다.
+        assert!(store.try_begin_chart_fetch_at(8, start));
+
+        // 끝나면 곧바로 풀린다.
+        store.end_chart_fetch(7);
+        assert!(!store.is_chart_fetching_at(7, start));
+        assert!(store.try_begin_chart_fetch_at(7, start));
+
+        // end 를 못 부르고 죽어도 유통기한이 지나면 다음 사람이 이어받는다.
+        let stale = start + ChronoDuration::seconds(CHART_FETCH_STALE_SECS + 1);
+        assert!(!store.is_chart_fetching_at(7, stale), "버려진 표시가 안 풀렸다");
+        assert!(store.try_begin_chart_fetch_at(7, stale));
+        // 이어받은 쪽의 시계는 새로 시작한다.
+        assert!(store.is_chart_fetching_at(7, stale + ChronoDuration::seconds(1)));
+
+        cleanup(store, path);
     }
 
     fn test_track(id: &str) -> TrackRef {

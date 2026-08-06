@@ -660,7 +660,16 @@ body[data-dragging="tab"] { user-select: none; }
 .portal .seedbtn { display: none; }
 .portal[data-seeds="1"] .seedbtn { display: inline-flex; }
 
-.queue__list { flex: 1; min-height: 0; padding: 0 var(--sp-2) var(--sp-3); }
+/* 가상 스크롤(§18.2 (2))의 위아래 여백은 **자식 노드가 아니라 패딩**이다.
+ * core.js의 list()가 __mmKey 없는 자식을 먼저 지우고 레이아웃을 강제하기 때문에,
+ * 빈 상자로 높이를 채우면 그 순간 컨테이너가 줄면서 브라우저가 scrollTop을 잘라 목록이 위로 튄다.
+ * 패딩은 list()가 손댈 수 없어서 높이가 한 순간도 줄지 않는다. portal.js가 두 변수만 갱신한다. */
+.queue__list {
+  flex: 1;
+  min-height: 0;
+  padding-inline: var(--sp-2);
+  padding-block: var(--virt-pad-top, 0px) calc(var(--sp-3) + var(--virt-pad-bottom, 0px));
+}
 
 .qitem {
   position: relative;
@@ -1273,6 +1282,10 @@ body[data-dragging="tab"] { user-select: none; }
 }
 .perm__row .why { color: var(--text-3); font-size: var(--fs-xs); text-align: right; }
 .perm__row .why em { color: var(--accent); font-style: normal; }
+/* "지금은 @DJ 이 쓸 수 있어요 (3명)" — 이유 다음에 오는 대상 안내 (§23.3).
+ * 더 죽이고 싶어도 --text-4 는 쓰지 않는다. 전 테마에서 대비가 4.5:1 미만이라
+ * 정작 "왜 막혔는지"가 안 읽히면 이 줄을 넣은 의미가 없다 (§17.2). */
+.perm__who { color: var(--text-3); }
 .perm__row--no .label { color: var(--text-3); }
 .label { color: var(--text-1); }
 
@@ -1378,11 +1391,15 @@ body[data-dragging="tab"] { user-select: none; }
 }
 .dk-tabs::-webkit-scrollbar { height: 0; }
 
+/* role=tab 을 단 div 다 (버튼 안에 버튼을 넣지 않으려고). button UA 리셋을 못 받으므로
+ * 커서·사용자 선택만 여기서 직접 준다. */
 .dk-tab {
   display: inline-flex;
   align-items: center;
   gap: var(--sp-1);
   flex: none;
+  cursor: pointer;
+  user-select: none;
   height: 28px;
   padding: 0 var(--sp-2);
   border-radius: var(--r-sm);
@@ -2033,7 +2050,8 @@ body.gate {
 .vote--down:hover { background: var(--danger-soft); color: var(--danger); }
 .score__seg--down { background: var(--danger); }
 
-.queue__spacerpad { flex: none; }
+/* (구) .queue__spacerpad — 가상 스크롤 여백을 빈 상자에서 컨테이너 패딩으로 옮기면서 없앴다.
+ * 빈 상자는 list()가 매 렌더마다 지웠다 붙였고 그 사이에 스크롤 위치가 잘렸다. */
 
 /* 누가 눌렀는지 (§10.4) */
 .voters { display: grid; gap: var(--sp-2); min-width: 180px; max-width: 320px; }
