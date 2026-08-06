@@ -193,7 +193,7 @@ impl Default for RemoteGuildSettings {
             vote_rule: PermissionRule::GuildMember,
             chat_rule: PermissionRule::GuildMember,
             playback_rule: PermissionRule::SameVoiceChannel,
-            seek_rule: PermissionRule::SameVoiceChannel,
+            seek_rule: PermissionRule::GuildMember,
             volume_rule: PermissionRule::SameVoiceChannel,
             queue_edit_rule: PermissionRule::SameVoiceChannel,
             configured_role_ids: Vec::new(),

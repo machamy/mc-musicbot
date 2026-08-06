@@ -2550,11 +2550,17 @@ mod tests {
     }
 
     #[test]
-    fn permission_defaults_require_same_voice_for_playback() {
+    fn permission_defaults_match_remote_contract() {
         let settings = RemoteGuildSettings::default();
         let member = MemberContext::default();
         assert!(!permission_allowed(
             settings.playback_rule,
+            &settings,
+            &member
+        ));
+        assert!(permission_allowed(settings.seek_rule, &settings, &member));
+        assert!(!permission_allowed(
+            settings.volume_rule,
             &settings,
             &member
         ));
@@ -2564,6 +2570,11 @@ mod tests {
         };
         assert!(permission_allowed(
             settings.playback_rule,
+            &settings,
+            &same_voice
+        ));
+        assert!(permission_allowed(
+            settings.volume_rule,
             &settings,
             &same_voice
         ));
