@@ -432,6 +432,11 @@ pub struct BlacklistEntry {
 pub enum PlaylistScope {
     Global,
     Guild,
+    /// 개인 재생목록 (V3 §12). 길드에 묶이지 않아 어느 서버에서든 보인다.
+    /// `owner_user_id` 로 거른다. 레거시 `playlists` 테이블에 컬럼 추가 없이
+    /// `scope` 값만 늘렸다. C# 엔진은 이 값을 모르지만 Global/Guild 조회 조건에
+    /// 걸리지 않으므로 서로 간섭하지 않는다.
+    User,
 }
 
 impl PlaylistScope {
@@ -439,11 +444,14 @@ impl PlaylistScope {
         match self {
             PlaylistScope::Global => "Global",
             PlaylistScope::Guild => "Guild",
+            PlaylistScope::User => "User",
         }
     }
     pub fn parse(s: &str) -> Self {
         if s.eq_ignore_ascii_case("guild") {
             PlaylistScope::Guild
+        } else if s.eq_ignore_ascii_case("user") {
+            PlaylistScope::User
         } else {
             PlaylistScope::Global
         }

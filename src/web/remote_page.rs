@@ -133,7 +133,7 @@ pub fn login(
             r#"<a class="btn btn--primary btn--wide" data-testid="discord-login" href="/music/oauth/start{next_query}">Discord로 계속하기</a>"#
         )
     } else {
-        r#"<div class="gate__note"><strong>OAuth 설정이 필요하다.</strong><br>운영 패널 → 봇 설정에서 Discord Client ID / Secret / 공개 URL을 넣어라.</div>"#.to_string()
+        r#"<div class="gate__note"><strong>OAuth 설정이 아직 없어요.</strong><br>운영 패널 → 봇 설정에서 Discord Client ID / Secret / 공개 URL을 넣어 주세요.</div>"#.to_string()
     };
     let dev = if dev_login {
         // dev 로그인은 폼 POST 라 next 를 hidden 으로 실어 보낸다.
@@ -156,9 +156,9 @@ pub fn login(
             r#"<main class="gate__wrap"><section class="gate__card">
 <div class="gate__logo" aria-hidden="true">♫</div>
 <h1>마참뮤직</h1>
-<p class="gate__lead">서버 음악을 같이 고르고, 투표하고, 한 화면에서 조작한다.</p>
+<p class="gate__lead">서버 음악을 같이 고르고, 투표하고, 한 화면에서 조작해요.</p>
 {notice}{action}{dev}
-<p class="gate__foot">로그인하면 Discord 서버 멤버십과 권한을 확인한다.</p>
+<p class="gate__foot">로그인하면 Discord 서버 멤버십과 권한을 확인해요.</p>
 </section></main>"#
         ),
     )
@@ -181,7 +181,7 @@ pub fn guild_selector(session: &RemoteSession, guilds: &[OAuthGuild]) -> String 
         })
         .collect();
     let empty = if guilds.is_empty() {
-        r#"<p class="gate__foot">봇이 들어가 있는 서버가 없다. 먼저 봇을 서버에 초대해라.</p>"#
+        r#"<p class="gate__foot">봇이 들어가 있는 서버가 없어요. 먼저 봇을 서버에 초대해 주세요.</p>"#
     } else {
         ""
     };
@@ -191,8 +191,8 @@ pub fn guild_selector(session: &RemoteSession, guilds: &[OAuthGuild]) -> String 
         &format!(
             r#"<main class="gate__wrap"><section class="gate__card gate__card--wide">
 <div class="gate__logo" aria-hidden="true">♫</div>
-<h1>어서 와, {user}</h1>
-<p class="gate__lead">리모컨을 열 서버를 골라라. 좋아요와 보관함은 서버마다 따로 관리된다.</p>
+<h1>어서 오세요, {user}</h1>
+<p class="gate__lead">리모컨을 열 서버를 골라 주세요. 좋아요와 보관함은 서버마다 따로 관리돼요.</p>
 <div class="gate__guilds">{cards}</div>{empty}
 <form method="post" action="/music/logout" class="gate__dev"><input type="hidden" name="csrf" value="{csrf}"><button class="btn btn--ghost" type="submit">로그아웃</button></form>
 </section></main>"#,
@@ -224,7 +224,7 @@ pub fn guild(
         "portal.css",
         "portal.js",
         &bootstrap,
-        r#"<div id="app" data-testid="music-portal"></div><noscript><p style="padding:24px">마참뮤직 리모컨은 자바스크립트가 필요하다.</p></noscript>"#,
+        r#"<div id="app" data-testid="music-portal"></div><noscript><p style="padding:24px">마참뮤직 리모컨은 자바스크립트가 있어야 움직여요. 브라우저에서 자바스크립트를 켜 주세요.</p></noscript>"#,
     )
 }
 
@@ -251,7 +251,7 @@ pub fn admin(
         "console.css",
         "console.js",
         &bootstrap,
-        r#"<div id="app"></div><noscript><p style="padding:24px">서버 관리 콘솔은 자바스크립트가 필요하다.</p></noscript>"#,
+        r#"<div id="app"></div><noscript><p style="padding:24px">서버 관리 콘솔은 자바스크립트가 있어야 움직여요. 브라우저에서 자바스크립트를 켜 주세요.</p></noscript>"#,
     )
 }
 
@@ -263,7 +263,7 @@ pub fn denied(message: &str, guild_id: u64) -> String {
         &format!(
             r#"<main class="gate__wrap"><section class="gate__card">
 <div class="gate__logo" aria-hidden="true">🔒</div>
-<h1>들어갈 수 없다</h1>
+<h1>여기는 못 들어가요</h1>
 <p class="gate__lead">{message}</p>
 <a class="btn btn--primary btn--wide" href="/music/guilds/{guild_id}">← 리모컨으로 돌아가기</a>
 </section></main>"#,

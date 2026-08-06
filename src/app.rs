@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 /// 대기열 재정렬 주기 (사양서 §3.3 — 10초에서 단축).
-const QUEUE_SORT_INTERVAL: Duration = Duration::from_secs(5);
+/// 웹이 `last_queue_sort + QUEUE_SORT_INTERVAL` 로 `nextSortAt` 을 계산해 카운트다운을 그린다(v3 §5).
+pub const QUEUE_SORT_INTERVAL: Duration = Duration::from_secs(5);
 /// 보존 정리 주기 (사양서 B16) — 기동 직후 1회 + 24시간마다.
 const RETENTION_PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -84,6 +85,10 @@ pub struct App {
     /// 웹이 `web::serve()`에서 걸어 두면 `queue.set` 이벤트를 그때만 broadcast 할 수 있다.
     /// 비어 있으면 정렬만 하고 아무도 깨우지 않는다.
     pub on_queue_sorted: OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
+    /// 마지막 재정렬 시각. 웹이 nextSortAt 을 계산해 카운트다운을 그린다.
+    /// 순서가 바뀌었는지와 무관하게 매 tick 갱신된다 — 카운트다운은 "다음 검사 시각"이지
+    /// "다음에 순서가 바뀌는 시각"이 아니다. 아직 한 번도 안 돌았으면 `None`.
+    pub last_queue_sort: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
     /// 길드별 마지막 명령 채널 (현재 재생 중 알림 대상).
     pub announce_channels: Mutex<HashMap<u64, u64>>,
     /// 길드별 직전 Now-Playing 메시지 (채널, 메시지) — 새 카드 전송 시 이전 카드 버튼 제거용.
@@ -144,6 +149,7 @@ impl App {
             intent_status: RwLock::new(IntentStatus::default()),
             owner_user_ids: RwLock::new(Vec::new()),
             on_queue_sorted: OnceLock::new(),
+            last_queue_sort: RwLock::new(None),
             announce_channels: Mutex::new(HashMap::new()),
             last_np_message: Mutex::new(HashMap::new()),
             pending_leaves: Mutex::new(HashMap::new()),
@@ -182,6 +188,11 @@ async fn queue_sort_loop(app: Arc<App>) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
+        // 길드를 다 돌기 전에 찍는다 — 웹의 카운트다운 기준은 "이번 tick 이 시작된 시각"이어야
+        // 다음 tick 까지 정확히 QUEUE_SORT_INTERVAL 이 남는다.
+        if let Ok(mut slot) = app.last_queue_sort.write() {
+            *slot = Some(chrono::Utc::now());
+        }
         for guild_id in app.db.list_known_guild_ids() {
             if app.player.resort_if_changed(guild_id).await
                 && let Some(hook) = app.on_queue_sorted.get()

@@ -1,19 +1,20 @@
 use super::{
-    AuditEntry, ChatMessage, ChatReactionSummary, ChatReplyPreview, ChatReport, ChatTrackTag,
-    LyricsCacheHit, LyricsDocument, Participant, PruneReport, QueueScore, QueueVoteKind,
-    RecentTrack, RemoteGuildSettings, RetentionConfig, StoredSession, Suggestion, SuggestionStatus,
-    Suspension, SuspensionScope, UserTrack, UserTrackKind,
+    AuditEntry, AutoplaySeed, ChatMessage, ChatReactionSummary, ChatReplyPreview, ChatReport,
+    ChatTrackTag, LyricsCacheHit, LyricsDocument, MAX_AUTOPLAY_SEEDS, Participant, PruneReport,
+    QueueScore, QueueVoteKind, RecentTrack, RemoteGuildSettings, RetentionConfig, SeedAddOutcome,
+    StoredSession, Suggestion, SuggestionStatus, Suspension, SuspensionScope, UserTrack,
+    UserTrackKind,
 };
 use crate::models::{QueueItem, TrackRef};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 10;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -219,6 +220,73 @@ const MIGRATION_V8: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_remote_lyrics_fetched
         ON remote_lyrics(found, fetched_utc);
 "#;
+
+/// v8 → v9. 개인 설정(화면 배치·테마 등). **길드가 아니라 유저 단위**다.
+const MIGRATION_V9: &str = r#"
+    CREATE TABLE IF NOT EXISTS remote_user_prefs (
+        user_id INTEGER NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        updated_utc TEXT NOT NULL,
+        PRIMARY KEY(user_id, key)
+    );
+"#;
+
+/// v9 → v10. 자동 재생이 참고할 기준 곡.
+const MIGRATION_V10: &str = r#"
+    CREATE TABLE IF NOT EXISTS remote_autoplay_seeds (
+        guild_id INTEGER NOT NULL,
+        cache_key TEXT NOT NULL,
+        track_json TEXT NOT NULL,
+        sort_order INTEGER NOT NULL,
+        added_by_user_id INTEGER NOT NULL,
+        added_utc TEXT NOT NULL,
+        PRIMARY KEY(guild_id, cache_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_autoplay_seeds_order
+        ON remote_autoplay_seeds(guild_id, sort_order);
+"#;
+
+/// 서버가 받아 주는 개인 설정 키. 여기 없는 키는 조용히 버린다 —
+/// 아무 값이나 저장되면 개인 설정 테이블이 남의 키-밸류 저장소가 돼 버린다.
+pub const PREF_KEYS: [&str; 7] = [
+    "layout",
+    "theme",
+    "layoutSizes",
+    "panelLayout",
+    "lyricsOpen",
+    "webPlayback",
+    "webVolume",
+];
+
+/// `layoutSizes` 값 길이 상한(바이트). 열 너비 몇 개면 충분한 크기다.
+const PREF_LAYOUT_SIZES_MAX: usize = 2 * 1024;
+/// `panelLayout` 값 길이 상한(바이트). 도킹 트리라 조금 더 준다.
+const PREF_PANEL_LAYOUT_MAX: usize = 8 * 1024;
+
+/// 개인 설정 한 쌍이 저장 가능한 값인지. 웹도 같은 판정을 쓰라고 공개해 둔다.
+/// (화면에서 통과한 값이 서버에서 조용히 버려지면 원인을 못 찾는다.)
+pub fn is_valid_pref(key: &str, value: &str) -> bool {
+    match key {
+        "layout" => matches!(value, "three" | "two" | "panel"),
+        "theme" => matches!(value, "dark" | "light"),
+        "lyricsOpen" | "webPlayback" => matches!(value, "0" | "1"),
+        "webVolume" => value
+            .parse::<u32>()
+            .map(|volume| volume <= 100 && !value.starts_with('+'))
+            .unwrap_or(false),
+        "layoutSizes" => is_valid_json_pref(value, PREF_LAYOUT_SIZES_MAX),
+        "panelLayout" => is_valid_json_pref(value, PREF_PANEL_LAYOUT_MAX),
+        _ => false,
+    }
+}
+
+/// JSON 문자열 설정: 길이 상한을 넘거나 JSON이 아니면 거부한다.
+fn is_valid_json_pref(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && serde_json::from_str::<serde_json::Value>(value).is_ok()
+}
 
 /// 마참뮤직 전용 테이블 저장소. 기존 음악봇 테이블과 같은 SQLite 파일을 WAL로 공유한다.
 pub struct RemoteStore {
@@ -1300,6 +1368,216 @@ impl RemoteStore {
         )
     }
 
+    // ───────── 개인 설정 ─────────
+
+    /// 이 사람이 저장해 둔 개인 설정 전부. 기본값은 채우지 않는다 —
+    /// "한 번도 고른 적 없음"(예: `layout` 없음)을 화면이 구분해야 첫 진입 시트를 띄울 수 있다.
+    pub fn load_prefs(&self, user_id: u64) -> BTreeMap<String, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = match conn
+            .prepare("SELECT key, value FROM remote_user_prefs WHERE user_id = ?1")
+        {
+            Ok(statement) => statement,
+            Err(_) => return BTreeMap::new(),
+        };
+        let rows = match statement.query_map(params![user_id as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return BTreeMap::new(),
+        };
+        // 화이트리스트가 바뀌어 옛 키가 남아 있을 수 있으니 읽을 때도 한 번 거른다.
+        rows.flatten()
+            .filter(|(key, value)| is_valid_pref(key, value))
+            .collect()
+    }
+
+    /// 부분 갱신. 모르는 키와 상한을 넘는 값은 저장하지 않는다.
+    /// 400을 돌려주고 싶으면 호출부가 먼저 `is_valid_pref`로 걸러라 — 여기서는 조용히 버린다.
+    pub fn save_prefs(
+        &self,
+        user_id: u64,
+        updates: &BTreeMap<String, String>,
+    ) -> rusqlite::Result<()> {
+        let accepted: Vec<(&String, &String)> = updates
+            .iter()
+            .filter(|(key, value)| is_valid_pref(key, value))
+            .collect();
+        if accepted.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = Self::now_iso();
+        for (key, value) in accepted {
+            tx.execute(
+                r#"INSERT INTO remote_user_prefs(user_id, key, value, updated_utc)
+                   VALUES(?1, ?2, ?3, ?4)
+                   ON CONFLICT(user_id, key) DO UPDATE SET
+                     value = excluded.value, updated_utc = excluded.updated_utc"#,
+                params![user_id as i64, key, value, now],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// "기본으로 되돌리기"용. 지운 키는 다시 미선택 상태가 된다.
+    pub fn delete_prefs(&self, user_id: u64, keys: &[&str]) -> rusqlite::Result<usize> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut removed = 0;
+        for key in keys {
+            removed += tx.execute(
+                "DELETE FROM remote_user_prefs WHERE user_id = ?1 AND key = ?2",
+                params![user_id as i64, key],
+            )?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    // ───────── 자동 재생 기준 곡 ─────────
+
+    /// 등록된 기준 곡을 정렬 순서대로. 추천 엔진이 이 순서를 라운드로빈으로 돈다.
+    pub fn list_autoplay_seeds(&self, guild_id: u64) -> Vec<AutoplaySeed> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = match conn.prepare(
+            r#"SELECT cache_key, track_json, sort_order, added_by_user_id, added_utc
+               FROM remote_autoplay_seeds WHERE guild_id = ?1
+               ORDER BY sort_order, cache_key"#,
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match statement.query_map(params![guild_id as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|(cache_key, json, sort_order, added_by, added_utc)| {
+                serde_json::from_str::<TrackRef>(&json)
+                    .ok()
+                    .map(|track| AutoplaySeed {
+                        guild_id,
+                        cache_key,
+                        track,
+                        sort_order,
+                        added_by_user_id: added_by as u64,
+                        added_utc,
+                    })
+            })
+            .collect()
+    }
+
+    /// 기준 곡 추가. 상한(10곡)과 중복은 여기서 막는다 — 라우트마다 다시 세면 어긋난다.
+    pub fn add_autoplay_seed(
+        &self,
+        guild_id: u64,
+        track: &TrackRef,
+        added_by_user_id: u64,
+    ) -> rusqlite::Result<SeedAddOutcome> {
+        let cache_key = track.cache_key();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM remote_autoplay_seeds WHERE guild_id = ?1 AND cache_key = ?2)",
+            params![guild_id as i64, cache_key],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(SeedAddOutcome::Duplicate);
+        }
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM remote_autoplay_seeds WHERE guild_id = ?1",
+            params![guild_id as i64],
+            |row| row.get(0),
+        )?;
+        if count as usize >= MAX_AUTOPLAY_SEEDS {
+            return Ok(SeedAddOutcome::LimitReached);
+        }
+        let next_order: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM remote_autoplay_seeds WHERE guild_id = ?1",
+            params![guild_id as i64],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            r#"INSERT INTO remote_autoplay_seeds
+               (guild_id, cache_key, track_json, sort_order, added_by_user_id, added_utc)
+               VALUES(?1, ?2, ?3, ?4, ?5, ?6)"#,
+            params![
+                guild_id as i64,
+                cache_key,
+                serde_json::to_string(track).unwrap_or_else(|_| "{}".into()),
+                next_order,
+                added_by_user_id as i64,
+                Self::now_iso(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(SeedAddOutcome::Added)
+    }
+
+    /// 없는 곡을 지우려 하면 `false` — 라우트가 404를 줄 수 있게.
+    pub fn remove_autoplay_seed(&self, guild_id: u64, cache_key: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM remote_autoplay_seeds WHERE guild_id = ?1 AND cache_key = ?2",
+            params![guild_id as i64, cache_key],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// 드래그 정렬 결과 반영. 목록에 빠진 곡은 지우지 않고 뒤로 밀어 둔다
+    /// (다른 탭에서 그사이 추가된 곡이 사라지면 안 된다).
+    pub fn reorder_autoplay_seeds(
+        &self,
+        guild_id: u64,
+        cache_keys: &[String],
+    ) -> rusqlite::Result<()> {
+        if cache_keys.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current: Vec<String> = {
+            let mut statement = tx.prepare(
+                "SELECT cache_key FROM remote_autoplay_seeds WHERE guild_id = ?1 ORDER BY sort_order, cache_key",
+            )?;
+            let rows = statement.query_map(params![guild_id as i64], |row| row.get::<_, String>(0))?;
+            rows.flatten().collect()
+        };
+        // 요청 순서 중 실제로 있는 곡만 앞에, 목록에 없던 곡은 원래 순서 그대로 뒤에.
+        let mut ordered: Vec<&String> = Vec::with_capacity(current.len());
+        for cache_key in cache_keys {
+            if current.contains(cache_key) && !ordered.iter().any(|key| *key == cache_key) {
+                ordered.push(cache_key);
+            }
+        }
+        for cache_key in &current {
+            if !ordered.iter().any(|key| *key == cache_key) {
+                ordered.push(cache_key);
+            }
+        }
+        for (order, cache_key) in ordered.into_iter().enumerate() {
+            tx.execute(
+                "UPDATE remote_autoplay_seeds SET sort_order = ?3 WHERE guild_id = ?1 AND cache_key = ?2",
+                params![guild_id as i64, cache_key, order as i64],
+            )?;
+        }
+        tx.commit()
+    }
+
     // ───────── 활동 로그 ─────────
 
     #[allow(clippy::too_many_arguments)]
@@ -1376,6 +1654,10 @@ impl RemoteStore {
     // ───────── 보존 정리 ─────────
 
     /// 기동 시 + 하루 1회 부른다. 길드 설정이 있으면 길드 설정이 이긴다.
+    ///
+    /// `remote_user_prefs`와 `remote_autoplay_seeds`는 **건드리지 않는다.**
+    /// 화면 배치와 기준 곡은 사용자가 직접 지우기 전까지 오래 남아 있어야 한다
+    /// (한 달 뒤에 들어왔더니 배치가 초기화돼 있으면 그건 그냥 고장이다).
     pub fn prune_all(&self, retention: RetentionConfig) -> rusqlite::Result<PruneReport> {
         // load_guild_settings 가 같은 뮤텍스를 잡으므로 설정은 먼저 다 읽어 둔다.
         let guild_ids = self.remote_guild_ids();
@@ -1552,6 +1834,8 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                 add_column(&tx, "remote_lyrics", "found", "INTEGER NOT NULL DEFAULT 1")?;
                 tx.execute_batch(MIGRATION_V8)?;
             }
+            8 => tx.execute_batch(MIGRATION_V9)?,
+            9 => tx.execute_batch(MIGRATION_V10)?,
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -2221,6 +2505,176 @@ mod tests {
         assert_eq!(report.chat, 1);
         assert_eq!(report.lyrics, 1);
         assert!(store.list_chat_messages(1, 10, 50, None).is_empty());
+        cleanup(store, path);
+    }
+
+    #[test]
+    fn pref_whitelist_rejects_unknown_keys_and_oversized_values() {
+        let (store, path) = temp_store("prefs");
+        let mut updates = BTreeMap::new();
+        updates.insert("layout".into(), "panel".into());
+        updates.insert("theme".into(), "light".into());
+        updates.insert("webVolume".into(), "45".into());
+        // 화이트리스트 밖 키 — 조용히 버린다.
+        updates.insert("evilKey".into(), "payload".into());
+        // 값 자체가 틀린 것들.
+        updates.insert("layout".into(), "panel".into());
+        updates.insert("lyricsOpen".into(), "yes".into());
+        updates.insert("panelLayout".into(), "{ not json".into());
+        // layoutSizes 2KB 상한 초과 (JSON 자체는 멀쩡하다).
+        updates.insert("layoutSizes".into(), format!("[\"{}\"]", "x".repeat(3000)));
+        store.save_prefs(10, &updates).unwrap();
+
+        let saved = store.load_prefs(10);
+        assert_eq!(saved.get("layout").map(String::as_str), Some("panel"));
+        assert_eq!(saved.get("theme").map(String::as_str), Some("light"));
+        assert_eq!(saved.get("webVolume").map(String::as_str), Some("45"));
+        assert!(!saved.contains_key("evilKey"));
+        assert!(!saved.contains_key("lyricsOpen"));
+        assert!(!saved.contains_key("panelLayout"));
+        assert!(!saved.contains_key("layoutSizes"), "2KB 상한이 안 걸렸다");
+
+        // 다른 사람 설정은 섞이지 않는다.
+        assert!(store.load_prefs(11).is_empty());
+
+        // 부분 갱신 — 보낸 키만 바뀐다.
+        let mut patch = BTreeMap::new();
+        patch.insert("theme".into(), "dark".into());
+        store.save_prefs(10, &patch).unwrap();
+        let saved = store.load_prefs(10);
+        assert_eq!(saved.get("theme").map(String::as_str), Some("dark"));
+        assert_eq!(saved.get("layout").map(String::as_str), Some("panel"));
+
+        // 되돌리기 — 지운 키는 다시 미선택 상태.
+        assert_eq!(store.delete_prefs(10, &["layout"]).unwrap(), 1);
+        assert!(!store.load_prefs(10).contains_key("layout"));
+        cleanup(store, path);
+    }
+
+    #[test]
+    fn pref_validation_matches_the_spec_table() {
+        assert!(is_valid_pref("layout", "three"));
+        assert!(is_valid_pref("layout", "two"));
+        assert!(is_valid_pref("layout", "panel"));
+        assert!(!is_valid_pref("layout", "four"));
+        assert!(is_valid_pref("theme", "dark"));
+        assert!(!is_valid_pref("theme", "solarized"));
+        assert!(is_valid_pref("lyricsOpen", "0"));
+        assert!(is_valid_pref("webPlayback", "1"));
+        assert!(!is_valid_pref("webPlayback", "true"));
+        assert!(is_valid_pref("webVolume", "0"));
+        assert!(is_valid_pref("webVolume", "100"));
+        assert!(!is_valid_pref("webVolume", "101"));
+        assert!(!is_valid_pref("webVolume", "-1"));
+        assert!(is_valid_pref("layoutSizes", r#"{"three":{"rail":320}}"#));
+        assert!(!is_valid_pref("layoutSizes", "그냥 문자열"));
+        assert!(is_valid_pref(
+            "panelLayout",
+            r#"{"type":"tabs","panels":["now"]}"#
+        ));
+        assert!(!is_valid_pref("panelLayout", &"\"".repeat(9000)));
+        assert!(!is_valid_pref("unknown", "value"));
+        // 화이트리스트 상수와 판정이 어긋나지 않는지.
+        for key in PREF_KEYS {
+            assert!(!is_valid_pref(key, ""), "빈 값은 어떤 키도 통과하면 안 된다");
+        }
+    }
+
+    #[test]
+    fn autoplay_seeds_are_capped_at_ten_and_reject_duplicates() {
+        let (store, path) = temp_store("seeds");
+        for index in 0..MAX_AUTOPLAY_SEEDS {
+            let outcome = store
+                .add_autoplay_seed(1, &test_track(&format!("seed{index}")), 10)
+                .unwrap();
+            assert_eq!(outcome, SeedAddOutcome::Added);
+        }
+        assert_eq!(store.list_autoplay_seeds(1).len(), MAX_AUTOPLAY_SEEDS);
+
+        // 11번째는 거부. 문구까지 계약이다.
+        let overflow = store.add_autoplay_seed(1, &test_track("seed11"), 10).unwrap();
+        assert_eq!(overflow, SeedAddOutcome::LimitReached);
+        assert_eq!(overflow.message(), "시드곡은 10곡까지 넣을 수 있어요.");
+        assert_eq!(store.list_autoplay_seeds(1).len(), MAX_AUTOPLAY_SEEDS);
+
+        // 중복도 거부하되 상한과는 다른 사유다.
+        assert!(store.remove_autoplay_seed(1, &test_track("seed0").cache_key()).unwrap());
+        assert_eq!(store.list_autoplay_seeds(1).len(), MAX_AUTOPLAY_SEEDS - 1);
+        assert_eq!(
+            store.add_autoplay_seed(1, &test_track("seed1"), 10).unwrap(),
+            SeedAddOutcome::Duplicate
+        );
+        assert!(!store.remove_autoplay_seed(1, "없는키").unwrap());
+
+        // 길드끼리 섞이지 않는다.
+        assert!(store.list_autoplay_seeds(2).is_empty());
+        cleanup(store, path);
+    }
+
+    #[test]
+    fn reordering_seeds_keeps_unlisted_songs_at_the_back() {
+        let (store, path) = temp_store("seed-order");
+        for name in ["가", "나", "다"] {
+            store
+                .add_autoplay_seed(1, &test_track(name), 10)
+                .unwrap();
+        }
+        let keys: Vec<String> = store
+            .list_autoplay_seeds(1)
+            .iter()
+            .map(|seed| seed.cache_key.clone())
+            .collect();
+        assert_eq!(keys.len(), 3);
+
+        // 3 → 1번째로 끌어올린다.
+        store
+            .reorder_autoplay_seeds(1, &[keys[2].clone(), keys[0].clone(), keys[1].clone()])
+            .unwrap();
+        let after: Vec<String> = store
+            .list_autoplay_seeds(1)
+            .iter()
+            .map(|seed| seed.cache_key.clone())
+            .collect();
+        assert_eq!(after, vec![keys[2].clone(), keys[0].clone(), keys[1].clone()]);
+
+        // 목록에 빠진 곡은 사라지지 않고 뒤로 간다. 없는 키는 무시된다.
+        store
+            .reorder_autoplay_seeds(1, &[keys[1].clone(), "유령키".into()])
+            .unwrap();
+        let after: Vec<String> = store
+            .list_autoplay_seeds(1)
+            .iter()
+            .map(|seed| seed.cache_key.clone())
+            .collect();
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0], keys[1]);
+        cleanup(store, path);
+    }
+
+    /// 보존 정리가 개인 설정과 기준 곡을 건드리면 안 된다.
+    #[test]
+    fn prune_all_leaves_prefs_and_seeds_alone() {
+        let (store, path) = temp_store("prune-prefs");
+        let mut prefs = BTreeMap::new();
+        prefs.insert("layout".into(), "two".into());
+        store.save_prefs(10, &prefs).unwrap();
+        store.add_autoplay_seed(1, &test_track("seed"), 10).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE remote_user_prefs SET updated_utc = '2020-01-01T00:00:00+00:00'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE remote_autoplay_seeds SET added_utc = '2020-01-01T00:00:00+00:00'",
+                [],
+            )
+            .unwrap();
+        }
+        store.prune_all(RetentionConfig::default()).unwrap();
+        assert_eq!(store.load_prefs(10).get("layout").map(String::as_str), Some("two"));
+        assert_eq!(store.list_autoplay_seeds(1).len(), 1);
         cleanup(store, path);
     }
 

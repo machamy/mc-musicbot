@@ -37,11 +37,13 @@ body { overflow: hidden; }
 .portal__banners { flex: none; }
 
 .portal__grid {
+  /* 열 사이 간격은 gap이 아니라 '손잡이 트랙'이다. 폭은 예전 gap과 같아서 보이는 건 그대로다. */
+  --gutter-w: var(--sp-3);
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--side-w);
-  gap: var(--sp-3);
+  grid-template-columns: var(--rail-w) var(--gutter-w) minmax(0, 1fr) var(--gutter-w) var(--side-w);
+  gap: 0;
   padding: var(--sp-3);
   padding-top: 0;
 }
@@ -55,6 +57,39 @@ body { overflow: hidden; }
 }
 
 .scroll { overflow-y: auto; overscroll-behavior: contain; }
+
+/* ═══════════════════════ 크기 조절 손잡이 ═══════════════════════
+ * 평소에는 그냥 여백처럼 보이고, 가까이 가면 선이 뜬다. 키보드 포커스도 받는다.
+ */
+
+.gutter {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  touch-action: none;
+}
+.gutter--rail, .gutter--side { cursor: col-resize; }
+.gutter--row { cursor: row-resize; height: var(--sp-2); }
+
+.gutter__grip {
+  border-radius: var(--r-full);
+  background: transparent;
+  transition: background var(--t-fast) var(--ease);
+}
+.gutter--rail .gutter__grip,
+.gutter--side .gutter__grip { width: 3px; height: 44px; }
+.gutter--row .gutter__grip { width: 44px; height: 3px; }
+
+.gutter:hover .gutter__grip,
+.gutter:focus-visible .gutter__grip,
+.gutter[data-drag="1"] .gutter__grip { background: var(--accent); }
+
+/* 끄는 동안 글자가 선택되면 지저분하다 */
+body[data-resizing] { user-select: none; cursor: col-resize; }
+body[data-resizing="row"] { cursor: row-resize; }
+body[data-dragging="tab"] { user-select: none; }
 
 /* ═══════════════════════ 헤더 ═══════════════════════ */
 
@@ -215,9 +250,9 @@ body { overflow: hidden; }
 }
 
 /* ── 화면 배치 고르기 ── 도식은 실제 열 비율을 그대로 줄여 놓은 것이다 */
-.dd__menu--wide { min-width: 336px; }
+.dd__menu--wide { min-width: 392px; }
 
-.lay { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); padding: 0 var(--sp-3) var(--sp-1); }
+.lay { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--sp-2); padding: 0 var(--sp-3) var(--sp-1); }
 
 .lay__opt {
   display: grid;
@@ -231,21 +266,57 @@ body { overflow: hidden; }
 }
 .lay__opt:hover { background: var(--surface-3); border-color: var(--line-3); }
 .lay__opt[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); }
-.lay__opt strong { color: var(--text-1); font-size: var(--fs-md); font-weight: var(--fw-semi); }
+.lay__opt strong {
+  display: flex; align-items: center; gap: var(--sp-1);
+  color: var(--text-1); font-size: var(--fs-md); font-weight: var(--fw-semi);
+}
+.lay__opt strong .chip { height: 16px; padding: 0 5px; font-size: 9px; }
 .lay__opt[aria-checked="true"] strong { color: var(--accent); }
 .lay__opt small { color: var(--text-3); font-size: var(--fs-xs); line-height: 1.35; }
 
 .lay__glyph { display: grid; gap: 2px; height: 30px; }
 .lay__glyph i { border-radius: 2px; background: var(--surface-4); }
 .lay__glyph i.is-main { background: var(--text-4); }
-.lay__opt[aria-checked="true"] .lay__glyph i { background: var(--accent-line); }
-.lay__opt[aria-checked="true"] .lay__glyph i.is-main { background: var(--accent); }
+.lay__opt[aria-checked="true"] .lay__glyph i,
+.pick__card:hover .lay__glyph i { background: var(--accent-line); }
+.lay__opt[aria-checked="true"] .lay__glyph i.is-main,
+.pick__card:hover .lay__glyph i.is-main { background: var(--accent); }
 
 .lay__glyph--three { grid-template-columns: 0.8fr 1.4fr 1fr; }
 .lay__glyph--two { grid-template-columns: 1.7fr 1fr; grid-template-rows: 1.3fr 1fr; }
 .lay__glyph--two i:nth-child(1) { grid-area: 1 / 1; }
 .lay__glyph--two i:nth-child(2) { grid-area: 2 / 1; }
 .lay__glyph--two i:nth-child(3) { grid-area: 1 / 2 / span 2; }
+.lay__glyph--panel { grid-template-columns: 1.5fr 1fr; grid-template-rows: 1fr 1fr; }
+.lay__glyph--panel i:nth-child(1) { grid-area: 1 / 1; }
+.lay__glyph--panel i:nth-child(2) { grid-area: 2 / 1; }
+.lay__glyph--panel i:nth-child(3) { grid-area: 1 / 2; }
+.lay__glyph--panel i:nth-child(4) { grid-area: 2 / 2; }
+
+/* ── 첫 진입 배치 선택 시트 ── */
+.pick { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--sp-3); }
+.pick__card {
+  display: grid;
+  align-content: start;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  text-align: left;
+  transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease),
+              transform var(--t-fast) var(--ease);
+}
+.pick__card:hover { border-color: var(--accent); background: var(--accent-soft); transform: translateY(-2px); }
+.pick__card .lay__glyph { height: 62px; }
+.pick__card strong {
+  display: flex; align-items: center; gap: var(--sp-2);
+  color: var(--text-1); font-size: var(--fs-lg);
+}
+.pick__card strong .chip { height: 18px; font-size: 10px; }
+.pick__card p { color: var(--text-2); font-size: var(--fs-md); }
+.pick__card small { color: var(--text-3); font-size: var(--fs-xs); line-height: 1.4; }
+@media (max-width: 640px) { .pick { grid-template-columns: 1fr; } }
 
 /* 넘치는 제목은 오른쪽 끝을 흐리게 해서 "더 있다"는 걸 알린다. 호버하면 전광판이 돌면서 선명해진다. */
 .mq[data-over="1"] {
@@ -266,6 +337,7 @@ body { overflow: hidden; }
   box-shadow: var(--shadow-pop);
   animation: dd-in var(--t-fast) var(--ease-out);
 }
+.pop--menu { display: grid; gap: 2px; min-width: 190px; max-height: 60dvh; overflow-y: auto; }
 
 /* 어디에 있는지 눈으로 찾게 하는 강조 */
 .flash { animation: flash 1.3s var(--ease); }
@@ -433,10 +505,13 @@ body { overflow: hidden; }
 }
 .search__results[hidden] { display: none; }
 .search__meta {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; gap: var(--sp-2);
   padding: var(--sp-1) var(--sp-2) var(--sp-2);
   color: var(--text-3); font-size: var(--fs-xs);
 }
+.search__meta > span:first-child { flex: 1; }
+/* 결과가 어디서 왔는지 — 작게, 그러나 숨기지 않는다 */
+.search__src { color: var(--text-4); font-size: 10px; }
 
 /* ═══════════════════════ 트랙 행 (검색결과·최근·보관함 공용) ═══════════════════════ */
 
@@ -515,6 +590,74 @@ body { overflow: hidden; }
   opacity: 0.72;
 }
 .modebadge__i:hover { background: var(--accent-line); opacity: 1; }
+
+/* 5초마다 도는 재정렬까지 남은 시간. 숫자만 조용히 바뀐다. */
+.sorttick {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-full);
+  background: var(--surface-3);
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+.sorttick__label { opacity: 0.8; }
+.sorttick b {
+  min-width: 8px;
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-weight: var(--fw-bold);
+  text-align: center;
+}
+
+/* ── 자동 재생 기준 곡 ── */
+.seedbox {
+  flex: none;
+  margin: 0 var(--sp-3) var(--sp-2);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.seedbox__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  text-align: left;
+}
+.seedbox__head:hover { color: var(--text-1); }
+.seedbox__caret {
+  color: var(--text-4);
+  transition: transform var(--t-fast) var(--ease);
+}
+.seedbox__head[data-open="1"] .seedbox__caret { transform: rotate(90deg); }
+.seedbox__body {
+  display: grid;
+  gap: 2px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 0 var(--sp-2) var(--sp-2);
+}
+.seedbox__body .hint { padding: var(--sp-2); }
+.seedrow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+}
+.seedrow:hover { background: var(--surface-3); }
+.seedrow .row__art { width: 32px; height: 32px; }
+
+/* 시드곡 API가 없거나 권한이 없으면 버튼 자체를 내보내지 않는다 */
+.seedbtn { display: none; }
+.portal[data-seeds="1"] .seedbtn { display: inline-flex; }
 
 .queue__list { flex: 1; min-height: 0; padding: 0 var(--sp-2) var(--sp-3); }
 
@@ -786,6 +929,39 @@ body { overflow: hidden; }
 .vol__range { flex: 1; accent-color: var(--art-1); cursor: pointer; }
 .vol__label { width: 40px; text-align: right; color: var(--text-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
 
+/* ── 볼륨 두 개 ──
+ * "왜 볼륨을 줄였는데 다른 사람도 줄어들지?" 사고를 막으려면 둘이 눈에 띄게 달라야 한다.
+ * 서버 볼륨은 회색 테두리, 내 볼륨은 강조색 테두리 + 강조색 라벨.
+ */
+.vols { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); margin-top: var(--sp-3); }
+.vol--server, .vol--me {
+  flex: 1 1 250px;
+  min-width: 210px;
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-full);
+  background: var(--surface-2);
+}
+.vol--me { border-color: var(--accent-line); background: var(--accent-soft); }
+.vol--me .vol__range { accent-color: var(--accent); }
+.vol__tag { flex: none; color: var(--text-3); font-size: var(--fs-xs); white-space: nowrap; }
+.vol--me .vol__tag { color: var(--accent); font-weight: var(--fw-semi); }
+
+.webbtn[aria-pressed="true"] { box-shadow: 0 0 0 1px var(--accent-line); }
+.webnote { flex: 1 0 100%; color: var(--warn); font-size: var(--fs-xs); line-height: 1.45; }
+
+/* 숨긴 유튜브 플레이어. 화면 밖으로 완전히 빼면 브라우저가 재생을 미루는 경우가 있어
+ * 화면 구석에 2px로 남겨 둔다. 듣기 전용이라 조작 UI는 노출하지 않는다. */
+.webhost {
+  position: fixed;
+  left: 0; bottom: 0;
+  width: 2px; height: 2px;
+  z-index: -1;
+  opacity: 0.01;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 /* 가사 */
 .lyrics { flex: none; display: flex; flex-direction: column; min-height: 0; }
 .lyrics__head {
@@ -950,8 +1126,9 @@ body { overflow: hidden; }
 .compose__box { display: flex; align-items: flex-end; gap: var(--sp-2); }
 .compose__box textarea {
   flex: 1;
+  height: var(--compose-h, 36px);
   min-height: 36px;
-  max-height: 140px;
+  max-height: 260px;
   resize: none;
   line-height: 1.45;
   padding: var(--sp-2) var(--sp-3);
@@ -985,6 +1162,15 @@ body { overflow: hidden; }
 .ac__item[aria-selected="true"] { background: var(--accent-soft); color: var(--accent); }
 
 /* ── 멤버 ── */
+.mnote {
+  padding: var(--sp-2) var(--sp-4) 0;
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+}
+.dot--othervoice { background: var(--presence-idle); }
+.member--othervoice .member__name { color: var(--text-2); }
+.pcount--off { color: var(--warn); font-weight: var(--fw-semi); white-space: nowrap; }
+
 .mgroup { padding: var(--sp-3) var(--sp-2) 0; }
 .mgroup__title {
   display: flex; align-items: center; gap: var(--sp-2);
@@ -1089,6 +1275,157 @@ body { overflow: hidden; }
 .lockwrap { display: inline-flex; }
 .lockwrap > :disabled { pointer-events: none; }
 
+/* ═══════════════════════ 패널형 도킹 ═══════════════════════
+ * <html data-layout="panel">. 트리(split/tabs)를 flex로 그린다.
+ * 패널 알맹이는 3단·2단과 **완전히 같은 노드**를 옮겨 온 것이다 — 여기서 새로 만드는 건 껍데기뿐이다.
+ */
+
+.dock {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: var(--sp-3);
+  padding-top: 0;
+}
+.dock > * { flex: 1; min-width: 0; min-height: 0; }
+
+.dk-split { display: flex; flex: 1; min-width: 0; min-height: 0; }
+.dk-split--row { flex-direction: row; }
+.dk-split--col { flex-direction: column; }
+
+.dk-slot { display: flex; flex-basis: 0; min-width: 0; min-height: 0; }
+.dk-slot > * { flex: 1; min-width: 0; min-height: 0; }
+
+/* 분할선 — 손잡이와 같은 어법을 쓴다 */
+.dk-div {
+  position: relative;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+}
+.dk-split--row > .dk-div { width: var(--sp-3); cursor: col-resize; }
+.dk-split--col > .dk-div { height: var(--sp-3); cursor: row-resize; }
+.dk-div::after {
+  content: '';
+  border-radius: var(--r-full);
+  background: transparent;
+  transition: background var(--t-fast) var(--ease);
+}
+.dk-split--row > .dk-div::after { width: 3px; height: 44px; }
+.dk-split--col > .dk-div::after { width: 44px; height: 3px; }
+.dk-div:hover::after, .dk-div:focus-visible::after, .dk-div[data-drag="1"]::after { background: var(--accent); }
+
+/* 탭 그룹 */
+.dk-group {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--surface-1);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+
+.dk-tabs {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: var(--sp-2);
+  border-bottom: 1px solid var(--line-1);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.dk-tabs::-webkit-scrollbar { height: 0; }
+
+.dk-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex: none;
+  height: 28px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+  touch-action: none;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.dk-tab:hover { background: var(--surface-2); color: var(--text-1); }
+.dk-tab[aria-selected="true"] { background: var(--surface-3); color: var(--text-1); }
+
+.dk-x {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px;
+  margin-left: 2px;
+  border-radius: var(--r-xs);
+  color: var(--text-4);
+  font-size: 9px;
+  opacity: 0;
+  transition: opacity var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
+}
+.dk-tab:hover .dk-x, .dk-tab[aria-selected="true"] .dk-x, .dk-tab:focus-within .dk-x { opacity: 1; }
+.dk-x:hover { background: var(--danger-soft); color: var(--danger); }
+@media (hover: none) { .dk-x { opacity: 1; } }
+
+.dk-add {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: none;
+  width: 24px; height: 24px;
+  margin-left: auto;
+  border-radius: var(--r-sm);
+  color: var(--text-4);
+  font-size: var(--fs-md);
+}
+.dk-add:hover { background: var(--surface-3); color: var(--text-1); }
+
+.dk-body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.dk-body > * { flex: 1 1 auto; min-height: 0; }
+
+/* 그룹이 이미 테두리를 가졌으니 안쪽 카드는 테두리를 벗는다 */
+.dk-body > .now, .dk-body > .lyrics { border: 0; border-radius: 0; }
+.dk-body > .lyrics { display: flex; flex-direction: column; }
+.dk-body > .lyrics .lyrics__view { max-height: none; flex: 1; }
+.dk-body > .now { overflow-y: auto; }
+
+/* 드롭 하이라이트 — 어디에 붙을지 끌기 중에 반드시 보여야 한다 */
+.dk-drop {
+  position: absolute;
+  z-index: 20;
+  pointer-events: none;
+  border-radius: var(--r-md);
+  background: var(--accent-soft);
+  border: 2px dashed var(--accent);
+  transition: left var(--t-fast) var(--ease), top var(--t-fast) var(--ease),
+              width var(--t-fast) var(--ease), height var(--t-fast) var(--ease);
+}
+
+.dk-ghost {
+  position: fixed;
+  z-index: var(--z-tooltip);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: var(--r-full);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semi);
+  box-shadow: var(--shadow-pop);
+  pointer-events: none;
+}
+
+/* 패널형에서는 드로어도, 하단 탭바도 쓰지 않는다 */
+:root[data-layout="panel"] .hdr__drawer { display: none; }
+
 /* ═══════════════════════ 모바일 하단 탭바 ═══════════════════════ */
 
 .mtabs {
@@ -1119,7 +1456,8 @@ body { overflow: hidden; }
 
 /* 1280px 미만 — 2열. 우측 탭은 드로어로 뺀다. */
 @media (max-width: 1279px) {
-  .portal__grid { grid-template-columns: var(--rail-w) minmax(0, 1fr); }
+  .portal__grid { grid-template-columns: var(--rail-w) var(--gutter-w) minmax(0, 1fr); }
+  .gutter--side { display: none; }
   .hdr__drawer { display: inline-flex; }
   .side {
     position: fixed;
@@ -1149,6 +1487,7 @@ body { overflow: hidden; }
 /* 680px 이하 — 단일 열 + 하단 탭바 */
 @media (max-width: 680px) {
   .portal__grid { grid-template-columns: minmax(0, 1fr); gap: 0; padding: var(--sp-2); padding-top: 0; }
+  .gutter { display: none; }
   .hdr { gap: var(--sp-2); padding: 0 var(--sp-2); }
   .hdr__presence, .hdr__drawer, .hdr__brand small { display: none; }
   .hdr__guild { max-width: 150px; }
@@ -1199,10 +1538,11 @@ body { overflow: hidden; }
  * 2단 규칙은 전부 681px부터만 산다. 아래 블록 밖으로 새어 나가면 안 된다.
  */
 @media (min-width: 681px) {
-  :root[data-layout="two"] .portal { --side-w: 390px; }
+  /* --side-w 는 portal.js가 prefs.layoutSizes 로 직접 박는다(2단 기본 390px).
+   * 여기서 다시 선언하면 인라인 값을 덮어써서 크기 조절이 먹지 않는다. */
 
   :root[data-layout="two"] .portal__grid {
-    grid-template-columns: minmax(0, 1fr) var(--side-w);
+    grid-template-columns: minmax(0, 1fr) var(--gutter-w) var(--side-w);
     grid-template-rows: auto auto;
     align-items: start;
     overflow-y: auto;
@@ -1211,6 +1551,8 @@ body { overflow: hidden; }
 
   :root[data-layout="two"] .stage { grid-column: 1; grid-row: 1; }
   :root[data-layout="two"] .rail  { grid-column: 1; grid-row: 2; }
+  :root[data-layout="two"] .gutter--rail { display: none; }
+  :root[data-layout="two"] .gutter--side { grid-column: 2; grid-row: 1 / span 2; align-self: stretch; }
 
   /* 열 안쪽의 내부 스크롤을 풀어 바깥 한 줄기로 잇는다 */
   :root[data-layout="two"] .stage,
@@ -1232,7 +1574,7 @@ body { overflow: hidden; }
    * 1280px 미만에서 켜지는 드로어 규칙(.side{position:fixed;...})을 여기서 전부 되돌린다.
    * 2단은 981px까지 사이드를 붙박이로 쓰기 때문이다. */
   :root[data-layout="two"] .side {
-    grid-column: 2;
+    grid-column: 3;
     grid-row: 1 / span 2;
     align-self: start;
     position: sticky;
@@ -1254,6 +1596,7 @@ body { overflow: hidden; }
  * 3단은 1280px 미만에서 빠지지만 2단은 사이드가 배치의 절반이라 더 오래 붙잡는다. */
 @media (min-width: 681px) and (max-width: 980px) {
   :root[data-layout="two"] .portal__grid { grid-template-columns: minmax(0, 1fr); }
+  :root[data-layout="two"] .gutter--side { display: none; }
   :root[data-layout="two"] .hdr__drawer { display: inline-flex; }
   :root[data-layout="two"] .side {
     position: fixed;

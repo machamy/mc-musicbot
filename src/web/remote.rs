@@ -10,11 +10,13 @@ use crate::models::{
     CsTimeSpan, PlaylistEntry, PlaylistScope, ProviderKind, QueueItem, RepeatMode, TrackRef,
 };
 use crate::remote::ranking;
+use crate::remote::store::is_valid_pref;
 use crate::remote::{
-    ChatTrackTag, LyricsCacheHit, LyricsDocument, LyricsLine, PermissionRule, QueueScore,
-    QueueSortMode, QueueVoteKind, RemoteGuildSettings, StoredSession, SuggestionStatus, Suspension,
-    SuspensionScope, UserTrackKind,
+    AutoplaySeed, ChatTrackTag, LyricsCacheHit, LyricsDocument, LyricsLine, MAX_AUTOPLAY_SEEDS,
+    PERMISSION_KEYS, PermissionRule, QueueScore, QueueSortMode, QueueVoteKind, RemoteGuildSettings,
+    SeedAddOutcome, StoredSession, SuggestionStatus, Suspension, SuspensionScope, UserTrackKind,
 };
+use std::collections::BTreeMap;
 use axum::Json;
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -71,6 +73,8 @@ struct StoredRemoteAuthConfig {
     public_base_url: Option<String>,
     /// 봇 주인 Discord 유저 ID. JS 정밀도 문제를 피하려고 문자열로 저장한다.
     owner_user_ids: Vec<String>,
+    /// YouTube Data API v3 키. 브라우저 검색(V3 §6)에 쓰이므로 결국 클라이언트로 나간다.
+    youtube_api_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -81,6 +85,9 @@ pub struct RemoteAuthConfig {
     pub dev_login: bool,
     /// 봇 주인 Discord 유저 ID 목록. 여기 있으면 유저 UI에서 `Owner` 등급이 된다.
     pub owner_user_ids: Vec<u64>,
+    /// YouTube Data API v3 키. 있으면 `/state/cold`가 브라우저 검색 모드를 내려보낸다.
+    /// **브라우저에 그대로 노출되는 값**이라 Google Cloud에서 HTTP 리퍼러 제한이 전제다.
+    youtube_api_key: Option<String>,
 }
 
 impl std::fmt::Debug for RemoteAuthConfig {
@@ -92,6 +99,7 @@ impl std::fmt::Debug for RemoteAuthConfig {
             .field("public_base_url", &self.public_base_url)
             .field("dev_login", &self.dev_login)
             .field("owner_user_ids", &self.owner_user_ids)
+            .field("youtube_api_key_configured", &self.youtube_api_key.is_some())
             .finish()
     }
 }
@@ -109,26 +117,31 @@ impl RemoteAuthConfig {
                 .filter(|value| !value.is_empty())
         };
         let env = |name: &str| clean(std::env::var(name).ok());
-        let (client_id, client_secret, public_base_url, owner_user_ids) = match stored {
-            Some(stored) => (
-                clean(stored.client_id),
-                clean(stored.client_secret),
-                clean(stored.public_base_url).unwrap_or_else(|| "http://localhost:8693".into()),
-                parse_owner_ids(&stored.owner_user_ids.join(",")),
-            ),
-            None => (
-                env("MUSICBOT_DISCORD_CLIENT_ID"),
-                env("MUSICBOT_DISCORD_CLIENT_SECRET"),
-                env("MUSICBOT_PUBLIC_BASE_URL").unwrap_or_else(|| "http://localhost:8693".into()),
-                parse_owner_ids(env("MUSICBOT_OWNER_USER_IDS").unwrap_or_default().as_str()),
-            ),
-        };
+        let (client_id, client_secret, public_base_url, owner_user_ids, youtube_api_key) =
+            match stored {
+                Some(stored) => (
+                    clean(stored.client_id),
+                    clean(stored.client_secret),
+                    clean(stored.public_base_url).unwrap_or_else(|| "http://localhost:8693".into()),
+                    parse_owner_ids(&stored.owner_user_ids.join(",")),
+                    clean(stored.youtube_api_key),
+                ),
+                None => (
+                    env("MUSICBOT_DISCORD_CLIENT_ID"),
+                    env("MUSICBOT_DISCORD_CLIENT_SECRET"),
+                    env("MUSICBOT_PUBLIC_BASE_URL")
+                        .unwrap_or_else(|| "http://localhost:8693".into()),
+                    parse_owner_ids(env("MUSICBOT_OWNER_USER_IDS").unwrap_or_default().as_str()),
+                    env("MUSICBOT_YOUTUBE_API_KEY"),
+                ),
+            };
         Self {
             client_id,
             client_secret,
             public_base_url: public_base_url.trim_end_matches('/').to_string(),
             dev_login: std::env::var("MUSICBOT_DEV_LOGIN").ok().as_deref() == Some("1"),
             owner_user_ids,
+            youtube_api_key,
         }
     }
 
@@ -155,6 +168,7 @@ impl RemoteAuthConfig {
             public_base_url: public_base_url.trim_end_matches('/').to_string(),
             dev_login: self.dev_login,
             owner_user_ids: self.owner_user_ids.clone(),
+            youtube_api_key: self.youtube_api_key.clone(),
         }
     }
 
@@ -163,6 +177,39 @@ impl RemoteAuthConfig {
         let mut next = self.clone();
         next.owner_user_ids = owner_user_ids;
         next
+    }
+
+    /// YouTube API 키만 교체한 사본. Client Secret과 같은 규칙이에요 —
+    /// 빈 값이면 기존 키를 그대로 두고, `clear`일 때만 지워요.
+    pub fn with_youtube_api_key(&self, update: Option<String>, clear: bool) -> Self {
+        let mut next = self.clone();
+        next.youtube_api_key = if clear {
+            None
+        } else {
+            update
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| self.youtube_api_key.clone())
+        };
+        next
+    }
+
+    /// 지금 저장된 YouTube API 키. 브라우저로 내려보낼 값이라 `/state/cold`만 읽어요.
+    pub fn youtube_api_key(&self) -> Option<&str> {
+        self.youtube_api_key.as_deref()
+    }
+
+    /// 운영 패널에 보여줄 마스킹 값 — 앞 4자와 뒤 4자만 남겨요.
+    /// 키 자체는 어차피 브라우저로 나가지만, 어깨너머로 통째로 읽히게 두진 않아요.
+    pub fn masked_youtube_api_key(&self) -> Option<String> {
+        let key = self.youtube_api_key.as_deref()?;
+        let chars: Vec<char> = key.chars().collect();
+        if chars.len() <= 8 {
+            return Some("•".repeat(chars.len().max(4)));
+        }
+        let head: String = chars[..4].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        Some(format!("{head}{}{tail}", "•".repeat(chars.len() - 8)))
     }
 
     pub fn save(&self, data_root: &FsPath) -> Result<(), String> {
@@ -177,6 +224,7 @@ impl RemoteAuthConfig {
                 .iter()
                 .map(|id| id.to_string())
                 .collect(),
+            youtube_api_key: self.youtube_api_key.clone(),
         };
         let payload = serde_json::to_vec_pretty(&stored)
             .map_err(|error| format!("OAuth 설정 직렬화 실패: {error}"))?;
@@ -341,19 +389,20 @@ impl AuthContext {
     }
 
     /// 규칙 하나에 대한 최종 허용 여부. `Viewer`는 언제나 false다.
-    fn allows(&self, rule: PermissionRule) -> bool {
-        !self.tier.is_viewer() && permission_allowed(rule, &self.settings, &self.member)
+    /// `key`는 권한 키(`search`·`volume`…)로, 지정 역할을 **그 키의 역할 목록**에서 찾는다.
+    fn allows(&self, key: &str, rule: PermissionRule) -> bool {
+        !self.tier.is_viewer() && permission_allowed(key, rule, &self.settings, &self.member)
     }
 
-    fn require(&self, rule: PermissionRule, message: &str) -> Result<(), Response> {
-        if self.allows(rule) {
+    fn require(&self, key: &str, rule: PermissionRule, message: &str) -> Result<(), Response> {
+        if self.allows(key, rule) {
             Ok(())
         } else if self.tier.is_viewer() {
             Err(json_error(
                 StatusCode::FORBIDDEN,
                 self.viewer_reason
                     .clone()
-                    .unwrap_or_else(|| "읽기 전용 상태라 조작할 수 없습니다.".into()),
+                    .unwrap_or_else(|| "읽기 전용이라 아무것도 조작할 수 없어요.".into()),
             ))
         } else {
             Err(json_error(StatusCode::FORBIDDEN, message.to_string()))
@@ -366,7 +415,7 @@ impl AuthContext {
         } else {
             Err(json_error(
                 StatusCode::FORBIDDEN,
-                "서버 관리자만 할 수 있습니다.",
+                "서버 관리자만 할 수 있어요.",
             ))
         }
     }
@@ -381,7 +430,7 @@ impl AuthContext {
             Some(item) => Err(json_error(
                 StatusCode::FORBIDDEN,
                 format!(
-                    "{} 정지 중입니다.{}",
+                    "{} 정지 중이에요.{}",
                     item.scope.label(),
                     item.reason
                         .as_deref()
@@ -459,6 +508,8 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/manifest.webmanifest",
             get(super::assets::serve_manifest),
         )
+        // 개인 설정 — 길드와 무관하다 (V3 §2)
+        .route("/music/api/prefs", get(api_prefs_get).put(api_prefs_put))
         // 유저 API
         .route("/music/api/guilds/{guild_id}/state", get(api_state))
         .route("/music/api/guilds/{guild_id}/state/hot", get(api_state_hot))
@@ -520,6 +571,19 @@ pub fn router() -> Router<Arc<WebState>> {
         )
         .route("/music/api/guilds/{guild_id}/settings", post(api_settings))
         .route("/music/api/guilds/{guild_id}/events", get(api_events))
+        // 자동 재생 기준 곡 (V3 §8)
+        .route(
+            "/music/api/guilds/{guild_id}/autoplay/seeds",
+            get(api_autoplay_seeds).post(api_autoplay_seed_add),
+        )
+        .route(
+            "/music/api/guilds/{guild_id}/autoplay/seeds/remove",
+            post(api_autoplay_seed_remove),
+        )
+        .route(
+            "/music/api/guilds/{guild_id}/autoplay/seeds/reorder",
+            post(api_autoplay_seeds_reorder),
+        )
         // 서버 관리 콘솔 API — 전부 Manager 이상
         .route(
             "/music/api/guilds/{guild_id}/admin/settings",
@@ -710,6 +774,32 @@ fn host_of(url: &str) -> String {
 
 fn now_utc() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// `app::queue_sort_loop`의 재정렬 주기(초). 값 자체는 `app.rs`가 갖고 있다.
+const QUEUE_SORT_PERIOD_SECONDS: i64 = crate::app::QUEUE_SORT_INTERVAL.as_secs() as i64;
+
+/// 대기열 갱신 카운트다운(V3 §5)의 기준 시각 두 개 — `(sortedAt, nextSortAt)`.
+///
+/// `nextSortAt`은 5초 루프가 **마지막으로 돈 시각 + 주기**다. 클라이언트 타이머만 쓰면
+/// 탭이 백그라운드에 갔다 오는 순간 어긋나므로 기준 시각은 서버가 준다.
+/// 루프가 아직 한 번도 안 돌았으면(기동 직후) "지금부터 한 주기"로 근사한다.
+fn sort_clock(state: &WebState) -> (String, String) {
+    let now = chrono::Utc::now();
+    let last = state
+        .app
+        .last_queue_sort
+        .read()
+        .ok()
+        .and_then(|slot| *slot)
+        .unwrap_or(now);
+    let period = chrono::Duration::seconds(QUEUE_SORT_PERIOD_SECONDS);
+    let mut next = last + period;
+    // 루프가 밀렸으면(길드가 많거나 tick을 건너뛰었으면) 이미 지난 시각을 주지 않는다.
+    while next <= now {
+        next += period;
+    }
+    (now.to_rfc3339(), next.to_rfc3339())
 }
 
 fn parse_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -1111,7 +1201,12 @@ async fn same_voice_channel(state: &WebState, guild_id: u64, user_id: u64) -> bo
 /// **S3 수정**: `Disabled`는 누구도(관리자·봇 주인 포함) 통과하지 못한다.
 /// 관리자 우회는 `Disabled`가 아닌 규칙에만 적용된다.
 /// 서버 관리 콘솔의 permission-preview도 이 함수를 그대로 쓰므로 화면과 실제 판정이 항상 같다.
+///
+/// **V3 §1**: 지정 역할은 이제 권한 키마다 따로다. 검색용으로 `@DJ`를 넣었다고
+/// 볼륨·대기열편집까지 열리면 안 된다. `key`는 `PERMISSION_KEYS`의 값이고,
+/// 목록에 없는 키(`library` 등)는 레거시 지정 역할로 폴백한다(`roles_for` 참고).
 pub fn permission_allowed(
+    key: &str,
     rule: PermissionRule,
     settings: &RemoteGuildSettings,
     member: &MemberContext,
@@ -1125,16 +1220,24 @@ pub fn permission_allowed(
     match rule {
         PermissionRule::GuildMember => true,
         PermissionRule::SameVoiceChannel => member.same_voice_channel,
-        PermissionRule::ConfiguredRole => member
-            .role_ids
-            .iter()
-            .any(|role| settings.configured_role_ids.contains(role)),
+        PermissionRule::ConfiguredRole => has_configured_role(key, settings, member),
         PermissionRule::Administrator | PermissionRule::Disabled => false,
     }
 }
 
+/// 이 사람이 그 권한 키의 지정 역할을 하나라도 갖고 있는지.
+fn has_configured_role(
+    key: &str,
+    settings: &RemoteGuildSettings,
+    member: &MemberContext,
+) -> bool {
+    let allowed = settings.roles_for(key);
+    member.role_ids.iter().any(|role| allowed.contains(role))
+}
+
 /// 관리자 우회 없이 규칙 자체로 통과하는지 — "← 관리자라 통과" 표시 판정에 쓴다.
 fn rule_base_allowed(
+    key: &str,
     rule: PermissionRule,
     settings: &RemoteGuildSettings,
     member: &MemberContext,
@@ -1142,10 +1245,7 @@ fn rule_base_allowed(
     match rule {
         PermissionRule::GuildMember => true,
         PermissionRule::SameVoiceChannel => member.same_voice_channel,
-        PermissionRule::ConfiguredRole => member
-            .role_ids
-            .iter()
-            .any(|role| settings.configured_role_ids.contains(role)),
+        PermissionRule::ConfiguredRole => has_configured_role(key, settings, member),
         PermissionRule::Administrator => member.is_admin,
         PermissionRule::Disabled => false,
     }
@@ -1192,12 +1292,12 @@ async fn authorize(
 ) -> Result<AuthContext, Response> {
     // 1. 세션
     let mut session = current_session(state, cookies)
-        .ok_or_else(|| json_error(StatusCode::UNAUTHORIZED, "Discord 로그인이 필요합니다."))?;
+        .ok_or_else(|| json_error(StatusCode::UNAUTHORIZED, "Discord 로그인이 필요해요."))?;
     if let Some(headers) = headers {
         if !verify_csrf(&session, headers) {
             return Err(json_error(
                 StatusCode::FORBIDDEN,
-                "CSRF 검증에 실패했습니다.",
+                "CSRF 검증에 실패했어요.",
             ));
         }
     }
@@ -1205,13 +1305,13 @@ async fn authorize(
 
     // 2. 세션의 길드 목록에 없음 → 403
     let guild = guild_from_session(&session, guild_id)
-        .ok_or_else(|| json_error(StatusCode::FORBIDDEN, "이 서버의 멤버가 아닙니다."))?;
+        .ok_or_else(|| json_error(StatusCode::FORBIDDEN, "이 서버의 멤버가 아니에요."))?;
 
     // 3. 봇이 그 길드에 없음 → 403
     if !session.is_developer && !bot_in_guild(state, guild_id) {
         return Err(json_error(
             StatusCode::FORBIDDEN,
-            "봇이 이 Discord 서버에 없습니다.",
+            "봇이 이 Discord 서버에 없어요.",
         ));
     }
 
@@ -1233,7 +1333,7 @@ async fn authorize(
     if all_suspended {
         tier = AccessTier::Viewer;
         member.is_admin = false;
-        viewer_reason = Some("전체 정지 중이라 읽기 전용입니다.".into());
+        viewer_reason = Some("전체 정지 중이라 읽기 전용이에요.".into());
     }
 
     Ok(AuthContext {
@@ -1297,19 +1397,17 @@ async fn resolve_tier(
                 same_voice_channel: same_voice,
                 role_ids,
             },
-            Some("이 서버에서 나갔거나 추방되어 읽기 전용입니다.".into()),
+            Some("이 서버에서 나갔거나 추방돼서 읽기 전용이에요.".into()),
         );
     }
 
     // 5. 봇 주인
+    let manager_roles = settings.manager_roles();
     let tier = if owner {
         AccessTier::Owner
-    } else if guild.is_admin()
-        || role_ids
-            .iter()
-            .any(|role| settings.configured_role_ids.contains(role))
-    {
-        // 6. ADMINISTRATOR / MANAGE_GUILD / 길드 소유자 / 지정 역할
+    } else if guild.is_admin() || role_ids.iter().any(|role| manager_roles.contains(role)) {
+        // 6. ADMINISTRATOR / MANAGE_GUILD / 길드 소유자 / **관리자 지정 역할**
+        //    (V3 §1: 권한용 지정 역할과 갈라졌다 — 검색 역할을 준 사람이 관리자가 되면 안 된다)
         AccessTier::Manager
     } else {
         AccessTier::Member
@@ -1406,37 +1504,110 @@ fn schedule_presence(state: &Arc<WebState>, guild_id: u64) {
     });
 }
 
-/// 🎧 듣는 중 / 🖥 보는 중 / 🟢 온라인. 인텐트가 꺼져 있으면 해당 부분을 빼고 보낸다.
+/// 봇이 지금 어디에 있는지. Discord 캐시 + 메모리만 본다 — **DB를 쓰지 않는다**(V3 §4).
+///
+/// `voice_channel_id`(플레이어가 기억하는 값)와 캐시의 실제 음성 상태가 어긋날 수 있어서,
+/// 캐시에 봇의 voice_state가 있으면 그쪽을 진짜로 친다. 화면에 "듣는 중"이 뜨는데
+/// 실제로는 아무도 같은 방에 없는 상황이 §4가 지적한 바로 그 버그다.
+#[derive(Debug, Clone, Default)]
+struct BotVoiceStatus {
+    in_guild: bool,
+    channel_id: Option<u64>,
+    channel_name: Option<String>,
+}
+
+fn bot_voice_status(state: &WebState, guild_id: u64, player_channel: Option<u64>) -> BotVoiceStatus {
+    let Some(cache) = state.app.discord_cache.get() else {
+        return BotVoiceStatus::default();
+    };
+    let Some(guild) = cache.guild(GuildId::new(guild_id)) else {
+        return BotVoiceStatus::default();
+    };
+    let bot_id = cache.current_user().id;
+    let channel_id = guild
+        .voice_states
+        .get(&bot_id)
+        .and_then(|voice| voice.channel_id)
+        .map(|channel| channel.get())
+        .or(player_channel);
+    let channel_name = channel_id.and_then(|channel| {
+        guild
+            .channels
+            .get(&serenity::all::ChannelId::new(channel))
+            .map(|channel| channel.name.clone())
+    });
+    BotVoiceStatus {
+        in_guild: true,
+        channel_id,
+        channel_name,
+    }
+}
+
+/// 음성에 있는 사람들을 `듣는 중`과 `다른 채널에 있어요`로 가른다 (V3 §4).
+///
+/// **봇이 음성에 없으면 `듣는 중`은 언제나 빈 배열**이다. 그때 음성에 있는 사람은
+/// 전부 "다른 채널"이다 — 봇 없는 방에서 나는 소리를 듣는 중이라고 부를 수는 없다.
+fn split_voice_members(
+    bot_channel: Option<u64>,
+    members: &[(u64, Option<u64>)],
+) -> (Vec<String>, Vec<String>) {
+    let mut listening: Vec<String> = Vec::new();
+    let mut in_other_voice: Vec<String> = Vec::new();
+    for (user_id, channel) in members {
+        let Some(channel) = channel else { continue };
+        match bot_channel {
+            Some(bot_channel) if bot_channel == *channel => listening.push(user_id.to_string()),
+            _ => in_other_voice.push(user_id.to_string()),
+        }
+    }
+    listening.sort();
+    in_other_voice.sort();
+    (listening, in_other_voice)
+}
+
+/// 🎧 듣는 중 / 🎤 다른 채널 / 🖥 보는 중 / 🟢 온라인 + 봇 상태.
+/// 인텐트가 꺼져 있으면 해당 부분을 빼고 보낸다.
+///
+/// `listening`은 **봇이 들어가 있는 그 채널에 같이 있는 사람만**이다.
+/// 봇이 음성에 없으면 언제나 빈 배열이고, 다른 채널에 있는 사람은 `inOtherVoice`로 간다.
 async fn build_presence(state: &Arc<WebState>, guild_id: u64) -> Value {
     let viewing: Vec<String> = viewers_of(state, guild_id)
         .into_iter()
         .map(|id| id.to_string())
         .collect();
     let player = state.app.player.get_state(guild_id).await;
-    let intents = state
+    let bot = bot_voice_status(state, guild_id, player.voice_channel_id);
+    let presences_intent = state
         .app
         .intent_status
         .read()
-        .map(|status| (status.members, status.presences))
-        .unwrap_or((true, true));
+        .map(|status| status.presences)
+        .unwrap_or(true);
 
-    let mut listening: Vec<String> = Vec::new();
+    let mut voice_members: Vec<(u64, Option<u64>)> = Vec::new();
     let mut online = serde_json::Map::new();
     if let Some(cache) = state.app.discord_cache.get() {
         if let Some(guild) = cache.guild(GuildId::new(guild_id)) {
             let bot_id = cache.current_user().id;
-            if let Some(channel) = player.voice_channel_id {
-                for (user_id, voice) in guild.voice_states.iter() {
-                    if *user_id == bot_id {
-                        continue;
-                    }
-                    if voice.channel_id.map(|c| c.get()) == Some(channel) {
-                        listening.push(user_id.get().to_string());
-                    }
+            for (user_id, voice) in guild.voice_states.iter() {
+                if *user_id == bot_id {
+                    continue;
                 }
-                listening.sort();
+                // 다른 봇은 인원수에 넣지 않는다 — "3명이 듣는 중"에 봇이 끼면 거짓말이 된다.
+                if guild
+                    .members
+                    .get(user_id)
+                    .map(|member| member.user.bot)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                voice_members.push((
+                    user_id.get(),
+                    voice.channel_id.map(|channel| channel.get()),
+                ));
             }
-            if intents.1 {
+            if presences_intent {
                 for (user_id, presence) in guild.presences.iter() {
                     online.insert(
                         user_id.get().to_string(),
@@ -1446,13 +1617,22 @@ async fn build_presence(state: &Arc<WebState>, guild_id: u64) -> Value {
             }
         }
     }
-
+    let (listening, in_other_voice) = split_voice_members(bot.channel_id, &voice_members);
     json!({
         "listening": listening,
+        "inOtherVoice": in_other_voice,
         "viewing": viewing,
         "online": Value::Object(online),
         "listeningCount": listening.len(),
+        "inOtherVoiceCount": in_other_voice.len(),
         "viewingCount": viewing.len(),
+        "bot": {
+            "inGuild": bot.in_guild,
+            "inVoice": bot.channel_id.is_some(),
+            "voiceChannelId": bot.channel_id.map(|id| id.to_string()),
+            "voiceChannelName": bot.channel_name,
+            "listenerCount": listening.len(),
+        },
     })
 }
 
@@ -1490,13 +1670,13 @@ fn build_members(state: &WebState, ctx_guild_id: u64, settings: &RemoteGuildSett
                     })
                     .unwrap_or(false)
             });
-        let configured = member
+        let manager_role = member
             .roles
             .iter()
-            .any(|role| settings.configured_role_ids.contains(&role.get()));
+            .any(|role| settings.manager_roles().contains(&role.get()));
         let tier = if is_owner_user(state, user_id.get()) {
             AccessTier::Owner
-        } else if admin || configured {
+        } else if admin || manager_role {
             AccessTier::Manager
         } else {
             AccessTier::Member
@@ -1533,10 +1713,20 @@ fn ensure_guild_watcher(state: &Arc<WebState>, guild_id: u64) {
     let state = state.clone();
     tokio::spawn(async move {
         let mut last_signature = String::new();
+        let mut last_presence = String::new();
         loop {
             tokio::time::sleep(WATCH_INTERVAL).await;
             if viewer_count(&state, guild_id) == 0 {
                 break;
+            }
+            // 봇이 음성 채널을 옮기거나 사람이 들락날락하는 건 WS 연결 수와 무관해서
+            // 접속 레지스트리만 봐서는 알 수 없다. 여기서 캐시를 훑어 달라졌을 때만 민다.
+            // 전부 메모리·Discord 캐시라 DB 쿼리는 0회다 (§5.2 E).
+            let presence = build_presence(&state, guild_id).await;
+            let presence_wire = presence.to_string();
+            if presence_wire != last_presence {
+                last_presence = presence_wire;
+                emit(&state, guild_id, "presence", presence);
             }
             let player = state.app.player.get_state(guild_id).await;
             let position = state
@@ -1717,6 +1907,7 @@ async fn broadcast_queue(state: &Arc<WebState>, guild_id: u64) {
             value
         })
         .collect();
+    let (sorted_at, next_sort_at) = sort_clock(state);
     emit(
         state,
         guild_id,
@@ -1724,7 +1915,9 @@ async fn broadcast_queue(state: &Arc<WebState>, guild_id: u64) {
         json!({
             "items": items,
             "mode": settings.sort_mode.as_str(),
-            "sortedAt": now_utc(),
+            "sortedAt": sorted_at,
+            // 카운트다운 기준(V3 §5). 클라 타이머만 쓰면 백그라운드 탭에서 어긋난다.
+            "nextSortAt": next_sort_at,
         }),
     );
 }
@@ -1818,7 +2011,7 @@ async fn admin_page(
     };
     if !ctx.tier.is_manager() {
         let mut response = html_page(remote_page::denied(
-            "서버 관리 콘솔은 관리자만 들어올 수 있습니다.",
+            "서버 관리 콘솔은 관리자만 들어올 수 있어요.",
             guild_id,
         ));
         *response.status_mut() = StatusCode::FORBIDDEN;
@@ -1937,7 +2130,7 @@ async fn oauth_callback(
         return html_page(remote_page::login(
             auth.configured(),
             auth.dev_login,
-            Some(&format!("Discord 로그인이 취소되었습니다: {error}")),
+            Some(&format!("Discord 로그인이 취소됐어요: {error}")),
             None,
         ));
     }
@@ -2077,7 +2270,7 @@ async fn discord_get<T: for<'de> Deserialize<'de>>(
         .map_err(|error| format!("Discord API 연결 실패: {error}"))?;
     if !response.status().is_success() {
         return Err(format!(
-            "Discord API가 요청을 거부했습니다 ({})",
+            "Discord API가 요청을 거부했어요 ({})",
             response.status()
         ));
     }
@@ -2168,10 +2361,134 @@ async fn remote_logout(
         return Redirect::to("/music/login").into_response();
     };
     if !constant_time_eq(&form.csrf, &session.csrf_token) {
-        return json_error(StatusCode::FORBIDDEN, "CSRF 검증에 실패했습니다.");
+        return json_error(StatusCode::FORBIDDEN, "CSRF 검증에 실패했어요.");
     }
     end_remote_session(&state, &cookies);
     Redirect::to("/music/login").into_response()
+}
+
+// ───────────────────────── 개인 설정 (V3 §2) ─────────────────────────
+//
+// 화면 배치·테마는 **길드가 아니라 사람**에 붙는다. 서버마다 다른 배치를 쓰고 싶은
+// 사람은 없으니 길드 인가를 태우지 않고 세션만 본다. 대신 변경은 CSRF를 검사한다.
+
+/// 길드 없이 세션만 확인한다. `headers`가 있으면 CSRF도 같이 본다(변경 요청).
+fn session_only(
+    state: &Arc<WebState>,
+    cookies: &Cookies,
+    headers: Option<&HeaderMap>,
+) -> Result<RemoteSession, Response> {
+    let session = current_session(state, cookies)
+        .ok_or_else(|| json_error(StatusCode::UNAUTHORIZED, "Discord 로그인이 필요해요."))?;
+    if let Some(headers) = headers {
+        if !verify_csrf(&session, headers) {
+            return Err(json_error(StatusCode::FORBIDDEN, "CSRF 검증에 실패했어요."));
+        }
+    }
+    Ok(session)
+}
+
+/// 저장된 개인 설정. **기본값을 채우지 않는다** — `layout`이 없다는 사실 자체가
+/// "아직 한 번도 안 골랐다"는 신호라서, 첫 진입 배치 선택 시트가 그걸 보고 뜬다(V3 §3).
+fn prefs_json(state: &WebState, user_id: u64) -> Value {
+    Value::Object(
+        state
+            .app
+            .remote
+            .load_prefs(user_id)
+            .into_iter()
+            .map(|(key, value)| (key, Value::String(value)))
+            .collect(),
+    )
+}
+
+/// 부분 갱신 요청을 `(저장할 것, 지울 것)`으로 가른다.
+///
+/// 숫자·불리언으로 와도 문자열로 바꿔 받는다(`webVolume: 60`, `lyricsOpen: true`).
+/// 모르는 키나 범위를 벗어난 값은 **조용히 버리지 않고 400**으로 돌려준다 —
+/// 화면에서 통과한 값이 서버에서 사라지면 아무도 원인을 못 찾는다.
+fn parse_pref_patch(
+    object: &serde_json::Map<String, Value>,
+) -> Result<(BTreeMap<String, String>, Vec<String>), String> {
+    let mut updates: BTreeMap<String, String> = BTreeMap::new();
+    let mut removals: Vec<String> = Vec::new();
+    for (key, value) in object {
+        let text = match value {
+            // null = "기본으로 되돌리기". 지운 키는 다시 미선택 상태가 된다.
+            Value::Null => {
+                removals.push(key.clone());
+                continue;
+            }
+            Value::String(text) => text.clone(),
+            Value::Number(number) => number.to_string(),
+            Value::Bool(flag) => (if *flag { "1" } else { "0" }).to_string(),
+            _ => return Err(format!("{key}: 값이 문자열이나 숫자여야 해요.")),
+        };
+        if !is_valid_pref(key, &text) {
+            return Err(format!("{key}: 저장할 수 없는 값이에요 ({text})."));
+        }
+        updates.insert(key.clone(), text);
+    }
+    Ok((updates, removals))
+}
+
+async fn api_prefs_get(State(state): State<Arc<WebState>>, cookies: Cookies) -> Response {
+    let session = match session_only(&state, &cookies, None) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    json_ok(json!({ "prefs": prefs_json(&state, session.user_id) }))
+}
+
+/// 부분 갱신. `null`을 보내면 그 키를 지운다("기본으로 되돌리기").
+/// 값 검증은 저장소와 **같은** `is_valid_pref`를 쓴다 — 화면에서 통과한 값이
+/// 서버에서 조용히 사라지면 원인을 못 찾는다.
+async fn api_prefs_put(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let session = match session_only(&state, &cookies, Some(&headers)) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Some(object) = body.as_object() else {
+        return json_error(StatusCode::BAD_REQUEST, "개인 설정은 객체로 보내 주세요.");
+    };
+    if object.len() > 20 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "한 번에 바꿀 수 있는 항목은 20개까지예요.",
+        );
+    }
+    if rate_limited(
+        &state,
+        0,
+        session.user_id,
+        "prefs",
+        Duration::from_millis(200),
+    ) {
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "설정 저장이 너무 잦아요. 드래그가 끝난 뒤 한 번만 보내 주세요.",
+        );
+    }
+
+    let (updates, removals) = match parse_pref_patch(object) {
+        Ok(parsed) => parsed,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
+    };
+    if let Err(error) = state.app.remote.save_prefs(session.user_id, &updates) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    }
+    if !removals.is_empty() {
+        let keys: Vec<&str> = removals.iter().map(String::as_str).collect();
+        if let Err(error) = state.app.remote.delete_prefs(session.user_id, &keys) {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+        }
+    }
+    json_ok(json!({ "ok": true, "prefs": prefs_json(&state, session.user_id) }))
 }
 
 // ───────────────────────── 상태 조회 (hot / cold) ─────────────────────────
@@ -2214,6 +2531,7 @@ async fn api_state_hot(
             queue_item_json(item, &score, ctx.user_id(), my_vote)
         })
         .collect();
+    let (sorted_at, next_sort_at) = sort_clock(&state);
 
     json_ok(json!({
         "player": {
@@ -2230,7 +2548,8 @@ async fn api_state_hot(
         "positionSeconds": position,
         "sampledAtUtc": sampled_at,
         "queueMode": ctx.settings.sort_mode.as_str(),
-        "sortedAt": now_utc(),
+        "sortedAt": sorted_at,
+        "nextSortAt": next_sort_at,
         "queue": queue,
         "presence": build_presence(&state, guild_id).await,
     }))
@@ -2335,6 +2654,9 @@ async fn api_state_cold(
             "sortMode": settings.sort_mode.as_str(),
         },
         "permissions": permissions_json(&state, &ctx),
+        "search": search_json(&state),
+        // 진입 시 왕복을 하나 줄이려고 개인 설정도 같이 싣는다 (V3 §2).
+        "prefs": prefs_json(&state, session.user_id),
         "suspension": ctx.suspension_json(),
         "playlists": playlists,
         "liked": liked,
@@ -2344,6 +2666,18 @@ async fn api_state_cold(
     }))
 }
 
+/// 검색을 어디서 돌릴지(V3 §6).
+///
+/// 운영 패널에 YouTube API 키가 있으면 브라우저가 YouTube Data API를 직접 부른다
+/// (봇 호스트의 `yt-dlp`가 느리거나 막혀도 검색이 살아 있다). 키가 없으면 지금처럼 서버가 찾는다.
+/// 키는 브라우저로 그대로 나가는 값이라 리퍼러 제한이 전제다 — 운영 패널에 그렇게 적어 뒀다.
+fn search_json(state: &WebState) -> Value {
+    match auth_config(state).youtube_api_key() {
+        Some(key) => json!({ "mode": "browser", "youtubeApiKey": key }),
+        None => json!({ "mode": "server" }),
+    }
+}
+
 /// `can` 맵과 "내 권한" 화면의 근거(`entries`)를 한 번에 만든다.
 /// 두 값이 같은 판정 함수를 쓰기 때문에 화면이 실제 서버 판정과 어긋나지 않는다.
 fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
@@ -2351,41 +2685,44 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
     let member = &ctx.member;
     let viewer = ctx.tier.is_viewer();
 
-    // (키, 라벨, 규칙, 추가 게이트)
-    let rows: Vec<(&str, &str, PermissionRule, bool)> = vec![
-        ("search", "곡 검색·신청", settings.search_rule, true),
-        ("vote", "좋아요·슈퍼 좋아요", settings.vote_rule, true),
-        ("playback", "재생 / 일시정지 / 스킵", settings.playback_rule, true),
-        ("seek", "재생 위치 이동", settings.seek_rule, true),
-        ("volume", "볼륨 조절", settings.volume_rule, true),
-        ("queueEdit", "대기열 편집", settings.queue_edit_rule, true),
-        ("chat", "채팅 쓰기·반응·답장", settings.chat_rule, settings.chat_enabled),
-        ("playlistEdit", "재생목록 편집", settings.queue_edit_rule, true),
-        ("library", "보관함·재생목록", PermissionRule::GuildMember, true),
-        ("suggest", "제안 작성·공감", PermissionRule::GuildMember, settings.suggestion_enabled),
-        ("chatDelete", "남의 채팅 삭제", PermissionRule::Administrator, true),
-        ("suggestStatus", "제안 상태 변경", PermissionRule::Administrator, true),
-        ("suspend", "유저 정지·해제", PermissionRule::Administrator, true),
-        ("sortMode", "정렬 모드 변경", PermissionRule::Administrator, true),
-        ("console", "서버 관리 콘솔", PermissionRule::Administrator, true),
+    // (화면 키, 라벨, 규칙, 추가 게이트, 지정 역할을 찾을 권한 키)
+    // 마지막 항목이 §1의 핵심이다. `playlistEdit`처럼 다른 권한의 규칙을 빌려 쓰는 줄은
+    // 역할도 그 권한(`queueEdit`)의 것을 봐야 화면과 실제 판정이 어긋나지 않는다.
+    let rows: Vec<(&str, &str, PermissionRule, bool, &str)> = vec![
+        ("search", "곡 검색·신청", settings.search_rule, true, "search"),
+        ("vote", "좋아요·슈퍼 좋아요", settings.vote_rule, true, "vote"),
+        ("playback", "재생 / 일시정지 / 스킵", settings.playback_rule, true, "playback"),
+        ("seek", "재생 위치 이동", settings.seek_rule, true, "seek"),
+        ("volume", "볼륨 조절", settings.volume_rule, true, "volume"),
+        ("queueEdit", "대기열 편집", settings.queue_edit_rule, true, "queueEdit"),
+        ("chat", "채팅 쓰기·반응·답장", settings.chat_rule, settings.chat_enabled, "chat"),
+        ("autoplaySeed", "자동 재생 기준 곡 등록", settings.autoplay_seed_rule, true, "autoplaySeed"),
+        ("playlistEdit", "재생목록 편집", settings.queue_edit_rule, true, "queueEdit"),
+        ("library", "보관함·재생목록", PermissionRule::GuildMember, true, "library"),
+        ("suggest", "제안 작성·공감", PermissionRule::GuildMember, settings.suggestion_enabled, "suggest"),
+        ("chatDelete", "남의 채팅 삭제", PermissionRule::Administrator, true, "chatDelete"),
+        ("suggestStatus", "제안 상태 변경", PermissionRule::Administrator, true, "suggestStatus"),
+        ("suspend", "유저 정지·해제", PermissionRule::Administrator, true, "suspend"),
+        ("sortMode", "정렬 모드 변경", PermissionRule::Administrator, true, "sortMode"),
+        ("console", "서버 관리 콘솔", PermissionRule::Administrator, true, "console"),
     ];
 
     let mut can = serde_json::Map::new();
     let mut entries: Vec<Value> = Vec::with_capacity(rows.len() + 1);
-    for (key, label, rule, gate) in rows {
-        let base = rule_base_allowed(rule, settings, member);
-        let allowed = !viewer && gate && permission_allowed(rule, settings, member);
+    for (key, label, rule, gate, role_key) in rows {
+        let base = rule_base_allowed(role_key, rule, settings, member);
+        let allowed = !viewer && gate && permission_allowed(role_key, rule, settings, member);
         let via_admin = allowed && !base;
         let reason = if viewer {
             Some(
                 ctx.viewer_reason
                     .clone()
-                    .unwrap_or_else(|| "읽기 전용이라 조작할 수 없다.".into()),
+                    .unwrap_or_else(|| "읽기 전용이라 아무것도 조작할 수 없어요.".into()),
             )
         } else if !gate {
-            Some("관리자가 이 기능을 껐다.".into())
+            Some("관리자가 이 기능을 꺼 뒀어요.".into())
         } else if !allowed && rule == PermissionRule::Disabled {
-            Some("사용 안 함으로 설정돼 있어 아무도 쓸 수 없다.".into())
+            Some("사용 안 함으로 설정돼 있어서 아무도 쓸 수 없어요.".into())
         } else {
             None
         };
@@ -2398,6 +2735,13 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
             "ruleLabel": rule_label(rule),
             "viaAdmin": via_admin,
             "reason": reason,
+            // 왜 되는지/안 되는지 설명하려면 역할 이름이 있어야 말이 된다 (V3 §1).
+            // 지정 역할 규칙이 아닌 줄은 빈 배열이다.
+            "roleNames": if rule == PermissionRule::ConfiguredRole {
+                json!(role_names(state, ctx.guild_id(), settings.roles_for(role_key)))
+            } else {
+                json!([])
+            },
         }));
     }
 
@@ -2411,11 +2755,31 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
         "rule": "owner",
         "ruleLabel": "봇 주인 전용",
         "viaAdmin": false,
-        "reason": if ops { Value::Null } else { Value::String("봇 주인만 들어갈 수 있다.".into()) },
+        "reason": if ops { Value::Null } else { Value::String("여기는 봇 주인만 들어갈 수 있어요.".into()) },
+        "roleNames": json!([]),
     }));
-    let _ = state;
 
     json!({ "can": Value::Object(can), "entries": entries })
+}
+
+/// 역할 ID를 사람이 읽는 이름으로. 캐시에 없는 역할(지워졌거나 아직 못 받은)은
+/// ID를 그대로 보여 준다 — 조용히 빼면 "역할 3개 지정했는데 2개만 보이는" 상황이 된다.
+fn role_names(state: &WebState, guild_id: u64, role_ids: &[u64]) -> Vec<String> {
+    let guild = state
+        .app
+        .discord_cache
+        .get()
+        .and_then(|cache| cache.guild(GuildId::new(guild_id)));
+    role_ids
+        .iter()
+        .map(|role_id| {
+            guild
+                .as_ref()
+                .and_then(|guild| guild.roles.get(&serenity::all::RoleId::new(*role_id)))
+                .map(|role| role.name.clone())
+                .unwrap_or_else(|| format!("역할 {role_id}"))
+        })
+        .collect()
 }
 
 /// 기존 단일 스냅샷. 새 프런트는 쓰지 않지만 외부 스크립트 호환을 위해 남긴다.
@@ -2703,7 +3067,7 @@ async fn api_search(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    if let Err(response) = ctx.require(ctx.settings.search_rule, "검색 권한이 없습니다.") {
+    if let Err(response) = ctx.require("search", ctx.settings.search_rule, "검색 권한이 없어요.") {
         return response;
     }
     if let Err(response) = ctx.require_not_suspended(SuspensionScope::Queue) {
@@ -2716,11 +3080,11 @@ async fn api_search(
         "search",
         Duration::from_millis(600),
     ) {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, "검색 요청이 너무 빠릅니다.");
+        return json_error(StatusCode::TOO_MANY_REQUESTS, "검색 요청이 너무 빨라요. 잠깐만 쉬었다 해요.");
     }
     let input = query.q.trim();
     if input.is_empty() || input.chars().count() > 200 {
-        return json_error(StatusCode::BAD_REQUEST, "검색어는 1~200자로 입력하세요.");
+        return json_error(StatusCode::BAD_REQUEST, "검색어는 1~200자로 입력해요.");
     }
     let provider = match query.provider.as_deref() {
         Some("SoundCloud") => ProviderKind::SoundCloud,
@@ -2872,7 +3236,7 @@ async fn api_enqueue(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    if let Err(response) = ctx.require(ctx.settings.search_rule, "대기열 등록 권한이 없습니다.") {
+    if let Err(response) = ctx.require("search", ctx.settings.search_rule, "대기열에 곡을 담을 권한이 없어요.") {
         return response;
     }
     if let Err(response) = ctx.require_not_suspended(SuspensionScope::Queue) {
@@ -2888,11 +3252,11 @@ async fn api_enqueue(
     ) {
         return json_error(
             StatusCode::TOO_MANY_REQUESTS,
-            "곡 등록 요청이 너무 빠릅니다.",
+            "곡 등록 요청이 너무 빨라요. 잠깐만 쉬었다 해요.",
         );
     }
     if !crate::media::resolver::can_resolve(&request.track.source_url) {
-        return json_error(StatusCode::BAD_REQUEST, "지원하지 않는 곡 URL입니다.");
+        return json_error(StatusCode::BAD_REQUEST, "지원하지 않는 곡 URL이에요.");
     }
     if let Some(rule) = state
         .app
@@ -2910,7 +3274,7 @@ async fn api_enqueue(
         return json_error(
             StatusCode::BAD_REQUEST,
             format!(
-                "차단 규칙에 의해 등록할 수 없습니다: {}",
+                "차단 규칙 때문에 담을 수 없어요: {}",
                 crate::blacklist::Blacklist::describe_rule(&rule)
             ),
         );
@@ -2932,7 +3296,7 @@ async fn api_enqueue(
         return json_error(
             StatusCode::BAD_REQUEST,
             format!(
-                "허용 곡 길이({}초)를 초과했습니다.",
+                "허용 곡 길이({}초)를 넘었어요.",
                 ctx.settings.max_track_seconds
             ),
         );
@@ -2954,7 +3318,7 @@ async fn api_enqueue(
         );
         return json_error(
             StatusCode::CONFLICT,
-            "이미 현재 곡이나 대기열에 있는 곡입니다.",
+            "이미 지금 재생 중이거나 대기열에 있는 곡이에요.",
         );
     }
     let user_count = player
@@ -2975,7 +3339,7 @@ async fn api_enqueue(
         );
         return json_error(
             StatusCode::CONFLICT,
-            "서버 또는 사용자 대기열 제한에 도달했습니다.",
+            "서버나 개인 대기열 제한에 닿았어요.",
         );
     }
     let item = QueueItem::new_user(
@@ -3042,16 +3406,17 @@ async fn api_control(
     ) {
         return json_error(
             StatusCode::TOO_MANY_REQUESTS,
-            "재생 제어 요청이 너무 빠릅니다.",
+            "재생 제어 요청이 너무 빨라요. 잠깐만 쉬었다 해요.",
         );
     }
-    let rule = match request.action.as_str() {
-        "seek" => ctx.settings.seek_rule,
-        "volume" => ctx.settings.volume_rule,
-        "shuffle" => ctx.settings.queue_edit_rule,
-        _ => ctx.settings.playback_rule,
+    // 어떤 권한 키로 볼지도 같이 정한다 — 지정 역할이 키마다 다르기 때문이다 (V3 §1).
+    let (rule_key_for_action, rule) = match request.action.as_str() {
+        "seek" => ("seek", ctx.settings.seek_rule),
+        "volume" => ("volume", ctx.settings.volume_rule),
+        "shuffle" => ("queueEdit", ctx.settings.queue_edit_rule),
+        _ => ("playback", ctx.settings.playback_rule),
     };
-    if let Err(response) = ctx.require(rule, "재생 제어 권한이 없습니다.") {
+    if let Err(response) = ctx.require(rule_key_for_action, rule, "재생을 조작할 권한이 없어요.") {
         return response;
     }
     if let Err(response) = ctx.require_not_suspended(SuspensionScope::Queue) {
@@ -3061,7 +3426,7 @@ async fn api_control(
     if player.voice_channel_id.is_none() {
         return json_error(
             StatusCode::CONFLICT,
-            "봇이 음성 채널에 연결되어 있지 않습니다.",
+            "봇이 음성 채널에 안 들어가 있어요.",
         );
     }
     if matches!(request.action.as_str(), "skip" | "seek") {
@@ -3069,7 +3434,7 @@ async fn api_control(
         if request.expected_item_id.as_deref() != current_id.as_deref() {
             return json_error(
                 StatusCode::CONFLICT,
-                "재생 상태가 이미 바뀌었습니다. 최신 상태를 다시 확인해 주세요.",
+                "재생 상태가 그새 바뀌었어요. 화면을 새로 받아 볼게요.",
             );
         }
     }
@@ -3110,7 +3475,7 @@ async fn api_control(
                 .map(|duration| duration.as_secs_f64())
                 .unwrap_or(0.0);
             if seconds < 0.0 || duration <= 0.0 || seconds > duration {
-                Err("탐색 위치가 곡 길이를 벗어났습니다.".into())
+                Err("옮기려는 위치가 곡 길이를 벗어났어요.".into())
             } else {
                 state
                     .app
@@ -3128,7 +3493,7 @@ async fn api_control(
             let volume = request.value.unwrap_or(-1.0).round() as i32;
             if volume < ctx.settings.min_volume || volume > ctx.settings.max_volume {
                 Err(format!(
-                    "볼륨은 {}~{} 사이여야 합니다.",
+                    "볼륨은 {}~{} 사이여야 해요.",
                     ctx.settings.min_volume, ctx.settings.max_volume
                 ))
             } else {
@@ -3145,7 +3510,7 @@ async fn api_control(
                 state.app.player.set_repeat(guild_id, mode).await;
                 Ok(format!("repeat:{}", repeat_key(mode)))
             }
-            None => Err("반복 모드는 off / track / queue 중 하나여야 합니다.".into()),
+            None => Err("반복 모드는 off / track / queue 중 하나여야 해요.".into()),
         },
         "shuffle" => {
             let enabled = request.value.map(|value| value > 0.5).unwrap_or(false);
@@ -3153,7 +3518,7 @@ async fn api_control(
             queue_changed = true;
             Ok(format!("shuffle:{enabled}"))
         }
-        _ => Err("지원하지 않는 재생 제어입니다.".into()),
+        _ => Err("지원하지 않는 재생 제어예요.".into()),
     };
     match result {
         Ok(after) => {
@@ -3217,7 +3582,7 @@ async fn api_vote(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    if let Err(response) = ctx.require(ctx.settings.vote_rule, "투표 권한이 없습니다.") {
+    if let Err(response) = ctx.require("vote", ctx.settings.vote_rule, "투표할 권한이 없어요.") {
         return response;
     }
     if let Err(response) = ctx.require_not_suspended(SuspensionScope::Queue) {
@@ -3230,7 +3595,7 @@ async fn api_vote(
         "vote",
         Duration::from_millis(250),
     ) {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, "투표 요청이 너무 빠릅니다.");
+        return json_error(StatusCode::TOO_MANY_REQUESTS, "투표 요청이 너무 빨라요. 잠깐만 쉬었다 해요.");
     }
     let player = state.app.player.get_state(guild_id).await;
     let Some(item) = player
@@ -3238,12 +3603,12 @@ async fn api_vote(
         .iter()
         .find(|item| item.id == request.item_id)
     else {
-        return json_error(StatusCode::NOT_FOUND, "대기열 항목을 찾을 수 없습니다.");
+        return json_error(StatusCode::NOT_FOUND, "그 대기열 항목을 찾지 못했어요.");
     };
     if item.requested_by_user_id == Some(ctx.user_id()) {
         return json_error(
             StatusCode::FORBIDDEN,
-            "자신이 신청한 곡에는 투표할 수 없습니다.",
+            "자기가 신청한 곡에는 투표할 수 없어요.",
         );
     }
     if let Err(error) = state.app.remote.set_vote(
@@ -3310,7 +3675,7 @@ async fn api_queue_action(
             StatusCode::FORBIDDEN,
             ctx.viewer_reason
                 .clone()
-                .unwrap_or_else(|| "읽기 전용 상태입니다.".into()),
+                .unwrap_or_else(|| "지금은 읽기 전용이에요.".into()),
         );
     }
     if let Err(response) = ctx.require_not_suspended(SuspensionScope::Queue) {
@@ -3322,14 +3687,14 @@ async fn api_queue_action(
         .iter()
         .position(|item| item.id == request.item_id)
     else {
-        return json_error(StatusCode::NOT_FOUND, "대기열 항목을 찾을 수 없습니다.");
+        return json_error(StatusCode::NOT_FOUND, "그 대기열 항목을 찾지 못했어요.");
     };
     let item = &player.upcoming[index];
     match request.action.as_str() {
         "remove" => {
             let own = item.requested_by_user_id == Some(ctx.user_id());
-            if !own && !ctx.allows(ctx.settings.queue_edit_rule) {
-                return json_error(StatusCode::FORBIDDEN, "이 곡을 제거할 권한이 없습니다.");
+            if !own && !ctx.allows("queueEdit", ctx.settings.queue_edit_rule) {
+                return json_error(StatusCode::FORBIDDEN, "이 곡을 뺄 권한이 없어요.");
             }
             let title = item.track.display_title().to_string();
             if !matches!(
@@ -3342,7 +3707,7 @@ async fn api_queue_action(
             ) {
                 return json_error(
                     StatusCode::CONFLICT,
-                    "대기열이 이미 바뀌었습니다. 최신 상태를 다시 확인해 주세요.",
+                    "대기열이 그새 바뀌었어요. 화면을 새로 받아 볼게요.",
                 );
             }
             audit_ok(
@@ -3389,7 +3754,7 @@ async fn api_queue_action(
                 }),
             );
         }
-        _ => return json_error(StatusCode::BAD_REQUEST, "지원하지 않는 큐 작업입니다."),
+        _ => return json_error(StatusCode::BAD_REQUEST, "지원하지 않는 대기열 작업이에요."),
     }
     broadcast_queue(&state, guild_id).await;
     json_ok(json!({ "ok": true }))
@@ -3417,8 +3782,9 @@ async fn api_library(
     };
     // 보관함은 "멤버라면 누구나"가 기준이지만, Viewer와 전체 정지자는 막힌다.
     if let Err(response) = ctx.require(
+        "library",
         PermissionRule::GuildMember,
-        "보관함을 사용할 권한이 없습니다.",
+        "보관함을 쓸 권한이 없어요.",
     ) {
         return response;
     }
@@ -3431,7 +3797,7 @@ async fn api_library(
     ) {
         return json_error(
             StatusCode::TOO_MANY_REQUESTS,
-            "보관함 요청이 너무 빠릅니다.",
+            "보관함 요청이 너무 빨라요. 잠깐만 쉬었다 해요.",
         );
     }
     if let Err(error) = state.app.remote.set_user_track(
@@ -3477,8 +3843,9 @@ async fn api_playlist_action(
         Err(response) => return response,
     };
     if let Err(response) = ctx.require(
+        "queueEdit",
         ctx.settings.queue_edit_rule,
-        "재생목록을 편집할 권한이 없습니다.",
+        "재생목록을 편집할 권한이 없어요.",
     ) {
         return response;
     }
@@ -3495,7 +3862,7 @@ async fn api_playlist_action(
     ) {
         return json_error(
             StatusCode::TOO_MANY_REQUESTS,
-            "재생목록 요청이 너무 빠릅니다.",
+            "재생목록 요청이 너무 빨라요. 잠깐만 쉬었다 해요.",
         );
     }
     let name = request.name.as_deref().map(str::trim).unwrap_or("");
@@ -3504,19 +3871,19 @@ async fn api_playlist_action(
         .and_then(|id| state.app.db.find_playlist(id));
     if let Some(playlist) = target.as_ref() {
         if playlist.scope != PlaylistScope::Guild || playlist.guild_id != Some(guild_id) {
-            return json_error(StatusCode::NOT_FOUND, "이 서버의 재생목록이 아닙니다.");
+            return json_error(StatusCode::NOT_FOUND, "이 서버의 재생목록이 아니에요.");
         }
         if playlist.owner_user_id != session.user_id && !ctx.tier.is_manager() {
             return json_error(
                 StatusCode::FORBIDDEN,
-                "소유자나 관리자만 수정할 수 있습니다.",
+                "만든 사람이나 관리자만 고칠 수 있어요.",
             );
         }
     }
     let audit_target = match request.action.as_str() {
         "create" => {
             if name.is_empty() || name.chars().count() > 80 {
-                return json_error(StatusCode::BAD_REQUEST, "이름은 1~80자로 입력하세요.");
+                return json_error(StatusCode::BAD_REQUEST, "이름은 1~80자로 입력해요.");
             }
             let id = state.app.db.create_playlist(
                 PlaylistScope::Guild,
@@ -3528,31 +3895,31 @@ async fn api_playlist_action(
         }
         "rename" => {
             let Some(playlist) = target else {
-                return json_error(StatusCode::NOT_FOUND, "재생목록을 찾을 수 없습니다.");
+                return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
             };
             if name.is_empty() || name.chars().count() > 80 {
-                return json_error(StatusCode::BAD_REQUEST, "이름은 1~80자로 입력하세요.");
+                return json_error(StatusCode::BAD_REQUEST, "이름은 1~80자로 입력해요.");
             }
             if !state.app.db.rename_playlist(playlist.id, name) {
-                return json_error(StatusCode::CONFLICT, "이름을 변경하지 못했습니다.");
+                return json_error(StatusCode::CONFLICT, "이름을 바꾸지 못했어요.");
             }
             format!("{}:{name}", playlist.id)
         }
         "delete" => {
             let Some(playlist) = target else {
-                return json_error(StatusCode::NOT_FOUND, "재생목록을 찾을 수 없습니다.");
+                return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
             };
             if !state.app.db.delete_playlist(playlist.id) {
-                return json_error(StatusCode::CONFLICT, "재생목록을 삭제하지 못했습니다.");
+                return json_error(StatusCode::CONFLICT, "재생목록을 지우지 못했어요.");
             }
             format!("{}:{}", playlist.id, playlist.name)
         }
         "addTrack" => {
             let Some(playlist) = target else {
-                return json_error(StatusCode::NOT_FOUND, "재생목록을 찾을 수 없습니다.");
+                return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
             };
             let Some(track) = request.track else {
-                return json_error(StatusCode::BAD_REQUEST, "추가할 곡이 없습니다.");
+                return json_error(StatusCode::BAD_REQUEST, "추가할 곡이 없어요.");
             };
             if track.duration.is_some_and(|duration| {
                 duration.as_secs_f64() > ctx.settings.max_track_seconds as f64
@@ -3560,7 +3927,7 @@ async fn api_playlist_action(
             {
                 return json_error(
                     StatusCode::BAD_REQUEST,
-                    "곡 길이 또는 차단 규칙 때문에 추가할 수 없습니다.",
+                    "곡 길이나 차단 규칙 때문에 추가할 수 없어요.",
                 );
             }
             state.app.db.add_playlist_entry(
@@ -3576,19 +3943,19 @@ async fn api_playlist_action(
         }
         "removeEntry" => {
             let Some(playlist) = target else {
-                return json_error(StatusCode::NOT_FOUND, "재생목록을 찾을 수 없습니다.");
+                return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
             };
             let Some(index) = request.entry_index else {
-                return json_error(StatusCode::BAD_REQUEST, "삭제할 곡 순서가 없습니다.");
+                return json_error(StatusCode::BAD_REQUEST, "지울 곡의 순서 번호가 없어요.");
             };
             if !state.app.db.remove_playlist_entry(playlist.id, index) {
-                return json_error(StatusCode::NOT_FOUND, "재생목록 곡을 찾을 수 없습니다.");
+                return json_error(StatusCode::NOT_FOUND, "재생목록에서 그 곡을 찾지 못했어요.");
             }
             format!("{}:{index}", playlist.id)
         }
         "enqueue" => {
             let Some(playlist) = target else {
-                return json_error(StatusCode::NOT_FOUND, "재생목록을 찾을 수 없습니다.");
+                return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
             };
             let tracks: Vec<TrackRef> = playlist
                 .entries
@@ -3598,7 +3965,7 @@ async fn api_playlist_action(
             if tracks.is_empty() {
                 return json_error(
                     StatusCode::CONFLICT,
-                    "재생목록에 등록 가능한 곡이 없습니다.",
+                    "재생목록에 담을 수 있는 곡이 없어요.",
                 );
             }
             if tracks.iter().any(|track| {
@@ -3608,7 +3975,7 @@ async fn api_playlist_action(
             }) {
                 return json_error(
                     StatusCode::BAD_REQUEST,
-                    "재생목록에 길이 제한을 넘거나 차단된 곡이 있습니다.",
+                    "재생목록에 길이 제한을 넘거나 차단된 곡이 섞여 있어요.",
                 );
             }
             let player = state.app.player.get_state(guild_id).await;
@@ -3624,7 +3991,7 @@ async fn api_playlist_action(
             {
                 return json_error(
                     StatusCode::CONFLICT,
-                    "재생목록 곡 중 하나가 이미 현재 곡이나 대기열에 있습니다.",
+                    "재생목록의 곡 하나가 이미 재생 중이거나 대기열에 있어요.",
                 );
             }
             let own = player
@@ -3636,7 +4003,7 @@ async fn api_playlist_action(
                 > ctx.settings.max_queue_per_guild.max(1) as usize
                 || own + tracks.len() > ctx.settings.max_queue_per_user.max(1) as usize
             {
-                return json_error(StatusCode::CONFLICT, "대기열 제한을 초과합니다.");
+                return json_error(StatusCode::CONFLICT, "대기열 제한을 넘어요.");
             }
             for track in tracks {
                 if crate::media::resolver::can_resolve(&track.source_url)
@@ -3665,7 +4032,7 @@ async fn api_playlist_action(
         _ => {
             return json_error(
                 StatusCode::BAD_REQUEST,
-                "지원하지 않는 재생목록 작업입니다.",
+                "지원하지 않는 재생목록 작업이에요.",
             );
         }
     };
@@ -3706,10 +4073,10 @@ fn chat_gate(ctx: &AuthContext) -> Result<(), Response> {
     if !ctx.settings.chat_enabled {
         return Err(json_error(
             StatusCode::FORBIDDEN,
-            "관리자가 채팅을 껐습니다.",
+            "관리자가 채팅을 꺼 뒀어요.",
         ));
     }
-    ctx.require(ctx.settings.chat_rule, "채팅 권한이 없습니다.")?;
+    ctx.require("chat", ctx.settings.chat_rule, "채팅할 권한이 없어요.")?;
     ctx.require_not_suspended(SuspensionScope::Chat)
 }
 
@@ -3729,7 +4096,7 @@ async fn api_chat(
     }
     let content = request.content.trim();
     if content.is_empty() || content.chars().count() > 2000 {
-        return json_error(StatusCode::BAD_REQUEST, "메시지는 1~2000자로 입력하세요.");
+        return json_error(StatusCode::BAD_REQUEST, "메시지는 1~2000자로 입력해요.");
     }
     {
         let mut rate = state.remote_chat_rate.lock().unwrap();
@@ -3740,7 +4107,7 @@ async fn api_chat(
         {
             return json_error(
                 StatusCode::TOO_MANY_REQUESTS,
-                "메시지를 너무 빠르게 보내고 있습니다.",
+                "메시지를 너무 빠르게 보내고 있어요. 숨 좀 돌려요.",
             );
         }
         rate.insert((guild_id, ctx.user_id()), Instant::now());
@@ -3832,7 +4199,7 @@ async fn api_chat_reaction(
         return response;
     }
     if request.emoji.is_empty() || request.emoji.chars().count() > 8 {
-        return json_error(StatusCode::BAD_REQUEST, "이모지가 올바르지 않습니다.");
+        return json_error(StatusCode::BAD_REQUEST, "이모지가 올바르지 않아요.");
     }
     match state.app.remote.toggle_chat_reaction(
         guild_id,
@@ -3887,7 +4254,7 @@ async fn api_chat_delete(
     if !ctx.tier.is_manager() {
         // 내 메시지를 지우는 것도 채팅 권한이 있어야 한다.
         if !mine {
-            return json_error(StatusCode::FORBIDDEN, "이 메시지를 삭제할 권한이 없습니다.");
+            return json_error(StatusCode::FORBIDDEN, "이 메시지를 지울 권한이 없어요.");
         }
         if let Err(response) = chat_gate(&ctx) {
             return response;
@@ -3916,7 +4283,7 @@ async fn api_chat_delete(
             );
             json_ok(json!({ "ok": true }))
         }
-        Ok(false) => json_error(StatusCode::NOT_FOUND, "메시지를 찾을 수 없습니다."),
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "그 메시지를 찾지 못했어요."),
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
@@ -3966,7 +4333,7 @@ async fn api_chat_report(
             return response;
         }
         let Some(report_id) = request.report_id else {
-            return json_error(StatusCode::BAD_REQUEST, "신고 ID가 없습니다.");
+            return json_error(StatusCode::BAD_REQUEST, "신고 ID가 없어요.");
         };
         return match state.app.remote.resolve_chat_report(guild_id, report_id) {
             Ok(true) => {
@@ -3980,7 +4347,7 @@ async fn api_chat_report(
                 );
                 json_ok(json!({ "ok": true }))
             }
-            Ok(false) => json_error(StatusCode::NOT_FOUND, "신고를 찾을 수 없습니다."),
+            Ok(false) => json_error(StatusCode::NOT_FOUND, "그 신고를 찾지 못했어요."),
             Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         };
     }
@@ -3989,7 +4356,7 @@ async fn api_chat_report(
     }
     let reason = request.reason.trim();
     if reason.is_empty() || reason.chars().count() > 300 {
-        return json_error(StatusCode::BAD_REQUEST, "신고 사유는 1~300자로 입력하세요.");
+        return json_error(StatusCode::BAD_REQUEST, "신고 사유는 1~300자로 입력해요.");
     }
     if state
         .app
@@ -3997,7 +4364,7 @@ async fn api_chat_report(
         .chat_message_owner(guild_id, request.message_id)
         == Some(ctx.user_id())
     {
-        return json_error(StatusCode::FORBIDDEN, "자신의 메시지는 신고할 수 없습니다.");
+        return json_error(StatusCode::FORBIDDEN, "자기 메시지는 신고할 수 없어요.");
     }
     match state.app.remote.report_chat_message(
         guild_id,
@@ -4017,7 +4384,7 @@ async fn api_chat_report(
             );
             json_ok(json!({ "ok": true }))
         }
-        Ok(false) => json_error(StatusCode::NOT_FOUND, "메시지를 찾을 수 없습니다."),
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "그 메시지를 찾지 못했어요."),
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
@@ -4043,9 +4410,9 @@ async fn api_suggestion_create(
         Err(response) => return response,
     };
     if !ctx.settings.suggestion_enabled {
-        return json_error(StatusCode::FORBIDDEN, "관리자가 제안 게시판을 껐습니다.");
+        return json_error(StatusCode::FORBIDDEN, "관리자가 제안 게시판을 꺼 뒀어요.");
     }
-    if let Err(response) = ctx.require(PermissionRule::GuildMember, "제안 권한이 없습니다.") {
+    if let Err(response) = ctx.require("suggest", PermissionRule::GuildMember, "제안을 올릴 권한이 없어요.") {
         return response;
     }
     if let Err(response) = ctx.require_not_suspended(SuspensionScope::Chat) {
@@ -4054,10 +4421,10 @@ async fn api_suggestion_create(
     let title = request.title.trim();
     let body = request.body.trim();
     if title.is_empty() || title.chars().count() > 120 {
-        return json_error(StatusCode::BAD_REQUEST, "제목은 1~120자로 입력하세요.");
+        return json_error(StatusCode::BAD_REQUEST, "제목은 1~120자로 입력해요.");
     }
     if body.is_empty() || body.chars().count() > 4000 {
-        return json_error(StatusCode::BAD_REQUEST, "내용은 1~4000자로 입력하세요.");
+        return json_error(StatusCode::BAD_REQUEST, "내용은 1~4000자로 입력해요.");
     }
     if rate_limited(
         &state,
@@ -4066,7 +4433,7 @@ async fn api_suggestion_create(
         "suggest",
         Duration::from_secs(10),
     ) {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, "제안은 10초에 하나만 올릴 수 있습니다.");
+        return json_error(StatusCode::TOO_MANY_REQUESTS, "제안은 10초에 하나만 올릴 수 있어요.");
     }
     match state.app.remote.create_suggestion(
         guild_id,
@@ -4109,7 +4476,7 @@ async fn api_suggestion_vote(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    if let Err(response) = ctx.require(PermissionRule::GuildMember, "공감 권한이 없습니다.") {
+    if let Err(response) = ctx.require("suggest", PermissionRule::GuildMember, "공감할 권한이 없어요.") {
         return response;
     }
     if let Err(response) = ctx.require_not_suspended(SuspensionScope::Chat) {
@@ -4129,7 +4496,7 @@ async fn api_suggestion_vote(
             );
             json_ok(json!({ "ok": true, "active": active }))
         }
-        Ok(None) => json_error(StatusCode::NOT_FOUND, "제안을 찾을 수 없습니다."),
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "그 제안을 찾지 못했어요."),
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
@@ -4157,7 +4524,7 @@ async fn api_suggestion_status(
         return response;
     }
     let Some(status) = SuggestionStatus::parse(&request.status) else {
-        return json_error(StatusCode::BAD_REQUEST, "알 수 없는 제안 상태입니다.");
+        return json_error(StatusCode::BAD_REQUEST, "알 수 없는 제안 상태예요.");
     };
     let note = request.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
     match state.app.remote.set_suggestion_status(
@@ -4184,7 +4551,208 @@ async fn api_suggestion_status(
             );
             json_ok(json!({ "ok": true }))
         }
-        Ok(false) => json_error(StatusCode::NOT_FOUND, "제안을 찾을 수 없습니다."),
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "그 제안을 찾지 못했어요."),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+// ───────────────────────── 자동 재생 기준 곡 (V3 §8) ─────────────────────────
+//
+// 시드가 하나라도 있으면 추천 엔진이 그 곡들의 라디오를 라운드로빈으로 돈다.
+// 하나도 없으면 지금처럼 최근 재생 기반으로 움직인다 — 그 설명은 화면이 한다.
+
+fn autoplay_seed_json(state: &WebState, guild_id: u64, seed: &AutoplaySeed) -> Value {
+    let display = state
+        .app
+        .discord_cache
+        .get()
+        .and_then(|cache| cache.guild(GuildId::new(guild_id)))
+        .and_then(|guild| {
+            guild
+                .members
+                .get(&UserId::new(seed.added_by_user_id))
+                .map(|member| member.display_name().to_string())
+        });
+    json!({
+        "cacheKey": seed.cache_key,
+        "track": track_json(&seed.track),
+        "addedByUserId": seed.added_by_user_id.to_string(),
+        "addedByDisplayName": display.unwrap_or_else(|| seed.added_by_user_id.to_string()),
+        "addedUtc": seed.added_utc,
+    })
+}
+
+/// 목록 + 상한 + 내가 고칠 수 있는지. 권한이 없어도 **보이기는 한다**(V3 §8.5).
+fn autoplay_payload(state: &WebState, guild_id: u64, can_edit: bool) -> Value {
+    let seeds: Vec<Value> = state
+        .app
+        .remote
+        .list_autoplay_seeds(guild_id)
+        .iter()
+        .map(|seed| autoplay_seed_json(state, guild_id, seed))
+        .collect();
+    json!({ "seeds": seeds, "max": MAX_AUTOPLAY_SEEDS, "canEdit": can_edit })
+}
+
+/// 시드가 바뀌면 보고 있는 사람 모두에게 알린다. 개인화 필드가 없어서 그대로 보내도 된다.
+fn broadcast_autoplay(state: &Arc<WebState>, guild_id: u64) {
+    let payload = autoplay_payload(state, guild_id, true);
+    emit(state, guild_id, "autoplay", payload);
+}
+
+async fn api_autoplay_seeds(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let can_edit = ctx.allows("autoplaySeed", ctx.settings.autoplay_seed_rule);
+    json_ok(autoplay_payload(&state, guild_id, can_edit))
+}
+
+/// 기준 곡 편집 공통 게이트 — 권한 + 신청 정지.
+fn autoplay_gate(ctx: &AuthContext) -> Result<(), Response> {
+    ctx.require(
+        "autoplaySeed",
+        ctx.settings.autoplay_seed_rule,
+        "자동 재생 기준 곡을 바꿀 권한이 없어요.",
+    )?;
+    ctx.require_not_suspended(SuspensionScope::Queue)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoplaySeedAddRequest {
+    track: TrackRef,
+}
+
+async fn api_autoplay_seed_add(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<AutoplaySeedAddRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = autoplay_gate(&ctx) {
+        return response;
+    }
+    if !crate::media::resolver::can_resolve(&request.track.source_url) {
+        return json_error(StatusCode::BAD_REQUEST, "지원하지 않는 곡 URL이에요.");
+    }
+    if state.app.blacklist.is_blocked(guild_id, &request.track) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "차단된 곡은 기준 곡으로 삼을 수 없어요.",
+        );
+    }
+    let title = request.track.display_title().to_string();
+    match state
+        .app
+        .remote
+        .add_autoplay_seed(guild_id, &request.track, ctx.user_id())
+    {
+        Ok(SeedAddOutcome::Added) => {
+            audit_ok(
+                &state,
+                guild_id,
+                &ctx.session,
+                "autoplay.seed.add",
+                Some(&title),
+                Some("added"),
+            );
+            broadcast_autoplay(&state, guild_id);
+            json_ok(json!({ "ok": true, "message": SeedAddOutcome::Added.message() }))
+        }
+        // 거절 사유 문구는 저장소가 들고 있는 걸 그대로 쓴다 — 화면과 서버가 다른 말을 하면 안 된다.
+        Ok(outcome) => json_error(StatusCode::BAD_REQUEST, outcome.message()),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoplaySeedRemoveRequest {
+    cache_key: String,
+}
+
+async fn api_autoplay_seed_remove(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<AutoplaySeedRemoveRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = autoplay_gate(&ctx) {
+        return response;
+    }
+    match state
+        .app
+        .remote
+        .remove_autoplay_seed(guild_id, request.cache_key.trim())
+    {
+        Ok(true) => {
+            audit_ok(
+                &state,
+                guild_id,
+                &ctx.session,
+                "autoplay.seed.remove",
+                Some(request.cache_key.trim()),
+                Some("removed"),
+            );
+            broadcast_autoplay(&state, guild_id);
+            json_ok(json!({ "ok": true }))
+        }
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "그 기준 곡을 찾지 못했어요."),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoplaySeedReorderRequest {
+    cache_keys: Vec<String>,
+}
+
+async fn api_autoplay_seeds_reorder(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<AutoplaySeedReorderRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = autoplay_gate(&ctx) {
+        return response;
+    }
+    if request.cache_keys.len() > MAX_AUTOPLAY_SEEDS {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!("기준 곡은 {MAX_AUTOPLAY_SEEDS}곡까지예요."),
+        );
+    }
+    match state
+        .app
+        .remote
+        .reorder_autoplay_seeds(guild_id, &request.cache_keys)
+    {
+        Ok(()) => {
+            broadcast_autoplay(&state, guild_id);
+            json_ok(json!({ "ok": true }))
+        }
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
@@ -4225,24 +4793,24 @@ async fn suspend_impl(
     }
     let guild_id = ctx.guild_id();
     let Ok(target) = request.user_id.trim().parse::<u64>() else {
-        return json_error(StatusCode::BAD_REQUEST, "대상 사용자 ID가 올바르지 않습니다.");
+        return json_error(StatusCode::BAD_REQUEST, "대상 사용자 ID가 올바르지 않아요.");
     };
     let Some(scope) = SuspensionScope::parse(&request.scope) else {
-        return json_error(StatusCode::BAD_REQUEST, "정지 범위는 all / chat / queue 중 하나여야 합니다.");
+        return json_error(StatusCode::BAD_REQUEST, "정지 범위는 all / chat / queue 중 하나여야 해요.");
     };
     if target == ctx.user_id() {
-        return json_error(StatusCode::BAD_REQUEST, "자기 자신은 정지할 수 없습니다.");
+        return json_error(StatusCode::BAD_REQUEST, "자기 자신은 정지할 수 없어요.");
     }
     // 관리자는 다른 관리자를 정지할 수 없다. 봇 주인만 가능하다 (사양서 §1.2 마지막 줄).
     let target_tier = tier_of_member(state, guild_id, target, &ctx.settings);
     if target_tier.is_manager() && !ctx.tier.is_owner() {
         return json_error(
             StatusCode::FORBIDDEN,
-            "관리자와 봇 주인은 봇 주인만 정지할 수 있습니다.",
+            "관리자와 봇 주인은 봇 주인만 정지할 수 있어요.",
         );
     }
     if target_tier.is_owner() {
-        return json_error(StatusCode::FORBIDDEN, "봇 주인은 정지할 수 없습니다.");
+        return json_error(StatusCode::FORBIDDEN, "봇 주인은 정지할 수 없어요.");
     }
     let expires = match request.minutes {
         Some(minutes) if minutes > 0 => Some(
@@ -4320,11 +4888,11 @@ fn tier_of_member(
             })
             .unwrap_or(false)
     });
-    let configured = member
+    let manager_role = member
         .roles
         .iter()
-        .any(|role| settings.configured_role_ids.contains(&role.get()));
-    if admin || configured {
+        .any(|role| settings.manager_roles().contains(&role.get()));
+    if admin || manager_role {
         AccessTier::Manager
     } else {
         AccessTier::Member
@@ -4380,7 +4948,7 @@ async fn api_settings(
         || !(1..=3650).contains(&request.audit_retention_days)
         || request.configured_role_ids.len() > 50
     {
-        return json_error(StatusCode::BAD_REQUEST, "설정 값 범위가 올바르지 않습니다.");
+        return json_error(StatusCode::BAD_REQUEST, "설정 값이 허용 범위를 벗어났어요.");
     }
     let before = serde_json::to_string(&settings).unwrap_or_default();
     settings.min_volume = request.min_volume;
@@ -4394,7 +4962,11 @@ async fn api_settings(
     settings.seek_rule = request.seek_rule;
     settings.volume_rule = request.volume_rule;
     settings.queue_edit_rule = request.queue_edit_rule;
+    // 레거시 라우트는 "지정 역할 하나로 전부"라는 옛 의미 그대로 저장한다.
+    // 분리된 값(`rule_role_ids`/`manager_role_ids`)을 비워 두면 읽을 때 이 값으로 폴백한다.
     settings.configured_role_ids = request.configured_role_ids;
+    settings.rule_role_ids.clear();
+    settings.manager_role_ids.clear();
     settings.max_queue_per_user = request.max_queue_per_user;
     settings.max_queue_per_guild = request.max_queue_per_guild;
     settings.max_track_seconds = request.max_track_seconds;
@@ -4478,9 +5050,29 @@ async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value 
         "seekRule": rule_key(settings.seek_rule),
         "volumeRule": rule_key(settings.volume_rule),
         "queueEditRule": rule_key(settings.queue_edit_rule),
-        // 문자열 배열로 주고받는다 — JS 숫자 정밀도 손실 방지 (계약 §3).
-        "configuredRoleIds": settings
-            .configured_role_ids
+        "autoplaySeedRule": rule_key(settings.autoplay_seed_rule),
+        // V3 §1: 통짜 `configuredRoleIds`는 더 이상 내보내지 않는다.
+        // 권한 키마다 지정 역할이 따로이고, 관리자 지정 역할은 아예 별개다.
+        // 전부 문자열 배열이다 — JS 숫자 정밀도 손실 방지 (계약 §3).
+        "ruleRoleIds": Value::Object(
+            PERMISSION_KEYS
+                .iter()
+                .map(|key| {
+                    (
+                        (*key).to_string(),
+                        json!(
+                            settings
+                                .roles_for(key)
+                                .iter()
+                                .map(|id| id.to_string())
+                                .collect::<Vec<_>>()
+                        ),
+                    )
+                })
+                .collect(),
+        ),
+        "managerRoleIds": settings
+            .manager_roles()
             .iter()
             .map(|id| id.to_string())
             .collect::<Vec<_>>(),
@@ -4518,9 +5110,33 @@ fn json_rule(body: &Value, key: &str) -> Result<Option<PermissionRule>, String> 
     match body.get(key).and_then(Value::as_str) {
         Some(value) => parse_rule(value)
             .map(Some)
-            .ok_or_else(|| format!("{key}: 알 수 없는 권한 규칙입니다.")),
+            .ok_or_else(|| format!("{key}: 알 수 없는 권한 규칙이에요.")),
         None => Ok(None),
     }
+}
+
+/// 역할 ID 배열. 문자열로 오는 게 정상이지만(정밀도) 숫자도 받아 준다.
+fn parse_role_ids(value: &Value) -> Result<Vec<u64>, String> {
+    let Some(items) = value.as_array() else {
+        return Err("역할 목록은 배열이어야 해요.".into());
+    };
+    if items.len() > 50 {
+        return Err("지정 역할은 최대 50개까지예요.".into());
+    }
+    let mut ids: Vec<u64> = Vec::with_capacity(items.len());
+    for item in items {
+        let parsed = match item {
+            Value::String(text) => text.trim().parse::<u64>().ok(),
+            Value::Number(number) => number.as_u64(),
+            _ => None,
+        };
+        match parsed {
+            Some(id) if id != 0 && !ids.contains(&id) => ids.push(id),
+            Some(_) => {}
+            None => return Err("역할 ID가 숫자가 아니에요.".into()),
+        }
+    }
+    Ok(ids)
 }
 
 /// `PUT /admin/settings/{section}` — 그 섹션의 키만 담은 부분 객체를 받는다.
@@ -4543,7 +5159,7 @@ async fn admin_settings_put(
         "order" => {
             if let Some(mode) = body.get("sortMode").and_then(Value::as_str) {
                 let Some(mode) = QueueSortMode::parse(mode) else {
-                    return json_error(StatusCode::BAD_REQUEST, "알 수 없는 정렬 모드입니다.");
+                    return json_error(StatusCode::BAD_REQUEST, "알 수 없는 정렬 모드예요.");
                 };
                 sort_mode_changed = settings.sort_mode != mode;
                 settings.sort_mode = mode;
@@ -4552,7 +5168,7 @@ async fn admin_settings_put(
                 if volume < settings.min_volume || volume > settings.max_volume {
                     return json_error(
                         StatusCode::BAD_REQUEST,
-                        "기본 볼륨이 최소/최대 범위를 벗어났습니다.",
+                        "기본 볼륨이 최소/최대 범위를 벗어났어요.",
                     );
                 }
                 settings.default_volume = volume;
@@ -4565,13 +5181,16 @@ async fn admin_settings_put(
             }
             if let Some(mode) = body.get("repeatMode").and_then(Value::as_str) {
                 let Some(mode) = parse_repeat(mode) else {
-                    return json_error(StatusCode::BAD_REQUEST, "알 수 없는 반복 모드입니다.");
+                    return json_error(StatusCode::BAD_REQUEST, "알 수 없는 반복 모드예요.");
                 };
                 state.app.player.set_repeat(guild_id, mode).await;
             }
         }
         "perms" => {
-            let rules: [(&str, &mut PermissionRule); 7] = [
+            // 저장하는 순간 레거시 통짜 값을 8개 키로 펼친다. 그래야 이후로는
+            // 읽기 폴백에 기대지 않고 키마다 따로 관리된다 (V3 §1 마이그레이션).
+            settings.expand_legacy_roles();
+            let rules: [(&str, &mut PermissionRule); 8] = [
                 ("searchRule", &mut settings.search_rule),
                 ("voteRule", &mut settings.vote_rule),
                 ("chatRule", &mut settings.chat_rule),
@@ -4579,6 +5198,7 @@ async fn admin_settings_put(
                 ("seekRule", &mut settings.seek_rule),
                 ("volumeRule", &mut settings.volume_rule),
                 ("queueEditRule", &mut settings.queue_edit_rule),
+                ("autoplaySeedRule", &mut settings.autoplay_seed_rule),
             ];
             for (key, slot) in rules {
                 match json_rule(&body, key) {
@@ -4587,19 +5207,28 @@ async fn admin_settings_put(
                     Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
                 }
             }
-            if let Some(ids) = body.get("configuredRoleIds").and_then(Value::as_array) {
-                if ids.len() > 50 {
-                    return json_error(StatusCode::BAD_REQUEST, "지정 역할은 최대 50개입니다.");
+            // `ruleRoleIds`는 보낸 키만 갱신한다. 안 보낸 키는 건드리지 않는다 —
+            // 관리 콘솔이 섹션 일부만 저장해도 다른 권한의 역할이 날아가면 안 된다.
+            if let Some(map) = body.get("ruleRoleIds").and_then(Value::as_object) {
+                for (key, value) in map {
+                    if !PERMISSION_KEYS.contains(&key.as_str()) {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            format!("{key}: 알 수 없는 권한 키예요."),
+                        );
+                    }
+                    let ids = match parse_role_ids(value) {
+                        Ok(ids) => ids,
+                        Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
+                    };
+                    settings.rule_role_ids.insert(key.clone(), ids);
                 }
-                settings.configured_role_ids = ids
-                    .iter()
-                    .filter_map(|value| match value {
-                        Value::String(text) => text.trim().parse::<u64>().ok(),
-                        Value::Number(number) => number.as_u64(),
-                        _ => None,
-                    })
-                    .filter(|id| *id != 0)
-                    .collect();
+            }
+            if let Some(value) = body.get("managerRoleIds") {
+                match parse_role_ids(value) {
+                    Ok(ids) => settings.manager_role_ids = ids,
+                    Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
+                }
             }
         }
         "limits" => {
@@ -4633,7 +5262,7 @@ async fn admin_settings_put(
                 || !(1..=3650).contains(&settings.audit_retention_days)
                 || !(1..=365).contains(&settings.chat_retention_days)
             {
-                return json_error(StatusCode::BAD_REQUEST, "허용 범위를 벗어난 값이 있습니다.");
+                return json_error(StatusCode::BAD_REQUEST, "허용 범위를 벗어난 값이 있어요.");
             }
             settings.default_volume = settings
                 .default_volume
@@ -4650,7 +5279,7 @@ async fn admin_settings_put(
                 settings.visualizer_enabled = value;
             }
         }
-        _ => return json_error(StatusCode::NOT_FOUND, "알 수 없는 설정 섹션입니다."),
+        _ => return json_error(StatusCode::NOT_FOUND, "알 수 없는 설정 섹션이에요."),
     }
 
     if let Err(error) = state.app.remote.save_guild_settings(&settings) {
@@ -4680,7 +5309,7 @@ async fn admin_settings_put(
             guild_id,
             "notice",
             json!({
-                "message": format!("정렬 모드가 {}(으)로 바뀌었습니다.", settings.sort_mode.description()),
+                "message": format!("정렬 모드가 바뀌었어요 — {}", settings.sort_mode.description()),
                 "kind": "info",
             }),
         );
@@ -4797,6 +5426,8 @@ async fn admin_queue_preview(
 #[serde(rename_all = "camelCase")]
 struct PermissionPreviewQuery {
     rule: String,
+    /// 어떤 권한의 미리보기인지. 지정 역할이 키마다 다르므로 이게 있어야 인원이 맞는다 (V3 §1).
+    key: Option<String>,
     role_ids: Option<String>,
 }
 
@@ -4813,14 +5444,27 @@ async fn admin_permission_preview(
         Err(response) => return response,
     };
     let Some(rule) = parse_rule(&query.rule) else {
-        return json_error(StatusCode::BAD_REQUEST, "알 수 없는 권한 규칙입니다.");
+        return json_error(StatusCode::BAD_REQUEST, "알 수 없는 권한 규칙이에요.");
     };
+    // 키가 없으면 예전처럼 통짜 지정 역할로 본다(옛 콘솔 호환).
+    let key = query
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .unwrap_or("search");
+    if !PERMISSION_KEYS.contains(&key) {
+        return json_error(StatusCode::BAD_REQUEST, "알 수 없는 권한 키예요.");
+    }
     let mut settings = ctx.settings.clone();
     if let Some(role_ids) = query.role_ids.as_deref() {
-        settings.configured_role_ids = role_ids
+        // 아직 저장하지 않은 화면 값으로 미리 세어 본다 — 그 키의 역할만 갈아끼운다.
+        let ids: Vec<u64> = role_ids
             .split(',')
             .filter_map(|value| value.trim().parse::<u64>().ok())
+            .filter(|id| *id != 0)
             .collect();
+        settings.rule_role_ids.insert(key.to_string(), ids);
     }
 
     let player = state.app.player.get_state(guild_id).await;
@@ -4839,6 +5483,11 @@ async fn admin_permission_preview(
                 member_count += 1;
                 let admin = guild.owner_id == *user_id
                     || is_owner_user(&state, user_id.get())
+                    // 관리자 지정 역할도 관리자다 — 실제 판정(`resolve_tier`)과 같아야 한다.
+                    || member
+                        .roles
+                        .iter()
+                        .any(|role| settings.manager_roles().contains(&role.get()))
                     || member.roles.iter().any(|role| {
                         guild
                             .roles
@@ -4862,11 +5511,11 @@ async fn admin_permission_preview(
                     same_voice_channel: same_voice,
                     role_ids: member.roles.iter().map(|role| role.get()).collect(),
                 };
-                if !permission_allowed(rule, &settings, &context) {
+                if !permission_allowed(key, rule, &settings, &context) {
                     continue;
                 }
                 pass_count += 1;
-                let bypass = !rule_base_allowed(rule, &settings, &context);
+                let bypass = !rule_base_allowed(key, rule, &settings, &context);
                 if bypass {
                     bypass_count += 1;
                 }
@@ -4888,17 +5537,20 @@ async fn admin_permission_preview(
         .map(|status| status.members)
         .unwrap_or(true);
     if !members_intent {
-        note = "Server Members Intent가 꺼져 있어 캐시에 있는 사람만 셌다.".into();
+        note = "Server Members Intent가 꺼져 있어서 캐시에 있는 사람만 셌어요.".into();
     } else if member_count == 0 {
-        note = "아직 멤버 캐시가 비어 있다. 봇이 접속을 마치면 정확해진다.".into();
+        note = "아직 멤버 캐시가 비어 있어요. 봇이 접속을 마치면 정확해져요.".into();
     } else if rule == PermissionRule::Disabled {
-        note = "사용 안 함은 관리자와 봇 주인까지 전부 막는다.".into();
+        note = "사용 안 함은 관리자와 봇 주인까지 전부 막아요.".into();
     } else if rule == PermissionRule::SameVoiceChannel && player.voice_channel_id.is_none() {
-        note = "봇이 음성 채널에 없어서 지금은 관리자만 통과한다.".into();
+        note = "봇이 음성 채널에 없어서 지금은 관리자만 통과해요.".into();
+    } else if rule == PermissionRule::ConfiguredRole && settings.roles_for(key).is_empty() {
+        note = "이 권한에 지정된 역할이 없어서 지금은 관리자만 통과해요.".into();
     }
 
     json_ok(json!({
         "rule": rule_key(rule),
+        "key": key,
         "passCount": pass_count,
         "memberCount": member_count,
         "managerBypassCount": bypass_count,
@@ -5080,7 +5732,7 @@ async fn admin_suspensions_lift(
         Err(response) => return response,
     };
     let Ok(target) = request.user_id.trim().parse::<u64>() else {
-        return json_error(StatusCode::BAD_REQUEST, "대상 사용자 ID가 올바르지 않습니다.");
+        return json_error(StatusCode::BAD_REQUEST, "대상 사용자 ID가 올바르지 않아요.");
     };
     let scope = request.scope.as_deref().and_then(SuspensionScope::parse);
     match state.app.remote.unsuspend_user(guild_id, target, scope) {
@@ -5180,7 +5832,7 @@ async fn admin_report_resolve(
             }
         }
     } else if request.action != "dismiss" {
-        return json_error(StatusCode::BAD_REQUEST, "처리 방식은 delete 또는 dismiss입니다.");
+        return json_error(StatusCode::BAD_REQUEST, "처리 방식은 delete 또는 dismiss예요.");
     }
     match state.app.remote.resolve_chat_report(guild_id, report_id) {
         Ok(true) => {
@@ -5194,7 +5846,7 @@ async fn admin_report_resolve(
             );
             json_ok(json!({ "ok": true }))
         }
-        Ok(false) => json_error(StatusCode::NOT_FOUND, "신고를 찾을 수 없습니다."),
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "그 신고를 찾지 못했어요."),
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
@@ -5240,7 +5892,7 @@ async fn admin_suggestion_status(
         Err(response) => return response,
     };
     let Some(status) = SuggestionStatus::parse(&request.status) else {
-        return json_error(StatusCode::BAD_REQUEST, "알 수 없는 제안 상태입니다.");
+        return json_error(StatusCode::BAD_REQUEST, "알 수 없는 제안 상태예요.");
     };
     let note = request
         .note
@@ -5269,7 +5921,7 @@ async fn admin_suggestion_status(
             );
             json_ok(json!({ "ok": true }))
         }
-        Ok(false) => json_error(StatusCode::NOT_FOUND, "제안을 찾을 수 없습니다."),
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "그 제안을 찾지 못했어요."),
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
@@ -5372,7 +6024,7 @@ async fn api_events(
     ws: WebSocketUpgrade,
 ) -> Response {
     if !origin_allowed(&state, &headers) {
-        return json_error(StatusCode::FORBIDDEN, "허용되지 않은 Origin입니다.");
+        return json_error(StatusCode::FORBIDDEN, "허용되지 않은 Origin이에요.");
     }
     if current_session(&state, &cookies).is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -5405,7 +6057,7 @@ async fn deny_socket(mut socket: WebSocket, reason: &str) {
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
             code: 4403,
-            reason: format!("접근이 거부되었습니다 ({reason})").into(),
+            reason: format!("접근이 거부됐어요 ({reason})").into(),
         })))
         .await;
 }
@@ -5586,7 +6238,7 @@ async fn seed_dev_guild(state: &WebState, guild_id: u64, user_id: u64) {
         user_id,
         "로컬 검증자",
         None,
-        "마참뮤직 리모컨 동작 확인 중입니다.",
+        "마참뮤직 리모컨 동작 확인 중이에요.",
         None,
     );
     let playlist_id =
@@ -5681,6 +6333,200 @@ mod tests {
         settings
     }
 
+    fn member_with_roles(role_ids: Vec<u64>) -> MemberContext {
+        MemberContext {
+            is_admin: false,
+            same_voice_channel: false,
+            role_ids,
+        }
+    }
+
+    // ── V3 §1: 권한 키별 지정 역할 ──
+
+    /// 검색용으로 준 역할이 볼륨·대기열편집까지 열면 안 된다. 그게 §1이 고치는 버그다.
+    #[test]
+    fn configured_roles_are_scoped_to_their_permission_key() {
+        let mut settings = RemoteGuildSettings::default();
+        settings.search_rule = PermissionRule::ConfiguredRole;
+        settings.volume_rule = PermissionRule::ConfiguredRole;
+        settings.rule_role_ids.insert("search".into(), vec![100]);
+        settings.rule_role_ids.insert("volume".into(), vec![200]);
+
+        let dj = member_with_roles(vec![100]);
+        assert!(permission_allowed("search", settings.search_rule, &settings, &dj));
+        assert!(!permission_allowed("volume", settings.volume_rule, &settings, &dj));
+
+        let mixer = member_with_roles(vec![200]);
+        assert!(!permission_allowed("search", settings.search_rule, &settings, &mixer));
+        assert!(permission_allowed("volume", settings.volume_rule, &settings, &mixer));
+    }
+
+    /// 옛 설정을 쓰던 서버의 동작이 조용히 바뀌면 안 된다 — 키가 없으면 레거시 값으로 폴백한다.
+    #[test]
+    fn legacy_configured_roles_still_open_every_key() {
+        let mut settings = RemoteGuildSettings::default();
+        settings.configured_role_ids = vec![777];
+        settings.search_rule = PermissionRule::ConfiguredRole;
+        settings.queue_edit_rule = PermissionRule::ConfiguredRole;
+        let member = member_with_roles(vec![777]);
+        for key in ["search", "queueEdit"] {
+            let rule = settings.rule_for(key).unwrap();
+            assert!(
+                permission_allowed(key, rule, &settings, &member),
+                "{key} 폴백 실패"
+            );
+        }
+    }
+
+    /// 빈 배열은 "일부러 비웠다"는 뜻이라 레거시로 되살아나면 안 된다.
+    #[test]
+    fn empty_role_list_does_not_fall_back_to_legacy() {
+        let mut settings = RemoteGuildSettings::default();
+        settings.configured_role_ids = vec![777];
+        settings.search_rule = PermissionRule::ConfiguredRole;
+        settings.rule_role_ids.insert("search".into(), Vec::new());
+        let member = member_with_roles(vec![777]);
+        assert!(!permission_allowed("search", settings.search_rule, &settings, &member));
+    }
+
+    /// 자동 재생 기준 곡 권한도 같은 판정 경로를 탄다(기본은 관리자만).
+    #[test]
+    fn autoplay_seed_rule_defaults_to_administrator_only() {
+        let settings = RemoteGuildSettings::default();
+        assert_eq!(settings.autoplay_seed_rule, PermissionRule::Administrator);
+        let member = MemberContext::default();
+        assert!(!permission_allowed(
+            "autoplaySeed",
+            settings.autoplay_seed_rule,
+            &settings,
+            &member
+        ));
+        let admin = MemberContext {
+            is_admin: true,
+            ..Default::default()
+        };
+        assert!(permission_allowed(
+            "autoplaySeed",
+            settings.autoplay_seed_rule,
+            &settings,
+            &admin
+        ));
+    }
+
+    // ── V3 §2: 개인 설정 화이트리스트 ──
+
+    #[test]
+    fn pref_patch_accepts_known_keys_and_coerces_scalars() {
+        let body = json!({
+            "layout": "panel",
+            "theme": "light",
+            "webVolume": 60,
+            "lyricsOpen": true,
+            "webPlayback": false,
+        });
+        let (updates, removals) = parse_pref_patch(body.as_object().unwrap()).unwrap();
+        assert!(removals.is_empty());
+        assert_eq!(updates.get("layout").map(String::as_str), Some("panel"));
+        assert_eq!(updates.get("theme").map(String::as_str), Some("light"));
+        // 숫자·불리언도 받아 문자열로 저장한다.
+        assert_eq!(updates.get("webVolume").map(String::as_str), Some("60"));
+        assert_eq!(updates.get("lyricsOpen").map(String::as_str), Some("1"));
+        assert_eq!(updates.get("webPlayback").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn pref_patch_rejects_unknown_keys_and_out_of_range_values() {
+        for body in [
+            json!({ "adminPassword": "hunter2" }),
+            json!({ "layout": "four" }),
+            json!({ "theme": "solarized" }),
+            json!({ "webVolume": 101 }),
+            json!({ "layoutSizes": "그냥 문자열" }),
+            json!({ "layout": ["three"] }),
+        ] {
+            assert!(
+                parse_pref_patch(body.as_object().unwrap()).is_err(),
+                "{body} 를 통과시켰다"
+            );
+        }
+    }
+
+    /// null은 "기본으로 되돌리기"다. 저장이 아니라 삭제로 간다.
+    #[test]
+    fn pref_patch_treats_null_as_removal() {
+        let body = json!({ "layout": Value::Null, "theme": "dark" });
+        let (updates, removals) = parse_pref_patch(body.as_object().unwrap()).unwrap();
+        assert_eq!(removals, vec!["layout".to_string()]);
+        assert_eq!(updates.get("theme").map(String::as_str), Some("dark"));
+    }
+
+    // ── V3 §4: 접속 표시 정확도 ──
+
+    /// 봇이 있는 그 채널의 사람만 "듣는 중"이다. 나머지는 "다른 채널".
+    #[test]
+    fn listening_counts_only_the_bot_channel() {
+        let members = [(11, Some(500)), (12, Some(500)), (13, Some(900)), (14, None)];
+        let (listening, other) = split_voice_members(Some(500), &members);
+        assert_eq!(listening, vec!["11".to_string(), "12".to_string()]);
+        assert_eq!(other, vec!["13".to_string()]);
+    }
+
+    /// 봇이 음성에 없으면 듣는 사람도 없다 — 음성에 있는 사람은 전부 "다른 채널"이다.
+    #[test]
+    fn listening_is_empty_when_the_bot_is_not_in_voice() {
+        let members = [(11, Some(500)), (12, Some(900))];
+        let (listening, other) = split_voice_members(None, &members);
+        assert!(listening.is_empty());
+        assert_eq!(other, vec!["11".to_string(), "12".to_string()]);
+    }
+
+    // ── V3 §5: 대기열 갱신 카운트다운 ──
+
+    /// 카운트다운 기준은 `app.rs`의 재정렬 주기와 같은 값이어야 한다.
+    /// 상수가 갈라지면 화면의 숫자가 실제 재정렬과 어긋난다.
+    #[test]
+    fn countdown_period_follows_the_sort_loop() {
+        assert_eq!(
+            QUEUE_SORT_PERIOD_SECONDS,
+            crate::app::QUEUE_SORT_INTERVAL.as_secs() as i64
+        );
+        assert_eq!(QUEUE_SORT_PERIOD_SECONDS, 5);
+    }
+
+    // ── V3 §6: 브라우저 검색 ──
+
+    #[test]
+    fn youtube_api_key_is_kept_when_the_form_field_is_blank() {
+        let base = RemoteAuthConfig {
+            client_id: None,
+            client_secret: None,
+            public_base_url: "https://music.example.com".into(),
+            dev_login: false,
+            owner_user_ids: Vec::new(),
+            youtube_api_key: Some("AIzaKEEPME0123456789".into()),
+        };
+        // 빈 값으로 저장 → 기존 키 유지 (Client Secret과 같은 규칙)
+        assert_eq!(
+            base.with_youtube_api_key(None, false).youtube_api_key(),
+            Some("AIzaKEEPME0123456789")
+        );
+        assert_eq!(
+            base.with_youtube_api_key(Some("   ".into()), false).youtube_api_key(),
+            Some("AIzaKEEPME0123456789")
+        );
+        // 새 값은 교체, 제거 체크박스는 삭제
+        assert_eq!(
+            base.with_youtube_api_key(Some("AIzaNEW9876543210".into()), false)
+                .youtube_api_key(),
+            Some("AIzaNEW9876543210")
+        );
+        assert_eq!(base.with_youtube_api_key(None, true).youtube_api_key(), None);
+        // 마스킹은 앞뒤 4자만 남긴다 — 전체 키가 운영 화면에 그대로 찍히지 않는다.
+        let masked = base.masked_youtube_api_key().unwrap();
+        assert!(masked.starts_with("AIza") && masked.ends_with("6789"));
+        assert!(!masked.contains("KEEPME"));
+    }
+
     #[test]
     fn lrc_parser_supports_fractional_seconds() {
         let lines = parse_lrc("[00:17.12] first\n[03:20.310] second");
@@ -5700,7 +6546,7 @@ mod tests {
                 role_ids: vec![777],
             };
             assert!(
-                !permission_allowed(PermissionRule::Disabled, &settings, &member),
+                !permission_allowed("search", PermissionRule::Disabled, &settings, &member),
                 "is_admin={is_admin} 인데 Disabled를 통과했다"
             );
         }
@@ -5717,7 +6563,7 @@ mod tests {
         ];
         let passed = members
             .iter()
-            .filter(|member| permission_allowed(PermissionRule::Disabled, &settings, member))
+            .filter(|member| permission_allowed("search", PermissionRule::Disabled, &settings, member))
             .count();
         assert_eq!(passed, 0);
     }
@@ -5736,9 +6582,10 @@ mod tests {
             PermissionRule::ConfiguredRole,
             PermissionRule::Administrator,
         ] {
-            assert!(permission_allowed(rule, &settings, &admin), "{rule:?}");
+            assert!(permission_allowed("search", rule, &settings, &admin), "{rule:?}");
         }
         assert!(!permission_allowed(
+            "search",
             PermissionRule::Disabled,
             &settings,
             &admin
@@ -5749,14 +6596,15 @@ mod tests {
     fn permission_defaults_match_remote_contract() {
         let settings = RemoteGuildSettings::default();
         let member = MemberContext::default();
-        assert!(!permission_allowed(settings.playback_rule, &settings, &member));
-        assert!(permission_allowed(settings.seek_rule, &settings, &member));
-        assert!(!permission_allowed(settings.volume_rule, &settings, &member));
+        assert!(!permission_allowed("playback", settings.playback_rule, &settings, &member));
+        assert!(permission_allowed("seek", settings.seek_rule, &settings, &member));
+        assert!(!permission_allowed("volume", settings.volume_rule, &settings, &member));
         let same_voice = MemberContext {
             same_voice_channel: true,
             ..Default::default()
         };
         assert!(permission_allowed(
+            "playback",
             settings.playback_rule,
             &settings,
             &same_voice
@@ -5773,11 +6621,13 @@ mod tests {
             role_ids: Vec::new(),
         };
         assert!(permission_allowed(
+            "playback",
             PermissionRule::SameVoiceChannel,
             &settings,
             &admin_outside_voice
         ));
         assert!(!rule_base_allowed(
+            "playback",
             PermissionRule::SameVoiceChannel,
             &settings,
             &admin_outside_voice
@@ -5806,13 +6656,14 @@ mod tests {
         };
         // 규칙 자체는 통과한다.
         assert!(permission_allowed(
+            "chat",
             PermissionRule::GuildMember,
             &settings,
             &member
         ));
         // 등급이 Viewer면 최종 판정은 거부다.
-        let viewer_allows =
-            !AccessTier::Viewer.is_viewer() && permission_allowed(PermissionRule::GuildMember, &settings, &member);
+        let viewer_allows = !AccessTier::Viewer.is_viewer()
+            && permission_allowed("chat", PermissionRule::GuildMember, &settings, &member);
         assert!(!viewer_allows);
     }
 
@@ -5921,6 +6772,7 @@ mod tests {
             public_base_url: "https://music.example.com".into(),
             dev_login: false,
             owner_user_ids: Vec::new(),
+            youtube_api_key: None,
         };
         assert!(cookie_should_be_secure(&auth, None));
         auth.public_base_url = "http://localhost:8693".into();
@@ -5947,6 +6799,7 @@ mod tests {
             public_base_url: "https://musicbot.example.test".into(),
             dev_login: false,
             owner_user_ids: vec![42, 43],
+            youtube_api_key: Some("AIzaTESTKEY0123456789".into()),
         };
         config.save(&root).unwrap();
         let loaded = RemoteAuthConfig::load(&root);

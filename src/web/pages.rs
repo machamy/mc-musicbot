@@ -506,10 +506,10 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
 <label class="checkbox"><input type="checkbox" name="auto_leave_when_empty" {al}/> 빈 음성 채널 감지 켜기</label>
 <label class="field">빈 채널 대기 시간(초, 5–3600)</label><input type="number" name="auto_leave_delay_seconds" min="5" max="3600" value="{ald}"/>
 <label class="field">빈 음성 채널 정책</label>
-<select name="empty_voice_policy" title="자동 퇴장: 대기 시간 후 재생 중단 + 음성 채널 퇴장. 재생 중단: 대기 시간 후 재생만 멈추고 채널에는 그대로 머문다. 그대로 둠: 비어 있어도 계속 재생한다.">
-<option value="AutoLeave" {p1} title="대기 시간이 지나면 재생을 중단하고 음성 채널에서 나간다.">자동 퇴장</option>
-<option value="StopPlayback" {p2} title="대기 시간이 지나면 재생만 멈추고 음성 채널에는 그대로 남는다.">재생 중단</option>
-<option value="DoNothing" {p3} title="채널이 비어도 아무 동작도 하지 않고 계속 재생한다.">그대로 둠</option>
+<select name="empty_voice_policy" title="자동 퇴장: 대기 시간이 지나면 재생을 멈추고 음성 채널에서 나가요. 재생 중단: 재생만 멈추고 채널에는 그대로 머물러요. 그대로 둠: 아무도 없어도 계속 재생해요.">
+<option value="AutoLeave" {p1} title="대기 시간이 지나면 재생을 멈추고 음성 채널에서 나가요.">자동 퇴장</option>
+<option value="StopPlayback" {p2} title="대기 시간이 지나면 재생만 멈추고 음성 채널에는 그대로 남아요.">재생 중단</option>
+<option value="DoNothing" {p3} title="채널이 비어도 아무것도 하지 않고 계속 재생해요.">그대로 둠</option>
 </select>
 <label class="checkbox"><input type="checkbox" name="announce_now_playing" {an}/> 곡 시작 시 '현재 재생 중' 알림 보내기</label>
 </div>
@@ -652,6 +652,11 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
     } else {
         "미설정"
     };
+    // 키 자체는 어차피 브라우저로 나가지만, 화면에는 앞뒤 4자만 보여 준다.
+    let youtube_status = auth
+        .masked_youtube_api_key()
+        .map(|masked| format!("설정됨 — <code>{}</code>", html_escape(&masked)))
+        .unwrap_or_else(|| "미설정 — 지금은 봇 호스트의 yt-dlp가 검색해요.".to_string());
     let meta = app.db.list_guild_metadata();
     let known: String = meta
         .iter()
@@ -691,6 +696,12 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
 <label class="field" for="oauth-owner-ids">봇 주인 Discord 유저 ID (쉼표 구분)</label>
 <input id="oauth-owner-ids" type="text" name="owner_user_ids" inputmode="numeric" placeholder="예: 1234567890, 9876543210" value="{owner_user_ids}"/>
 <p class="kv">여기 등록된 사람은 리모컨에서 <strong>봇 주인</strong> 등급이 되어 배지·전용 컨트롤·운영 패널 링크를 받습니다. 저장 즉시 반영됩니다.</p>
+<label class="field" for="oauth-youtube-key">YouTube Data API 키 (선택)</label>
+<input id="oauth-youtube-key" type="password" name="youtube_api_key" autocomplete="new-password" placeholder="변경할 때만 새 키 입력"/>
+<p class="kv">현재 상태: {youtube_status}</p>
+<p class="kv">키를 넣으면 리모컨 검색을 <strong>브라우저가 직접</strong> 해요. 봇 호스트의 yt-dlp가 느리거나 유튜브에 막혀도 검색이 살아 있어요. 키가 없으면 지금처럼 서버가 검색해요.</p>
+<p class="kv"><strong>⚠ 이 키는 브라우저에 그대로 노출돼요.</strong> 검색을 브라우저에서 하니까 어쩔 수 없어요. Google Cloud 콘솔 → 사용자 인증 정보 → 이 키 → 애플리케이션 제한사항에서 <strong>HTTP 리퍼러 제한</strong>을 꼭 거세요(예: <code>{youtube_referrer}</code>). 제한을 안 걸면 누구든 이 키로 할당량을 태울 수 있어요.</p>
+<label class="checkbox"><input type="checkbox" name="clear_youtube_api_key"/> 저장된 YouTube API 키 제거</label>
 <label class="checkbox"><input type="checkbox" name="clear_secret"/> 저장된 Client Secret 제거</label>
 <div class="actions"><button class="btn btn-primary" type="submit">OAuth 설정 저장</button>
 <a class="btn btn-secondary" href="/music/login" target="_blank" rel="noopener">로그인 화면 열기</a></div>
@@ -734,6 +745,8 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        youtube_status = youtube_status,
+        youtube_referrer = html_escape(&format!("{}/*", auth.public_base_url)),
         redirect_uri = html_escape(&auth.redirect_uri()),
         oauth_path = html_escape(
             &crate::web::remote::RemoteAuthConfig::storage_path(&app.config.data_root)
@@ -751,7 +764,10 @@ pub struct OAuthSettingsForm {
     public_base_url: String,
     /// 봇 주인 Discord 유저 ID — 쉼표 구분. 리모컨의 `AccessTier::Owner` 판정 근거다.
     owner_user_ids: Option<String>,
+    /// YouTube Data API v3 키. 비워 두면 기존 키를 그대로 둔다(Client Secret과 같은 규칙).
+    youtube_api_key: Option<String>,
     clear_secret: Option<String>,
+    clear_youtube_api_key: Option<String>,
 }
 
 pub async fn botsettings_oauth_post(
@@ -829,6 +845,23 @@ pub async fn botsettings_oauth_post(
             true,
         );
     }
+    let youtube_update = form
+        .youtube_api_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    // 키 형식을 완전히 검증할 방법은 없지만, 실수로 URL이나 문장을 붙여넣는 건 걸러 준다.
+    if youtube_update.as_ref().is_some_and(|key| {
+        key.chars().count() > 200
+            || key
+                .chars()
+                .any(|c| c.is_whitespace() || c == '<' || c == '>' || c == '"')
+    }) {
+        return redirect_flash(
+            "/botsettings",
+            "YouTube API 키에 공백이나 따옴표가 섞여 있어요. 키 값만 붙여넣어 주세요.",
+            true,
+        );
+    }
     let current = state.remote_auth.read().unwrap().clone();
     let next = current
         .updated(
@@ -837,7 +870,8 @@ pub async fn botsettings_oauth_post(
             form.clear_secret.is_some(),
             public_base_url,
         )
-        .with_owner_user_ids(owner_user_ids.clone());
+        .with_owner_user_ids(owner_user_ids.clone())
+        .with_youtube_api_key(youtube_update, form.clear_youtube_api_key.is_some());
     if let Err(error) = next.save(&state.app.config.data_root) {
         state
             .app

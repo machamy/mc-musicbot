@@ -412,8 +412,31 @@ impl Db {
             .unwrap_or(false)
     }
 
+    /// 서버 관리자가 지우는 경로 (V3 §19).
+    ///
+    /// **이 길드가 직접 만든 항목만** 지운다. `guild_id = 0` 인 전역 규칙과
+    /// 다른 길드 항목은 조건에 안 걸려 `false` 가 나온다. 호출부는 이걸 403 으로 바꾼다.
+    /// UI 에서 버튼을 숨기는 것에 의존하지 않기 위해 쿼리 자체로 막는다.
+    pub fn remove_guild_blacklist(&self, id: i64, guild_id: u64) -> bool {
+        if guild_id == 0 {
+            return false;
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM blacklist WHERE id = ?1 AND guild_id = ?2",
+            params![id, guild_id as i64],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
     // ───────── 플레이리스트 ─────────
 
+    /// 범위별 재생목록 조회.
+    ///
+    /// `PlaylistScope::User` 는 **개인 재생목록**(V3 §12)이라 길드가 아니라 소유자로 거른다.
+    /// 그래서 이 경우 두 번째 인자는 guild_id 가 아니라 **user_id** 로 해석한다.
+    /// 헷갈리기 쉬워서 `list_user_playlists` 헬퍼를 같이 둔다 — 그쪽을 쓰는 게 안전하다.
     pub fn list_playlists(&self, scope: PlaylistScope, guild_id: Option<u64>) -> Vec<Playlist> {
         let conn = self.conn.lock().unwrap();
         let mut lists = Vec::new();
@@ -421,6 +444,10 @@ impl Db {
             PlaylistScope::Global => "SELECT id, scope, guild_id, owner_user_id, name FROM playlists WHERE scope = 'Global' ORDER BY name COLLATE NOCASE".to_string(),
             PlaylistScope::Guild => format!(
                 "SELECT id, scope, guild_id, owner_user_id, name FROM playlists WHERE scope = 'Guild' AND guild_id = {} ORDER BY name COLLATE NOCASE",
+                guild_id.unwrap_or(0) as i64
+            ),
+            PlaylistScope::User => format!(
+                "SELECT id, scope, guild_id, owner_user_id, name FROM playlists WHERE scope = 'User' AND owner_user_id = {} ORDER BY name COLLATE NOCASE",
                 guild_id.unwrap_or(0) as i64
             ),
         };
@@ -512,6 +539,27 @@ impl Db {
             params![scope.as_str(), guild_id.map(|v| v as i64), owner as i64, name, now, now],
         );
         conn.last_insert_rowid()
+    }
+
+    /// 내 개인 재생목록 (V3 §12). 길드와 무관하게 소유자로만 거른다.
+    pub fn list_user_playlists(&self, user_id: u64) -> Vec<Playlist> {
+        self.list_playlists(PlaylistScope::User, Some(user_id))
+    }
+
+    /// 개인 재생목록을 만든다. `guild_id` 는 넣지 않는다 — 어느 서버에서든 보여야 하니까.
+    pub fn create_user_playlist(&self, owner: u64, name: &str) -> i64 {
+        self.create_playlist(PlaylistScope::User, None, owner, name)
+    }
+
+    /// 이 재생목록을 이 사람이 고쳐도 되는지. 개인 것은 주인만, 나머지는 호출부가 관리자 권한으로 판단한다.
+    pub fn is_own_user_playlist(&self, id: i64, user_id: u64) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM playlists WHERE id = ?1 AND scope = 'User' AND owner_user_id = ?2",
+            params![id, user_id as i64],
+            |_| Ok(()),
+        )
+        .is_ok()
     }
 
     pub fn delete_playlist(&self, id: i64) -> bool {

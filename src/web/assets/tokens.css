@@ -164,6 +164,198 @@
   --shadow-pop: 0 18px 48px rgba(16, 24, 40, 0.18);
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * 추가 테마 (V3 §17) — 코딩 에디터 팔레트에서 가져왔다.
+ *
+ * 규칙: 각 테마는 :root 의 토큰을 **빠짐없이** 다시 정의한다.
+ * 하나라도 빠지면 다크 값이 새어 나와 글씨가 안 보이는 조합이 생긴다.
+ * 특히 잊기 쉬운 것: --presence-*, --tier-*, --shadow-*, --art-wash.
+ *
+ * 본문 대비는 어느 테마에서도 4.5:1 이상을 지킨다. 예뻐도 안 읽히면 실패다.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* ── 미드나잇 — 짙은 곤색. Tokyo Night 계열 ── */
+[data-theme="midnight"] {
+  color-scheme: dark;
+
+  --surface-0: #16161e;  --surface-1: #1a1b26;  --surface-2: #1f2130;
+  --surface-3: #262a3d;  --surface-4: #323752;  --surface-inset: #12121a;
+
+  --text-1: #c8d3f5;  --text-2: #a9b1d6;  --text-3: #8189b3;  --text-4: #626b94;
+  --text-on-accent: #16161e;
+
+  --line-1: #232433;  --line-2: #2f334d;  --line-3: #414868;
+
+  --accent: #7aa2f7;  --accent-hover: #8fb3f9;  --accent-press: #6a90e0;
+  --accent-soft: rgba(122, 162, 247, 0.14);
+  --accent-line: rgba(122, 162, 247, 0.34);
+  --accent-glow: rgba(122, 162, 247, 0.30);
+  --art-1: var(--accent);  --art-2: #bb9af7;  --art-wash: rgba(122, 162, 247, 0.10);
+
+  --ok: #9ece6a;      --ok-soft: rgba(158, 206, 106, 0.14);
+  --warn: #e0af68;    --warn-soft: rgba(224, 175, 104, 0.14);
+  --danger: #f7768e;  --danger-soft: rgba(247, 118, 142, 0.14);
+  --info: #7dcfff;    --info-soft: rgba(125, 207, 255, 0.14);
+
+  --presence-listening: #9ece6a;  --presence-viewing: #7dcfff;
+  --presence-online: #9ece6a;     --presence-idle: #e0af68;
+  --presence-dnd: #f7768e;        --presence-offline: #626b94;
+
+  --tier-owner: #e0af68;  --tier-manager: #bb9af7;
+  --tier-member: #7aa2f7; --tier-viewer: #8189b3;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.50);
+  --shadow-3: 0 12px 34px rgba(0, 0, 0, 0.58);
+  --shadow-pop: 0 18px 48px rgba(0, 0, 0, 0.66);
+}
+
+/* ── 그레이 — 채도를 뺀 중성 회색. GitHub Dimmed 계열. 눈이 제일 안 피곤하다 ── */
+[data-theme="slate"] {
+  color-scheme: dark;
+
+  --surface-0: #1c2128;  --surface-1: #22272e;  --surface-2: #262c36;
+  --surface-3: #2d333b;  --surface-4: #373e47;  --surface-inset: #171b21;
+
+  --text-1: #cdd9e5;  --text-2: #adbac7;  --text-3: #8b95a1;  --text-4: #6f7b87;
+  --text-on-accent: #ffffff;
+
+  --line-1: #262c36;  --line-2: #373e47;  --line-3: #444c56;
+
+  --accent: #539bf5;  --accent-hover: #6cb0ff;  --accent-press: #4184e4;
+  --accent-soft: rgba(83, 155, 245, 0.13);
+  --accent-line: rgba(83, 155, 245, 0.32);
+  --accent-glow: rgba(83, 155, 245, 0.26);
+  --art-1: var(--accent);  --art-2: #6cb6ff;  --art-wash: rgba(83, 155, 245, 0.08);
+
+  --ok: #6bc46d;      --ok-soft: rgba(107, 196, 109, 0.14);
+  --warn: #daaa3f;    --warn-soft: rgba(218, 170, 63, 0.14);
+  --danger: #e5534b;  --danger-soft: rgba(229, 83, 75, 0.14);
+  --info: #539bf5;    --info-soft: rgba(83, 155, 245, 0.14);
+
+  --presence-listening: #6bc46d;  --presence-viewing: #539bf5;
+  --presence-online: #6bc46d;     --presence-idle: #daaa3f;
+  --presence-dnd: #e5534b;        --presence-offline: #6f7b87;
+
+  --tier-owner: #daaa3f;  --tier-manager: #a371f7;
+  --tier-member: #539bf5; --tier-viewer: #8b95a1;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.40);
+  --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.45);
+  --shadow-3: 0 12px 34px rgba(0, 0, 0, 0.52);
+  --shadow-pop: 0 18px 48px rgba(0, 0, 0, 0.60);
+}
+
+/* ── 노르드 — 차가운 청회색. Nord 팔레트 ── */
+[data-theme="nord"] {
+  color-scheme: dark;
+
+  --surface-0: #242933;  --surface-1: #2e3440;  --surface-2: #333b4a;
+  --surface-3: #3b4252;  --surface-4: #4c566a;  --surface-inset: #1e222a;
+
+  --text-1: #eceff4;  --text-2: #d8dee9;  --text-3: #a3aec2;  --text-4: #7b869c;
+  --text-on-accent: #2e3440;
+
+  --line-1: #333b4a;  --line-2: #3b4252;  --line-3: #4c566a;
+
+  --accent: #88c0d0;  --accent-hover: #9ed0de;  --accent-press: #74aebe;
+  --accent-soft: rgba(136, 192, 208, 0.15);
+  --accent-line: rgba(136, 192, 208, 0.36);
+  --accent-glow: rgba(136, 192, 208, 0.28);
+  --art-1: var(--accent);  --art-2: #b48ead;  --art-wash: rgba(136, 192, 208, 0.10);
+
+  --ok: #a3be8c;      --ok-soft: rgba(163, 190, 140, 0.15);
+  --warn: #ebcb8b;    --warn-soft: rgba(235, 203, 139, 0.15);
+  --danger: #d08770;  --danger-soft: rgba(208, 135, 112, 0.16);
+  --info: #81a1c1;    --info-soft: rgba(129, 161, 193, 0.15);
+
+  --presence-listening: #a3be8c;  --presence-viewing: #88c0d0;
+  --presence-online: #a3be8c;     --presence-idle: #ebcb8b;
+  --presence-dnd: #bf616a;        --presence-offline: #7b869c;
+
+  --tier-owner: #ebcb8b;  --tier-manager: #b48ead;
+  --tier-member: #88c0d0; --tier-viewer: #a3aec2;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.36);
+  --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.42);
+  --shadow-3: 0 12px 34px rgba(0, 0, 0, 0.50);
+  --shadow-pop: 0 18px 48px rgba(0, 0, 0, 0.58);
+}
+
+/* ── 베이지 — 따뜻한 종이색. 밝은 방에서 좋다. Solarized Light 계열 ── */
+[data-theme="sepia"] {
+  color-scheme: light;
+
+  --surface-0: #efe6d3;  --surface-1: #fdf6e3;  --surface-2: #fbf3de;
+  --surface-3: #f0e7d0;  --surface-4: #e3d8bd;  --surface-inset: #eae0c8;
+
+  --text-1: #3a2f24;  --text-2: #55483a;  --text-3: #7a6850;  --text-4: #9c8b71;
+  --text-on-accent: #fdf6e3;
+
+  --line-1: #e6dcc4;  --line-2: #d9cdb0;  --line-3: #c4b593;
+
+  --accent: #9c5a2d;  --accent-hover: #8a4e25;  --accent-press: #78431f;
+  --accent-soft: rgba(156, 90, 45, 0.10);
+  --accent-line: rgba(156, 90, 45, 0.28);
+  --accent-glow: rgba(156, 90, 45, 0.20);
+  --art-1: var(--accent);  --art-2: #a07800;  --art-wash: rgba(156, 90, 45, 0.07);
+
+  --ok: #4d660d;      --ok-soft: rgba(77, 102, 13, 0.11);
+  --warn: #8a5c00;    --warn-soft: rgba(138, 92, 0, 0.11);
+  --danger: #9c2b23;  --danger-soft: rgba(156, 43, 35, 0.11);
+  --info: #1c6180;    --info-soft: rgba(28, 97, 128, 0.11);
+
+  --presence-listening: #4d660d;  --presence-viewing: #1c6180;
+  --presence-online: #4d660d;     --presence-idle: #8a5c00;
+  --presence-dnd: #9c2b23;        --presence-offline: #9c8b71;
+
+  --tier-owner: #8a5c00;  --tier-manager: #6d4078;
+  --tier-member: #1c6180; --tier-viewer: #7a6850;
+
+  --shadow-1: 0 1px 2px rgba(90, 70, 40, 0.08);
+  --shadow-2: 0 4px 14px rgba(90, 70, 40, 0.12);
+  --shadow-3: 0 12px 34px rgba(90, 70, 40, 0.16);
+  --shadow-pop: 0 18px 48px rgba(90, 70, 40, 0.22);
+}
+
+/* ── 레트로 — 옛날 CRT 앰버 단색. 아마 제일 재밌고 제일 안 쓰일 테마다.
+ * 단색이라 의미색을 구분하기 어렵다. 성공/위험은 색상을 확실히 벌려
+ * 앰버 사이에서도 구분되게 했다. ── */
+[data-theme="retro"] {
+  color-scheme: dark;
+
+  --surface-0: #0a0803;  --surface-1: #12100a;  --surface-2: #191509;
+  --surface-3: #241d0c;  --surface-4: #33290f;  --surface-inset: #070500;
+
+  --text-1: #ffc457;  --text-2: #e8ae44;  --text-3: #b98b33;  --text-4: #8a6726;
+  --text-on-accent: #0a0803;
+
+  --line-1: #241d0c;  --line-2: #3a2e12;  --line-3: #55431a;
+
+  --accent: #ffb000;  --accent-hover: #ffc233;  --accent-press: #d99500;
+  --accent-soft: rgba(255, 176, 0, 0.14);
+  --accent-line: rgba(255, 176, 0, 0.38);
+  --accent-glow: rgba(255, 176, 0, 0.34);
+  --art-1: var(--accent);  --art-2: #ff8c00;  --art-wash: rgba(255, 176, 0, 0.09);
+
+  --ok: #8ade63;      --ok-soft: rgba(138, 222, 99, 0.14);
+  --warn: #ffb000;    --warn-soft: rgba(255, 176, 0, 0.16);
+  --danger: #ff6f5c;  --danger-soft: rgba(255, 111, 92, 0.16);
+  --info: #5fd4e0;    --info-soft: rgba(95, 212, 224, 0.14);
+
+  --presence-listening: #8ade63;  --presence-viewing: #5fd4e0;
+  --presence-online: #8ade63;     --presence-idle: #ffb000;
+  --presence-dnd: #ff6f5c;        --presence-offline: #8a6726;
+
+  --tier-owner: #ffb000;  --tier-manager: #ff8c00;
+  --tier-member: #ffc457; --tier-viewer: #b98b33;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.60);
+  --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.66);
+  --shadow-3: 0 12px 34px rgba(0, 0, 0, 0.72);
+  --shadow-pop: 0 18px 48px rgba(0, 0, 0, 0.80);
+}
+
 /* ───────────────────────── 리셋 ───────────────────────── */
 
 *, *::before, *::after { box-sizing: border-box; }

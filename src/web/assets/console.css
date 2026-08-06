@@ -375,6 +375,69 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
 .prev__delta.is-down { color: var(--warn); }
 .prev__delta.is-flat { color: var(--text-4); }
 
+/* ═══════════════════════════ 자동 재생 기준 곡 (v3 §8.5) ═══════════════════════════ */
+
+.seeds { overflow: hidden; }
+
+.seeds__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--line-1);
+}
+.seeds__count {
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semi);
+}
+.seeds__count.is-full { color: var(--warn); }
+.seeds .hint { padding: 0 var(--sp-4) var(--sp-3); }
+.seeds__head .hint { padding: 0; }
+
+.seeds__rows { display: flex; flex-direction: column; }
+
+.seed {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-4);
+  border-top: 1px solid var(--line-1);
+  background: var(--surface-1);
+  transition: background var(--t-fast) var(--ease), opacity var(--t-fast) var(--ease);
+}
+.seeds__rows > .seed:first-child { border-top: none; }
+.seed:hover { background: var(--surface-3); }
+
+/* 끌기 손잡이 — 마우스 전용이므로 키보드 사용자는 ↑↓ 버튼을 쓴다 */
+.seed__handle {
+  flex: none;
+  color: var(--text-4);
+  font-size: var(--fs-lg);
+  line-height: 1;
+  cursor: grab;
+  user-select: none;
+}
+.seed[draggable="true"]:active .seed__handle { cursor: grabbing; }
+
+.seed__idx {
+  flex: none;
+  width: 20px;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  text-align: right;
+}
+.seed__main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.seed__title { min-width: 0; color: var(--text-1); font-size: var(--fs-md); }
+.seed__sub { color: var(--text-3); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.seed__acts { flex: none; display: flex; align-items: center; gap: var(--sp-1); }
+
+/* 끌고 있는 줄은 흐리게, 떨어질 자리는 위쪽에 선을 그어 미리 보여준다 */
+.seed.is-drag { opacity: 0.45; }
+.seed.is-over { box-shadow: inset 0 2px 0 var(--accent); background: var(--accent-soft); }
+
 /* ═══════════════════════════ 권한 ═══════════════════════════ */
 
 .permrow { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
@@ -420,6 +483,40 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
   font-size: var(--fs-sm);
   line-height: 1.5;
 }
+
+/* 위험이 아니라 설명 — 관리자 역할 카드처럼 "헷갈리지 마세요" 용도 */
+.warnbox--info {
+  background: var(--info-soft);
+  border-color: color-mix(in srgb, var(--info) 60%, transparent);
+}
+
+/* ── 권한별 지정 역할 (v3 §1) ──
+ * 규칙이 "지정 역할"일 때만 펼쳐진다. 항목마다 자기 목록을 가지므로 왼쪽 선을 그어
+ * 어느 권한에 딸린 선택인지 한눈에 보이게 한다. */
+
+.permroles {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  border-left: 2px solid var(--accent-line);
+  background: var(--surface-inset);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+.permroles[hidden] { display: none; }
+.permroles__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+.permroles__title { color: var(--text-1); font-size: var(--fs-sm); font-weight: var(--fw-semi); }
+.permroles__note { color: var(--text-3); font-size: var(--fs-xs); }
+.permroles__note.is-warn { color: var(--warn); }
+
+/* 관리자 지정 역할은 기능 권한과 다른 무게라 카드부터 구분한다 */
+.grp--manager { border-color: color-mix(in srgb, var(--warn) 45%, var(--line-1)); }
 
 /* ── 역할 선택 ── */
 
@@ -655,6 +752,13 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
   .permrow { flex-direction: column; align-items: stretch; }
   .permrow .field { width: 100%; }
   .permprev__faces { margin-left: 0; }
+  .permroles { padding: var(--sp-2); }
+  .permroles__head { flex-direction: column; gap: 2px; }
+
+  /* 시드 목록은 좁은 화면에서 제목을 먼저 보여주고 버튼을 아래 줄로 내린다 */
+  .seed { flex-wrap: wrap; }
+  .seed__main { flex-basis: calc(100% - 60px); }
+  .seed__acts { width: 100%; justify-content: flex-end; }
 
   .row { flex-wrap: wrap; }
   .row__acts { width: 100%; justify-content: flex-end; }
