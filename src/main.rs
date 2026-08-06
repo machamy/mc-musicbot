@@ -13,6 +13,8 @@ mod media;
 mod models;
 mod player;
 mod remote;
+/// 개인 통계와 우리 차트. **musicbot.sqlite 와 파일이 분리된 별도 DB**를 쓴다 (V3 §22.1).
+mod stats;
 mod web;
 
 use serenity::all::{GatewayError, GatewayIntents};

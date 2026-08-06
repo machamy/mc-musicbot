@@ -318,6 +318,7 @@ let libraryQuery = '';
 let lastCurrentId = null;
 let acState = null;            // 자동완성 { kind, from, to, items, index }
 let serverSkewMs = 0;          // 서버 시계 − 내 시계. 카운트다운을 서버 기준으로 맞추는 데 쓴다
+let lastBotState = null;       // presence.bot — WS 이벤트가 안 실어 보내도 잃어버리지 않게 따로 보관
 let seedState = null;          // { seeds, max, canEdit } — 없으면 서버가 아직 시드곡을 모른다는 뜻
 let seedOpen = false;
 
@@ -1934,7 +1935,11 @@ async function loadSeeds() {
 
 function renderSeeds() {
   if (!el.seedBox) return;
-  const editable = !!(seedState && seedState.canEdit && can('search'));
+  // 최종 판정은 서버의 canEdit(권한 키 autoplaySeed)이다. 여기서는 화면 상태만 덧대 막는다.
+  const state = store.get();
+  const blocked = state.conn === 'down' || state.tier === 'viewer'
+    || !!(state.suspension && (state.suspension.scope === 'all' || state.suspension.scope === 'queue'));
+  const editable = !!(seedState && seedState.canEdit && !blocked);
   el.portal?.setAttribute('data-seeds', editable ? '1' : '0');
 
   if (!seedState) { el.seedBox.hidden = true; return; }
@@ -3467,7 +3472,7 @@ function renderMembers(state) {
   }
 
   const buckets = { listening: [], otherVoice: [], viewing: [], online: [], offline: [] };
-  const members = state.members.length ? state.members : synthesizeMembers(state, listening, viewing);
+  const members = state.members.length ? state.members : synthesizeMembers(state, listening, otherVoice, viewing);
   for (const member of members) {
     const id = String(member.userId ?? member.id);
     const status = online[id] || 'offline';
@@ -3499,7 +3504,7 @@ function renderMembers(state) {
 }
 
 /** 멤버 목록 인텐트가 꺼져 있어도 접속 중인 사람은 보여준다. */
-function synthesizeMembers(state, listening, viewing) {
+function synthesizeMembers(state, listening, otherVoice, viewing) {
   const map = new Map();
   const add = (id, name, avatarUrl) => {
     if (!id || map.has(String(id))) return;
@@ -3509,7 +3514,7 @@ function synthesizeMembers(state, listening, viewing) {
   for (const item of state.queue) add(item.requestedByUserId, item.requestedByDisplay);
   if (state.current) add(state.current.requestedByUserId, state.current.requestedByDisplay);
   add(state.user?.id, state.user?.displayName, state.user?.avatarUrl);
-  for (const id of [...listening, ...viewing]) add(id, null, null);
+  for (const id of [...listening, ...otherVoice, ...viewing]) add(id, null, null);
   return [...map.values()];
 }
 
@@ -4047,6 +4052,7 @@ async function loadHot() {
   const data = await api('/state/hot');
   // 카운트다운은 서버 시각 기준으로 센다. 표본 시각으로 시계 차이를 맞춰 둔다.
   noteServerTime(data.sampledAtUtc || data.sortedAt);
+  if (data.presence && data.presence.bot !== undefined) lastBotState = data.presence.bot;
   store.patch({
     player: data.player || null,
     current: data.current || null,
@@ -4143,6 +4149,9 @@ async function boot() {
     // core.js의 merge()는 계약에 없던 필드를 흘려보낸다. 여기서 원본 payload를 다시 주워 담는다.
     onAny: (type, data) => {
       if (type === 'presence' && data) {
+        // core.js가 이미 presence를 {listening,viewing,online}으로 갈아 끼운 뒤라
+        // 직전 값에서 bot을 되찾을 수 없다. 마지막으로 본 봇 상태는 따로 들고 있는다.
+        if (data.bot !== undefined) lastBotState = data.bot;
         store.patch({
           presence: {
             listening: data.listening || [],
@@ -4151,7 +4160,7 @@ async function boot() {
             online: data.online || {},
             listeningCount: data.listeningCount,
             viewingCount: data.viewingCount,
-            bot: data.bot || null,
+            bot: lastBotState,
           },
         });
       }
