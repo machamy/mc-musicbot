@@ -27,6 +27,8 @@ pub struct WebState {
     pub app: Arc<App>,
     /// 웹 비밀번호 SHA-256 해시. None 이면 미설정(최초 설정 필요) 상태.
     pub password_hash: Mutex<Option<[u8; 32]>>,
+    /// 최초 비밀번호 설정 폼의 일회성 프로세스 CSRF 토큰.
+    pub setup_csrf: String,
     pub sessions: Mutex<HashMap<String, Instant>>,
     /// 운영자 세션별 CSRF 토큰. OAuth 비밀 설정처럼 민감한 POST에 사용한다.
     pub admin_csrf: Mutex<HashMap<String, String>>,
@@ -95,6 +97,7 @@ pub async fn serve(app: Arc<App>) {
     let state = Arc::new(WebState {
         app: app.clone(),
         password_hash: Mutex::new(initial_hash),
+        setup_csrf: crate::models::uuid_like(),
         sessions: Mutex::new(HashMap::new()),
         admin_csrf: Mutex::new(HashMap::new()),
         remote_sessions: Mutex::new(HashMap::new()),

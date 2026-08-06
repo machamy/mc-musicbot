@@ -165,7 +165,7 @@ pub async fn logout(State(state): Ctx, cookies: Cookies) -> Redirect {
 
 // ───────── 최초 비밀번호 설정 (localhost) ─────────
 
-fn setup_html(error: Option<&str>) -> String {
+fn setup_html(error: Option<&str>, csrf_token: &str) -> String {
     let err = error
         .map(|e| format!(r#"<div class="status err">{}</div>"#, html_escape(e)))
         .unwrap_or_default();
@@ -179,6 +179,7 @@ fn setup_html(error: Option<&str>) -> String {
 <p class="kv">처음 실행입니다. 웹 관리자 비밀번호를 설정하세요. (보안상 봇이 실행 중인 PC, 즉 localhost 에서만 설정할 수 있습니다.)</p>
 {err}
 <form method="post" action="/setup">
+<input type="hidden" name="csrf_token" value="{csrf_token}"/>
 <label class="field" for="password">새 비밀번호</label>
 <input type="password" id="password" name="password" autofocus/>
 <label class="field" for="confirm">비밀번호 확인</label>
@@ -187,6 +188,7 @@ fn setup_html(error: Option<&str>) -> String {
 </form>
 </div></div></body></html>"#,
         css = LOGIN_PAGE_CSS,
+        csrf_token = html_escape(csrf_token),
     )
 }
 
@@ -194,11 +196,12 @@ pub async fn setup_page(State(state): Ctx) -> Response {
     if state.password_hash.lock().unwrap().is_some() {
         return Redirect::to("/login").into_response();
     }
-    Html(setup_html(None)).into_response()
+    Html(setup_html(None, &state.setup_csrf)).into_response()
 }
 
 #[derive(Deserialize)]
 pub struct SetupForm {
+    csrf_token: String,
     password: String,
     confirm: String,
 }
@@ -212,24 +215,38 @@ pub async fn setup_post(
     if state.password_hash.lock().unwrap().is_some() {
         return Redirect::to("/login").into_response();
     }
+    if f.csrf_token != state.setup_csrf {
+        return (axum::http::StatusCode::FORBIDDEN, "CSRF 검증에 실패했습니다.")
+            .into_response();
+    }
     // 최초 설정은 호스트(localhost)에서만 — 원격에서 비밀번호를 선점하는 것을 방지.
     if !peer.ip().is_loopback() {
-        return Html(setup_html(Some(
-            "최초 비밀번호 설정은 봇이 실행 중인 PC(localhost)에서만 가능합니다.",
-        )))
+        return Html(setup_html(
+            Some("최초 비밀번호 설정은 봇이 실행 중인 PC(localhost)에서만 가능합니다."),
+            &state.setup_csrf,
+        ))
         .into_response();
     }
     if f.password.chars().count() < 4 {
-        return Html(setup_html(Some("비밀번호는 4자 이상이어야 합니다."))).into_response();
+        return Html(setup_html(
+            Some("비밀번호는 4자 이상이어야 합니다."),
+            &state.setup_csrf,
+        ))
+        .into_response();
     }
     if f.password != f.confirm {
-        return Html(setup_html(Some("비밀번호 확인이 일치하지 않습니다."))).into_response();
+        return Html(setup_html(
+            Some("비밀번호 확인이 일치하지 않습니다."),
+            &state.setup_csrf,
+        ))
+        .into_response();
     }
     let hash = hash_password(&f.password);
     if store_hash(&state.app, &hash).is_err() {
-        return Html(setup_html(Some(
-            "비밀번호 저장에 실패했습니다 (data 디렉터리 쓰기 권한을 확인하세요).",
-        )))
+        return Html(setup_html(
+            Some("비밀번호 저장에 실패했습니다 (data 디렉터리 쓰기 권한을 확인하세요)."),
+            &state.setup_csrf,
+        ))
         .into_response();
     }
     *state.password_hash.lock().unwrap() = Some(hash);
