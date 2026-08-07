@@ -1241,13 +1241,23 @@ function buildLayoutPicker() {
 
   const reset = h('button', {
     class: 'dd__item', type: 'button', role: 'menuitem',
+    tip: '기본 배치로 되돌려요. 저장해 둔 슬롯은 그대로예요',
     onClick: () => { closeMenus(); resetPanelLayout(); },
   }, h('span', null, '↺'), h('span', null, '패널 배치를 기본으로 되돌리기'));
   el.panelResetBtn = reset;
 
+  // 슬롯·공유는 패널형에서만 의미가 있다. 다른 배치에서는 숨긴다.
+  const slots = h('button', {
+    class: 'dd__item', type: 'button', role: 'menuitem',
+    tip: '배치를 여러 개 저장해 두거나, 코드로 남과 주고받아요',
+    onClick: () => { closeMenus(); openSlotSheet(); },
+  }, h('span', null, '▦'), h('span', null, '배치 슬롯 · 공유'));
+  el.panelSlotsBtn = slots;
+
   return frag(
     h('div', { class: 'dd__label' }, '화면 배치'),
     h('div', { class: 'lay', role: 'group', 'aria-label': '화면 배치' }, ...el.layoutOpts),
+    slots,
     reset);
 }
 
@@ -1286,6 +1296,7 @@ function syncLayoutOptions() {
     node.setAttribute('aria-checked', String(node.dataset.layout === activeLayout));
   }
   if (el.panelResetBtn) el.panelResetBtn.hidden = activeLayout !== 'panel';
+  if (el.panelSlotsBtn) el.panelSlotsBtn.hidden = activeLayout !== 'panel';
 }
 
 function applyLayout() {
@@ -1491,6 +1502,174 @@ function savePanelLayout() {
   prefSet('panelLayout', JSON.stringify(serializeTree(dockTree)));
 }
 
+/* ═══════════════════════ 배치 슬롯과 공유 (패널형 전용) ═══════════════════════
+ * 슬롯은 계정(prefs.panelSlots)에 저장한다. 기기를 바꿔도 따라온다.
+ * 공유는 서버를 거치지 않는다 — 트리를 그대로 문자열로 만들어 주고받는다.
+ * 남의 코드를 붙여넣는 자리라 sanitizeTree 로 반드시 걸러서 쓴다.
+ */
+
+const MAX_SLOTS = 5;
+
+function readSlots() {
+  const raw = prefJson('panelSlots');
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((slot) => {
+      const tree = sanitizeTree(slot && slot.tree);
+      if (!tree) return null;
+      return { name: escapeText(String(slot.name || '이름 없음')).slice(0, 24), tree };
+    })
+    .filter(Boolean)
+    .slice(0, MAX_SLOTS);
+}
+
+function writeSlots(slots) {
+  prefSet('panelSlots', JSON.stringify(slots.slice(0, MAX_SLOTS)));
+}
+
+function saveSlot(name) {
+  if (!dockTree) return;
+  const slots = readSlots();
+  const clean = escapeText(String(name || '').trim()).slice(0, 24) || `배치 ${slots.length + 1}`;
+  const tree = serializeTree(dockTree);
+  const at = slots.findIndex((slot) => slot.name === clean);
+  if (at >= 0) slots[at] = { name: clean, tree };
+  else if (slots.length >= MAX_SLOTS) { toast(`슬롯은 ${MAX_SLOTS}개까지예요. 하나를 덮어써 주세요.`, 'warn'); return; }
+  else slots.push({ name: clean, tree });
+  writeSlots(slots);
+  toast(`"${clean}" 에 저장했어요.`, 'ok');
+}
+
+function loadSlot(index) {
+  const slot = readSlots()[index];
+  if (!slot) return;
+  dockTree = slot.tree;
+  savePanelLayout();
+  if (panelMode()) renderDock();
+  toast(`"${slot.name}" 배치를 불러왔어요.`, 'ok');
+}
+
+function deleteSlot(index) {
+  const slots = readSlots();
+  if (!slots[index]) return;
+  const [gone] = slots.splice(index, 1);
+  writeSlots(slots);
+  toast(`"${gone.name}" 슬롯을 지웠어요.`, 'ok');
+}
+
+/** 트리 → 공유 코드. 사람이 실수로 자르기 쉬운 문자를 피하려고 base64url 로 만든다. */
+function encodeLayout(tree) {
+  const json = JSON.stringify(serializeTree(tree));
+  const bytes = new TextEncoder().encode(json);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return 'MCM1' + btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/** 공유 코드 → 트리. **반드시 sanitizeTree 를 통과시킨다** — 남이 준 문자열이다. */
+function decodeLayout(code) {
+  const raw = String(code || '').trim().replace(/\s+/g, '');
+  if (!raw.startsWith('MCM1')) return null;
+  try {
+    const b64 = raw.slice(4).replace(/-/g, '+').replace(/_/g, '/');
+    const binary = atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4));
+    const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+    return sanitizeTree(JSON.parse(new TextDecoder().decode(bytes)));
+  } catch {
+    return null;
+  }
+}
+
+async function copyLayoutCode() {
+  if (!dockTree) return;
+  const code = encodeLayout(dockTree);
+  try {
+    await navigator.clipboard.writeText(code);
+    toast('배치 코드를 복사했어요. 붙여넣어 공유하세요.', 'ok');
+  } catch {
+    // 클립보드가 막힌 환경(비 HTTPS 등)에서는 직접 고를 수 있게 보여준다.
+    sheet({
+      title: '배치 코드',
+      desc: '아래 코드를 전체 복사해서 공유해 주세요.',
+      body: h('textarea', {
+        class: 'field', rows: '4', readonly: true, value: code,
+        ref: (node) => setTimeout(() => { node.focus(); node.select(); }, 20),
+      }),
+      actions: [{ label: '닫기', kind: 'primary', value: true, autofocus: false }],
+    });
+  }
+}
+
+async function importLayoutSheet() {
+  const input = h('textarea', {
+    class: 'field', rows: '4', placeholder: 'MCM1... 로 시작하는 코드를 붙여넣어 주세요',
+    ref: (node) => setTimeout(() => node.focus(), 20),
+  });
+  const ok = await sheet({
+    title: '배치 코드 가져오기',
+    desc: '남이 준 코드를 붙여넣으면 그 사람 배치를 그대로 써요. 지금 배치는 덮어써요.',
+    body: input,
+    actions: [
+      { label: '취소', kind: 'ghost', value: false },
+      { label: '가져오기', kind: 'primary', value: true },
+    ],
+  });
+  if (!ok) return;
+  const tree = decodeLayout(input.value);
+  if (!tree) { toast('코드를 알아볼 수 없어요. 전체를 복사했는지 확인해 주세요.', 'danger'); return; }
+  dockTree = tree;
+  savePanelLayout();
+  if (panelMode()) renderDock();
+  toast('배치를 가져왔어요.', 'ok');
+}
+
+/** 슬롯 목록 시트 — 저장·불러오기·삭제·공유를 한 자리에 모은다. */
+async function openSlotSheet() {
+  const slots = readSlots();
+  const nameInput = h('input', {
+    class: 'field', type: 'text', maxlength: '24',
+    placeholder: `지금 배치 이름 (예: 노래고를때)`,
+    ref: (node) => setTimeout(() => node.focus(), 20),
+  });
+  const list = h('div', { class: 'slotlist' },
+    slots.length
+      ? slots.map((slot, index) => h('div', { class: 'slotrow' },
+        h('button', {
+          class: 'slotrow__load', type: 'button', tip: `"${slot.name}" 배치로 바꿔요`,
+          onClick: () => { closeSheets(); loadSlot(index); },
+        }, h('span', null, '▦'), h('span', null, slot.name)),
+        h('button', {
+          class: 'btn btn--sm btn--ghost', type: 'button', tip: '지금 배치로 덮어써요',
+          onClick: () => { saveSlot(slot.name); },
+        }, '덮어쓰기'),
+        h('button', {
+          class: 'btn btn--sm btn--danger', type: 'button', tip: '이 슬롯을 지워요',
+          onClick: (event) => { deleteSlot(index); event.currentTarget.closest('.slotrow').remove(); },
+        }, '✕')))
+      : h('p', { class: 'hint' }, '저장한 배치가 아직 없어요.'));
+
+  const action = await sheet({
+    title: '배치 슬롯',
+    desc: `배치를 ${MAX_SLOTS}개까지 저장해 두고 골라 쓸 수 있어요. 계정에 저장돼서 다른 기기에서도 그대로예요.`,
+    body: h('div', { class: 'slotbox' }, list, nameInput),
+    wide: true,
+    actions: [
+      { label: '닫기', kind: 'ghost', value: 'close' },
+      { label: '📋 코드 복사', kind: 'ghost', value: 'copy' },
+      { label: '📥 코드 가져오기', kind: 'ghost', value: 'import' },
+      { label: '＋ 지금 배치 저장', kind: 'primary', value: 'save' },
+    ],
+  });
+  if (action === 'save') saveSlot(nameInput.value);
+  else if (action === 'copy') copyLayoutCode();
+  else if (action === 'import') importLayoutSheet();
+}
+
+/** 시트 안의 버튼이 시트를 닫아야 할 때 쓴다. */
+function closeSheets() {
+  document.querySelectorAll('.sheet-back').forEach((back) => back.remove());
+}
+
 /* ── 트리 조작 ── */
 
 function eachNode(node, fn, parent = null) {
@@ -1663,10 +1842,20 @@ function buildDockGroup(group) {
 
   const tabs = h('div', { class: 'dk-tabs', role: 'tablist', 'aria-label': '패널 탭' });
   for (const id of group.panels) tabs.appendChild(buildDockTab(group, id));
+
+  // 닫은 패널을 되살리는 유일한 입구다. 아이콘만 두면 패널을 닫은 사람이
+  // "되돌릴 방법이 없다"고 느낀다. 라벨을 붙이고, 닫아 둔 게 있으면 개수까지 보여준다.
+  const closedCount = Object.keys(PANELS).length - openPanels().size;
   tabs.appendChild(h('button', {
-    class: 'dk-add', type: 'button', tip: '닫은 패널 다시 열기', 'aria-label': '패널 추가',
+    class: 'dk-add', type: 'button',
+    dataset: { closed: closedCount > 0 ? '1' : '0' },
+    tip: closedCount > 0
+      ? `닫아 둔 창 ${closedCount}개를 여기서 다시 열어요`
+      : '창을 추가해요. 지금은 전부 열려 있어요',
+    'aria-label': '패널 추가',
     onClick: (event) => openAddPanelMenu(group, event.currentTarget),
-  }, '＋'));
+  }, h('span', { 'aria-hidden': 'true' }, '＋'), h('span', null, '창'),
+     closedCount > 0 ? h('span', { class: 'dk-add__n' }, String(closedCount)) : null));
 
   const body = h('div', { class: 'dk-body' });
   for (const id of group.panels) {
@@ -1707,9 +1896,16 @@ function buildDockTab(group, id) {
     h('span', { 'aria-hidden': 'true' }, meta.icon),
     h('span', null, meta.label));
 
+  // 마지막 하나 남은 창은 못 닫는다. 눌러도 아무 일이 없는 버튼을 그냥 두면 고장으로 보이니
+  // 미리 비활성으로 알려 준다. (§23.3 — 막힌 컨트롤에는 이유가 붙는다)
+  const isLast = openPanels().size <= 1;
   const close = h('button', {
-    class: 'dk-x', type: 'button', tip: `${meta.label} 닫기`, 'aria-label': `${meta.label} 닫기`,
-    onClick: (event) => { event.stopPropagation(); closeDockPanel(id); },
+    class: ['dk-x', isLast && 'is-locked'],
+    type: 'button',
+    tip: isLast ? '창이 하나뿐이라 닫을 수 없어요' : `${meta.label} 닫기`,
+    'aria-label': isLast ? '창이 하나뿐이라 닫을 수 없어요' : `${meta.label} 닫기`,
+    'aria-disabled': isLast ? 'true' : null,
+    onClick: (event) => { event.stopPropagation(); if (!isLast) closeDockPanel(id); },
   }, '✕');
   tab.appendChild(close);
 

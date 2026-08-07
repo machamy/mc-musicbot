@@ -1427,19 +1427,42 @@ body[data-dragging="tab"] { user-select: none; }
 .dk-x:hover { background: var(--danger-soft); color: var(--danger); }
 @media (hover: none) { .dk-x { opacity: 1; } }
 
+/* 닫은 패널을 되살리는 유일한 입구다. 아이콘만 흐리게 두면 패널을 닫은 사람이
+ * "되돌릴 방법이 없다"고 느낀다. 라벨을 붙이고 색을 올린다. */
 .dk-add {
   display: inline-flex; align-items: center; justify-content: center;
+  gap: var(--sp-1);
   flex: none;
-  width: 24px; height: 24px;
+  height: 24px;
+  padding: 0 var(--sp-2);
   margin-left: auto;
   border-radius: var(--r-sm);
-  color: var(--text-4);
-  font-size: var(--fs-md);
+  border: 1px dashed var(--line-3);
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
 }
-.dk-add:hover { background: var(--surface-3); color: var(--text-1); }
+.dk-add:hover { background: var(--surface-3); border-color: var(--accent-line); color: var(--text-1); }
+/* 닫아 둔 패널이 있으면 더 눈에 띄게 — 되살릴 게 있다는 신호다 */
+.dk-add[data-closed="1"] { border-style: solid; border-color: var(--accent-line); color: var(--accent); }
+.dk-add__n { font-variant-numeric: tabular-nums; }
 
-.dk-body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-.dk-body > * { flex: 1 1 auto; min-height: 0; }
+/* 패널 안이 넘치면 그 패널 안에서 스크롤한다.
+ * 화면 하나에 가로 스크롤바를 길게 두는 방식은 쓰기 번거롭다 —
+ * 크기를 줄인 그 패널만 스스로 스크롤하는 게 맞다. */
+.dk-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;   /* iOS 관성 스크롤 */
+}
+/* 자식이 세로로 줄어드는 걸 막아야 스크롤이 생긴다.
+ * flex: 1 1 auto 만 두면 자식이 찌그러져서 스크롤할 게 없어진다. */
+.dk-body > * { flex: 1 0 auto; min-height: min-content; }
 
 /* 그룹이 이미 테두리를 가졌으니 안쪽 카드는 테두리를 벗는다 */
 .dk-body > .now, .dk-body > .lyrics { border: 0; border-radius: 0; }
@@ -2339,3 +2362,35 @@ body.gate {
 .qitem__acts { flex-wrap: wrap; row-gap: var(--sp-1); min-width: 0; }
 .vote { white-space: nowrap; flex: none; }
 .queue__list { overflow-x: hidden; }
+
+/* ═══════════════════════ 배치 슬롯 · 공유 ═══════════════════════ */
+
+.slotbox { display: grid; gap: var(--sp-3); }
+.slotlist { display: grid; gap: var(--sp-2); }
+
+.slotrow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-sm);
+}
+.slotrow__load {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: 1;
+  min-width: 0;
+  color: var(--text-1);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  text-align: left;
+}
+.slotrow__load span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slotrow:hover { border-color: var(--accent-line); }
+
+/* 마지막 하나 남은 창은 못 닫는다 — 눌리는 것처럼 보이면 안 된다 */
+.dk-x.is-locked { opacity: 0.35; cursor: not-allowed; }
+.dk-x.is-locked:hover { background: none; color: var(--text-4); }

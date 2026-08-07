@@ -996,6 +996,198 @@ fn playlist_name(item: Option<&str>) -> Option<&str> {
     }
 }
 
+/// 설정 키를 사람이 읽는 이름으로. 모르는 키는 그대로 쓴다.
+fn settings_label(key: &str) -> &str {
+    match key {
+        "minVolume" => "최소 볼륨",
+        "maxVolume" => "최대 볼륨",
+        "defaultVolume" => "기본 볼륨",
+        "maxQueuePerUser" => "1인 대기열 수",
+        "maxQueuePerGuild" => "서버 대기열 수",
+        "maxTrackSeconds" => "곡 최대 길이",
+        "auditRetentionDays" => "로그 보관일",
+        "chatRetentionDays" => "채팅 보관일",
+        "sortMode" => "대기열 정렬 방식",
+        "chatEnabled" => "웹 채팅",
+        "suggestionEnabled" => "제안 게시판",
+        "visualizerEnabled" => "비주얼라이저",
+        "autoBgmEnabled" => "자동 재생",
+        "repeatMode" => "반복",
+        "searchRule" => "곡 검색·신청 권한",
+        "voteRule" => "좋아요 권한",
+        "chatRule" => "채팅 쓰기 권한",
+        "playbackRule" => "재생·일시정지 권한",
+        "skipRule" => "스킵 권한",
+        "seekRule" => "재생 위치 이동 권한",
+        "volumeRule" => "볼륨 권한",
+        "queueEditRule" => "대기열 편집 권한",
+        "autoplayRule" => "자동 재생 설정 권한",
+        "bulkEnqueueRule" => "한 번에 담기 권한",
+        "managerRoleIds" => "관리자 지정 역할",
+        "ruleRoleIds" => "권한별 지정 역할",
+        "likePoints" => "좋아요 점수",
+        "dislikePoints" => "싫어요 점수",
+        "superLikePoints" => "슈퍼 좋아요 점수",
+        "waitPoints" => "대기 가점",
+        "boomttaEnabled" => "붐따",
+        "boomttaThreshold" => "붐따 기준 수",
+        "boomttaAction" => "붐따 동작",
+        "voteSkipEnabled" => "투표 스킵",
+        "voteSkipBasis" => "투표 스킵 기준",
+        "voteSkipRatio" => "투표 스킵 비율",
+        "voteSkipMin" => "투표 스킵 최소 인원",
+        "superLikeCooldownSec" => "슈퍼 좋아요 쿨타임",
+        "superLikeDailyLimit" => "슈퍼 좋아요 하루 횟수",
+        "autoplayMode" => "자동 재생 방식",
+        "autoplayPolicy" => "자동 재생 정책",
+        "autoplayRecentCount" => "자동 재생 참고 곡 수",
+        "autoplayGenres" => "자동 재생 장르",
+        "autoplayArtistCooldown" => "같은 아티스트 쿨다운",
+        "autoplayRecentDecayHours" => "최근 재생 회피 시간",
+        "autoplaySeedMax" => "기준 곡 최대 수",
+        "chartSuperWeight" => "차트 슈퍼 좋아요 가중치",
+        "bulkEnqueueLimit" => "한 번에 담기 상한",
+        "chartLimit" => "차트에서 가져올 곡 수",
+        other => other,
+    }
+}
+
+/// 설정 값 하나를 사람이 읽는 문자열로. 0은 대부분 "무제한"이다 (§23.1).
+fn settings_value(key: &str, value: &serde_json::Value) -> String {
+    // 규칙 값은 한국어 라벨이 따로 있다.
+    if key.ends_with("Rule")
+        && let Some(text) = value.as_str()
+    {
+        let label = match text {
+            "guildMember" => Some("모든 멤버"),
+            "sameVoiceChannel" => Some("같은 음성 채널"),
+            "configuredRole" => Some("지정 역할"),
+            "administrator" => Some("관리자"),
+            "disabled" => Some("사용 안 함"),
+            _ => None,
+        };
+        if let Some(label) = label {
+            return label.to_string();
+        }
+    }
+    match value {
+        serde_json::Value::Bool(true) => "켬".into(),
+        serde_json::Value::Bool(false) => "끔".into(),
+        serde_json::Value::Null => "없음".into(),
+        serde_json::Value::Array(items) if items.is_empty() => "없음".into(),
+        serde_json::Value::Array(items) => format!("{}개", items.len()),
+        serde_json::Value::Object(map) => format!("{}개", map.len()),
+        serde_json::Value::Number(number) => {
+            let raw = number.to_string();
+            // 0 = 무제한 규약. 볼륨·비율처럼 0이 진짜 숫자인 키는 예외다.
+            let unlimited_ok = !matches!(
+                key,
+                "minVolume"
+                    | "maxVolume"
+                    | "defaultVolume"
+                    | "voteSkipRatio"
+                    | "likePoints"
+                    | "dislikePoints"
+                    | "superLikePoints"
+                    | "waitPoints"
+                    | "chartSuperWeight"
+            );
+            if raw == "0" && unlimited_ok {
+                "무제한".into()
+            } else if key == "maxTrackSeconds"
+                && let Some(seconds) = number.as_i64()
+                && seconds > 0
+            {
+                let hours = seconds / 3600;
+                let minutes = (seconds % 3600) / 60;
+                if hours > 0 {
+                    format!("{hours}시간")
+                } else {
+                    format!("{minutes}분")
+                }
+            } else {
+                raw
+            }
+        }
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                "없음".into()
+            } else {
+                truncate_title(trimmed)
+            }
+        }
+    }
+}
+
+/// 설정 변경을 사람이 읽는 문장으로.
+///
+/// **여기가 없으면 사람 피드에 설정 JSON 통째가 그대로 나간다.**
+/// `마참 님이 limits 을 {"guildId":497...,"minVolume":0,...} → {...} 로 바꿨어요` 가
+/// 실제로 화면에 나갔던 문장이다. 무엇이 바뀌었는지만 짚어 준다.
+fn settings_change_text(actor: &str, section: &str, before: Option<&str>, after: Option<&str>) -> String {
+    let parse = |raw: Option<&str>| -> Option<serde_json::Map<String, serde_json::Value>> {
+        serde_json::from_str::<serde_json::Value>(raw?.trim())
+            .ok()?
+            .as_object()
+            .cloned()
+    };
+    let (Some(old), Some(new)) = (parse(before), parse(after)) else {
+        // 값이 통짜 JSON 이 아니라 단일 값인 경로도 있다(`settings.maxVolume` 처럼).
+        // 그때는 그대로 전후를 보여 준다 — 이건 짧아서 읽는 데 문제가 없다.
+        let what = settings_label(section);
+        return match (before.map(str::trim), after.map(str::trim)) {
+            (Some(from), Some(to)) if !from.is_empty() && !to.is_empty() => {
+                format!(
+                    "{actor}님이 **{what}** 을 {} → {} 로 바꿨어요",
+                    truncate_title(from),
+                    truncate_title(to)
+                )
+            }
+            (_, Some(to)) if !to.is_empty() => {
+                format!("{actor}님이 **{what}** 을 {} 로 바꿨어요", truncate_title(to))
+            }
+            _ => format!("{actor}님이 {what} 설정을 바꿨어요"),
+        };
+    };
+
+    // 실제로 달라진 키만 모은다. guildId 처럼 설정이 아닌 것은 뺀다.
+    let mut changed: Vec<(String, String, String)> = Vec::new();
+    for (key, next) in &new {
+        if key == "guildId" {
+            continue;
+        }
+        let previous = old.get(key).unwrap_or(&serde_json::Value::Null);
+        if previous == next {
+            continue;
+        }
+        changed.push((
+            settings_label(key).to_string(),
+            settings_value(key, previous),
+            settings_value(key, next),
+        ));
+    }
+
+    match changed.len() {
+        // 저장은 했는데 값이 그대로면 굳이 남길 게 없다.
+        0 => format!("{actor}님이 설정을 저장했어요"),
+        1 => {
+            let (label, from, to) = &changed[0];
+            format!("{actor}님이 **{label}** 을 {from} → {to} 로 바꿨어요")
+        }
+        _ => {
+            let names: Vec<&str> = changed.iter().take(3).map(|(label, _, _)| label.as_str()).collect();
+            let rest = changed.len().saturating_sub(names.len());
+            let listed = names.join(", ");
+            if rest > 0 {
+                format!("{actor}님이 설정 {}개를 바꿨어요 ({listed} 외 {rest}개)", changed.len())
+            } else {
+                format!("{actor}님이 설정 {}개를 바꿨어요 ({listed})", changed.len())
+            }
+        }
+    }
+}
+
 fn audit_value<'a>(after: Option<&'a str>, prefix: &str) -> Option<&'a str> {
     let raw = after?.trim();
     Some(
@@ -1145,16 +1337,12 @@ pub fn audit_text(
             Some(pattern) => format!("{actor}님이 차단 목록에서 **{pattern}** 을 뺐어요"),
             None => format!("{actor}님이 차단 목록에서 규칙을 뺐어요"),
         },
-        _ if action.starts_with("settings.") => {
-            let what = item.unwrap_or_else(|| action.trim_start_matches("settings.").into());
-            match (before, after) {
-                (Some(old), Some(new)) => {
-                    format!("{actor}님이 {what} 을 {old} → {new} 로 바꿨어요")
-                }
-                (None, Some(new)) => format!("{actor}님이 {what} 을 {new} 로 바꿨어요"),
-                _ => format!("{actor}님이 {what} 을 바꿨어요"),
-            }
-        }
+        _ if action.starts_with("settings.") => settings_change_text(
+            actor,
+            action.trim_start_matches("settings."),
+            before,
+            after,
+        ),
         other => match item {
             Some(title) => format!("{actor}님이 {other} 을 했어요 (**{title}**)"),
             None => format!("{actor}님이 {other} 을 했어요"),
@@ -1543,6 +1731,10 @@ pub struct RemoteGuildSettings {
     /// 사랑받은 곡 차트에서 슈퍼 좋아요를 몇 배로 칠지 (0~5). `0`이면 슈퍼를 무시한다.
     #[serde(default = "default_chart_super_weight")]
     pub chart_super_weight: u32,
+    /// 차트 하나에서 가져올 곡 수 (§15). 10~100. 검색형 차트는 `ytsearchN:` 의 N 을 이 값으로 갈아 끼운다.
+    /// 재생목록형은 앞에서부터 이 개수만 쓴다.
+    #[serde(default = "default_chart_limit")]
+    pub chart_limit: u32,
 }
 
 fn default_chat_retention_days() -> u32 {
@@ -1578,6 +1770,30 @@ fn default_autoplay_seed_max() -> u32 {
 fn default_bulk_enqueue_limit() -> u32 {
     200
 }
+/// 차트 곡 수 기본값. 50 이면 한 화면에 담기고 yt-dlp 도 빠르다.
+fn default_chart_limit() -> u32 {
+    50
+}
+
+/// `ytsearch50:...` 의 숫자를 설정값으로 갈아 끼운다.
+///
+/// 검색형 차트는 URL 에 개수가 박혀 있어서, 설정을 바꿔도 주소를 안 고치면 그대로 50 이다.
+/// 재생목록·internal 주소는 건드리지 않는다.
+pub fn chart_url_with_limit(url: &str, limit: u32) -> String {
+    let limit = limit.clamp(1, 100);
+    for prefix in ["ytsearch", "scsearch"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            // `ytsearch50:검색어` 에서 숫자와 콜론을 찾는다.
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let tail = &rest[digits.len()..];
+            if tail.starts_with(':') {
+                return format!("{prefix}{limit}{tail}");
+            }
+        }
+    }
+    url.to_string()
+}
+
 fn default_chart_super_weight() -> u32 {
     2
 }
@@ -1659,6 +1875,11 @@ impl RemoteGuildSettings {
     }
 
     /// 기준 곡 상한. `0`이면 무제한이라 `None`이다 (§23.1).
+    /// 차트에서 가져올 곡 수. 10~100 으로 조인다.
+    pub fn chart_limit(&self) -> u32 {
+        self.chart_limit.clamp(10, 100)
+    }
+
     pub fn seed_limit(&self) -> Option<u32> {
         as_limit_u32(self.autoplay_seed_max)
     }
@@ -1736,6 +1957,7 @@ impl Default for RemoteGuildSettings {
     fn default() -> Self {
         Self {
             guild_id: 0,
+            chart_limit: default_chart_limit(),
             min_volume: 0,
             max_volume: 200,
             default_volume: 100,
@@ -2114,6 +2336,50 @@ mod tests {
 
     /// `POST /control` 이 남기는 `키:값` 결과와 옛 액션명이 사람 피드에 그대로 새면 안 된다.
     /// (`민수님이 playback.autoplay 을 했어요` · `서버 볼륨을 volume:150으로 바꿨어요`)
+    /// 실제로 화면에 나갔던 문장:
+    /// `마참 님이 limits 을 {"guildId":497...,"minVolume":0,...} → {...} 로 바꿨어요`
+    #[test]
+    fn settings_changes_never_dump_json_into_the_feed() {
+        let before = r#"{"guildId":100000000000000002,"minVolume":0,"maxVolume":100,
+            "maxQueuePerUser":100,"maxQueuePerGuild":100,"sortMode":"score","chatEnabled":true}"#;
+        let after = r#"{"guildId":100000000000000002,"minVolume":0,"maxVolume":100,
+            "maxQueuePerUser":100,"maxQueuePerGuild":991,"sortMode":"score","chatEnabled":true}"#;
+        let text = audit_text("settings.limits", "마참", None, Some(before), Some(after), 0);
+        assert!(!text.contains('{'), "JSON 이 새어 나갔다: {text}");
+        assert!(!text.contains("guildId"), "내부 필드가 새어 나갔다: {text}");
+        assert!(text.contains("서버 대기열 수"), "바뀐 항목 이름이 없다: {text}");
+        assert!(text.contains("100") && text.contains("991"), "전후 값이 없다: {text}");
+    }
+
+    #[test]
+    fn settings_changes_summarize_when_many_moved() {
+        let before = r#"{"maxVolume":100,"maxQueuePerUser":5,"chatEnabled":true,"sortMode":"score"}"#;
+        let after = r#"{"maxVolume":150,"maxQueuePerUser":10,"chatEnabled":false,"sortMode":"fair"}"#;
+        let text = audit_text("settings.limits", "마참", None, Some(before), Some(after), 0);
+        assert!(!text.contains('{'), "{text}");
+        assert!(text.contains("4개"), "바뀐 개수가 없다: {text}");
+    }
+
+    #[test]
+    fn settings_values_read_like_korean() {
+        // 0 = 무제한 (§23.1), 불리언은 켬/끔, 규칙은 한국어 라벨
+        let before = r#"{"maxQueuePerGuild":100,"chatEnabled":true,"searchRule":"guildMember"}"#;
+        let after = r#"{"maxQueuePerGuild":0,"chatEnabled":true,"searchRule":"guildMember"}"#;
+        let text = audit_text("settings.limits", "마참", None, Some(before), Some(after), 0);
+        assert!(text.contains("무제한"), "0 이 무제한으로 안 읽힌다: {text}");
+
+        let rule_before = r#"{"searchRule":"guildMember"}"#;
+        let rule_after = r#"{"searchRule":"sameVoiceChannel"}"#;
+        let rule_text = audit_text("settings.perms", "마참", None, Some(rule_before), Some(rule_after), 0);
+        assert!(rule_text.contains("같은 음성 채널"), "규칙이 코드값 그대로다: {rule_text}");
+        assert!(!rule_text.contains("sameVoiceChannel"), "{rule_text}");
+
+        let flag_before = r#"{"chatEnabled":true}"#;
+        let flag_after = r#"{"chatEnabled":false}"#;
+        let flag_text = audit_text("settings.chat", "마참", None, Some(flag_before), Some(flag_after), 0);
+        assert!(flag_text.contains("끔"), "{flag_text}");
+    }
+
     #[test]
     fn playlist_sentences_never_leak_the_id_or_the_action_name() {
         // 화면에 `playlist.addTrack 을 했어요 (1:aespa - Spicy)` 가 그대로 나갔던 자리다.

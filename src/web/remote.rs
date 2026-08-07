@@ -3199,6 +3199,8 @@ async fn api_state_cold(
             "maxTrackSeconds": settings.max_track_seconds,
             "bulkEnqueueLimit": settings.bulk_enqueue_limit,
             "chartSuperWeight": settings.chart_super_weight,
+        "chartLimit": settings.chart_limit,
+            "chartLimit": settings.chart_limit,
             // 붐따 (V3 §10.3) — 꺼져 있으면 싫어요는 점수에만 영향을 준다.
             "boomttaEnabled": settings.boomtta_enabled,
             "boomttaThreshold": settings.boomtta_threshold,
@@ -7142,6 +7144,16 @@ async fn admin_settings_put(
                     .map(str::to_string)
                     .collect();
             }
+            // ── 차트에서 가져올 곡 수 (V3 §15) ──
+            if let Some(value) = json_i32(&body, "chartLimit") {
+                if !(10..=100).contains(&value) {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "차트 곡 수는 10~100곡이에요.",
+                    );
+                }
+                settings.chart_limit = value as u32;
+            }
             // ── 차트 가중치 (V3 §15.2b) ──
             if let Some(value) = json_i32(&body, "chartSuperWeight") {
                 if !(0..=5).contains(&value) {
@@ -8577,7 +8589,7 @@ async fn api_chart_detail(
             json_ok(payload)
         };
     }
-    match fetch_chart_tracks(&state, &chart, false).await {
+    match fetch_chart_tracks(&state, guild_id, &chart, false).await {
         Ok(snapshot) => json_ok(json!({
             "chart": chart_def_json(&chart),
             "tracks": snapshot.tracks,
@@ -8608,6 +8620,7 @@ impl Drop for ChartFetchGuard {
 
 async fn fetch_chart_tracks(
     state: &Arc<WebState>,
+    guild_id: u64,
     chart: &ChartDef,
     force: bool,
 ) -> Result<ChartSnapshot, String> {
@@ -8645,11 +8658,16 @@ async fn fetch_chart_tracks(
         "SoundCloud" => ProviderKind::SoundCloud,
         _ => ProviderKind::YouTube,
     };
-    let tracks = state
+    // 검색형 차트는 URL 에 개수가 박혀 있다. 설정값(10~100)으로 갈아 끼운다.
+    let limit = state
         .app
-        .ytdlp()
-        .expand_collection(&chart.url, provider)
-        .await;
+        .remote
+        .load_guild_settings(guild_id)
+        .chart_limit();
+    let url = crate::remote::models::chart_url_with_limit(&chart.url, limit);
+    let mut tracks = state.app.ytdlp().expand_collection(&url, provider).await;
+    // 재생목록형은 URL 로 개수를 못 줄이므로 여기서 자른다.
+    tracks.truncate(limit as usize);
     if tracks.is_empty() {
         // **숨기지 말고 그대로 알린다** (§15.2). 관리 콘솔이 실패 시각을 보여 준다.
         let _ = state
@@ -8722,7 +8740,7 @@ async fn api_chart_enqueue(
             .filter_map(|row| serde_json::from_value::<TrackRef>(row.track).ok())
             .collect()
     } else {
-        match fetch_chart_tracks(&state, &chart, false).await {
+        match fetch_chart_tracks(&state, guild_id, &chart, false).await {
             Ok(snapshot) => snapshot.tracks,
             Err(error) => return json_error(StatusCode::BAD_GATEWAY, error),
         }
@@ -8792,7 +8810,7 @@ async fn api_chart_refresh(
             "message": "우리 차트는 늘 최신이라 새로고침할 게 없어요.",
         }));
     }
-    match fetch_chart_tracks(&state, &chart, true).await {
+    match fetch_chart_tracks(&state, guild_id, &chart, true).await {
         Ok(snapshot) => {
             audit_ok(
                 &state,

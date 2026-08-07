@@ -982,3 +982,27 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
   .cs__body { display: block; max-width: none; padding: 0; }
   .grp, .fld, .card { break-inside: avoid; }
 }
+
+/* 차트 주소 방식 설명 — 관리자가 주소를 직접 넣는 자리라 형식을 알려줘야 한다 */
+.urlhelp {
+  margin: var(--sp-3) 0;
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--surface-2);
+  border: 1px solid var(--line-1);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-sm);
+}
+.urlhelp > strong { display: block; margin-bottom: var(--sp-2); color: var(--text-1); font-size: var(--fs-md); }
+.urlhelp__list { display: grid; gap: var(--sp-2); margin: 0 0 var(--sp-2); }
+.urlhelp__list dt {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  color: var(--accent);
+  word-break: break-all;
+}
+.urlhelp__list dd {
+  margin: 2px 0 0;
+  color: var(--text-3);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-base);
+}

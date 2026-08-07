@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -313,31 +313,53 @@ const MIGRATION_V13: &str = r#"
         ON remote_audit_logs(guild_id, user_id, action, id DESC);
 "#;
 
+/// v14 — 죽은 차트 주소를 고치고 노래방 장르를 늘린다.
+///
+/// YouTube Music 인기곡 재생목록 두 개가 죽어서 "한국 인기곡"·"전세계 인기곡"이
+/// **빈 차트로 나가고 있었다**(yt-dlp 로 0곡 확인, 2026-08-07).
+/// `builtin = 1` 이고 **관리자가 손대지 않은 것만** 고친다 — 직접 바꾼 주소를 덮어쓰면 안 된다.
+const MIGRATION_V14: &str = r#"
+    UPDATE remote_charts
+       SET url = 'ytsearch50:한국 인기곡 최신', provider = 'YouTube'
+     WHERE builtin = 1 AND name = '한국 인기곡'
+       AND url = 'https://music.youtube.com/playlist?list=PL4fGSI1pDJn5Kj4TvUZBcNlkzuxCe4vVh';
+    UPDATE remote_charts
+       SET url = 'ytsearch50:global top songs this week', provider = 'YouTube'
+     WHERE builtin = 1 AND name = '전세계 인기곡'
+       AND url = 'https://music.youtube.com/playlist?list=PL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i';
+    -- 실패 기록을 지워 다음 조회에서 다시 시도하게 한다.
+    DELETE FROM remote_chart_cache
+     WHERE chart_id IN (SELECT id FROM remote_charts WHERE builtin = 1 AND name IN ('한국 인기곡','전세계 인기곡'));
+"#;
+
 /// 기본 제공 차트 (§15.2). `guild_id IS NULL` 이라 모든 서버가 같이 본다.
 ///
 /// **주소가 재생목록 ID 대신 `ytsearchN:` 인 것들이 있다.** 유튜브 뮤직의 장르·노래방 차트는
 /// 공개 재생목록 ID 가 자주 바뀌어서, 바뀔 때마다 코드를 고치느니 검색을 쓰는 편이 안 죽는다.
 /// 더 좋은 재생목록을 아는 관리자는 관리 콘솔에서 주소만 갈아 끼우면 된다.
 /// `internal:` 로 시작하는 것은 바깥에서 가져오지 않고 통계 DB 로 만드는 차트다(§15.2b).
-const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 22] = [
+/// 기본 제공 차트.
+///
+/// **주소는 두 가지 방식이 있다.**
+///   - `ytsearch50:검색어` — yt-dlp 검색. 한 번 호출로 N곡을 가져온다.
+///     재생목록 ID 와 달리 죽지 않아서 기본값으로 쓴다. 앞의 숫자는 설정값(`chart_limit`)으로 갈아 끼운다.
+///   - `https://...playlist?list=...` — 실제 재생목록. 정확하지만 **ID 가 자주 바뀐다.**
+///     실제로 YouTube Music 의 인기곡 재생목록 ID 두 개가 죽어서 차트가 빈 채로 나갔다(2026-08-07 확인).
+///     쓰려면 반드시 yt-dlp 로 곡이 나오는지 확인하고 넣는다.
+///   - `internal:...` — 우리가 튼 기록으로 만드는 차트(§15.2b). 외부 호출이 없다.
+///
+/// 관리 콘솔에서 주소를 바꿀 수 있다. 여기 값은 **처음 한 번만** 심어진다.
+const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 26] = [
     // 우리가 실제로 튼 것으로 만드는 차트 — 자동재생으로 나간 곡은 세지 않는다.
     (ChartCategory::Ours, "우리 서버 인기곡", "Internal", "internal:guild-plays"),
     (ChartCategory::Ours, "우리 서버 사랑받은 곡", "Internal", "internal:guild-love"),
     (ChartCategory::Ours, "마참뮤직 전체 인기곡", "Internal", "internal:global-plays"),
     (ChartCategory::Ours, "마참뮤직 전체 사랑받은 곡", "Internal", "internal:global-love"),
     // 인기
-    (
-        ChartCategory::Popular,
-        "전세계 인기곡",
-        "YouTubeMusic",
-        "https://music.youtube.com/playlist?list=PL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i",
-    ),
-    (
-        ChartCategory::Popular,
-        "한국 인기곡",
-        "YouTubeMusic",
-        "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5Kj4TvUZBcNlkzuxCe4vVh",
-    ),
+    // 이 두 개는 원래 YouTube Music 재생목록 ID 였는데 **둘 다 죽어서 빈 차트가 나갔다.**
+    // yt-dlp 로 확인해 보면 0곡이다. 검색은 죽지 않으므로 검색으로 바꿨다.
+    (ChartCategory::Popular, "전세계 인기곡", "YouTube", "ytsearch50:global top songs this week"),
+    (ChartCategory::Popular, "한국 인기곡", "YouTube", "ytsearch50:한국 인기곡 최신"),
     (ChartCategory::Popular, "오늘 뜨는 곡", "YouTube", "ytsearch50:인기 급상승 음악"),
     // 나라별
     (ChartCategory::Region, "미국 인기곡", "YouTube", "ytsearch50:US top songs this week"),
@@ -354,6 +376,10 @@ const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 22] = [
     (ChartCategory::Karaoke, "TJ 인기차트", "YouTube", "ytsearch50:TJ노래방 인기차트"),
     (ChartCategory::Karaoke, "TJ 발라드", "YouTube", "ytsearch50:TJ노래방 발라드"),
     (ChartCategory::Karaoke, "TJ 댄스", "YouTube", "ytsearch50:TJ노래방 댄스"),
+    (ChartCategory::Karaoke, "TJ 힙합", "YouTube", "ytsearch50:TJ노래방 힙합 랩"),
+    (ChartCategory::Karaoke, "TJ J-Pop", "YouTube", "ytsearch50:TJ노래방 일본노래"),
+    (ChartCategory::Karaoke, "TJ 팝송", "YouTube", "ytsearch50:TJ노래방 팝송"),
+    (ChartCategory::Karaoke, "TJ 록·밴드", "YouTube", "ytsearch50:TJ노래방 락 밴드"),
     (ChartCategory::Karaoke, "금영 인기차트", "YouTube", "ytsearch50:금영노래방 인기차트"),
     // SoundCloud
     (
@@ -380,11 +406,12 @@ const CHART_FETCH_STALE_SECS: i64 = 180;
 
 /// 서버가 받아 주는 개인 설정 키. 여기 없는 키는 조용히 버린다 —
 /// 아무 값이나 저장되면 개인 설정 테이블이 남의 키-밸류 저장소가 돼 버린다.
-pub const PREF_KEYS: [&str; 9] = [
+pub const PREF_KEYS: [&str; 10] = [
     "layout",
     "theme",
     "layoutSizes",
     "panelLayout",
+    "panelSlots",
     "lyricsOpen",
     "webPlayback",
     "webVolume",
@@ -417,6 +444,9 @@ pub fn is_valid_pref(key: &str, value: &str) -> bool {
             .unwrap_or(false),
         "layoutSizes" => is_valid_json_pref(value, PREF_LAYOUT_SIZES_MAX),
         "panelLayout" => is_valid_json_pref(value, PREF_PANEL_LAYOUT_MAX),
+        // 배치 슬롯 (최대 5개 × 트리 하나). 트리 상한의 6배까지 받는다.
+        // 내용 검증은 클라이언트의 sanitizeTree 가 한다 — 여기서는 크기와 JSON 여부만 본다.
+        "panelSlots" => is_valid_json_pref(value, PREF_PANEL_LAYOUT_MAX * 6),
         // 로그 필터 칩 선택 (§13.4). 분류 이름을 콤마로 이은 값이다.
         // 전부 끈 상태는 빈 문자열이 아니라 `none` 으로 저장한다 —
         // 빈 값은 "저장한 적 없음"과 구분이 안 돼서 기본 필터가 되살아난다.
@@ -2713,6 +2743,11 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                 tx.execute_batch(MIGRATION_V13)?;
                 // 이미 쌓인 줄에도 분류를 채워 준다 — 필터가 옛 줄만 통째로 놓치면 안 된다.
                 backfill_audit_kinds(&tx)?;
+            }
+            13 => {
+                tx.execute_batch(MIGRATION_V14)?;
+                // 새로 늘린 노래방·장르 차트를 기존 DB 에도 심는다.
+                seed_builtin_charts(&tx)?;
             }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}

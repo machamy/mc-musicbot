@@ -283,6 +283,10 @@ const NUM_SPECS = {
   },
 
   /* ── 우리 차트 (v3 §15.2b) ── 0 은 "슈퍼 좋아요를 아예 안 센다"는 뜻이라 무제한이 아니다. */
+  chartLimit: {
+    label: '차트 곡 수', min: 10, max: 100, step: 10, unit: '곡',
+    desc: '차트 하나를 열 때 가져올 곡 수예요. 검색으로 만든 차트는 이 숫자만큼 찾아오고, 재생목록으로 만든 차트는 앞에서부터 이만큼만 써요. 많이 가져올수록 처음 여는 데 조금 더 걸려요.',
+  },
   chartSuperWeight: {
     label: '슈퍼 좋아요 가중치', min: 0, max: 5, step: 1, unit: '배',
     desc: '"많이 사랑받은 곡" 차트에서 슈퍼 좋아요를 몇 배로 칠지예요. 배수라서 무제한이 없고, 0은 무제한이 아니라 "슈퍼 좋아요를 아예 안 센다"는 뜻이에요.',
@@ -299,7 +303,7 @@ const SECTION_KEYS = {
     'superLikeCooldownSec', 'superLikeDailyLimit',
     'autoplayMode', 'autoplayRecentCount', 'autoplayGenres',
     'autoplayPolicy', 'autoplayArtistCooldown', 'autoplayRecentDecayHours', 'autoplaySeedMax',
-    'chartSuperWeight',
+    'chartSuperWeight', 'chartLimit',
   ],
   perms:  PERM_FIELDS.map((field) => field.key).concat(['ruleRoleIds', 'managerRoleIds']),
   limits: ['minVolume', 'maxVolume', 'maxQueuePerUser', 'maxQueuePerGuild', 'maxTrackSeconds', 'bulkEnqueueLimit', 'auditRetentionDays', 'chatRetentionDays'],
@@ -314,7 +318,7 @@ const SETTING_DEFAULTS = {
   superLikeCooldownSec: 0, superLikeDailyLimit: 0,
   autoplayMode: 'recent', autoplayRecentCount: 5, autoplayGenres: [],
   autoplayPolicy: 'balanced', autoplayArtistCooldown: 3, autoplayRecentDecayHours: 24,
-  autoplaySeedMax: 10, chartSuperWeight: 2, bulkEnqueueLimit: 200,
+  autoplaySeedMax: 10, chartSuperWeight: 2, chartLimit: 50, bulkEnqueueLimit: 200,
 };
 
 /** 정지 범위 · 기간 (사양서 결정 #14). */
@@ -1213,8 +1217,24 @@ function chartsGroup() {
   const group = h('div', { class: 'grp' },
     h('h3', { class: 'grp__title' }, '📈 차트 관리'),
     h('p', { class: 'grp__desc' },
-      '리모컨의 차트 탭에 무엇을 보여줄지 정해요. 차트는 결국 재생목록 주소라, 유튜브가 주소를 바꾸면 ' +
-      '코드를 고치지 않고 여기서 주소만 갈아 끼우시면 돼요. 기본 제공 차트는 지울 수 없고 끄기만 돼요.'),
+      '리모컨의 차트 탭에 무엇을 보여줄지 정해요. 기본 제공 차트는 지울 수 없고 끄기만 돼요.'),
+    h('div', { class: 'urlhelp' },
+      h('strong', null, '주소는 세 가지 방식이 있어요'),
+      h('dl', { class: 'urlhelp__list' },
+        h('dt', null, 'ytsearch50:검색어'),
+        h('dd', null, '유튜브에서 검색해 가져와요. 재생목록 ID 와 달리 죽지 않아서 기본값으로 써요. ' +
+          '앞의 숫자는 위 "차트 곡 수" 설정으로 자동으로 바뀌니 그대로 두셔도 돼요. ' +
+          '예: ytsearch50:TJ노래방 발라드'),
+        h('dt', null, 'https://…playlist?list=…'),
+        h('dd', null, '실제 재생목록이라 더 정확한데 ID 가 자주 바뀌어요. ' +
+          '실제로 유튜브 뮤직 인기곡 재생목록 두 개가 죽어서 빈 차트가 나간 적이 있어요. ' +
+          '넣으신 뒤 아래 곡 수가 0 이 아닌지 꼭 확인해 주세요.'),
+        h('dt', null, 'internal:…'),
+        h('dd', null, '우리가 실제로 튼 기록으로 만드는 차트예요. 바깥을 안 부르고 주소도 못 바꿔요.')),
+      h('p', { class: 'hint' },
+        '가져온 목록은 6시간 동안 저장해 두고 다시 써요. 여러 명이 같은 차트를 눌러도 한 번만 가져와요. ' +
+        '바로 새로 받고 싶으시면 각 줄의 ↻ 를 눌러 주세요.')),
+    numberField('chartLimit'),
     numberField('chartSuperWeight'),
     box,
     h('button', {
