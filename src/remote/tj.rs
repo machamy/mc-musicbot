@@ -142,16 +142,39 @@ pub fn parse_response(body: &str) -> Result<Vec<TjEntry>, String> {
     Ok(entries)
 }
 
-/// 반주 영상을 찾을 때 쓰는 검색어.
+/// 이 곡의 **원곡**을 찾을 때 쓰는 검색어.
 ///
-/// `TJ노래방` 을 붙이는 게 핵심이다. 빼면 원곡 뮤직비디오가 잡혀서 노래방 차트인데
-/// 반주가 아닌 곡이 들어온다. 곡번호까지 붙이면 오히려 검색 결과가 사라진다.
+/// TJ 는 순위만 빌려 오고 **트는 것은 원곡(AR)이다.** 반주(MR)를 틀면 노래방 기기가
+/// 되지 노래봇이 아니다. 그래서 `TJ노래방` 같은 말을 일부러 **안** 붙인다 —
+/// 붙이면 `[TJ노래방] 곡 - 가수 / TJ Karaoke` 반주 영상이 1순위로 잡힌다.
 pub fn search_query(entry: &TjEntry) -> String {
     if entry.artist.is_empty() {
-        format!("TJ노래방 {}", entry.title)
+        entry.title.clone()
     } else {
-        format!("TJ노래방 {} {}", entry.title, entry.artist)
+        format!("{} {}", entry.title, entry.artist)
     }
+}
+
+/// 반주·커버처럼 원곡이 아닌 결과를 걸러낸다.
+///
+/// 검색어에서 노래방을 뺐어도 곡에 따라 반주 영상이 먼저 잡힌다(특히 옛날 가요).
+/// 제목만 보고도 확실히 아닌 것들은 여기서 버리고 다음 후보를 쓴다.
+/// **원곡을 못 찾는 것보다 반주를 트는 게 더 나쁘다** — 사람들은 노래를 들으려고 넣는다.
+pub fn looks_like_karaoke(title: &str) -> bool {
+    let lowered = title.to_lowercase();
+    const MARKERS: [&str; 10] = [
+        "노래방",
+        "karaoke",
+        "instrumental",
+        "inst.",
+        "(mr)",
+        "[mr]",
+        "mr 버전",
+        "반주",
+        "가라오케",
+        "カラオケ",
+    ];
+    MARKERS.iter().any(|marker| lowered.contains(marker))
 }
 
 /// TJ 차트를 가져와 재생 가능한 트랙 목록으로 만든다.
@@ -179,19 +202,8 @@ pub async fn fetch(
             continue;
         }
         spent += 1;
-        let found = ytdlp
-            .search(&search_query(&entry), 1)
-            .await
-            .into_iter()
-            .next();
-        match found {
-            Some(mut track) => {
-                // TJ 가 준 제목/가수를 우선한다 — 유튜브 제목은 `[TJ노래방] 곡 - 가수 / TJ Karaoke`
-                // 라서 그대로 두면 대기열이 온통 같은 접두사로 도배된다.
-                track.title = Some(entry.title.clone());
-                if !entry.artist.is_empty() {
-                    track.artist = Some(entry.artist.clone());
-                }
+        match resolve_original(&entry, ytdlp).await {
+            Some(track) => {
                 store.save_tj_track(entry.number, &entry.title, &entry.artist, Some(&track));
                 tracks.push(track);
             }
@@ -204,6 +216,30 @@ pub async fn fetch(
     }
     Ok(tracks)
 }
+
+/// 이 곡의 원곡을 한 번 찾는다. 반주로 보이는 후보는 건너뛴다.
+///
+/// 후보를 여러 개 받아 보는 이유가 있다. 1위 결과가 반주일 때 그걸 버리고 끝내면
+/// 원곡이 있는데도 "못 찾음" 으로 기록돼 [`MAX_MISS`] 까지 재시도만 낭비한다.
+async fn resolve_original(entry: &TjEntry, ytdlp: &YtDlp) -> Option<crate::models::TrackRef> {
+    let candidates = ytdlp.search(&search_query(entry), RESOLVE_CANDIDATES).await;
+    let mut track = candidates.into_iter().find(|candidate| {
+        candidate
+            .title
+            .as_deref()
+            .is_none_or(|title| !looks_like_karaoke(title))
+    })?;
+    // TJ 가 준 제목·가수를 쓴다. 유튜브 제목은 `... (Official MV) [4K]` 처럼 군더더기가 붙어
+    // 그대로 두면 대기열이 지저분해진다.
+    track.title = Some(entry.title.clone());
+    if !entry.artist.is_empty() {
+        track.artist = Some(entry.artist.clone());
+    }
+    Some(track)
+}
+
+/// 원곡을 고를 때 훑어볼 후보 수. 1위가 반주여도 다음 것에서 건질 수 있게 한다.
+const RESOLVE_CANDIDATES: usize = 5;
 
 /// 순위만 가져온다. 프리페치가 "무엇을 채워야 하는지" 알아내는 데도 쓴다.
 pub async fn request(chart: TjChart, client: &reqwest::Client) -> Result<Vec<TjEntry>, String> {
@@ -256,17 +292,8 @@ pub async fn resolve_pending(
             continue;
         }
         filled += 1;
-        let found = ytdlp.search(&search_query(&entry), 1).await.into_iter().next();
-        match found {
-            Some(mut track) => {
-                track.title = Some(entry.title.clone());
-                if !entry.artist.is_empty() {
-                    track.artist = Some(entry.artist.clone());
-                }
-                store.save_tj_track(entry.number, &entry.title, &entry.artist, Some(&track));
-            }
-            None => store.save_tj_track(entry.number, &entry.title, &entry.artist, None),
-        }
+        let found = resolve_original(&entry, ytdlp).await;
+        store.save_tj_track(entry.number, &entry.title, &entry.artist, found.as_ref());
     }
     filled
 }
@@ -370,20 +397,45 @@ mod tests {
         assert!(parse_response(body).is_err(), "빈 차트를 조용히 내보내면 안 된다");
     }
 
-    /// 검색어에 `TJ노래방` 이 빠지면 원곡 뮤직비디오가 잡힌다. 노래방 차트가 노래방이 아니게 된다.
+    /// TJ 는 **순위만** 빌려 온다. 트는 것은 원곡이라 검색어에 노래방을 붙이면 안 된다.
+    /// 붙이면 반주(MR)가 1순위로 잡혀서 노래봇이 노래방 기기가 된다.
     #[test]
-    fn search_query_always_says_karaoke() {
+    fn search_query_looks_for_the_original_not_the_karaoke_track() {
         let entry = TjEntry {
             rank: 1,
             number: 1,
             title: "좋니".into(),
             artist: "윤종신".into(),
         };
-        assert_eq!(search_query(&entry), "TJ노래방 좋니 윤종신");
+        assert_eq!(search_query(&entry), "좋니 윤종신");
+        assert!(!search_query(&entry).contains("노래방"));
         let no_artist = TjEntry {
             artist: String::new(),
             ..entry
         };
-        assert_eq!(search_query(&no_artist), "TJ노래방 좋니");
+        assert_eq!(search_query(&no_artist), "좋니");
+    }
+
+    /// 검색어에서 노래방을 빼도 곡에 따라 반주가 먼저 잡힌다. 제목으로 한 번 더 거른다.
+    #[test]
+    fn rejects_karaoke_results_by_title() {
+        for title in [
+            "[TJ노래방] 좋니 - 윤종신 / TJ Karaoke",
+            "좋니 - 윤종신 (KY.53410) / KY Karaoke",
+            "IU - Through the Night (Instrumental)",
+            "밤편지 (MR)",
+            "夜に駆ける カラオケ",
+            "애상 반주",
+        ] {
+            assert!(looks_like_karaoke(title), "반주로 걸러야 한다: {title}");
+        }
+        for title in [
+            "윤종신 - 좋니 (Official Music Video)",
+            "IU(아이유) _ Through the Night(밤편지)",
+            "YOASOBI「夜に駆ける」Official Music Video",
+            "Radiohead - Creep",
+        ] {
+            assert!(!looks_like_karaoke(title), "원곡을 버리면 안 된다: {title}");
+        }
     }
 }

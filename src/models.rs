@@ -157,6 +157,11 @@ pub enum EmptyVoiceChannelPolicy {
 pub struct TrackRef {
     pub provider: ProviderKind,
     pub content_id: String,
+    /// **없이 와도 받는다.** 예전에는 필수라, 클라이언트가 빠뜨리면 본문 해석 단계에서
+    /// 통째로 실패해 422 만 나갔다. 화면에는 "입력값을 확인해 주세요" 라는, 사람이 고칠 수
+    /// 없는 문구만 떴다 — 실제로 브라우저 검색으로 곡을 담을 때 그랬다.
+    /// 비어 있으면 [`TrackRef::ensure_source_url`] 이 provider·content_id 로 만들어 준다.
+    #[serde(default)]
     pub source_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -169,6 +174,24 @@ pub struct TrackRef {
 }
 
 impl TrackRef {
+    /// `source_url` 이 비어 있으면 provider 와 `content_id` 로 만들어 채운다.
+    ///
+    /// 받는 쪽에서 한 번만 부르면 그 뒤로는 늘 채워진 값이라, 재생기와 캐시가
+    /// "주소가 비었을 수도 있다" 를 신경 쓰지 않아도 된다.
+    pub fn ensure_source_url(&mut self) {
+        if !self.source_url.trim().is_empty() {
+            return;
+        }
+        let id = &self.content_id;
+        self.source_url = match self.provider {
+            ProviderKind::YouTubeMusic => format!("https://music.youtube.com/watch?v={id}"),
+            ProviderKind::YouTube => format!("https://www.youtube.com/watch?v={id}"),
+            // 사운드클라우드는 ID 로 주소를 만들 수 없다(경로가 사람이 정한 문자열이다).
+            // 여기서 지어내면 재생 단계에서 더 헷갈리는 실패가 나므로 비운 채로 둔다.
+            ProviderKind::SoundCloud => String::new(),
+        };
+    }
+
     /// C# 과 동일: YouTubeMusic 은 캐시 키 차원에서 youtube 로 통일 (같은 영상 ID 네임스페이스).
     pub fn cache_key(&self) -> String {
         let provider_key = match self.provider {

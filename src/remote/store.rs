@@ -341,6 +341,10 @@ const MIGRATION_V14: &str = r#"
 /// "권한이 없어요" 를 본다. 로그에는 429 만 찍히고 화면에는 권한 없음만 뜬다.
 /// 디스크에 두면 재시작을 건너뛰어도 유예 시간(6시간) 동안 등급이 유지된다.
 const MIGRATION_V16: &str = r#"
+    -- 노래방 차트는 **순위만** TJ 에서 빌려 오고 트는 것은 원곡이다.
+    -- 앞선 버전은 반주(MR)를 찾아 넣었으므로 그때 저장된 해석은 전부 버린다.
+    DELETE FROM remote_tj_tracks;
+
     CREATE TABLE IF NOT EXISTS remote_member_roles (
         guild_id    INTEGER NOT NULL,
         user_id     INTEGER NOT NULL,

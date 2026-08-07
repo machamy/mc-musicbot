@@ -2384,12 +2384,19 @@ async function youtubeSearch(query, provider) {
   return items.map((item) => {
     const videoId = item.id.videoId;
     const snippet = item.snippet || {};
+    const kind = provider === 'YouTubeMusic' ? 'YouTubeMusic' : 'YouTube';
     return {
       title: snippet.title || videoId,
       artist: snippet.channelTitle || '',
-      provider: provider === 'YouTubeMusic' ? 'YouTubeMusic' : 'YouTube',
+      provider: kind,
       contentId: videoId,
-      cacheKey: `${provider === 'YouTubeMusic' ? 'YouTubeMusic' : 'YouTube'}:${videoId}`,
+      // **서버의 TrackRef 는 sourceUrl 이 필수다.** 이게 빠지면 본문 해석이 실패해서
+      // 곡을 담을 때 422 가 나고 화면에는 "입력값을 확인해 주세요" 만 뜬다.
+      // 서버 검색 경로는 Rust 가 채워 주지만 브라우저 검색은 여기서 채워야 한다.
+      sourceUrl: kind === 'YouTubeMusic'
+        ? `https://music.youtube.com/watch?v=${videoId}`
+        : `https://www.youtube.com/watch?v=${videoId}`,
+      cacheKey: `${kind}:${videoId}`,
       durationSeconds: durations.get(videoId) || 0,
       artUrl: snippet.thumbnails?.medium?.url || snippet.thumbnails?.default?.url || null,
     };

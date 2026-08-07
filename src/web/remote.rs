@@ -4227,8 +4227,11 @@ async fn api_enqueue(
     cookies: Cookies,
     Path(guild_id): Path<u64>,
     headers: HeaderMap,
-    Json(request): Json<EnqueueRequest>,
+    Json(mut request): Json<EnqueueRequest>,
 ) -> Response {
+    // 브라우저 검색으로 온 곡은 `sourceUrl` 이 비어 있을 수 있다. 받는 자리에서 한 번
+    // 채우면 그 뒤 재생·캐시 경로는 늘 채워진 값만 본다.
+    request.track.ensure_source_url();
     let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
         Ok(ctx) => ctx,
         Err(response) => return response,
@@ -5350,8 +5353,10 @@ async fn api_library(
     cookies: Cookies,
     Path(guild_id): Path<u64>,
     headers: HeaderMap,
-    Json(request): Json<LibraryRequest>,
+    Json(mut request): Json<LibraryRequest>,
 ) -> Response {
+    // 브라우저 검색으로 온 곡은 sourceUrl 이 빌 수 있다 (§23.4).
+    request.track.ensure_source_url();
     let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
         Ok(ctx) => ctx,
         Err(response) => return response,
@@ -6602,8 +6607,10 @@ async fn api_autoplay_seed_add(
     cookies: Cookies,
     Path(guild_id): Path<u64>,
     headers: HeaderMap,
-    Json(request): Json<AutoplaySeedAddRequest>,
+    Json(mut request): Json<AutoplaySeedAddRequest>,
 ) -> Response {
+    // 브라우저 검색으로 온 곡은 sourceUrl 이 빌 수 있다 (§23.4).
+    request.track.ensure_source_url();
     let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
         Ok(ctx) => ctx,
         Err(response) => return response,
