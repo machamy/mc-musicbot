@@ -197,15 +197,10 @@ async fn evaluate_auto_leave(app: Arc<App>, ctx: Context, guild_id: GuildId) {
         return;
     }
 
-    let settings = app.db.load_global_settings();
-    if !settings.auto_leave_when_empty {
-        return;
-    }
-    if settings.empty_voice_policy == EmptyVoiceChannelPolicy::DoNothing {
-        app.log.info(
-            "Voice",
-            &format!("Empty voice policy = DoNothing; leaving guild {gid} playback untouched."),
-        );
+    // 서버마다 다르다 (§27). 봇 주인이 강제로 걸었으면 그 값이 이긴다.
+    // 판정은 `app::empty_voice_rule` 한 곳에서만 한다 — 화면과 실제가 갈라지면 안 된다.
+    let rule = crate::app::empty_voice_rule(&app, gid);
+    if rule.policy == EmptyVoiceChannelPolicy::DoNothing {
         return;
     }
 
@@ -216,8 +211,8 @@ async fn evaluate_auto_leave(app: Arc<App>, ctx: Context, guild_id: GuildId) {
         map.insert(gid, next_gen);
         next_gen
     };
-    let delay = settings.auto_leave_delay_seconds.clamp(5, 3600) as u64;
-    let policy = settings.empty_voice_policy;
+    let delay = rule.delay_seconds as u64;
+    let policy = rule.policy;
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         // 아직 같은 세대인지 + 여전히 비어 있는지 재확인.

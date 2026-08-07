@@ -1,4 +1,4 @@
-use crate::models::TrackRef;
+use crate::models::{EmptyVoiceChannelPolicy, TrackRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -1878,6 +1878,43 @@ pub struct RemoteGuildSettings {
     /// 기본은 갱신 — 여러 서버가 쓰면 새 글 방식은 채널을 금방 도배한다.
     #[serde(default)]
     pub now_playing_mode: NowPlayingMode,
+    /// 음성 채널에 봇만 남았을 때 무엇을 할지 (§27). **기본은 아무것도 안 함.**
+    /// 남이 듣고 있는데 갑자기 나가면 그게 더 놀랍다 — 켜는 건 서버 주인이 정한다.
+    #[serde(default)]
+    pub empty_voice_policy: EmptyVoiceChannelPolicy,
+    /// 비었다고 판단하고 나서 기다릴 시간(초). 5~3600.
+    /// 잠깐 나갔다 오는 사람 때문에 바로 끊기면 안 된다.
+    #[serde(default = "default_empty_voice_delay")]
+    pub empty_voice_delay_seconds: u32,
+}
+
+fn default_empty_voice_delay() -> u32 {
+    300
+}
+
+/// 빈 채널 규칙을 **누가 정했는지**까지 담은 결과 (§27).
+///
+/// 봇 주인이 운영 패널에서 강제로 걸면 서버 주인은 못 바꾼다. 그때 화면이
+/// "왜 잠겼는지" 를 말해야 해서, 값만이 아니라 출처도 같이 들고 다닌다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyVoiceRule {
+    pub policy: EmptyVoiceChannelPolicy,
+    pub delay_seconds: u32,
+    /// 봇 주인이 강제로 건 값인가. true 면 서버 주인은 못 바꾼다.
+    pub forced: bool,
+}
+
+impl EmptyVoiceRule {
+    /// 서버 주인이 이 값을 바꿀 수 있는지.
+    pub fn editable(self) -> bool {
+        !self.forced
+    }
+
+    /// 못 바꿀 때 보여 줄 이유. 잠긴 사실만 보이면 고장으로 읽힌다.
+    pub fn lock_reason(self) -> Option<&'static str> {
+        self.forced
+            .then_some("봇 주인이 모든 서버에 같은 규칙을 걸어 뒀어요. 서버에서는 바꿀 수 없어요.")
+    }
 }
 
 fn default_chat_retention_days() -> u32 {
@@ -2113,6 +2150,8 @@ impl Default for RemoteGuildSettings {
             guild_id: 0,
             chart_limit: default_chart_limit(),
             now_playing_mode: NowPlayingMode::default(),
+            empty_voice_policy: EmptyVoiceChannelPolicy::default(),
+            empty_voice_delay_seconds: default_empty_voice_delay(),
             min_volume: 0,
             max_volume: 200,
             default_volume: 100,

@@ -4071,6 +4071,34 @@ mod tests {
         cleanup(store, path);
     }
 
+    /// 빈 채널 규칙은 기본이 **꺼짐**이고, 봇 주인이 강제로 걸면 서버 값이 무시된다 (§27).
+    /// 강제가 기본이면 서버 주인이 아무것도 못 정한다 — 그래서 기본은 강제 안 함이다.
+    #[test]
+    fn empty_voice_defaults_to_off_and_force_overrides_the_guild() {
+        use crate::models::EmptyVoiceChannelPolicy as P;
+        use crate::remote::EmptyVoiceRule;
+
+        let guild = RemoteGuildSettings::default();
+        assert_eq!(guild.empty_voice_policy, P::DoNothing, "기본은 아무것도 안 함");
+        assert_eq!(guild.empty_voice_delay_seconds, 300);
+
+        let global = crate::models::GlobalSettings::default();
+        assert!(!global.empty_voice_forced, "기본은 강제 안 함");
+
+        // 잠금 문구는 강제일 때만 나온다.
+        let free = EmptyVoiceRule {
+            policy: P::AutoLeave,
+            delay_seconds: 60,
+            forced: false,
+        };
+        assert!(free.editable());
+        assert!(free.lock_reason().is_none());
+
+        let forced = EmptyVoiceRule { forced: true, ..free };
+        assert!(!forced.editable());
+        assert!(forced.lock_reason().is_some(), "왜 잠겼는지 말해야 한다");
+    }
+
     /// 회귀: 봇을 내보냈다 다시 부르는 것만으로 차단이 풀리면 승인 자체가 의미가 없다.
     #[test]
     fn rejoining_does_not_reset_a_decision() {

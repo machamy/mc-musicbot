@@ -3358,8 +3358,12 @@ async fn api_state_cold(
             "maxTrackSeconds": settings.max_track_seconds,
             "bulkEnqueueLimit": settings.bulk_enqueue_limit,
             "chartSuperWeight": settings.chart_super_weight,
-        "chartLimit": settings.chart_limit,
             "chartLimit": settings.chart_limit,
+            // 곡 알림 방식 (§25).
+            "nowPlayingMode": settings.now_playing_mode.as_str(),
+            // 빈 채널 규칙 (§27). **잠금 여부까지 같이 보낸다** — 값만 보내면
+            // 화면이 바꿀 수 있는 것처럼 그려 놓고 저장에서 거절당한다.
+            "emptyVoice": empty_voice_json(&state, guild_id),
             // 붐따 (V3 §10.3) — 꺼져 있으면 싫어요는 점수에만 영향을 준다.
             "boomttaEnabled": settings.boomtta_enabled,
             "boomttaThreshold": settings.boomtta_threshold,
@@ -7462,6 +7466,40 @@ async fn admin_settings_put(
                 }
                 settings.chart_super_weight = value as u32;
             }
+            // ── 곡 알림 방식 (§25) ──
+            if let Some(value) = body.get("nowPlayingMode").and_then(|v| v.as_str())
+                && let Some(mode) = crate::remote::NowPlayingMode::parse(value)
+            {
+                settings.now_playing_mode = mode;
+            }
+            // ── 빈 채널 규칙 (§27) ──
+            //
+            // **강제 중이면 여기서 거절한다.** 조용히 무시하면 화면은 저장된 줄 알고
+            // 바뀐 값을 보여 주다가 새로고침하면 되돌아간다 — 제일 헷갈리는 실패다.
+            let rule = crate::app::empty_voice_rule(&state.app, guild_id);
+            let touches_empty_voice = body.get("emptyVoicePolicy").is_some()
+                || body.get("emptyVoiceDelaySeconds").is_some();
+            if touches_empty_voice && !rule.editable() {
+                return json_error(
+                    StatusCode::FORBIDDEN,
+                    rule.lock_reason().unwrap_or("지금은 바꿀 수 없어요."),
+                );
+            }
+            if let Some(value) = body.get("emptyVoicePolicy").and_then(|v| v.as_str()) {
+                let Some(policy) = crate::models::EmptyVoiceChannelPolicy::parse(value) else {
+                    return json_error(StatusCode::BAD_REQUEST, "빈 채널 동작을 알 수 없어요.");
+                };
+                settings.empty_voice_policy = policy;
+            }
+            if let Some(value) = json_i32(&body, "emptyVoiceDelaySeconds") {
+                if !(5..=3600).contains(&value) {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "빈 채널 대기 시간은 5초에서 1시간 사이여야 해요.",
+                    );
+                }
+                settings.empty_voice_delay_seconds = value as u32;
+            }
         }
         "perms" => {
             // 저장하는 순간 레거시 통짜 값을 8개 키로 펼친다. 그래야 이후로는
@@ -8914,6 +8952,33 @@ impl Drop for ChartFetchGuard {
     fn drop(&mut self) {
         self.state.app.remote.end_chart_fetch(self.chart_id);
     }
+}
+
+/// 빈 채널 규칙을 화면이 쓸 모양으로 (§27).
+/// `locked` 면 서버 주인이 못 바꾼다 — 이유까지 같이 실어 준다.
+fn empty_voice_json(state: &WebState, guild_id: u64) -> Value {
+    let rule = crate::app::empty_voice_rule(&state.app, guild_id);
+    json!({
+        "policy": rule.policy.as_str(),
+        "policyLabel": rule.policy.label(),
+        "policyDescription": rule.policy.description(),
+        "delaySeconds": rule.delay_seconds,
+        "locked": !rule.editable(),
+        "lockReason": rule.lock_reason(),
+        "options": [
+            option_json(crate::models::EmptyVoiceChannelPolicy::DoNothing),
+            option_json(crate::models::EmptyVoiceChannelPolicy::StopPlayback),
+            option_json(crate::models::EmptyVoiceChannelPolicy::AutoLeave),
+        ],
+    })
+}
+
+fn option_json(policy: crate::models::EmptyVoiceChannelPolicy) -> Value {
+    json!({
+        "value": policy.as_str(),
+        "label": policy.label(),
+        "description": policy.description(),
+    })
 }
 
 // ───────────────────────── 서버 승인 (§26) ─────────────────────────

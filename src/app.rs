@@ -399,6 +399,34 @@ async fn retention_prune_loop(app: Arc<App>) {
 /// `web::serve()` 가 둘을 같이 채운다.
 static PUBLIC_BASE_URL: OnceLock<String> = OnceLock::new();
 
+/// 이 서버에 실제로 적용될 빈 채널 규칙 (§27).
+///
+/// **판정이 한 군데여야 한다.** 화면이 보여 주는 값과 실제로 도는 값이 갈라지면
+/// "설정은 나가기인데 안 나간다" 같은 신고가 들어오고 원인을 못 찾는다.
+/// 리모컨 화면, 운영 패널, 음성 감시 루프가 전부 이 함수를 부른다.
+pub fn empty_voice_rule(app: &App, guild_id: u64) -> crate::remote::EmptyVoiceRule {
+    let global = app.db.load_global_settings();
+    if global.empty_voice_forced {
+        // 봇 주인이 강제로 걸었다. 서버 설정은 아예 안 본다.
+        let policy = if global.auto_leave_when_empty {
+            global.empty_voice_policy
+        } else {
+            crate::models::EmptyVoiceChannelPolicy::DoNothing
+        };
+        return crate::remote::EmptyVoiceRule {
+            policy,
+            delay_seconds: global.auto_leave_delay_seconds.clamp(5, 3600) as u32,
+            forced: true,
+        };
+    }
+    let guild = app.remote.load_guild_settings(guild_id);
+    crate::remote::EmptyVoiceRule {
+        policy: guild.empty_voice_policy,
+        delay_seconds: guild.empty_voice_delay_seconds.clamp(5, 3600),
+        forced: false,
+    }
+}
+
 /// `web::serve()` 전용. 끝 슬래시를 떼고 저장한다.
 pub fn set_public_base_url(url: &str) {
     let trimmed = url.trim().trim_end_matches('/');

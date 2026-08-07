@@ -513,6 +513,8 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
 <label class="checkbox"><input type="checkbox" name="autoplay_default" {ad}/> 자동추천 기본값 켜기</label>
 </div>
 <div class="card"><h2>음성 채널 / 알림</h2>
+<p class="hint">평소에는 <b>서버마다 리모컨에서 각자 정한다.</b> 아래 값은 강제로 걸 때만 쓰인다.</p>
+<label class="checkbox" title="켜면 모든 서버가 아래 설정을 그대로 따르고, 서버 관리자는 리모컨에서 바꿀 수 없다. 끄면 아래 세 값은 쓰이지 않는다."><input type="checkbox" name="empty_voice_forced" {evf}/> <b>모든 서버에 강제 적용</b> (서버 주인도 못 바꿈)</label>
 <label class="checkbox"><input type="checkbox" name="auto_leave_when_empty" {al}/> 빈 음성 채널 감지 켜기</label>
 <label class="field">빈 채널 대기 시간(초, 5–3600)</label><input type="number" name="auto_leave_delay_seconds" min="5" max="3600" value="{ald}"/>
 <label class="field">빈 음성 채널 정책</label>
@@ -548,6 +550,7 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
         ad = chk(s.autoplay_default),
         an = chk(s.announce_now_playing),
         al = chk(s.auto_leave_when_empty),
+        evf = chk(s.empty_voice_forced),
         ald = s.auto_leave_delay_seconds,
         p1 = pol(s.empty_voice_policy, EmptyVoiceChannelPolicy::AutoLeave),
         p2 = pol(s.empty_voice_policy, EmptyVoiceChannelPolicy::StopPlayback),
@@ -572,6 +575,7 @@ pub struct SettingsForm {
     autoplay_default: Option<String>,
     announce_now_playing: Option<String>,
     auto_leave_when_empty: Option<String>,
+    empty_voice_forced: Option<String>,
     auto_leave_delay_seconds: Option<i32>,
     empty_voice_policy: Option<String>,
     cache_limit_gb: Option<i32>,
@@ -599,6 +603,7 @@ pub async fn settings_post(
     s.autoplay_default = f.autoplay_default.is_some();
     s.announce_now_playing = f.announce_now_playing.is_some();
     s.auto_leave_when_empty = f.auto_leave_when_empty.is_some();
+    s.empty_voice_forced = f.empty_voice_forced.is_some();
     s.auto_leave_delay_seconds = f
         .auto_leave_delay_seconds
         .unwrap_or(s.auto_leave_delay_seconds)

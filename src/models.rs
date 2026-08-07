@@ -143,11 +143,53 @@ impl RepeatMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// 음성 채널에 봇만 남았을 때 무엇을 할지.
+///
+/// **기본은 `DoNothing`** 이다 (§27). 남이 듣고 있는데 갑자기 나가 버리는 쪽이
+/// 아무것도 안 하는 쪽보다 더 놀랍다. 켜는 것은 서버 주인이 정한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum EmptyVoiceChannelPolicy {
+    /// 재생을 멈추고 음성 채널에서 나간다.
     AutoLeave,
+    /// 재생만 멈추고 채널에는 남는다. 사람이 돌아오면 바로 이어 틀 수 있다.
     StopPlayback,
+    #[default]
     DoNothing,
+}
+
+impl EmptyVoiceChannelPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoLeave => "autoLeave",
+            Self::StopPlayback => "stopPlayback",
+            Self::DoNothing => "doNothing",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "autoLeave" | "AutoLeave" => Some(Self::AutoLeave),
+            "stopPlayback" | "StopPlayback" => Some(Self::StopPlayback),
+            "doNothing" | "DoNothing" => Some(Self::DoNothing),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutoLeave => "나가기",
+            Self::StopPlayback => "재생만 멈추기",
+            Self::DoNothing => "그대로 두기",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::AutoLeave => "아무도 없으면 재생을 멈추고 음성 채널에서 나가요.",
+            Self::StopPlayback => "재생만 멈추고 채널에는 남아요. 돌아오면 바로 이어 틀 수 있어요.",
+            Self::DoNothing => "아무도 없어도 계속 재생해요.",
+        }
+    }
 }
 
 // ───────────────────────── 트랙/큐 ─────────────────────────
@@ -305,6 +347,10 @@ pub struct GlobalSettings {
     pub auto_leave_when_empty: bool,
     pub auto_leave_delay_seconds: i32,
     pub empty_voice_policy: EmptyVoiceChannelPolicy,
+    /// 켜면 위 세 값을 **모든 서버에 강제**한다 (§27). 서버 주인은 못 바꾼다.
+    /// 꺼져 있으면 위 값들은 아무 데도 안 쓰이고 서버별 설정이 이긴다.
+    #[serde(default)]
+    pub empty_voice_forced: bool,
     pub announce_now_playing: bool,
     // 끊김 최적화 실험 토글 (C# 과 동일 키)
     pub tweak_ffmpeg_fast_start: bool,
@@ -334,6 +380,9 @@ impl Default for GlobalSettings {
             auto_leave_when_empty: true,
             auto_leave_delay_seconds: 60,
             empty_voice_policy: EmptyVoiceChannelPolicy::AutoLeave,
+            // **기본은 강제 안 함** (§27). 강제가 기본이면 서버 주인이 아무것도 못 정한다.
+            // 이 값이 꺼져 있는 동안 위 세 값은 "강제로 걸 때 쓸 기본안"일 뿐이다.
+            empty_voice_forced: false,
             announce_now_playing: true,
             tweak_ffmpeg_fast_start: false,
             tweak_ffmpeg_direct_output: false,
