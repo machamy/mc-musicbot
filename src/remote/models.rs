@@ -630,6 +630,13 @@ impl AutoplayPolicy {
 /// 여러 사람이 같은 차트를 눌러도 이 시간 안에는 한 번만 돈다.
 pub const CHART_CACHE_TTL_HOURS: i64 = 6;
 
+/// 노래방 차트 캐시 수명(시간). **하루가 넘는다** (§15.2c).
+///
+/// TJ 순위는 하루 단위로 움직인다. 6시간마다 다시 긁어 봐야 같은 목록이고,
+/// 노래방은 곡마다 원곡을 찾느라 다른 차트보다 훨씬 오래 걸린다.
+/// 자주 받아서 얻는 게 없고 잃는 것만 있다.
+pub const KARAOKE_CACHE_TTL_HOURS: i64 = 30;
+
 /// 차트 분류 (§15.2 · §15.3). 유저 UI 1단계의 카드 6장이다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1886,6 +1893,13 @@ pub struct RemoteGuildSettings {
     /// 잠깐 나갔다 오는 사람 때문에 바로 끊기면 안 된다.
     #[serde(default = "default_empty_voice_delay")]
     pub empty_voice_delay_seconds: u32,
+    /// 로그인 없이 **지금 무슨 곡인지**만 볼 수 있게 할지 (§29).
+    ///
+    /// 켜져 있어도 나가는 것은 곡 제목·가수·진행 상태뿐이다. 신청한 사람 이름,
+    /// 채팅, 멤버 목록은 **절대 안 나간다** — 그건 서버 안 사람들 정보다.
+    /// 서버마다 끌 수 있다. 활동을 밖에 안 보이고 싶은 서버가 있을 수 있다.
+    #[serde(default = "default_true")]
+    pub public_now_playing: bool,
 }
 
 fn default_empty_voice_delay() -> u32 {
@@ -2152,6 +2166,7 @@ impl Default for RemoteGuildSettings {
             now_playing_mode: NowPlayingMode::default(),
             empty_voice_policy: EmptyVoiceChannelPolicy::default(),
             empty_voice_delay_seconds: default_empty_voice_delay(),
+            public_now_playing: true,
             min_volume: 0,
             max_volume: 200,
             default_volume: 100,

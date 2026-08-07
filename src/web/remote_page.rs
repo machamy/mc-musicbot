@@ -268,6 +268,62 @@ pub fn admin(
     )
 }
 
+/// 로그인 없이 보는 "지금 이 곡" 화면 (§29).
+///
+/// **일부러 아주 작다.** 리모컨 셸을 재사용하면 로그인 안 한 사람에게 채팅·멤버·대기열
+/// 코드까지 내려가고, 언젠가 그중 하나가 데이터를 요구하게 된다. 이 화면은 곡 하나만
+/// 그리는 독립 페이지라 실수로 더 내보낼 여지가 없다.
+///
+/// 조작 요소가 하나도 없다 — 버튼도, 폼도 없다. 읽기 전용이라는 말이 코드에서도 참이다.
+pub fn public_now(guild_id: u64, build_id: &str) -> String {
+    plain(
+        "지금 이 곡",
+        "",
+        &format!(
+            r#"<main class="gate__wrap"><section class="gate__card" id="pub" data-guild="{guild_id}">
+<div class="gate__logo" aria-hidden="true">🎵</div>
+<h1 id="pub-title">불러오는 중…</h1>
+<p class="gate__lead" id="pub-artist"></p>
+<p class="gate__lead" id="pub-queue"></p>
+<p class="gate__lead" style="opacity:.7;font-size:.85em">보기만 할 수 있어요. 조작하려면 로그인해야 해요.</p>
+<a class="btn btn--primary btn--wide" href="/music/guilds/{guild_id}">Discord로 로그인하고 조작하기</a>
+</section></main>
+<script>
+// 5초마다 갱신한다. WebSocket 을 안 쓰는 이유: 로그인 안 한 사람에게 소켓을 열어 주면
+// 그 자체가 붙잡아 둘 자원이 된다. 이 화면은 가볍게 폴링만 한다.
+(function () {{
+  var box = document.getElementById('pub');
+  var url = '/music/api/guilds/' + box.dataset.guild + '/public?v={build_id}';
+  var tag = null;
+  function paint(d) {{
+    var t = document.getElementById('pub-title');
+    var a = document.getElementById('pub-artist');
+    var q = document.getElementById('pub-queue');
+    if (!d || !d.current) {{ t.textContent = '지금은 아무 곡도 안 나와요'; a.textContent = ''; q.textContent = ''; return; }}
+    t.textContent = d.current.title;
+    a.textContent = (d.current.artist || '') + (d.isPaused ? ' · 일시정지' : '');
+    q.textContent = d.queueTotal ? ('대기열 ' + d.queueTotal + '곡') : '';
+  }}
+  function tick() {{
+    var opt = {{ headers: {{}} }};
+    if (tag) opt.headers['If-None-Match'] = tag;
+    fetch(url, opt).then(function (r) {{
+      if (r.status === 304) return null;      // 안 바뀌었으면 아무것도 안 한다
+      if (!r.ok) throw new Error(String(r.status));
+      tag = r.headers.get('ETag');
+      return r.json();
+    }}).then(function (d) {{ if (d) paint(d); }}).catch(function () {{
+      document.getElementById('pub-title').textContent = '지금은 볼 수 없어요';
+    }});
+  }}
+  tick();
+  setInterval(tick, 5000);
+}})();
+</script>"#,
+        ),
+    )
+}
+
 /// 관리 콘솔 진입 거부 화면. 서버가 403을 주지만 사람이 읽을 수 있어야 한다.
 pub fn denied(message: &str, guild_id: u64) -> String {
     plain(

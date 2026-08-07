@@ -27,6 +27,9 @@ const CONSOLE_JS: &str = include_str!("assets/console.js");
 const SW_JS: &str = include_str!("assets/sw.js");
 
 // ── 기타 ──
+/// 사용자용 패치노트 (§30). **원본은 `docs/CHANGELOG.md` 하나뿐이다.**
+/// 화면용으로 따로 옮겨 적으면 둘이 갈라져서 결국 화면 쪽이 낡는다.
+pub const CHANGELOG_MD: &str = include_str!("../../docs/CHANGELOG.md");
 const MANIFEST: &str = include_str!("assets/manifest.webmanifest");
 const FAVICON_SVG: &str = include_str!("assets/favicon.svg");
 const ICON_192: &[u8] = include_bytes!("assets/icon-192.png");

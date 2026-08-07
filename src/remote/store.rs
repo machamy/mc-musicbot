@@ -2,7 +2,7 @@ use super::{
     AUDIT_MERGE_WINDOW_SECS, AuditEntry, AuditKind, AutoplaySeed, CHART_CACHE_TTL_HOURS,
     ChartCategory, ChartDef, ChartSnapshot, ChatMessage, ChatReactionSummary, ChatReplyPreview,
     ChatReport, ChatTrackTag, GuildApproval, GuildApprovalStatus, LyricsCacheHit, LyricsDocument,
-    MAX_VOTER_IDS, Participant,
+    KARAOKE_CACHE_TTL_HOURS, MAX_VOTER_IDS, Participant,
     PruneReport, QueueScore, QueueVoteKind, RecentTrack, RemoteGuildSettings, ResumePoint,
     RetentionConfig,
     SeedAddOutcome, StoredSession, Suggestion, SuggestionStatus, SuperLikeStatus, SuperLikeVerdict,
@@ -2984,6 +2984,24 @@ impl RemoteStore {
 
     /// 캐시된 곡 목록. `stale`이면 TTL(6시간)이 지난 것이라 다시 받아야 한다 —
     /// 그래도 일단 보여 주는 편이 빈 화면보다 낫다.
+    /// 이 차트의 분류. 캐시 수명이 분류마다 달라서 필요하다.
+    ///
+    /// **연결을 인자로 받는다.** `self.conn.lock()` 을 안에서 다시 잡으면
+    /// 이미 락을 쥔 `chart_cache` 에서 부를 때 자기 자신을 기다리며 멈춘다.
+    /// 실제로 그렇게 만들어서 테스트가 60초 넘게 걸렸다 — `Mutex` 는 재진입이 안 된다.
+    fn chart_category_on(conn: &Connection, chart_id: i64) -> Option<ChartCategory> {
+        let raw: String = conn
+            .query_row(
+                "SELECT category FROM remote_charts WHERE id = ?1",
+                params![chart_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        ChartCategory::parse(&raw)
+    }
+
     pub fn chart_cache(&self, chart_id: i64) -> Option<ChartSnapshot> {
         let conn = self.conn.lock().unwrap();
         let (json, fetched): (String, String) = conn
@@ -2999,8 +3017,14 @@ impl RemoteStore {
         if tracks.is_empty() {
             return None;
         }
+        // 노래방은 훨씬 오래 들고 있는다 (§15.2c). TJ 순위는 하루 단위로 움직이고,
+        // 곡마다 원곡을 찾느라 다시 받는 비용이 다른 차트보다 크다.
+        let ttl = Self::chart_category_on(&conn, chart_id)
+            .filter(|category| *category == ChartCategory::Karaoke)
+            .map(|_| KARAOKE_CACHE_TTL_HOURS)
+            .unwrap_or(CHART_CACHE_TTL_HOURS);
         let stale = DateTime::parse_from_rfc3339(&fetched)
-            .map(|at| Utc::now() - at.with_timezone(&Utc) > ChronoDuration::hours(CHART_CACHE_TTL_HOURS))
+            .map(|at| Utc::now() - at.with_timezone(&Utc) > ChronoDuration::hours(ttl))
             .unwrap_or(true);
         Some(ChartSnapshot {
             tracks,

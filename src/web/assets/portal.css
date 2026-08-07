@@ -973,6 +973,47 @@ body[data-dragging="tab"] { user-select: none; }
 .vol__tag { flex: none; color: var(--text-3); font-size: var(--fs-xs); white-space: nowrap; }
 .vol--me .vol__tag { color: var(--accent); font-weight: var(--fw-semi); }
 
+/* 패치노트 본문 (§30). 좁게 해석한 마크다운이라 태그 종류가 몇 안 된다. */
+.md { max-height: 62vh; overflow: auto; overscroll-behavior: contain; line-height: 1.6; }
+.md h2 { margin: var(--sp-4) 0 var(--sp-2); font-size: var(--fs-lg); }
+.md h3 { margin: var(--sp-3) 0 var(--sp-1); font-size: var(--fs-md); color: var(--text-2); }
+.md h4 { margin: var(--sp-2) 0 var(--sp-1); font-size: var(--fs-sm); color: var(--text-3); }
+.md p { margin: var(--sp-1) 0; }
+.md ul { margin: var(--sp-1) 0; padding-left: 1.2em; }
+.md li { margin: 2px 0; }
+.md code { padding: 1px 4px; border-radius: var(--r-xs); background: var(--surface-2); font-size: 0.92em; }
+.md pre { margin: var(--sp-2) 0; padding: var(--sp-2); border-radius: var(--r-sm); background: var(--surface-2); overflow-x: auto; }
+.md pre code { padding: 0; background: none; }
+/* 표는 줄마다 따로 그린다(파서가 좁아서). 칸 사이만 벌려 주면 읽힌다. */
+.md__t { width: 100%; border-collapse: collapse; }
+.md__t td { padding: 2px var(--sp-2); border-bottom: 1px solid var(--line-1); vertical-align: top; }
+
+/* 서버 승인 목록 (§26.2). */
+.aprlist { display: flex; flex-direction: column; gap: var(--sp-2); max-height: 60vh; overflow: auto; overscroll-behavior: contain; }
+.apr {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
+}
+/* 대기 중인 것만 눈에 띄게. 나머지는 조용히 둔다 — 할 일이 아니다. */
+.apr--pending { border-color: var(--accent-line); background: var(--accent-soft); }
+.apr--blocked { opacity: 0.7; }
+.apr__main { flex: 1; min-width: 0; }
+.apr__name { font-weight: var(--fw-semi); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.apr__sub { color: var(--text-3); font-size: var(--fs-xs); }
+.apr__acts { display: flex; gap: var(--sp-1); flex: none; }
+
+/* 누가 듣고·보고 있는지 창 (§28). 옆 패널이 없는 배치에서도 떠야 한다. */
+.who { display: flex; flex-direction: column; gap: var(--sp-3); }
+.who__group { display: flex; flex-direction: column; gap: var(--sp-1); }
+.who__title { display: flex; align-items: center; gap: var(--sp-2); font-weight: var(--fw-semi); color: var(--text-2); }
+/* 사람이 많아도 창이 화면을 넘지 않게. 넘치면 이 안에서 스크롤한다. */
+.who__rows { display: flex; flex-direction: column; max-height: 34vh; overflow: auto; overscroll-behavior: contain; }
+
 /* 지금 나오는 곡의 투표 버튼 (§10.7). 대기열 행의 `.vote` 를 그대로 쓰되
  * 카드 안에서는 한 줄로 서고, 눌러 둔 것은 눌린 상태로 보인다. */
 .nowvote { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1); margin-bottom: var(--sp-2); }

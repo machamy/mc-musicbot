@@ -94,6 +94,7 @@ const LS = {
   layout: 'macham.layout',        // 구버전 키 — 서버 저장이 없던 시절 값을 한 번 물려받는다
   prefs: 'macham.prefs',          // 서버 개인 설정의 로컬 거울
   theme: 'macham.theme',          // FOUC 방지 인라인 스크립트가 읽는 키
+  seenChangelog: 'macham.changelog.seen',  // 어느 빌드까지 패치노트를 봤는지 (§30)
 };
 
 /* ── 테마 7종 + 시스템 따라가기 (§17) ──
@@ -968,8 +969,8 @@ function buildHeader() {
 
   el.presenceBtn = h('button', {
     class: 'hdr__presence', type: 'button',
-    tip: '지금 누가 듣고 있는지 보기',
-    onClick: () => { openSide('members'); },
+    tip: '눌러서 지금 누가 듣고 보고 있는지 확인해요',
+    onClick: () => { openWhoSheet(); },
   });
 
   el.themeBtn = h('button', {
@@ -1088,11 +1089,26 @@ function buildProfileMenu() {
   el.opsLink = h('a', { class: 'dd__item', role: 'menuitem', href: '/', target: '_blank', rel: 'noreferrer' },
     h('span', null, '🛠'), h('span', null, '운영 패널'));
 
+  // 서버 승인 (§26.2) — 봇 주인만. 대기 중인 서버가 있으면 개수를 배지로 붙인다.
+  el.approvalBtn = h('button', {
+    class: 'dd__item', type: 'button', role: 'menuitem', hidden: true,
+    tip: '봇을 초대한 서버를 승인하거나 막아요',
+    onClick: () => { closeMenus(); openApprovalSheet(); },
+  }, h('span', null, '🛡'), h('span', null, '서버 승인'), el.approvalCount = h('span', { class: 'count', hidden: true }));
+
   el.statsBtn = h('button', {
     class: 'dd__item', type: 'button', role: 'menuitem',
     tip: '담은 곡·재생·받은 반응을 모아 봐요',
     onClick: () => { closeMenus(); openStatsModal(null); },
   }, h('span', null, '📊'), h('span', null, '내 기록'));
+
+  // 버전 버튼을 누르면 역대 패치노트가 뜬다 (§30).
+  el.changelogBtn = h('button', {
+    class: 'dd__item', type: 'button', role: 'menuitem',
+    tip: '무엇이 바뀌었는지 모아 봐요',
+    onClick: () => { closeMenus(); openChangelog(); },
+  }, h('span', null, '📝'), h('span', null, '패치노트'),
+    h('span', { class: 'count' }, ctx.buildId || ''));
 
   const logout = h('button', {
     class: 'dd__item dd__item--danger', type: 'button', role: 'menuitem',
@@ -1107,7 +1123,7 @@ function buildProfileMenu() {
   }, h('span', null, '↩'), h('span', null, '로그아웃'));
 
   return h('div', { class: 'dd__menu dd__menu--wide', role: 'menu', hidden: true },
-    el.meHead, permBtn, el.statsBtn, el.consoleBtn, el.opsLink,
+    el.meHead, permBtn, el.statsBtn, el.changelogBtn, el.consoleBtn, el.approvalBtn, el.opsLink,
     h('div', { class: 'dd__sep' }),
     buildLayoutPicker(),
     h('div', { class: 'dd__sep' }),
@@ -6220,6 +6236,98 @@ function checkVersion(state) {
   }).then((ok) => { if (ok) location.reload(); });
 }
 
+/* 패치노트 (§30).
+ *
+ * 원본은 `docs/CHANGELOG.md` 하나고 exe 에 같이 들어 있다. 화면용으로 옮겨 적지 않는다 —
+ * 두 벌이 되면 결국 화면 쪽이 낡는다.
+ *
+ * 마크다운은 여기서 아주 좁게만 해석한다. 범용 파서를 넣으면 그만큼 XSS 면이 넓어지는데,
+ * 우리가 쓰는 문법은 제목·목록·표·코드·굵게가 전부다. **HTML 은 통째로 이스케이프**하고
+ * 그 위에 우리가 아는 문법만 되살린다.
+ */
+function renderMarkdown(text) {
+  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const inline = (s) => esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+  const out = [];
+  let inCode = false;
+  let listOpen = false;
+  const closeList = () => { if (listOpen) { out.push('</ul>'); listOpen = false; } };
+
+  for (const raw of String(text).split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    if (line.startsWith('```')) {
+      closeList();
+      out.push(inCode ? '</code></pre>' : '<pre><code>');
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) { out.push(esc(line)); continue; }
+
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) { closeList(); out.push(`<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`); continue; }
+    if (/^\s*[-*]\s+/.test(line)) {
+      if (!listOpen) { out.push('<ul>'); listOpen = true; }
+      out.push(`<li>${inline(line.replace(/^\s*[-*]\s+/, ''))}</li>`);
+      continue;
+    }
+    // 표는 셀만 살린다. 정렬 줄(---)은 버린다.
+    if (line.includes('|') && line.trim().startsWith('|')) {
+      if (/^\s*\|[\s:|-]+\|\s*$/.test(line)) continue;
+      closeList();
+      const cells = line.split('|').slice(1, -1).map((cell) => `<td>${inline(cell.trim())}</td>`);
+      out.push(`<table class="md__t"><tr>${cells.join('')}</tr></table>`);
+      continue;
+    }
+    if (!line.trim()) { closeList(); continue; }
+    closeList();
+    out.push(`<p>${inline(line)}</p>`);
+  }
+  closeList();
+  if (inCode) out.push('</code></pre>');
+  return out.join('\n');
+}
+
+let changelogCache = null;
+
+async function openChangelog() {
+  if (!changelogCache) {
+    try {
+      changelogCache = await api('/music/api/changelog');
+    } catch {
+      toast('패치노트를 불러오지 못했어요.', 'warn');
+      return;
+    }
+  }
+  const body = h('div', { class: 'md' });
+  body.innerHTML = renderMarkdown(changelogCache.markdown || '');
+  // 읽었다고 표시한다. 다음 접속 때 같은 버전이면 안 띄운다.
+  try { localStorage.setItem(LS.seenChangelog, ctx.buildId || ''); } catch { /* 시크릿 모드 */ }
+  sheet({
+    title: '패치노트',
+    desc: changelogCache.latest ? `최신: ${changelogCache.latest}` : null,
+    wide: true,
+    body,
+    actions: [{ label: '닫기', kind: 'ghost' }],
+  });
+}
+
+/** 새 버전으로 처음 들어왔으면 무엇이 바뀌었는지 한 번 보여준다 (§30). */
+function maybeShowChangelog() {
+  if (!ctx.buildId) return;
+  let seen = null;
+  try { seen = localStorage.getItem(LS.seenChangelog); } catch { /* 시크릿 모드 */ }
+  // 처음 쓰는 사람에게는 안 띄운다 — 첫인상이 변경 목록이면 곤란하다.
+  if (!seen) {
+    try { localStorage.setItem(LS.seenChangelog, ctx.buildId); } catch { /* 무시 */ }
+    return;
+  }
+  if (seen === ctx.buildId) return;
+  openChangelog();
+}
+
 /* ═══════════════════════ 프로필 / 헤더 렌더 ═══════════════════════ */
 
 function renderProfile() {
@@ -6306,6 +6414,143 @@ function renderPresenceSummary(state) {
   el.presenceBtn.setAttribute('data-tip', bot?.voiceChannelName
     ? `'${bot.voiceChannelName}' 채널에서 ${listening}명이 같이 듣고 있어요`
     : '지금 누가 듣고 있는지 보기');
+}
+
+/* 서버 승인 (§26.2) — 봇 주인 전용.
+ *
+ * 봇 초대는 Discord 쪽이라 막을 수 없다. 그래서 **쓰는 것**을 승인제로 돌린다.
+ * 이 화면이 그 결정을 내리는 유일한 자리다.
+ */
+async function loadApprovals() {
+  // 봇 주인이 아니면 API 가 403 을 준다. 조용히 접는다 — 있지도 않은 메뉴를 깜빡이면 안 된다.
+  if (ctx.tier !== 'owner') return null;
+  try {
+    const data = await api('/music/api/owner/guilds');
+    const guilds = Array.isArray(data?.guilds) ? data.guilds : [];
+    const pending = guilds.filter((row) => row.status === 'pending').length;
+    if (el.approvalBtn) {
+      el.approvalBtn.hidden = false;
+      el.approvalCount.hidden = pending === 0;
+      el.approvalCount.textContent = String(pending);
+    }
+    return guilds;
+  } catch {
+    return null;
+  }
+}
+
+async function openApprovalSheet() {
+  const guilds = await loadApprovals();
+  if (!guilds) { toast('서버 목록을 불러오지 못했어요.', 'warn'); return; }
+
+  const decide = async (guildId, status, label) => {
+    const result = await call(() => api('/music/api/owner/guilds/decide', {
+      body: { guildId, status },
+    }));
+    if (!result) return;
+    toast(`${label} 처리했어요.`, 'ok');
+    document.querySelectorAll('.sheet-back').forEach((back) => back.remove());
+    openApprovalSheet();
+  };
+
+  const row = (guild) => {
+    const pending = guild.status === 'pending';
+    const blocked = guild.status === 'blocked';
+    // 이미 나간 서버는 승인해도 소용없다. 그 사실을 먼저 말한다.
+    const gone = guild.botInGuild === false;
+    return h('div', { class: `apr apr--${guild.status}` },
+      h('div', { class: 'apr__main' },
+        h('div', { class: 'apr__name' }, guild.name || `서버 ${guild.guildId}`),
+        h('div', { class: 'apr__sub' },
+          guild.statusLabel,
+          ' · ',
+          fmtAgo(guild.requestedUtc),
+          gone ? ' · 봇이 이미 나간 서버예요' : '')),
+      h('div', { class: 'apr__acts' },
+        pending || blocked
+          ? bindAct(h('button', { class: 'btn btn--sm btn--primary', type: 'button', tip: '이 서버가 봇을 쓸 수 있게 해요' }, '승인'),
+            () => decide(guild.guildId, 'approved', '승인'))
+          : null,
+        !blocked
+          ? bindAct(h('button', { class: 'btn btn--sm btn--danger', type: 'button', tip: '이 서버에서 봇을 못 쓰게 막아요' }, '차단'),
+            () => decide(guild.guildId, 'blocked', '차단'))
+          : null));
+  };
+
+  const pending = guilds.filter((g) => g.status === 'pending');
+  const rest = guilds.filter((g) => g.status !== 'pending');
+
+  sheet({
+    title: '서버 승인',
+    desc: '봇을 초대한 서버예요. 승인해야 명령어와 리모컨이 열려요.',
+    wide: true,
+    body: h('div', { class: 'aprlist' },
+      pending.length
+        ? frag(h('div', { class: 'who__title' }, '⏳ 승인 대기', h('span', { class: 'count' }, String(pending.length))),
+          ...pending.map(row))
+        : h('p', { class: 'hint' }, '기다리는 서버가 없어요.'),
+      rest.length
+        ? frag(h('div', { class: 'who__title' }, '📋 나머지', h('span', { class: 'count' }, String(rest.length))),
+          ...rest.map(row))
+        : null),
+    actions: [{ label: '닫기', kind: 'ghost' }],
+  });
+}
+
+/* 듣는중·보는중을 누르면 뜨는 창 (§28).
+ *
+ * 전에는 옆 패널을 여는 게 전부였다. **집중·패널 배치에서는 그 패널이 아예 없어서**
+ * 눌러도 아무 일이 안 일어났다. 어느 배치에서든 뜨도록 창으로 바꾼다.
+ *
+ * 옆 패널의 멤버 목록과 같은 데이터를 쓴다 — 두 벌로 만들면 한쪽만 고치게 된다.
+ */
+function whoBuckets(state) {
+  const presence = state.presence || {};
+  const bot = presence.bot || null;
+  const listening = new Set((presence.listening || []).map(String));
+  const otherVoice = new Set((presence.inOtherVoice || []).map(String));
+  const viewing = new Set((presence.viewing || []).map(String));
+  // 봇이 음성에 없으면 '이 채널에서 듣는 중'은 있을 수 없다.
+  if (bot && bot.inVoice === false) listening.clear();
+
+  const members = state.members.length
+    ? state.members
+    : synthesizeMembers(state, listening, otherVoice, viewing);
+  const pick = (ids) => members.filter((member) => ids.has(String(member.userId ?? member.id)));
+  return { bot, listening: pick(listening), otherVoice: pick(otherVoice), viewing: pick(viewing) };
+}
+
+function openWhoSheet() {
+  const state = store.get();
+  const { bot, listening, otherVoice, viewing } = whoBuckets(state);
+
+  const group = (icon, title, rows, empty) => h('div', { class: 'who__group' },
+    h('div', { class: 'who__title' },
+      h('span', { 'aria-hidden': 'true' }, icon), title,
+      h('span', { class: 'count' }, String(rows.length))),
+    rows.length
+      ? h('div', { class: 'who__rows' }, ...rows.map((member) => memberRow(member, 'listening')))
+      : h('p', { class: 'hint' }, empty));
+
+  const note = !bot || bot.inGuild === false
+    ? '봇이 이 서버에 없어요. 다시 초대해야 재생할 수 있어요.'
+    : bot.inVoice === false
+      ? '봇이 음성 채널에 없어서 같이 듣는 사람도 없어요. 봇을 부르면 바로 채워져요.'
+      : bot.voiceChannelName
+        ? `봇은 지금 '${bot.voiceChannelName}' 채널에 있어요.`
+        : '봇은 지금 음성 채널에 있어요.';
+
+  sheet({
+    title: '지금 누가 있나요',
+    desc: note,
+    wide: true,
+    body: h('div', { class: 'who' },
+      group('🎧', '이 채널에서 듣는 중', listening, '아직 아무도 없어요.'),
+      // 다른 채널에 있는 사람은 "부르면 올 수 있는 사람"이라 같이 보여준다.
+      otherVoice.length ? group('🔈', '다른 음성 채널에 있어요', otherVoice, '') : null,
+      group('🖥', '리모컨 보는 중', viewing, '지금은 아무도 안 보고 있어요.')),
+    actions: [{ label: '닫기', kind: 'ghost', autofocus: true }],
+  });
 }
 
 /* ═══════════════════════ 우클릭 메뉴 (§24.1) ═══════════════════════
@@ -7337,6 +7582,11 @@ async function boot() {
   if (lyricsOpen) loadLyrics();
   loadSeeds();
   loadMyScore();
+  // 봇 주인이면 승인 대기 개수를 메뉴에 배지로 붙인다 (§26.2).
+  // 대기 중인 서버가 있는데 아무 데도 안 보이면 영영 방치된다.
+  loadApprovals();
+  // 새 버전으로 처음 들어왔으면 무엇이 바뀌었는지 한 번 알려준다 (§30).
+  maybeShowChangelog();
   focusLinkedMessage();
   // 지난번에 보던 탭이 그대로 열려 있으면 그 탭 데이터도 챙긴다.
   // (탭을 다시 누르지 않으면 영영 안 불러오는 구멍이 있었다)

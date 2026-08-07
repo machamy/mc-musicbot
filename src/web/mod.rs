@@ -223,6 +223,14 @@ pub async fn serve(app: Arc<App>) {
         }));
     }
 
+    // 한가할 때 차트를 미리 받아 둔다 (§15.3).
+    {
+        let hook_state = state.clone();
+        let _ = app.on_chart_prefetch.set(Box::new(move || {
+            remote::spawn_chart_prefetch(&hook_state);
+        }));
+    }
+
     let router = Router::new()
         .route("/", get(pages::index))
         .route("/login", get(pages::login_page).post(pages::login_post))

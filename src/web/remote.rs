@@ -27,7 +27,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Form, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use serde::{Deserialize, Serialize};
@@ -751,6 +751,14 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/api/guilds/{guild_id}/autoplay/reset",
             post(api_autoplay_reset),
         )
+        // 로그인 없이 보는 지금 곡 (§29). **읽기 전용이고 사람 정보는 안 나간다.**
+        .route(
+            "/music/api/guilds/{guild_id}/public",
+            get(api_public_now_playing),
+        )
+        .route("/music/guilds/{guild_id}/now", get(public_now_page))
+        // 패치노트 (§30). 로그인 여부와 무관하다 — 무엇이 바뀌었는지는 비밀이 아니다.
+        .route("/music/api/changelog", get(api_changelog))
         // 서버 승인 (§26) — **봇 주인 전용**. 길드 인가를 안 태운다:
         // 아직 승인 안 된 서버가 대상이라 길드 게이트를 통과할 수 없기 때문이다.
         .route("/music/api/owner/guilds", get(api_owner_guilds))
@@ -8897,6 +8905,7 @@ async fn api_chart_detail(
     cookies: Cookies,
     Path((guild_id, chart_id)): Path<(u64, i64)>,
     Query(query): Query<ChartWindowQuery>,
+    headers: HeaderMap,
 ) -> Response {
     let ctx = match authorize(&state, &cookies, guild_id, None).await {
         Ok(ctx) => ctx,
@@ -8926,15 +8935,56 @@ async fn api_chart_detail(
         };
     }
     match fetch_chart_tracks(&state, guild_id, &chart, false).await {
-        Ok(snapshot) => json_ok(json!({
-            "chart": chart_def_json(&chart),
-            "tracks": snapshot.tracks,
-            "fetchedUtc": snapshot.fetched_utc,
-            "stale": snapshot.stale,
-            "internal": false,
-        })),
+        Ok(snapshot) => {
+            let payload = json!({
+                "chart": chart_def_json(&chart),
+                "tracks": snapshot.tracks,
+                "fetchedUtc": snapshot.fetched_utc,
+                "stale": snapshot.stale,
+                "internal": false,
+            });
+            // 순위는 자주 안 바뀐다. 해시를 붙여 두면 같은 목록을 두 번 내려보내지 않는다 (§15.6).
+            json_ok_etag(payload, headers.get(header::IF_NONE_MATCH))
+        }
         Err(error) => json_error(StatusCode::BAD_GATEWAY, error),
     }
+}
+
+/// 내용 해시를 `ETag` 로 붙여 응답한다. 브라우저가 같은 해시를 들고 오면 `304` 를 준다 (§15.6).
+///
+/// 한 번 받은 랭킹을 다시 받지 않게 하는 것이 목적이다. 차트 한 장이 100곡이라
+/// 새로고침마다 통째로 내려보내면 모바일에서 체감이 크다.
+/// **본문이 바뀌면 해시도 바뀌므로** 오래된 목록이 굳을 걱정은 없다.
+fn json_ok_etag(value: Value, if_none_match: Option<&HeaderValue>) -> Response {
+    use sha2::Digest;
+    let body = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
+    // 앞 8바이트면 충돌 걱정 없이 짧다. 에셋 쪽 `etag_of` 와 같은 규칙이다.
+    let digest = sha2::Sha256::digest(body.as_bytes());
+    let etag = format!(
+        "\"{}\"",
+        digest
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    if let Some(sent) = if_none_match.and_then(|value| value.to_str().ok())
+        && sent.split(',').any(|part| part.trim() == etag)
+    {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag),
+            // 캐시는 우리 해시로 판정한다. 시간 기반 캐시를 같이 걸면 순위가 바뀌었는데도
+            // 브라우저가 옛 목록을 그냥 쓰는 구간이 생긴다.
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+            (header::CONTENT_TYPE, "application/json".to_string()),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// 차트 하나를 펼친다. 캐시가 살아 있으면 그걸 그대로 준다 (V3 §15.1).
@@ -8952,6 +9002,65 @@ impl Drop for ChartFetchGuard {
     fn drop(&mut self) {
         self.state.app.remote.end_chart_fetch(self.chart_id);
     }
+}
+
+/// 한가할 때 식은 차트 **한 장**을 미리 받아 둔다 (§15.3).
+///
+/// 한 장만 하는 게 핵심이다. 40장을 한 번에 돌리면 프리페치가 yt-dlp 를 몇 분씩
+/// 붙들어서 정작 사람이 검색할 때 밀린다. 10분마다 한 장이면 6시간 캐시 수명 안에
+/// 자주 보는 차트는 늘 따뜻하게 유지된다.
+pub fn spawn_chart_prefetch(state: &Arc<WebState>) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        // 재생 중이면 건너뛴다. 사람이 듣고 있을 때 백그라운드가 자원을 다투면 안 된다.
+        if !state.app.coordinator.active_guild_ids().await.is_empty() {
+            return;
+        }
+        // 보고 있는 사람이 있어도 미룬다 — 그 사람이 곧 무언가를 누를 참이다.
+        if !state.presence.lock().unwrap().is_empty() {
+            return;
+        }
+
+        let guild_ids = state.app.db.list_known_guild_ids();
+        for guild_id in guild_ids {
+            // 승인 안 된 서버 것까지 미리 받아 둘 이유가 없다.
+            if !state
+                .app
+                .remote
+                .guild_approval(guild_id)
+                .map(|row| row.status.is_usable())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let charts = state.app.remote.list_charts(guild_id);
+            let stale = charts.into_iter().find(|chart| {
+                chart.enabled
+                    && !chart.is_internal()
+                    && state
+                        .app
+                        .remote
+                        .chart_cache(chart.id)
+                        .is_none_or(|snapshot| snapshot.stale)
+            });
+            let Some(chart) = stale else { continue };
+            match fetch_chart_tracks(&state, guild_id, &chart, false).await {
+                Ok(snapshot) => state.app.log.info(
+                    "Chart",
+                    &format!(
+                        "미리 받아 뒀어요: '{}' {}곡 (아무도 안 쓸 때)",
+                        chart.name,
+                        snapshot.tracks.len()
+                    ),
+                ),
+                Err(reason) => state
+                    .app
+                    .log
+                    .info("Chart", &format!("'{}' 미리 받기 실패: {reason}", chart.name)),
+            }
+            return; // 한 tick 에 한 장만.
+        }
+    });
 }
 
 /// 빈 채널 규칙을 화면이 쓸 모양으로 (§27).
@@ -8979,6 +9088,105 @@ fn option_json(policy: crate::models::EmptyVoiceChannelPolicy) -> Value {
         "label": policy.label(),
         "description": policy.description(),
     })
+}
+
+/// `GET /music/api/changelog` — 패치노트 (§30).
+///
+/// exe 에 박아 넣은 `docs/CHANGELOG.md` 를 그대로 준다. **원본이 하나뿐**이라
+/// 문서와 화면이 갈라질 수 없다. 마크다운 해석은 클라이언트가 한다 — 서버가 HTML 을
+/// 만들어 주면 거기서 이스케이프 실수가 나면 곧장 XSS 다.
+async fn api_changelog(headers: HeaderMap) -> Response {
+    let text = crate::web::assets::CHANGELOG_MD;
+    // 첫 `## ` 제목이 최신 버전 이름이다. 새 버전 안내 문구에 쓴다.
+    let latest = text
+        .lines()
+        .find(|line| line.starts_with("## "))
+        .map(|line| line.trim_start_matches("## ").trim().to_string());
+    json_ok_etag(
+        json!({ "markdown": text, "latest": latest }),
+        headers.get(header::IF_NONE_MATCH),
+    )
+}
+
+/// `GET /music/guilds/{id}/now` — 로그인 없이 보는 화면 (§29).
+/// 로그인한 사람은 리모컨으로 보낸다 — 이 화면보다 나은 걸 볼 수 있으니까.
+async fn public_now_page(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+) -> Response {
+    if current_session(&state, &cookies).is_some() {
+        return Redirect::to(&format!("/music/guilds/{guild_id}")).into_response();
+    }
+    html_page(remote_page::public_now(guild_id, &state.app.build_id))
+}
+
+/// `GET /music/api/guilds/{id}/public` — 로그인 없이 보는 지금 곡 (§29).
+///
+/// **여기서 나가는 것은 곡뿐이다.** 신청한 사람 이름, 채팅, 멤버, 대기열 신청자,
+/// 투표 정보는 하나도 안 실린다 — 그건 그 서버 안 사람들 정보고, 로그인하지 않은
+/// 사람에게 줄 이유가 없다. 대기열도 **제목만** 앞 5곡까지다.
+///
+/// 서버가 끄면 404. 승인 안 된 서버도 404 — 아직 쓸 수 없는 서버의 활동을
+/// 밖에 보여 줄 이유가 없다. "꺼짐"과 "없음"을 구분해 주지 않는 것도 의도다.
+async fn api_public_now_playing(
+    State(state): State<Arc<WebState>>,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+) -> Response {
+    let approved = state
+        .app
+        .remote
+        .guild_approval(guild_id)
+        .map(|row| row.status.is_usable())
+        .unwrap_or(false);
+    let settings = state.app.remote.load_guild_settings(guild_id);
+    if !approved || !settings.public_now_playing || !bot_in_guild(&state, guild_id) {
+        return json_error(StatusCode::NOT_FOUND, "여기서는 볼 수 없어요.");
+    }
+
+    let player = state.app.player.get_state(guild_id).await;
+    let position = state
+        .app
+        .coordinator
+        .current_position(guild_id)
+        .await
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+
+    let current = player.current_item.as_ref().map(|item| {
+        json!({
+            "title": item.track.title.clone().unwrap_or_else(|| "제목 없음".into()),
+            "artist": item.track.artist,
+            "durationSeconds": item.track.duration.map(|d| d.as_secs_f64()),
+        })
+    });
+    // 제목만. 누가 넣었는지는 안 준다.
+    let upcoming: Vec<Value> = player
+        .upcoming
+        .iter()
+        .take(5)
+        .map(|item| {
+            json!({ "title": item.track.title.clone().unwrap_or_else(|| "제목 없음".into()) })
+        })
+        .collect();
+
+    let payload = json!({
+        // 서버 이름은 승인 기록에 이미 들고 있다. 그것만 쓴다.
+        "guildName": state
+            .app
+            .remote
+            .guild_approval(guild_id)
+            .and_then(|row| row.guild_name),
+        "current": current,
+        "isPaused": player.is_paused,
+        "positionSeconds": position,
+        "sampledAtUtc": now_utc(),
+        "upcoming": upcoming,
+        "queueTotal": player.upcoming.len(),
+        "readOnly": true,
+    });
+    json_ok_etag(payload, headers.get(header::IF_NONE_MATCH))
 }
 
 // ───────────────────────── 서버 승인 (§26) ─────────────────────────

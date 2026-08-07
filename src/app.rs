@@ -143,6 +143,9 @@ pub struct App {
     /// 종료가 시작됐음을 접속 중인 브라우저에 알리는 훅. `web::serve` 가 채운다.
     /// 이게 없으면 사람은 오류 화면만 보고 무슨 일인지 모른다.
     pub on_restarting: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// 유휴 시간 차트 프리페치 훅 (§15.3). `web::serve` 가 채운다 —
+    /// 차트를 펼치는 코드가 웹 계층에 있어서 여기서 직접 부를 수 없다.
+    pub on_chart_prefetch: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// 마지막 재정렬 tick 시각(길드 무관). 웹이 nextSortAt 을 계산해 카운트다운을 그린다.
     /// 순서가 바뀌었는지와 무관하게 매 tick 갱신된다 — 카운트다운은 "다음 검사 시각"이지
     /// "다음에 순서가 바뀌는 시각"이 아니다. 아직 한 번도 안 돌았으면 `None`.
@@ -242,6 +245,7 @@ impl App {
             owner_user_ids: RwLock::new(Vec::new()),
             on_queue_sorted: OnceLock::new(),
             on_restarting: OnceLock::new(),
+            on_chart_prefetch: OnceLock::new(),
             last_queue_sort: RwLock::new(None),
             queue_sort_last: Mutex::new(HashMap::new()),
             announce_channels: Mutex::new(HashMap::new()),
@@ -262,6 +266,7 @@ impl App {
         }
         tokio::spawn(queue_sort_loop(self.clone()));
         tokio::spawn(retention_prune_loop(self.clone()));
+        tokio::spawn(chart_prefetch_loop(self.clone()));
     }
 
     // ───────── 대기열 재정렬 스케줄 (v3 §5 · §18.2) ─────────
@@ -354,6 +359,30 @@ async fn queue_sort_loop(app: Arc<App>) {
         }
     }
 }
+
+/// 차트를 **아무도 안 볼 때 미리 받아 둔다** (§15.3).
+///
+/// 차트 한 장을 펼치는 데 yt-dlp 가 몇 초 걸린다. 사람이 눌렀을 때 그걸 기다리면
+/// "느린 화면" 이 되고, 노래방 차트는 곡마다 원곡을 찾느라 더 오래 걸린다.
+/// 그래서 캐시가 식은 차트를 한가할 때 한 장씩 미리 채운다.
+///
+/// **한가할 때만 돈다.** 재생 중이거나 사람이 붙어 있으면 건너뛴다 — 프리페치가
+/// yt-dlp 를 붙들면 정작 사람이 검색할 때 밀린다. 한 번에 한 장만 하는 이유도 같다.
+async fn chart_prefetch_loop(app: Arc<App>) {
+    // 첫 tick 은 기동 직후를 피한다. 그때는 마이그레이션·게이트웨이 접속으로 이미 바쁘다.
+    tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+    let mut ticker = tokio::time::interval(CHART_PREFETCH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if let Some(hook) = app.on_chart_prefetch.get() {
+            hook();
+        }
+    }
+}
+
+/// 프리페치 주기. 캐시 수명(6시간)보다 촘촘해야 "식자마자 채워지는" 상태가 유지된다.
+const CHART_PREFETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// 보존 정리 루프 (사양서 B16). 첫 tick 은 즉시 발화하므로 기동 시 1회가 자동으로 포함된다.
 /// 길드별 `chat_retention_days`·`audit_retention_days` 는 `prune_all` 이 직접 읽어 반영한다.
