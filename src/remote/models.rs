@@ -706,6 +706,17 @@ pub struct ChartSnapshot {
     pub stale: bool,
 }
 
+/// 재시작 직전에 남겨 둔 재생 지점 (§24).
+#[derive(Debug, Clone)]
+pub struct ResumePoint {
+    /// 그때 틀던 대기열 항목. 기동 뒤 현재 곡과 다르면 이어 붙이지 않는다.
+    pub item_id: Option<String>,
+    pub position_seconds: f64,
+    pub was_paused: bool,
+    /// 저장한 지 몇 시간 지났는지. 오래된 기록으로 옛날 곡을 되살리면 안 된다.
+    pub age_hours: f64,
+}
+
 // ───────── 슈퍼 좋아요 제한 (§10.6) ─────────
 
 /// 슈퍼 좋아요를 지금 쓸 수 있는지. 거부할 때 **이유를 정확히** 말한다.
@@ -1800,6 +1811,17 @@ fn default_chart_super_weight() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+impl PermissionRule {
+    /// 판정하려면 그 사람의 **역할 목록을 알아야 하는** 규칙인지.
+    ///
+    /// Discord 조회가 실패해 역할을 모를 때, 이 규칙이면 "권한 없음"이라고 말하면 안 된다.
+    /// 실제로 재시작 직후 429 가 겹쳐서 지정 역할 권한자가 권한 없음을 봤다.
+    /// 나머지 규칙은 역할과 무관하게 판정되므로 그대로 거절해도 정확하다.
+    pub fn needs_roles(self) -> bool {
+        matches!(self, Self::ConfiguredRole | Self::Administrator)
+    }
 }
 
 impl RemoteGuildSettings {

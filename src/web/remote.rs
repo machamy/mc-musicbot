@@ -383,6 +383,10 @@ pub struct AuthContext {
     pub suspensions: Vec<Suspension>,
     /// `Viewer`로 강등된 이유(있으면 화면 상단 배너에 뜬다).
     pub viewer_reason: Option<String>,
+    /// 이 요청에서 역할 목록을 **실제로 확인했는지**. Discord 조회가 실패하고
+    /// 되살릴 캐시도 없으면 false. 이때 `member.role_ids` 가 빈 것은
+    /// "역할이 없다" 가 아니라 "모른다" 는 뜻이라, 권한 거절 문구를 달리 해야 한다.
+    pub roles_known: bool,
 }
 
 impl AuthContext {
@@ -402,16 +406,56 @@ impl AuthContext {
 
     fn require(&self, key: &str, rule: PermissionRule, message: &str) -> Result<(), Response> {
         if self.allows(key, rule) {
-            Ok(())
-        } else if self.tier.is_viewer() {
-            Err(json_error(
+            return Ok(());
+        }
+        if self.tier.is_viewer() {
+            return Err(json_error(
                 StatusCode::FORBIDDEN,
                 self.viewer_reason
                     .clone()
                     .unwrap_or_else(|| "읽기 전용이라 아무것도 조작할 수 없어요.".into()),
-            ))
-        } else {
-            Err(json_error(StatusCode::FORBIDDEN, message.to_string()))
+            ));
+        }
+        // **역할을 모르는 상태를 권한 없음으로 말하면 거짓말이 된다.** 실제로 겪은 일이다 —
+        // 재시작 직후 Discord 429 가 겹치면 지정 역할 권한자가 "권한이 없어요" 를 봤다.
+        // 이건 거절이 아니라 판정 실패이므로 503 으로, 다시 해 보라고 말한다.
+        if !self.roles_known && rule.needs_roles() {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Discord에서 내 역할을 확인하지 못했어요. 권한이 없는 게 아니라 조회가 잠시 밀린 거예요. 몇 초 뒤에 다시 해 주세요.",
+            ));
+        }
+        Err(json_error(
+            StatusCode::FORBIDDEN,
+            format!("{message} {}", self.who_has(key, rule)),
+        ))
+    }
+
+    /// 이 규칙이면 **누가** 할 수 있고 어떻게 하면 풀리는지 한 문장으로.
+    /// 막힌 사실만 말하고 끝내면 다음에 뭘 해야 할지 알 수가 없다 (§23.3).
+    fn who_has(&self, key: &str, rule: PermissionRule) -> String {
+        match rule {
+            // 멤버면 누구나인데 막혔다면 정지·읽기전용 같은 다른 사정이다.
+            PermissionRule::GuildMember => {
+                "원래는 서버 멤버면 누구나 할 수 있어요. 정지 중이거나 읽기 전용인지 확인해 주세요.".into()
+            }
+            PermissionRule::SameVoiceChannel => {
+                "봇과 같은 음성 채널에 있어야 해요. 봇이 있는 채널로 들어오면 바로 열려요.".into()
+            }
+            PermissionRule::ConfiguredRole => {
+                let count = self.settings.roles_for(key).len();
+                if count == 0 {
+                    "지정 역할만 쓸 수 있는데 아직 역할이 지정되지 않았어요. 지금은 서버 관리자만 할 수 있어요.".into()
+                } else {
+                    format!("지정된 역할({count}개) 중 하나를 가진 사람과 서버 관리자만 할 수 있어요. 관리자에게 역할을 요청해 보세요.")
+                }
+            }
+            PermissionRule::Administrator => {
+                "서버 관리자만 할 수 있어요. 관리자에게 부탁하거나 관리자 지정 역할을 받아야 해요.".into()
+            }
+            PermissionRule::Disabled => {
+                "이 기능은 서버 설정에서 꺼져 있어요. 관리자도 못 쓰고, 설정에서 켜야 열려요.".into()
+            }
         }
     }
 
@@ -1272,6 +1316,12 @@ async fn fetch_member_roles(
                 .lock()
                 .unwrap()
                 .insert(key, (Instant::now(), roles.clone()));
+            // **디스크에도 적는다.** 메모리 캐시는 재시작에 날아가고, 그 직후 Discord 가
+            // 429 를 주면 역할이 빈 목록이 되어 지정 역할 권한자가 통째로 강등된다.
+            state
+                .app
+                .remote
+                .save_member_roles(guild_id, session.user_id, &roles);
             Ok(roles)
         }
         Err(error) => Err(stale_or_transient(
@@ -1291,14 +1341,36 @@ fn stale_or_transient(
     MemberLookupError::Transient(reason)
 }
 
+/// 일시 실패 때 되살릴 역할. 메모리를 먼저 보고, 없으면 디스크를 본다.
+///
+/// **`None` 과 `Some(vec![])` 는 전혀 다른 뜻이다.** 앞은 "아직 모른다", 뒤는
+/// "역할이 진짜 하나도 없다". 예전엔 `unwrap_or_default()` 로 둘을 같게 만들어서,
+/// 재시작 직후 429 가 나면 지정 역할 권한자가 "권한이 없어요" 를 봤다.
 fn stale_roles(state: &Arc<WebState>, guild_id: u64, user_id: u64) -> Option<Vec<u64>> {
-    state
+    let in_memory = state
         .remote_member_roles
         .lock()
         .unwrap()
         .get(&(guild_id, user_id))
         .filter(|(seen, _)| seen.elapsed() < MEMBER_CACHE_GRACE)
-        .map(|(_, roles)| roles.clone())
+        .map(|(_, roles)| roles.clone());
+    if in_memory.is_some() {
+        return in_memory;
+    }
+    let grace_hours = (MEMBER_CACHE_GRACE.as_secs() / 3600).max(1) as i64;
+    let from_disk = state
+        .app
+        .remote
+        .load_member_roles(guild_id, user_id, grace_hours);
+    if let Some(roles) = from_disk.clone() {
+        // 디스크에서 살린 것도 메모리에 올려 둔다. 매 요청마다 SQLite 를 칠 이유가 없다.
+        state
+            .remote_member_roles
+            .lock()
+            .unwrap()
+            .insert((guild_id, user_id), (Instant::now(), roles));
+    }
+    from_disk
 }
 
 /// 이 사람이 봇과 같은 음성 채널에 있는지.
@@ -1466,7 +1538,7 @@ async fn authorize(
         .any(|item| item.scope == SuspensionScope::All);
 
     // 5~8. 등급 판정
-    let (mut tier, mut member, mut viewer_reason) =
+    let (mut tier, mut member, mut viewer_reason, roles_known) =
         resolve_tier(state, &session, &guild, &settings, headers.is_some()).await;
 
     if all_suspended {
@@ -1483,6 +1555,7 @@ async fn authorize(
         tier,
         suspensions,
         viewer_reason,
+        roles_known,
     })
 }
 
@@ -1493,7 +1566,7 @@ async fn resolve_tier(
     guild: &OAuthGuild,
     settings: &RemoteGuildSettings,
     fresh: bool,
-) -> (AccessTier, MemberContext, Option<String>) {
+) -> (AccessTier, MemberContext, Option<String>, bool) {
     let guild_id = guild.id;
     let owner = is_owner_user(state, session.user_id);
 
@@ -1506,25 +1579,37 @@ async fn resolve_tier(
                 role_ids: Vec::new(),
             },
             None,
+            true,
         );
     }
 
     let same_voice = same_voice_channel(state, guild_id, session.user_id);
     let lookup = fetch_member_roles(state, session, guild_id, fresh).await;
 
-    let (role_ids, demote) = match lookup {
-        Ok(roles) => (roles, false),
-        Err(MemberLookupError::NotInGuild) => (Vec::new(), true),
-        Err(MemberLookupError::Transient(reason)) => {
-            state.app.log.warn(
-                "RemoteAuth",
-                &format!("길드 {guild_id} 멤버 재조회 일시 실패 — 등급 유지: {reason}"),
-            );
-            (
-                stale_roles(state, guild_id, session.user_id).unwrap_or_default(),
-                false,
-            )
-        }
+    // `roles_known` 이 false 면 "역할이 없다" 가 아니라 **"아직 모른다"** 이다.
+    // 권한을 열어 주지는 않지만, 거절할 때 이유를 그렇게 말해야 한다.
+    let (role_ids, demote, roles_known) = match lookup {
+        Ok(roles) => (roles, false, true),
+        Err(MemberLookupError::NotInGuild) => (Vec::new(), true, true),
+        Err(MemberLookupError::Transient(reason)) => match stale_roles(state, guild_id, session.user_id) {
+            Some(roles) => {
+                state.app.log.warn(
+                    "RemoteAuth",
+                    &format!("길드 {guild_id} 멤버 재조회 일시 실패 — 저장된 역할로 등급 유지: {reason}"),
+                );
+                (roles, false, true)
+            }
+            None => {
+                // 되살릴 것이 아무것도 없다. 재시작 직후 + Discord 429 가 겹치면 여기 온다.
+                state.app.log.warn(
+                    "RemoteAuth",
+                    &format!(
+                        "길드 {guild_id} 멤버 재조회 실패 + 저장된 역할 없음 — 역할 기반 권한을 판정할 수 없어요: {reason}"
+                    ),
+                );
+                (Vec::new(), false, false)
+            }
+        },
     };
 
     // 7. 추방·탈퇴 → 403이 아니라 Viewer로 강등한다.
@@ -1537,6 +1622,7 @@ async fn resolve_tier(
                 role_ids,
             },
             Some("이 서버에서 나갔거나 추방돼서 읽기 전용이에요.".into()),
+            roles_known,
         );
     }
 
@@ -1560,6 +1646,7 @@ async fn resolve_tier(
             role_ids,
         },
         None,
+        roles_known,
     )
 }
 

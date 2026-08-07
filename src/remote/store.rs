@@ -2,7 +2,8 @@ use super::{
     AUDIT_MERGE_WINDOW_SECS, AuditEntry, AuditKind, AutoplaySeed, CHART_CACHE_TTL_HOURS,
     ChartCategory, ChartDef, ChartSnapshot, ChatMessage, ChatReactionSummary, ChatReplyPreview,
     ChatReport, ChatTrackTag, LyricsCacheHit, LyricsDocument, MAX_VOTER_IDS, Participant,
-    PruneReport, QueueScore, QueueVoteKind, RecentTrack, RemoteGuildSettings, RetentionConfig,
+    PruneReport, QueueScore, QueueVoteKind, RecentTrack, RemoteGuildSettings, ResumePoint,
+    RetentionConfig,
     SeedAddOutcome, StoredSession, Suggestion, SuggestionStatus, SuperLikeStatus, SuperLikeVerdict,
     Suspension, SuspensionScope, UserTrack, UserTrackKind, as_limit_u32, audit_kind_for,
     audit_text, is_mergeable_action, truncate_title,
@@ -17,7 +18,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -330,6 +331,33 @@ const MIGRATION_V14: &str = r#"
     -- 실패 기록을 지워 다음 조회에서 다시 시도하게 한다.
     DELETE FROM remote_chart_cache
      WHERE chart_id IN (SELECT id FROM remote_charts WHERE builtin = 1 AND name IN ('한국 인기곡','전세계 인기곡'));
+"#;
+
+/// v16 — 역할 캐시와 재시작 이어듣기를 디스크에 남긴다.
+///
+/// **역할 캐시가 메모리에만 있어서 생긴 실제 버그.** 재시작하면 캐시가 비는데, 그때
+/// Discord 가 429 를 주면 일시 실패 경로가 `unwrap_or_default()` 로 **빈 역할 목록**을
+/// 만든다. 그러면 지정 역할로 권한을 받은 사람이 통째로 일반 멤버가 되어
+/// "권한이 없어요" 를 본다. 로그에는 429 만 찍히고 화면에는 권한 없음만 뜬다.
+/// 디스크에 두면 재시작을 건너뛰어도 유예 시간(6시간) 동안 등급이 유지된다.
+const MIGRATION_V16: &str = r#"
+    CREATE TABLE IF NOT EXISTS remote_member_roles (
+        guild_id    INTEGER NOT NULL,
+        user_id     INTEGER NOT NULL,
+        roles_json  TEXT NOT NULL,
+        fetched_utc TEXT NOT NULL,
+        PRIMARY KEY (guild_id, user_id)
+    );
+
+    -- 재시작 이어듣기 (§24). 껐을 때의 재생 위치만 남긴다 —
+    -- 음성 채널과 현재 곡은 guild_states 가 이미 들고 있다.
+    CREATE TABLE IF NOT EXISTS remote_resume (
+        guild_id         INTEGER PRIMARY KEY,
+        item_id          TEXT NULL,
+        position_seconds REAL NOT NULL,
+        was_paused       INTEGER NOT NULL DEFAULT 0,
+        saved_utc        TEXT NOT NULL
+    );
 "#;
 
 /// 인기곡 두 장은 마이그레이션에서도 같은 값을 써야 해서 상수로 뽑았다.
@@ -2599,6 +2627,118 @@ impl RemoteStore {
             .find(|chart| chart.id == chart_id)
     }
 
+    // ───────── 역할 캐시 (S-429) ─────────
+
+    /// Discord 에서 읽은 역할을 디스크에 남긴다. 메모리 캐시와 **함께** 쓴다 —
+    /// 메모리는 빠르고, 이쪽은 재시작을 견딘다.
+    pub fn save_member_roles(&self, guild_id: u64, user_id: u64, roles: &[u64]) {
+        let Ok(json) = serde_json::to_string(roles) else {
+            return;
+        };
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            r#"INSERT INTO remote_member_roles(guild_id, user_id, roles_json, fetched_utc)
+               VALUES(?1, ?2, ?3, ?4)
+               ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                 roles_json = excluded.roles_json, fetched_utc = excluded.fetched_utc"#,
+            params![guild_id as i64, user_id as i64, json, Self::now_iso()],
+        );
+    }
+
+    /// `grace_hours` 안에 읽어 둔 역할. 없으면 `None` —
+    /// **빈 목록과 구분되어야 한다.** 빈 벡터를 돌려주면 "역할이 하나도 없는 사람" 과
+    /// "아직 모르는 사람" 이 같아져서, 모를 때 권한을 막아 버린다.
+    pub fn load_member_roles(
+        &self,
+        guild_id: u64,
+        user_id: u64,
+        grace_hours: i64,
+    ) -> Option<Vec<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let (json, fetched): (String, String) = conn
+            .query_row(
+                "SELECT roles_json, fetched_utc FROM remote_member_roles
+                  WHERE guild_id = ?1 AND user_id = ?2",
+                params![guild_id as i64, user_id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        let fresh_enough = DateTime::parse_from_rfc3339(&fetched)
+            .map(|at| Utc::now() - at.with_timezone(&Utc) < ChronoDuration::hours(grace_hours))
+            .unwrap_or(false);
+        if !fresh_enough {
+            return None;
+        }
+        serde_json::from_str(&json).ok()
+    }
+
+    // ───────── 재시작 이어듣기 (§24) ─────────
+
+    /// 끄기 직전의 재생 위치를 남긴다.
+    pub fn save_resume(
+        &self,
+        guild_id: u64,
+        item_id: Option<&str>,
+        position_seconds: f64,
+        was_paused: bool,
+    ) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            r#"INSERT INTO remote_resume(guild_id, item_id, position_seconds, was_paused, saved_utc)
+               VALUES(?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(guild_id) DO UPDATE SET
+                 item_id = excluded.item_id, position_seconds = excluded.position_seconds,
+                 was_paused = excluded.was_paused, saved_utc = excluded.saved_utc"#,
+            params![
+                guild_id as i64,
+                item_id,
+                position_seconds,
+                was_paused as i64,
+                Self::now_iso()
+            ],
+        );
+    }
+
+    /// 기록을 읽고 **곧바로 지운다.** 한 번만 이어 붙이려는 것이다 —
+    /// 안 지우면 나중에 그냥 재시작했을 때도 몇 시간 전 곡이 되살아난다.
+    pub fn take_resume(&self, guild_id: u64) -> Option<ResumePoint> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(Option<String>, f64, i64, String)> = conn
+            .query_row(
+                "SELECT item_id, position_seconds, was_paused, saved_utc
+                   FROM remote_resume WHERE guild_id = ?1",
+                params![guild_id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let (item_id, position_seconds, was_paused, saved_utc) = row?;
+        let _ = conn.execute(
+            "DELETE FROM remote_resume WHERE guild_id = ?1",
+            params![guild_id as i64],
+        );
+        let age_hours = DateTime::parse_from_rfc3339(&saved_utc)
+            .map(|at| (Utc::now() - at.with_timezone(&Utc)).num_seconds() as f64 / 3600.0)
+            .unwrap_or(f64::MAX);
+        Some(ResumePoint {
+            item_id,
+            position_seconds,
+            was_paused: was_paused != 0,
+            age_hours,
+        })
+    }
+
+    pub fn clear_resume(&self, guild_id: u64) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "DELETE FROM remote_resume WHERE guild_id = ?1",
+            params![guild_id as i64],
+        );
+    }
+
     // ───────── TJ 곡번호 → 재생 주소 (§15.2c) ─────────
 
     /// 이 TJ 곡번호로 저장해 둔 재생 가능한 트랙. 못 찾았던 곡이면 `None`.
@@ -3038,6 +3178,7 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                 tx.execute_batch(MIGRATION_V15)?;
                 seed_builtin_charts(&tx)?;
             }
+            15 => tx.execute_batch(MIGRATION_V16)?,
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -3763,6 +3904,58 @@ mod tests {
     }
 
     #[test]
+    /// 회귀: 역할 캐시가 메모리에만 있어서 재시작 뒤 429 가 나면 지정 역할 권한자가
+    /// "권한이 없어요" 를 봤다. 디스크에 남아야 재시작을 건너뛰어도 등급이 유지된다.
+    ///
+    /// **`None` 과 `Some(vec![])` 를 구분하는지가 핵심이다.** 둘을 같게 다루면
+    /// "아직 모른다" 가 "역할이 없다" 가 되어 다시 같은 버그가 난다.
+    #[test]
+    fn member_roles_survive_a_restart_and_unknown_differs_from_empty() {
+        let (store, path) = temp_store("member-roles");
+
+        // 저장한 적이 없으면 **빈 목록이 아니라 모름**이다.
+        assert!(store.load_member_roles(1, 7, 6).is_none());
+
+        store.save_member_roles(1, 7, &[100, 200]);
+        assert_eq!(store.load_member_roles(1, 7, 6), Some(vec![100, 200]));
+
+        // 역할이 진짜 하나도 없는 사람은 빈 목록으로 남아야 한다 — 모름이 아니다.
+        store.save_member_roles(1, 8, &[]);
+        assert_eq!(store.load_member_roles(1, 8, 6), Some(Vec::new()));
+
+        // 유예 시간이 0이면 방금 적은 것도 못 쓴다(오래된 캐시로 권한을 열지 않는다).
+        assert!(store.load_member_roles(1, 7, 0).is_none());
+
+        // 다른 길드는 별개다.
+        assert!(store.load_member_roles(2, 7, 6).is_none());
+        cleanup(store, path);
+    }
+
+    /// 재시작 이어듣기는 **한 번만** 쓰인다. 안 그러면 나중에 그냥 재시작했을 때도
+    /// 몇 시간 전 곡이 되살아난다.
+    #[test]
+    fn resume_point_is_consumed_once() {
+        let (store, path) = temp_store("resume");
+        assert!(store.take_resume(1).is_none());
+
+        store.save_resume(1, Some("item-9"), 123.5, false);
+        let point = store.take_resume(1).expect("저장한 지점");
+        assert_eq!(point.item_id.as_deref(), Some("item-9"));
+        assert!((point.position_seconds - 123.5).abs() < 0.001);
+        assert!(!point.was_paused);
+        assert!(point.age_hours < 1.0);
+
+        // 두 번째는 없어야 한다.
+        assert!(store.take_resume(1).is_none());
+
+        // 틀던 게 없으면 지운다 — 옛 기록이 남아 엉뚱한 곡이 살아나면 안 된다.
+        store.save_resume(1, Some("item-9"), 10.0, true);
+        store.clear_resume(1);
+        assert!(store.take_resume(1).is_none());
+        cleanup(store, path);
+    }
+
+    #[test]
     fn sessions_persist_by_hash_only() {
         let (store, path) = temp_store("session");
         let token = "super-secret-token";
@@ -3948,6 +4141,15 @@ mod tests {
         assert!(!is_valid_pref("auditFilter", "song,없는분류"));
         assert!(is_valid_pref("notify", r#"{"song":1,"mention":0}"#));
         assert!(!is_valid_pref("notify", "song"));
+
+        // 역할을 판정하는 데 실제로 목록이 필요한 규칙만 true 여야 한다.
+        // 여기가 틀리면 조회 실패 때 멀쩡한 거절까지 "잠시 뒤 다시" 로 바뀐다.
+        use crate::remote::PermissionRule as Rule;
+        assert!(Rule::ConfiguredRole.needs_roles());
+        assert!(Rule::Administrator.needs_roles());
+        assert!(!Rule::GuildMember.needs_roles());
+        assert!(!Rule::SameVoiceChannel.needs_roles());
+        assert!(!Rule::Disabled.needs_roles());
 
         // 싱크 보정은 **음수가 정상값**이다. 볼륨처럼 부호를 막으면 앞으로 당기질 못한다.
         assert!(is_valid_pref("webOffset", "-2.5"));
