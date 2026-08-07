@@ -3554,20 +3554,74 @@ function hideVoterCard() {
   if (voterPop) { voterPop.remove(); voterPop = null; }
 }
 
+/* 지금 나오는 곡의 좋아요·슈퍼·싫어요 (§10.7).
+ *
+ * 전에는 곡이 재생을 시작하는 순간 버튼이 사라졌다. 정작 **듣고 나서 판단이 서는** 시점이
+ * 그때인데 누를 데가 없었다. 점수는 우리 차트와 개인 통계로 가고, 이미 나가고 있는 곡의
+ * 순서는 바뀌지 않는다 — 대기열 정렬 대상이 아니기 때문이다.
+ *
+ * 권한 판정과 잠금 문구는 대기열 행과 **똑같은 규칙**을 쓴다. 여기만 느슨하면
+ * 같은 곡이 대기열에 있을 때와 재생 중일 때 서로 다르게 굴어 버린다.
+ */
+function nowVoteButtons(current) {
+  const points = votePoints();
+  const isMine = current.isMine
+    ?? (current.requestedByUserId && String(current.requestedByUserId) === String(store.get().user?.id));
+  const canVote = can('vote') && !isMine;
+  const mineReason = '내가 신청한 곡에는 투표할 수 없어요';
+  const reason = isMine ? mineReason : lockReason('vote');
+
+  const make = (kind, label, tip) => {
+    const button = bindAct(h('button', {
+      class: 'vote', type: 'button',
+      'aria-pressed': String(current.myVote === kind),
+      tip,
+    }, label), () => vote(current.id, kind));
+    return setLock(button, !canVote, reason);
+  };
+
+  const superInfo = superLikeInfo();
+  const superMine = current.myVote === 'superLike';
+  const superLabel = superInfo.coolLeft > 0 && !superMine
+    ? `⭐ ${fmtTime(superInfo.coolLeft)}`
+    : `⭐ ${points.superLike}`;
+  const superButton = make('superLike', superLabel, superMine
+    ? '슈퍼 좋아요를 취소해요'
+    : `슈퍼 좋아요 · ${points.superLike}점 올라가요`);
+  // 이미 눌러 둔 슈퍼의 **취소는 언제나 열어 둔다** — 대기열 행과 같은 규칙이다.
+  if (!superMine && (superInfo.coolLeft > 0 || superInfo.left === 0)) {
+    setLock(superButton, true, superInfo.coolLeft > 0
+      ? `슈퍼 좋아요는 ${fmtTime(superInfo.coolLeft)} 뒤에 다시 쓸 수 있어요`
+      : '오늘 슈퍼 좋아요를 다 썼어요 (UTC 자정에 초기화돼요)');
+  }
+
+  return h('div', { class: 'nowvote', role: 'group', 'aria-label': '지금 곡에 투표' },
+    make('like', `👍 ${points.like}`, `좋아요 · ${points.like}점 올라가요`),
+    superButton,
+    make('dislike', `👎 ${points.dislike}`, `싫어요 · ${points.dislike}점이에요`));
+}
+
 async function vote(itemId, kind) {
-  const item = store.get().queue.find((row) => row.id === itemId);
+  const state = store.get();
+  // 대기열에도, **지금 나오는 곡에도** 투표할 수 있다 (§10.7).
+  const item = state.queue.find((row) => row.id === itemId)
+    || (state.current?.id === itemId ? state.current : null);
   const next = item && item.myVote === kind ? null : kind;
   const result = await call(() => api('/vote', { body: { itemId, kind: next } }));
   if (!result) return;
 
-  // 서버 브로드캐스트(`queue.set`)는 개인화 필드를 비워 보낸다. 내가 무엇을 눌렀는지는
-  // 여기서만 알 수 있으므로 바로 기억하고 화면에도 반영한다 (§10.4).
+  // 서버 브로드캐스트(`queue.set`·`playback`)는 개인화 필드를 비워 보낸다. 내가 무엇을
+  // 눌렀는지는 여기서만 알 수 있으므로 바로 기억하고 화면에도 반영한다 (§10.4).
   notePersonalVote(itemId, next);
-  store.patch({
+  const patch = {
     queue: store.get().queue.map((row) => (row.id === itemId
       ? Object.assign({}, row, { myVote: next })
       : row)),
-  });
+  };
+  if (store.get().current?.id === itemId) {
+    patch.current = Object.assign({}, store.get().current, { myVote: next });
+  }
+  store.patch(patch);
 
   // 슈퍼 좋아요 남은 횟수·쿨타임은 응답에 실려 온다 (§10.6). 버리면 `⭐ 2:14` 가 절대 안 뜨고,
   // 다시 눌러 429 를 받기 전까지 화면은 아무 일도 없던 것처럼 보인다.
@@ -4632,12 +4686,12 @@ function renderNow(state) {
   // 지금 재생 중인 곡은 제일 궁금한 곡이라 툴팁이 아니라 카드에 바로 보여준다 (§10.4).
   // 서버가 `current.score` 를 안 실어 주는 동안에는 대기열에 있던 시절의 점수를 쓴다.
   const nowScore = scoreForCurrent(current);
+  clear(el.nowVoters);
+  if (current) el.nowVoters.appendChild(nowVoteButtons(current));
   if (nowScore && voterList(nowScore).length) {
-    clear(el.nowVoters).appendChild(voterPanel(nowScore));
-    el.nowVoters.hidden = false;
-  } else {
-    el.nowVoters.hidden = true;
+    el.nowVoters.appendChild(voterPanel(nowScore));
   }
+  el.nowVoters.hidden = !current;
 
   el.playBtn.textContent = player.isPaused ? '▶' : '⏸';
   el.playBtn.setAttribute('aria-label', player.isPaused ? '재생' : '일시정지');

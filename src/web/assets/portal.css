@@ -973,6 +973,16 @@ body[data-dragging="tab"] { user-select: none; }
 .vol__tag { flex: none; color: var(--text-3); font-size: var(--fs-xs); white-space: nowrap; }
 .vol--me .vol__tag { color: var(--accent); font-weight: var(--fw-semi); }
 
+/* 지금 나오는 곡의 투표 버튼 (§10.7). 대기열 행의 `.vote` 를 그대로 쓰되
+ * 카드 안에서는 한 줄로 서고, 눌러 둔 것은 눌린 상태로 보인다. */
+.nowvote { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1); margin-bottom: var(--sp-2); }
+.nowvote .vote[aria-pressed="true"] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: var(--fw-semi);
+}
+
 /* 추천 바구니 (§8.7). 세 칸을 나란히 두고 각각 비운다. */
 .basket {
   display: flex;

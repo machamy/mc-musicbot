@@ -2043,7 +2043,7 @@ fn ensure_guild_watcher(state: &Arc<WebState>, guild_id: u64) {
                 &state,
                 guild_id,
                 "playback",
-                playback_payload(&state, &player, position, &sampled_at),
+                playback_payload(&state, &player, position, &sampled_at, None),
             );
             if queue_changed {
                 broadcast_queue(&state, guild_id).await;
@@ -2402,19 +2402,37 @@ fn queue_item_json(
 /// 예전에는 `score` 가 없어서 재생 카드의 투표자 줄이 영영 `hidden` 이었다.
 /// 점수 행은 곡이 끝나 다음으로 넘어갈 때(`clear_item_runtime`) 지워지므로,
 /// 재생 중에는 대기열에 있던 그대로가 남아 있다.
-fn current_json(state: &WebState, guild_id: u64, item: &QueueItem, points: &VotePoints) -> Value {
+/// 지금 나오는 곡. `viewer` 가 있으면 그 사람 기준의 개인화 필드를 채운다.
+///
+/// **브로드캐스트에서는 반드시 `None` 이다.** 이 프레임은 모두가 같이 받으므로,
+/// 개인화된 값을 실으면 남의 화면이 내 투표를 자기 것으로 착각한다(§10.5에서 큐로 이미 겪음).
+/// 클라이언트는 `null` 을 "서버가 안 보냄"으로 읽고 자기 값을 지킨다.
+///
+/// 투표자 목록으로 클라이언트가 직접 계산하게 두지 않는다 — 그 목록은 12명에서 잘려서
+/// 13번째 사람부터는 자기 표가 안 눌린 것처럼 보인다.
+fn current_json(
+    state: &WebState,
+    guild_id: u64,
+    item: &QueueItem,
+    points: &VotePoints,
+    viewer: Option<u64>,
+) -> Value {
     let score = state
         .app
         .remote
         .queue_scores(guild_id)
         .get(&item.id)
         .cloned();
+    let my_vote = viewer.and_then(|user_id| state.app.remote.user_vote(&item.id, user_id));
     json!({
         "id": item.id,
         "track": track_json(&item.track),
         "durationSeconds": item.track.duration.map(|duration| duration.as_secs_f64()),
         "requestedByDisplay": item.requested_by_display,
         "requestedByUserId": item.requested_by_user_id.map(|id| id.to_string()),
+        // 재생 중인 곡에도 투표할 수 있다 (§10.7). 판정과 표시는 대기열 곡과 똑같다.
+        "isMine": viewer.map(|user_id| item.requested_by_user_id == Some(user_id)),
+        "myVote": my_vote.map(QueueVoteKind::api_key),
         "score": score.map(|score| json!({
             "waitScore": score.wait_score,
             "likeCount": score.like_count,
@@ -2430,11 +2448,14 @@ fn current_json(state: &WebState, guild_id: u64, item: &QueueItem, points: &Vote
     })
 }
 
+/// `viewer` 는 이 payload 를 **한 사람에게만** 보낼 때만 채운다.
+/// 브로드캐스트에는 `None` 이어야 한다 — 안 그러면 남의 투표 상태가 내 화면에 붙는다.
 fn playback_payload(
     state: &WebState,
     player: &crate::models::GuildPlayerState,
     position: f64,
     sampled_at: &str,
+    viewer: Option<u64>,
 ) -> Value {
     let state_ref = state;
     let current_points = state
@@ -2450,7 +2471,7 @@ fn playback_payload(
         "current": player
             .current_item
             .as_ref()
-            .map(|item| current_json(state_ref, player.guild_id, item, &current_points)),
+            .map(|item| current_json(state_ref, player.guild_id, item, &current_points, viewer)),
         "durationSeconds": player
             .current_item
             .as_ref()
@@ -3172,6 +3193,8 @@ async fn api_state_hot(
     let bot = bot_voice_status(&state, guild_id);
     let state_ref: &WebState = &state;
     let current_points = points.clone();
+    // 한 사람에게만 나가는 응답이라 개인화해도 안전하다(브로드캐스트는 None 이어야 한다).
+    let viewer = Some(ctx.user_id());
 
     json_ok(json!({
         "player": {
@@ -3190,7 +3213,7 @@ async fn api_state_hot(
         "current": player
             .current_item
             .as_ref()
-            .map(|item| current_json(state_ref, player.guild_id, item, &current_points)),
+            .map(|item| current_json(state_ref, player.guild_id, item, &current_points, viewer)),
         "positionSeconds": position,
         "sampledAtUtc": sampled_at,
         "queueMode": ctx.settings.sort_mode.as_str(),
@@ -3705,6 +3728,8 @@ async fn api_state(
     let bot = bot_voice_status(&state, guild_id);
     let state_ref: &WebState = &state;
     let current_points = points.clone();
+    // 한 사람에게만 나가는 응답이라 개인화해도 안전하다(브로드캐스트는 None 이어야 한다).
+    let viewer = Some(ctx.user_id());
     json_ok(json!({
         "guild": ctx.guild.to_json(),
         "user": {
@@ -3729,7 +3754,7 @@ async fn api_state(
         "current": player
             .current_item
             .as_ref()
-            .map(|item| current_json(state_ref, player.guild_id, item, &current_points)),
+            .map(|item| current_json(state_ref, player.guild_id, item, &current_points, viewer)),
         "positionSeconds": position,
         "sampledAtUtc": sampled_at,
         "queue": queue,
@@ -4596,7 +4621,7 @@ async fn api_control(
                 &state,
                 guild_id,
                 "playback",
-                playback_payload(&state, &player, position, &sampled_at),
+                playback_payload(&state, &player, position, &sampled_at, None),
             );
             if queue_changed {
                 broadcast_queue(&state, guild_id).await;
@@ -4791,12 +4816,16 @@ async fn api_vote(
         return json_error(StatusCode::TOO_MANY_REQUESTS, "투표 요청이 너무 빨라요. 잠깐만 쉬었다 해요.");
     }
     let player = state.app.player.get_state(guild_id).await;
+    // **지금 나오는 곡에도 투표할 수 있다** (V3 §10.7). 대기열만 보면 재생이 시작되는
+    // 순간 좋아요 버튼이 사라져서, 정작 곡을 듣고 판단이 선 시점에 누를 수가 없다.
+    // 점수는 우리 차트와 개인 통계로 가고, 이미 나가고 있는 곡의 순서는 바꾸지 않는다.
     let Some(item) = player
         .upcoming
         .iter()
+        .chain(player.current_item.iter())
         .find(|item| item.id == request.item_id)
     else {
-        return json_error(StatusCode::NOT_FOUND, "그 대기열 항목을 찾지 못했어요.");
+        return json_error(StatusCode::NOT_FOUND, "그 곡을 찾지 못했어요.");
     };
     if item.requested_by_user_id == Some(ctx.user_id()) {
         return json_error(
@@ -6751,7 +6780,7 @@ async fn api_autoplay_reroll(
         &state,
         guild_id,
         "playback",
-        playback_payload(&state, &player, position, &now_utc()),
+        playback_payload(&state, &player, position, &now_utc(), None),
     );
     json_ok(json!({ "ok": true }))
 }
