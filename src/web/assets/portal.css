@@ -957,6 +957,27 @@ body[data-dragging="tab"] { user-select: none; }
 .vol__tag { flex: none; color: var(--text-3); font-size: var(--fs-xs); white-space: nowrap; }
 .vol--me .vol__tag { color: var(--accent); font-weight: var(--fw-semi); }
 
+/* 싱크 보정. 볼륨 칩과 같은 줄에 서지만 슬라이더가 아니라 ± 버튼이라 폭이 훨씬 작다. */
+.sync {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex: 0 1 auto;
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-full);
+  background: var(--accent-soft);
+}
+.sync__tag { flex: none; color: var(--accent); font-size: var(--fs-xs); font-weight: var(--fw-semi); white-space: nowrap; }
+.sync__btn { min-width: 28px; padding-inline: var(--sp-1); }
+.sync__value {
+  min-width: 56px;
+  text-align: center;
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+
 .webbtn[aria-pressed="true"] { box-shadow: 0 0 0 1px var(--accent-line); }
 .webnote { flex: 1 0 100%; color: var(--warn); font-size: var(--fs-xs); line-height: 1.45; }
 

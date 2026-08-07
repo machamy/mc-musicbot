@@ -233,7 +233,7 @@ const SIDE_DEF_TWO = 390;   // 2단은 채팅이 배치의 절반이라 기본�
 
 const PREF_DEFAULTS = {
   layout: null, theme: 'dark', layoutSizes: null, panelLayout: null,
-  lyricsOpen: '1', webPlayback: '0', webVolume: '60',
+  lyricsOpen: '1', webPlayback: '0', webVolume: '60', webOffset: '0',
   auditFilter: null,          // JSON 배열 문자열. 없으면 곡+재생목록
   notify: null,               // {"song":1,"mention":1,"reply":1}
 };
@@ -3868,7 +3868,7 @@ function buildStage() {
         h('span', { class: 'ctrl__spacer' }),
         el.lyricsToggle,
         el.webBtn),
-      h('div', { class: 'vols' }, el.volumeWrap, el.webVolWrap, el.webNote)),
+      h('div', { class: 'vols' }, el.volumeWrap, el.webVolWrap, el.webSync, el.webNote)),
     el.nextRow);
 
   bindSeek();
@@ -4025,12 +4025,17 @@ async function control(action, value, extra) {
 }
 
 /* ═══════════════════════ 웹에서 듣기 (§9) ═══════════════════════
- * 서버는 오디오를 한 바이트도 나르지 않는다. 브라우저가 YouTube에서 직접 받아 재생하고,
- * 위치·곡 정보만 서버에서 받아 봇을 따라간다. 그래서 서버 추가 부담이 0이다.
+ * 서버는 오디오를 한 바이트도 나르지 않는다. 브라우저가 YouTube·SoundCloud 에서 직접 받아
+ * 재생하고, 위치·곡 정보만 서버에서 받아 봇을 따라간다. 그래서 서버 추가 부담이 0이다.
  * 듣기 전용이라 플레이어 UI는 안 보여준다 — 여기서 조작해도 봇은 꿈쩍하지 않는다.
+ *
+ * 제공자마다 플레이어가 다르다. **둘을 동시에 켜면 소리가 겹친다.** 그래서 곡이 바뀔 때
+ * 쓰지 않는 쪽을 반드시 먼저 멈춘다(`stopVideoQuietly`).
  */
 
 const WEB_SYNC_GAP = 2;        // 봇과 이만큼 벌어지면 조용히 맞춘다 (초)
+const WEB_OFFSET_LIMIT = 10;   // 싱크 보정 한계 (초). 서버 검증값과 같아야 한다.
+const WEB_OFFSET_STEP = 0.5;
 
 /* 브라우저 자동재생 정책 때문에 새로고침 뒤에는 반드시 사용자가 한 번 눌러야 한다.
  * 그래서 "켜 두겠다는 뜻"(webWanted)과 "지금 켜져 있다"(webOn)를 나눠 둔다. */
@@ -4040,13 +4045,36 @@ let webVolume = clampVolume(Number(prefGet('webVolume')));
 let ytApiPromise = null;
 let ytPlayer = null;
 let ytReady = false;
-let webVideoId = null;
+let scApiPromise = null;
+let scWidget = null;
+let scReady = false;
+/** 지금 물린 소스. `{ kind: 'yt'|'sc', key }` — 같은 곡이면 다시 로드하지 않는다. */
+let webSource = null;
 let webTimer = 0;
 let webBlocked = '';           // 외부 스크립트를 못 불러왔을 때의 이유
+let webOffset = clampOffset(Number(prefGet('webOffset')));
 
 function clampVolume(value) {
   const n = Number.isFinite(value) ? value : 60;
   return Math.round(Math.min(100, Math.max(0, n)));
+}
+
+/** 싱크 보정은 음수가 정상이다. 0.5초 단위로 반올림해 표시가 튀지 않게 한다. */
+function clampOffset(value) {
+  const n = Number.isFinite(value) ? value : 0;
+  const stepped = Math.round(n / WEB_OFFSET_STEP) * WEB_OFFSET_STEP;
+  return Math.min(WEB_OFFSET_LIMIT, Math.max(-WEB_OFFSET_LIMIT, stepped));
+}
+
+function offsetLabel(value) {
+  if (!value) return '딱 맞음';
+  const sign = value > 0 ? '+' : '−';
+  return `${sign}${Math.abs(value).toFixed(1)}초`;
+}
+
+/** 봇 위치에 내 보정을 얹은 값. 웹 재생이 참고하는 유일한 시각이다. */
+function webTargetPosition() {
+  return Math.max(0, clock.position() + webOffset);
 }
 
 function buildWebPlayback() {
@@ -4073,13 +4101,43 @@ function buildWebPlayback() {
     h('span', { class: 'vol__tag' }, '🎧 내 볼륨(나만)'),
     el.webVol, el.webVolLabel);
 
+  // 싱크 보정. 회선과 버퍼가 사람마다 달라 봇과 몇 초씩 어긋나는 걸 직접 맞춘다.
+  el.webOffLabel = h('span', { class: 'sync__value' }, offsetLabel(webOffset));
+  const bump = (delta) => bindAct(h('button', {
+    class: 'btn btn--sm btn--ghost sync__btn', type: 'button',
+    'aria-label': delta > 0 ? '웹 소리를 뒤로' : '웹 소리를 앞으로',
+    tip: delta > 0
+      ? '웹이 봇보다 빠를 때. 웹 재생을 뒤로 미뤄요.'
+      : '웹이 봇보다 늦을 때. 웹 재생을 앞으로 당겨요.',
+  }, delta > 0 ? '＋' : '－'), () => setWebOffset(webOffset + delta));
+
+  el.webSync = h('div', {
+    class: 'sync', hidden: true,
+    tip: '봇과 웹 소리가 어긋날 때 나만 쓰는 보정이에요. 계정에 저장돼서 다른 기기에서도 그대로예요.',
+  },
+    h('span', { class: 'sync__tag' }, '⏱ 싱크(나만)'),
+    bump(-WEB_OFFSET_STEP), el.webOffLabel, bump(WEB_OFFSET_STEP),
+    bindAct(h('button', {
+      class: 'btn btn--sm btn--ghost sync__btn', type: 'button', tip: '보정을 0으로 되돌려요.',
+    }, '↺'), () => setWebOffset(0)));
+
   el.webNote = h('div', { class: 'webnote', hidden: true, role: 'status' });
 
-  // 숨긴 1×1 플레이어. 화면에 안 보이지만 소리는 난다.
-  el.webHost = h('div', { class: 'webhost', 'aria-hidden': 'true' }, h('div', { id: 'macham-yt' }));
+  // 숨긴 1×1 플레이어 둘. 화면에 안 보이지만 소리는 난다.
+  el.webHost = h('div', { class: 'webhost', 'aria-hidden': 'true' },
+    h('div', { id: 'macham-yt' }),
+    h('div', { id: 'macham-sc' }));
   document.body.appendChild(el.webHost);
 
   window.addEventListener('pagehide', stopWebPlayback);
+}
+
+function setWebOffset(next) {
+  webOffset = clampOffset(next);
+  el.webOffLabel.textContent = offsetLabel(webOffset);
+  prefSet('webOffset', String(webOffset));
+  // 바로 체감되게 지금 위치를 다시 맞춘다. 다음 틱을 기다리면 조정한 티가 안 난다.
+  seekWebTo(webTargetPosition());
 }
 
 /** 외부 스크립트라 실패할 수 있다. 실패하면 이유를 남기고 토글을 잠근다. */
@@ -4128,6 +4186,66 @@ function createYtPlayer() {
   });
 }
 
+/** SoundCloud Widget API. 유튜브와 달리 트랙 주소로 iframe 을 만들어 붙인다. */
+function loadSoundCloudApi() {
+  if (scApiPromise) return scApiPromise;
+  scApiPromise = new Promise((resolve, reject) => {
+    if (window.SC && window.SC.Widget) { resolve(window.SC); return; }
+    const timer = setTimeout(() => reject(new Error('사운드클라우드 플레이어가 12초 안에 응답하지 않았어요.')), 12000);
+    const script = document.createElement('script');
+    script.src = 'https://w.soundcloud.com/player/api.js';
+    script.async = true;
+    script.onload = () => {
+      clearTimeout(timer);
+      if (window.SC && window.SC.Widget) resolve(window.SC);
+      else reject(new Error('사운드클라우드 플레이어를 준비하지 못했어요.'));
+    };
+    script.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error('사운드클라우드 스크립트를 불러오지 못했어요.'));
+    };
+    document.head.appendChild(script);
+  });
+  return scApiPromise;
+}
+
+/* SoundCloud 위젯은 곡을 바꿀 때 iframe src 를 갈아 끼운다. 유튜브의 loadVideoById 처럼
+ * 한 플레이어를 재사용하는 API 가 없다. 그래서 곡마다 위젯을 새로 묶는다. */
+function mountSoundCloud(sourceUrl, startSeconds, paused) {
+  const host = document.getElementById('macham-sc');
+  if (!host) return;
+  host.textContent = '';
+  const frame = document.createElement('iframe');
+  frame.width = '1';
+  frame.height = '1';
+  frame.allow = 'autoplay';
+  frame.setAttribute('frameborder', 'no');
+  const params = new URLSearchParams({
+    url: sourceUrl,
+    auto_play: paused ? 'false' : 'true',
+    show_artwork: 'false',
+    visual: 'false',
+  });
+  frame.src = `https://w.soundcloud.com/player/?${params.toString()}`;
+  host.appendChild(frame);
+
+  scReady = false;
+  scWidget = window.SC.Widget(frame);
+  scWidget.bind(window.SC.Widget.Events.READY, () => {
+    scReady = true;
+    try {
+      scWidget.setVolume(webVolume);
+      if (startSeconds > 0) scWidget.seekTo(startSeconds * 1000);
+      if (paused) scWidget.pause();
+    } catch { /* 다음 틱에서 다시 맞춘다 */ }
+  });
+  // 임베드가 막힌 트랙이 꽤 있다. 조용히 무음이 되면 고장으로 보이니 이유를 말한다.
+  scWidget.bind(window.SC.Widget.Events.ERROR, () => {
+    webSource = null;
+    setWebNote('이 사운드클라우드 곡은 다른 사이트에서의 재생이 막혀 있어요. Discord로 들어 주세요.');
+  });
+}
+
 async function toggleWebPlayback() {
   if (webBlocked) { toast(webBlocked, 'warn'); return; }
   if (webOn) {
@@ -4144,17 +4262,25 @@ async function toggleWebPlayback() {
   prefSet('webPlayback', '1');
   syncWebUi();
   setWebNote('플레이어를 준비하고 있어요…');
+
+  // **지금 곡에 필요한 쪽만 준비한다.** 유튜브가 막혀 있어도 사운드클라우드 곡은 들려야 하고,
+  // 그 반대도 마찬가지다. 예전엔 유튜브가 실패하면 토글을 통째로 잠갔다.
+  const need = webSourceOf(store.get().current?.track);
+  const kind = need?.kind || 'yt';
   try {
-    await loadYouTubeApi();
-    await createYtPlayer();
+    if (kind === 'yt') {
+      await loadYouTubeApi();
+      await createYtPlayer();
+    } else {
+      await loadSoundCloudApi();
+    }
   } catch (error) {
-    webOn = false;
-    prefSet('webPlayback', '0');
-    webBlocked = `${error.message || '유튜브 플레이어를 불러오지 못했어요.'} 지금은 Discord로만 들을 수 있어요.`;
-    setLock(el.webBtn, true, webBlocked);
-    syncWebUi();
-    setWebNote(webBlocked);
-    toast(webBlocked, 'warn');
+    const what = kind === 'yt' ? '유튜브' : '사운드클라우드';
+    // 토글은 살려 둔다 — 다음 곡이 다른 제공자면 멀쩡히 들린다.
+    const reason = `${error.message || `${what} 플레이어를 불러오지 못했어요.`} 이 곡은 Discord로 들어 주세요.`;
+    setWebNote(reason);
+    toast(reason, 'warn');
+    startWebLoop();
     return;
   }
   startWebLoop();
@@ -4165,8 +4291,7 @@ async function toggleWebPlayback() {
 function stopWebPlayback() {
   clearInterval(webTimer);
   webTimer = 0;
-  webVideoId = null;
-  try { ytPlayer?.stopVideo?.(); } catch { /* 이미 정리됨 */ }
+  stopVideoQuietly();
 }
 
 function startWebLoop() {
@@ -4174,62 +4299,131 @@ function startWebLoop() {
   webTimer = setInterval(webTick, 1500);
 }
 
-function webVideoOf(track) {
+/** 이 곡을 어느 플레이어로 틀지. 못 트는 곡이면 `null`. */
+function webSourceOf(track) {
   if (!track) return null;
-  if (!String(track.provider || '').startsWith('YouTube')) return null;
-  return track.contentId || null;
+  const provider = String(track.provider || '');
+  if (provider.startsWith('YouTube')) {
+    return track.contentId ? { kind: 'yt', key: track.contentId } : null;
+  }
+  if (provider === 'SoundCloud') {
+    // 위젯은 영상 ID 가 아니라 **트랙 주소**를 받는다. 주소가 없으면 못 튼다.
+    const url = track.sourceUrl || track.url || '';
+    return url.startsWith('http') ? { kind: 'sc', key: url } : null;
+  }
+  return null;
 }
 
 /** 곡이 바뀌거나 일시정지가 바뀌면 부른다. force면 위치까지 다시 맞춘다. */
 function syncWebNow(force) {
-  if (!webOn || !ytReady || !ytPlayer) return;
+  if (!webOn) return;
   const state = store.get();
   const current = state.current;
-  const videoId = webVideoOf(current?.track);
+  const next = webSourceOf(current?.track);
 
   if (!current) {
     stopVideoQuietly();
     setWebNote('재생 중인 곡이 없어요. 봇이 곡을 틀면 바로 따라갈게요.');
     return;
   }
-  if (!videoId) {
+  if (!next) {
     stopVideoQuietly();
     setWebNote('이 곡은 웹에서 재생할 수 없어요. Discord로 들어 주세요.');
     return;
   }
+  // 필요한 플레이어가 아직 안 붙었으면 붙이고 나서 다시 부른다.
+  if (next.kind === 'yt' && !ytReady) { ensureYouTube(); return; }
+  if (next.kind === 'sc' && !window.SC?.Widget) { ensureSoundCloud(); return; }
 
   setWebNote('');
-  const position = Math.max(0, clock.position());
-  if (force || videoId !== webVideoId) {
-    webVideoId = videoId;
-    try {
-      ytPlayer.loadVideoById({ videoId, startSeconds: position });
-      ytPlayer.setVolume(webVolume);
-      if (state.player?.isPaused) setTimeout(() => { try { ytPlayer.pauseVideo(); } catch { /* 무시 */ } }, 500);
-    } catch { /* 다음 틱에서 다시 시도한다 */ }
+  const paused = !!state.player?.isPaused;
+  const position = webTargetPosition();
+  const changed = force || !webSource || webSource.kind !== next.kind || webSource.key !== next.key;
+
+  if (changed) {
+    // **다른 제공자로 넘어갈 때 이전 플레이어를 반드시 멈춘다.** 안 그러면 두 곡이 겹쳐 들린다.
+    if (webSource && webSource.kind !== next.kind) stopVideoQuietly();
+    webSource = next;
+    if (next.kind === 'yt') {
+      try {
+        ytPlayer.loadVideoById({ videoId: next.key, startSeconds: position });
+        ytPlayer.setVolume(webVolume);
+        if (paused) setTimeout(() => { try { ytPlayer.pauseVideo(); } catch { /* 무시 */ } }, 500);
+      } catch { /* 다음 틱에서 다시 시도한다 */ }
+    } else {
+      mountSoundCloud(next.key, position, paused);
+    }
     return;
   }
   try {
-    if (state.player?.isPaused) ytPlayer.pauseVideo();
-    else ytPlayer.playVideo();
+    if (next.kind === 'yt') {
+      if (paused) ytPlayer.pauseVideo();
+      else ytPlayer.playVideo();
+    } else if (scReady) {
+      if (paused) scWidget.pause();
+      else scWidget.play();
+    }
   } catch { /* 무시 */ }
 }
 
+/** 켠 김에 준비만 해 둔다. 실패해도 토글은 살려 둔다 — 다른 제공자는 멀쩡할 수 있다. */
+function ensureYouTube() {
+  loadYouTubeApi().then(createYtPlayer).then(() => syncWebNow(true)).catch((error) => {
+    setWebNote(`${error.message || '유튜브 플레이어를 불러오지 못했어요.'} 이 곡은 Discord로 들어 주세요.`);
+  });
+}
+
+function ensureSoundCloud() {
+  loadSoundCloudApi().then(() => syncWebNow(true)).catch((error) => {
+    setWebNote(`${error.message || '사운드클라우드 플레이어를 불러오지 못했어요.'} 이 곡은 Discord로 들어 주세요.`);
+  });
+}
+
 function stopVideoQuietly() {
-  webVideoId = null;
+  webSource = null;
   try { ytPlayer?.stopVideo?.(); } catch { /* 무시 */ }
+  try { scWidget?.pause?.(); } catch { /* 무시 */ }
+  const host = document.getElementById('macham-sc');
+  if (host) host.textContent = '';   // iframe 을 떼야 소리가 완전히 멎는다
+  scWidget = null;
+  scReady = false;
+}
+
+/** 지금 위치를 강제로 맞춘다. 싱크 보정을 바꿨을 때 즉시 반영하려고 쓴다. */
+function seekWebTo(seconds) {
+  if (!webOn || !webSource) return;
+  try {
+    if (webSource.kind === 'yt' && ytReady) ytPlayer.seekTo(seconds, true);
+    else if (webSource.kind === 'sc' && scReady) scWidget.seekTo(seconds * 1000);
+  } catch { /* 무시 */ }
 }
 
 /** 매 프레임 맞추면 소리가 튄다. 2초 이상 벌어졌을 때만 조용히 옮긴다. */
 function webTick() {
-  if (!webOn || !ytReady || !ytPlayer || !webVideoId) return;
+  if (!webOn || !webSource) return;
   if (store.get().player?.isPaused) return;
-  let here = 0;
-  try { here = Number(ytPlayer.getCurrentTime()) || 0; } catch { return; }
-  const there = clock.position();
-  if (Math.abs(there - here) > WEB_SYNC_GAP) {
-    try { ytPlayer.seekTo(there, true); ytPlayer.playVideo(); } catch { /* 무시 */ }
+  const there = webTargetPosition();
+
+  if (webSource.kind === 'yt') {
+    if (!ytReady || !ytPlayer) return;
+    let here = 0;
+    try { here = Number(ytPlayer.getCurrentTime()) || 0; } catch { return; }
+    if (Math.abs(there - here) > WEB_SYNC_GAP) {
+      try { ytPlayer.seekTo(there, true); ytPlayer.playVideo(); } catch { /* 무시 */ }
+    }
+    return;
   }
+  if (!scReady || !scWidget) return;
+  // 위젯은 위치를 콜백으로만 준다. 밀리초 단위라 초로 바꿔서 본다.
+  try {
+    scWidget.getPosition((ms) => {
+      const here = Number(ms) / 1000;
+      if (!Number.isFinite(here)) return;
+      if (Math.abs(there - here) > WEB_SYNC_GAP) {
+        try { scWidget.seekTo(there * 1000); scWidget.play(); } catch { /* 무시 */ }
+      }
+    });
+  } catch { /* 무시 */ }
 }
 
 const WEB_ERRORS = {
@@ -4258,6 +4452,7 @@ function syncWebUi() {
   el.webBtn.classList.toggle('btn--primary', webOn);
   el.webBtn.textContent = webOn ? '🔊 웹에서 듣는 중' : '🔊 웹에서 듣기';
   el.webVolWrap.hidden = !webOn;
+  if (el.webSync) el.webSync.hidden = !webOn;
   if (!webOn) setWebNote(webBlocked || '');
 }
 

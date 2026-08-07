@@ -509,7 +509,7 @@ const CHART_FETCH_STALE_SECS: i64 = 180;
 
 /// 서버가 받아 주는 개인 설정 키. 여기 없는 키는 조용히 버린다 —
 /// 아무 값이나 저장되면 개인 설정 테이블이 남의 키-밸류 저장소가 돼 버린다.
-pub const PREF_KEYS: [&str; 10] = [
+pub const PREF_KEYS: [&str; 11] = [
     "layout",
     "theme",
     "layoutSizes",
@@ -518,9 +518,14 @@ pub const PREF_KEYS: [&str; 10] = [
     "lyricsOpen",
     "webPlayback",
     "webVolume",
+    "webOffset",
     "auditFilter",
     "notify",
 ];
+
+/// 웹에서 듣기 싱크 보정의 한계(초). 사람마다 회선과 버퍼가 달라서 봇과 어긋난다.
+/// ±10초면 실제로 겪는 어긋남은 다 덮는다. 그보다 크면 곡을 잘못 맞춘 것이다.
+pub const WEB_OFFSET_LIMIT: f64 = 10.0;
 
 /// 화면 배치 6종 (§7.2).
 pub const LAYOUT_VALUES: [&str; 6] = ["three", "two", "focus", "dj", "talk", "panel"];
@@ -544,6 +549,12 @@ pub fn is_valid_pref(key: &str, value: &str) -> bool {
         "webVolume" => value
             .parse::<u32>()
             .map(|volume| volume <= 100 && !value.starts_with('+'))
+            .unwrap_or(false),
+        // 웹에서 듣기 싱크 보정 (§20.4). 사람마다 다르므로 개인 설정이다.
+        // 음수를 받아야 해서 `webVolume` 처럼 부호를 막으면 안 된다.
+        "webOffset" => value
+            .parse::<f64>()
+            .map(|seconds| seconds.is_finite() && seconds.abs() <= WEB_OFFSET_LIMIT)
             .unwrap_or(false),
         "layoutSizes" => is_valid_json_pref(value, PREF_LAYOUT_SIZES_MAX),
         "panelLayout" => is_valid_json_pref(value, PREF_PANEL_LAYOUT_MAX),
@@ -3871,6 +3882,16 @@ mod tests {
         assert!(!is_valid_pref("auditFilter", "song,없는분류"));
         assert!(is_valid_pref("notify", r#"{"song":1,"mention":0}"#));
         assert!(!is_valid_pref("notify", "song"));
+
+        // 싱크 보정은 **음수가 정상값**이다. 볼륨처럼 부호를 막으면 앞으로 당기질 못한다.
+        assert!(is_valid_pref("webOffset", "-2.5"));
+        assert!(is_valid_pref("webOffset", "0"));
+        assert!(is_valid_pref("webOffset", "10"));
+        assert!(!is_valid_pref("webOffset", "10.5"), "한계를 넘으면 곡을 잘못 맞춘 것이다");
+        assert!(!is_valid_pref("webOffset", "-11"));
+        assert!(!is_valid_pref("webOffset", "NaN"));
+        assert!(!is_valid_pref("webOffset", "inf"));
+        assert!(!is_valid_pref("webOffset", "2초"));
         // 화이트리스트 상수와 판정이 어긋나지 않는지.
         for key in PREF_KEYS {
             assert!(!is_valid_pref(key, ""), "빈 값은 어떤 키도 통과하면 안 된다");
