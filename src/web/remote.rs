@@ -751,6 +751,10 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/api/guilds/{guild_id}/autoplay/reset",
             post(api_autoplay_reset),
         )
+        // 서버 승인 (§26) — **봇 주인 전용**. 길드 인가를 안 태운다:
+        // 아직 승인 안 된 서버가 대상이라 길드 게이트를 통과할 수 없기 때문이다.
+        .route("/music/api/owner/guilds", get(api_owner_guilds))
+        .route("/music/api/owner/guilds/decide", post(api_owner_decide))
         // 서버 관리 콘솔 API — 전부 Manager 이상
         .route(
             "/music/api/guilds/{guild_id}/admin/settings",
@@ -1551,6 +1555,19 @@ async fn authorize(
             StatusCode::FORBIDDEN,
             "봇이 이 Discord 서버에 없어요.",
         ));
+    }
+
+    // 3b. 아직 승인 안 된 서버 (§26). **봇 주인은 통과** — 승인 화면을 보려면 들어와야 한다.
+    if !session.is_developer && !is_owner_user(state, session.user_id) {
+        let approval = state
+            .app
+            .remote
+            .guild_approval(guild_id)
+            .map(|row| row.status)
+            .unwrap_or_default();
+        if !approval.is_usable() {
+            return Err(json_error(StatusCode::FORBIDDEN, approval.reason()));
+        }
     }
 
     let settings = state.app.remote.load_guild_settings(guild_id);
@@ -8897,6 +8914,105 @@ impl Drop for ChartFetchGuard {
     fn drop(&mut self) {
         self.state.app.remote.end_chart_fetch(self.chart_id);
     }
+}
+
+// ───────────────────────── 서버 승인 (§26) ─────────────────────────
+
+/// 봇 주인인지 확인하고 세션을 돌려준다. 길드 인가를 안 태우는 라우트 전용이다.
+fn require_owner(
+    state: &Arc<WebState>,
+    cookies: &Cookies,
+    headers: Option<&HeaderMap>,
+) -> Result<RemoteSession, Response> {
+    let session = current_session(state, cookies)
+        .ok_or_else(|| json_error(StatusCode::UNAUTHORIZED, "로그인이 필요해요."))?;
+    if let Some(headers) = headers
+        && !verify_csrf(&session, headers)
+    {
+        return Err(json_error(StatusCode::FORBIDDEN, "CSRF 검증에 실패했어요."));
+    }
+    if !session.is_developer && !is_owner_user(state, session.user_id) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "봇 주인만 볼 수 있어요.",
+        ));
+    }
+    Ok(session)
+}
+
+/// `GET /music/api/owner/guilds` — 승인 대기·사용 중·차단된 서버 목록.
+async fn api_owner_guilds(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+) -> Response {
+    if let Err(response) = require_owner(&state, &cookies, None) {
+        return response;
+    }
+    let rows: Vec<Value> = state
+        .app
+        .remote
+        .list_guild_approvals()
+        .into_iter()
+        .map(|row| {
+            json!({
+                "guildId": row.guild_id.to_string(),
+                "status": row.status.as_str(),
+                "statusLabel": row.status.label(),
+                // 봇이 지금도 그 서버에 있는지. 나간 서버를 승인해 봐야 소용없다.
+                "botInGuild": bot_in_guild(&state, row.guild_id),
+                "name": row.guild_name,
+                "requestedUtc": row.requested_utc,
+                "decidedUtc": row.decided_utc,
+                "note": row.note,
+            })
+        })
+        .collect();
+    json_ok(json!({ "guilds": rows }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OwnerDecideRequest {
+    guild_id: String,
+    /// `approved` 또는 `blocked`. 되돌리려면 `pending`.
+    status: String,
+    note: Option<String>,
+}
+
+/// `POST /music/api/owner/guilds/decide` — 승인·차단.
+async fn api_owner_decide(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    headers: HeaderMap,
+    Json(request): Json<OwnerDecideRequest>,
+) -> Response {
+    let session = match require_owner(&state, &cookies, Some(&headers)) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Ok(guild_id) = request.guild_id.trim().parse::<u64>() else {
+        return json_error(StatusCode::BAD_REQUEST, "서버 ID가 올바르지 않아요.");
+    };
+    let Some(status) = crate::remote::GuildApprovalStatus::parse(request.status.trim()) else {
+        return json_error(StatusCode::BAD_REQUEST, "알 수 없는 상태예요.");
+    };
+    let note = request.note.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if !state
+        .app
+        .remote
+        .decide_guild(guild_id, status, session.user_id, note)
+    {
+        return json_error(StatusCode::NOT_FOUND, "그 서버 기록을 찾지 못했어요.");
+    }
+    state.app.log.info(
+        "Bot",
+        &format!(
+            "{}님이 서버 {guild_id} 를 {} 로 바꿨어요.",
+            session.display_name,
+            status.label()
+        ),
+    );
+    json_ok(json!({ "ok": true, "status": status.as_str() }))
 }
 
 /// 차트에 넣어 줄 한 곡의 최대 길이(초).

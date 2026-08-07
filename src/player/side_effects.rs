@@ -457,16 +457,49 @@ async fn announce_now_playing(app: Arc<App>, guild_id: u64, item: QueueItem) {
             None => return,
         }
     };
+    // 서버마다 고른다 (§25). 기본은 갱신 — 곡마다 새 글을 쌓으면 채널이 금방 도배된다.
+    let mode = app.remote.load_guild_settings(guild_id).now_playing_mode;
+    if mode == crate::remote::NowPlayingMode::Off {
+        return;
+    }
+
     let state = app.player.get_state(guild_id).await;
     let embed = crate::commands::embeds::now_playing_embed(&state, &item, None);
     let components = crate::commands::embeds::playback_buttons_np(&state);
+    let channel = serenity::model::id::ChannelId::new(channel_id);
+
+    // 갱신 모드면 있던 카드를 고쳐 쓴다. **같은 채널일 때만** — 알림 채널이 바뀌었는데
+    // 옛 채널의 카드를 고치면 지금 보고 있는 채널에는 아무것도 안 뜬다.
+    if mode == crate::remote::NowPlayingMode::Edit {
+        let previous = app.last_np_message.lock().unwrap().get(&guild_id).copied();
+        if let Some((prev_ch, prev_msg)) = previous
+            && prev_ch == channel_id
+        {
+            let edit = serenity::builder::EditMessage::new()
+                .embed(embed.clone())
+                .components(components.clone());
+            match channel
+                .edit_message(http, serenity::model::id::MessageId::new(prev_msg), edit)
+                .await
+            {
+                Ok(_) => return,
+                // 카드를 누가 지웠거나 권한이 없어졌다. **조용히 포기하지 않는다** —
+                // 그러면 곡이 바뀌어도 채널에 아무 일도 안 일어나 고장으로 보인다.
+                Err(error) => {
+                    app.log.info(
+                        "Bot",
+                        &format!("재생 카드 갱신 실패({error}) — 새 카드로 보낼게요."),
+                    );
+                    app.last_np_message.lock().unwrap().remove(&guild_id);
+                }
+            }
+        }
+    }
+
     let builder = serenity::builder::CreateMessage::new()
         .embed(embed)
         .components(components);
-    match serenity::model::id::ChannelId::new(channel_id)
-        .send_message(http, builder)
-        .await
-    {
+    match channel.send_message(http, builder).await {
         Ok(msg) => {
             // 이전 카드 버튼 제거 (두 개가 동시에 활성으로 보이는 사고 방지).
             let prev = {

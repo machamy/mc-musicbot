@@ -80,6 +80,24 @@ impl EventHandler for Handler {
 
     async fn guild_create(&self, _ctx: Context, guild: Guild, _is_new: Option<bool>) {
         sync_guild_metadata(&self.app, &guild);
+        // 새 서버는 대기로 들어온다 (§26). 초대 자체는 Discord 쪽이라 막을 수 없으니
+        // **쓰는 것을 막는다.** 이미 아는 서버면 상태를 그대로 둔다 —
+        // 안 그러면 봇을 내보냈다 다시 부르는 것만으로 차단이 풀린다.
+        let status = self
+            .app
+            .remote
+            .register_guild(guild.id.get(), Some(&guild.name));
+        if !status.is_usable() {
+            self.app.log.info(
+                "Bot",
+                &format!(
+                    "서버 '{}'({})는 {} 상태예요. 운영 패널에서 승인해야 쓸 수 있어요.",
+                    guild.name,
+                    guild.id.get(),
+                    status.label()
+                ),
+            );
+        }
     }
 
     async fn guild_delete(

@@ -1,7 +1,8 @@
 use super::{
     AUDIT_MERGE_WINDOW_SECS, AuditEntry, AuditKind, AutoplaySeed, CHART_CACHE_TTL_HOURS,
     ChartCategory, ChartDef, ChartSnapshot, ChatMessage, ChatReactionSummary, ChatReplyPreview,
-    ChatReport, ChatTrackTag, LyricsCacheHit, LyricsDocument, MAX_VOTER_IDS, Participant,
+    ChatReport, ChatTrackTag, GuildApproval, GuildApprovalStatus, LyricsCacheHit, LyricsDocument,
+    MAX_VOTER_IDS, Participant,
     PruneReport, QueueScore, QueueVoteKind, RecentTrack, RemoteGuildSettings, ResumePoint,
     RetentionConfig,
     SeedAddOutcome, StoredSession, Suggestion, SuggestionStatus, SuperLikeStatus, SuperLikeVerdict,
@@ -341,6 +342,21 @@ const MIGRATION_V14: &str = r#"
 /// "권한이 없어요" 를 본다. 로그에는 429 만 찍히고 화면에는 권한 없음만 뜬다.
 /// 디스크에 두면 재시작을 건너뛰어도 유예 시간(6시간) 동안 등급이 유지된다.
 const MIGRATION_V16: &str = r#"
+    -- 서버 승인 (§26). 봇이 나 혼자 쓰는 것이 아니게 되면서, 아무나 초대해서
+    -- 바로 쓰는 것을 막아야 한다. 새 서버는 `pending` 으로 들어오고 봇 주인이
+    -- 승인해야 명령어와 리모컨이 열린다.
+    CREATE TABLE IF NOT EXISTS remote_guild_approval (
+        guild_id      INTEGER PRIMARY KEY,
+        status        TEXT NOT NULL,          -- pending | approved | blocked
+        guild_name    TEXT NULL,
+        invited_by    INTEGER NULL,
+        invited_by_name TEXT NULL,
+        requested_utc TEXT NOT NULL,
+        decided_by    INTEGER NULL,
+        decided_utc   TEXT NULL,
+        note          TEXT NULL
+    );
+
     -- 노래방 차트는 **순위만** TJ 에서 빌려 오고 트는 것은 원곡이다.
     -- 앞선 버전은 반주(MR)를 찾아 넣었으므로 그때 저장된 해석은 전부 버린다.
     DELETE FROM remote_tj_tracks;
@@ -2641,6 +2657,116 @@ impl RemoteStore {
             .find(|chart| chart.id == chart_id)
     }
 
+    // ───────── 서버 승인 (§26) ─────────
+
+    /// 이 서버의 승인 상태. 기록이 없으면 `None` — 아직 본 적 없는 서버다.
+    pub fn guild_approval(&self, guild_id: u64) -> Option<GuildApproval> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            r#"SELECT status, guild_name, invited_by, invited_by_name,
+                      requested_utc, decided_by, decided_utc, note
+                 FROM remote_guild_approval WHERE guild_id = ?1"#,
+            params![guild_id as i64],
+            |row| {
+                Ok(GuildApproval {
+                    guild_id,
+                    status: GuildApprovalStatus::parse(&row.get::<_, String>(0)?)
+                        .unwrap_or_default(),
+                    guild_name: row.get(1)?,
+                    invited_by: row.get::<_, Option<i64>>(2)?.map(|id| id as u64),
+                    invited_by_name: row.get(3)?,
+                    requested_utc: row.get(4)?,
+                    decided_by: row.get::<_, Option<i64>>(5)?.map(|id| id as u64),
+                    decided_utc: row.get(6)?,
+                    note: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// 새 서버를 대기 목록에 올린다. **이미 있는 서버는 건드리지 않는다** —
+    /// 안 그러면 봇을 내보냈다 다시 부르는 것만으로 차단이 풀린다.
+    pub fn register_guild(&self, guild_id: u64, name: Option<&str>) -> GuildApprovalStatus {
+        if let Some(existing) = self.guild_approval(guild_id) {
+            // 이름만 최신으로 맞춰 둔다. 운영 패널에서 어느 서버인지 알아보려면 필요하다.
+            if let Some(name) = name {
+                let conn = self.conn.lock().unwrap();
+                let _ = conn.execute(
+                    "UPDATE remote_guild_approval SET guild_name = ?2 WHERE guild_id = ?1",
+                    params![guild_id as i64, name],
+                );
+            }
+            return existing.status;
+        }
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            r#"INSERT INTO remote_guild_approval(guild_id, status, guild_name, requested_utc)
+               VALUES(?1, 'pending', ?2, ?3)"#,
+            params![guild_id as i64, name, Self::now_iso()],
+        );
+        GuildApprovalStatus::Pending
+    }
+
+    /// 승인·거절. 결정한 사람과 시각을 함께 남긴다.
+    pub fn decide_guild(
+        &self,
+        guild_id: u64,
+        status: GuildApprovalStatus,
+        decided_by: u64,
+        note: Option<&str>,
+    ) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"UPDATE remote_guild_approval
+                  SET status = ?2, decided_by = ?3, decided_utc = ?4, note = ?5
+                WHERE guild_id = ?1"#,
+            params![
+                guild_id as i64,
+                status.as_str(),
+                decided_by as i64,
+                Self::now_iso(),
+                note
+            ],
+        )
+        .map(|changed| changed > 0)
+        .unwrap_or(false)
+    }
+
+    /// 운영 패널 표. 대기 중인 것이 위로 온다 — 그게 사람이 처리해야 할 일이다.
+    pub fn list_guild_approvals(&self) -> Vec<GuildApproval> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = match conn.prepare(
+            r#"SELECT guild_id, status, guild_name, invited_by, invited_by_name,
+                      requested_utc, decided_by, decided_utc, note
+                 FROM remote_guild_approval
+                ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,
+                         requested_utc DESC"#,
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+        statement
+            .query_map([], |row| {
+                Ok(GuildApproval {
+                    guild_id: row.get::<_, i64>(0)? as u64,
+                    status: GuildApprovalStatus::parse(&row.get::<_, String>(1)?)
+                        .unwrap_or_default(),
+                    guild_name: row.get(2)?,
+                    invited_by: row.get::<_, Option<i64>>(3)?.map(|id| id as u64),
+                    invited_by_name: row.get(4)?,
+                    requested_utc: row.get(5)?,
+                    decided_by: row.get::<_, Option<i64>>(6)?.map(|id| id as u64),
+                    decided_utc: row.get(7)?,
+                    note: row.get(8)?,
+                })
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
     // ───────── 역할 캐시 (S-429) ─────────
 
     /// Discord 에서 읽은 역할을 디스크에 남긴다. 메모리 캐시와 **함께** 쓴다 —
@@ -3942,6 +4068,46 @@ mod tests {
 
         // 다른 길드는 별개다.
         assert!(store.load_member_roles(2, 7, 6).is_none());
+        cleanup(store, path);
+    }
+
+    /// 회귀: 봇을 내보냈다 다시 부르는 것만으로 차단이 풀리면 승인 자체가 의미가 없다.
+    #[test]
+    fn rejoining_does_not_reset_a_decision() {
+        let (store, path) = temp_store("guild-approval");
+        use crate::remote::GuildApprovalStatus as S;
+
+        // 처음 보는 서버는 대기다.
+        assert_eq!(store.register_guild(1, Some("첫 서버")), S::Pending);
+        assert!(!S::Pending.is_usable());
+
+        assert!(store.decide_guild(1, S::Approved, 999, Some("내 서버")));
+        assert_eq!(store.guild_approval(1).unwrap().status, S::Approved);
+
+        // 다시 초대돼도 승인 상태 그대로.
+        assert_eq!(store.register_guild(1, Some("첫 서버")), S::Approved);
+
+        // 차단한 뒤 재초대해도 대기로 안 돌아간다 — 여기가 핵심이다.
+        assert!(store.decide_guild(1, S::Blocked, 999, None));
+        assert_eq!(store.register_guild(1, Some("첫 서버")), S::Blocked);
+        assert!(!S::Blocked.is_usable());
+
+        // 이름은 최신으로 따라온다(운영 패널에서 알아봐야 하므로).
+        store.register_guild(1, Some("이름 바뀜"));
+        assert_eq!(
+            store.guild_approval(1).unwrap().guild_name.as_deref(),
+            Some("이름 바뀜")
+        );
+
+        // 결정한 사람과 시각이 남는다.
+        let row = store.guild_approval(1).unwrap();
+        assert_eq!(row.decided_by, Some(999));
+        assert!(row.decided_utc.is_some());
+
+        // 대기 중인 것이 목록 위로 온다.
+        store.register_guild(2, Some("새 서버"));
+        let listed = store.list_guild_approvals();
+        assert_eq!(listed.first().map(|row| row.guild_id), Some(2));
         cleanup(store, path);
     }
 

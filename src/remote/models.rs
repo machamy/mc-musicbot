@@ -443,6 +443,58 @@ impl VoteSkipBasis {
     }
 }
 
+/// 곡이 바뀔 때 Discord 채널에 **새 카드를 보낼지, 있던 카드를 고칠지** (§25).
+///
+/// 봇 하나를 여러 서버가 쓰기 시작하면 이게 곧바로 문제가 된다. 곡마다 새 글을 쌓으면
+/// 세 시간짜리 파티 뒤에 채널이 재생 카드 60장으로 도배된다.
+/// 그래서 **기본은 갱신**이다 — 카드 한 장이 계속 지금 곡을 보여 준다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NowPlayingMode {
+    /// 있던 카드를 고쳐 쓴다. 채널이 조용하다.
+    #[default]
+    Edit,
+    /// 곡마다 새 카드를 보낸다. 기록이 남지만 채널이 길어진다.
+    New,
+    /// 아예 안 보낸다. 리모컨만 쓰는 서버용.
+    Off,
+}
+
+impl NowPlayingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Edit => "edit",
+            Self::New => "new",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "edit" => Some(Self::Edit),
+            "new" => Some(Self::New),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Edit => "카드 하나를 갱신",
+            Self::New => "곡마다 새 글",
+            Self::Off => "안 보냄",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Edit => "재생 카드 한 장이 계속 지금 곡을 보여줘요. 채널이 안 밀려요.",
+            Self::New => "곡이 바뀔 때마다 새 글이 올라와요. 뭘 들었는지 기록이 남아요.",
+            Self::Off => "Discord에는 안 알려요. 리모컨에서만 봐요.",
+        }
+    }
+}
+
 /// 자동 재생이 **시드를 어디서 고르는지** (§8). 기본은 지금 동작인 `Recent`다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -704,6 +756,79 @@ pub struct ChartSnapshot {
     pub fetched_utc: String,
     /// TTL(6시간)이 지났는지. 지났어도 일단 보여 주고 뒤에서 다시 받는 편이 화면이 덜 비어 보인다.
     pub stale: bool,
+}
+
+/// 이 서버가 봇을 쓸 수 있는지 (§26).
+///
+/// 봇 초대는 Discord 쪽에서 아무나 할 수 있다. 그래서 **초대는 막지 못해도 사용은 막는다** —
+/// 새 서버는 대기 상태로 들어오고, 봇 주인이 승인해야 명령어와 리모컨이 열린다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuildApprovalStatus {
+    /// 초대는 됐지만 아직 못 쓴다.
+    #[default]
+    Pending,
+    Approved,
+    /// 거절됐다. 다시 초대해도 대기로 돌아가지 않는다.
+    Blocked,
+}
+
+impl GuildApprovalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "approved" => Some(Self::Approved),
+            "blocked" => Some(Self::Blocked),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "승인 대기",
+            Self::Approved => "사용 중",
+            Self::Blocked => "차단됨",
+        }
+    }
+
+    /// 이 상태에서 봇을 쓸 수 있는가.
+    pub fn is_usable(self) -> bool {
+        matches!(self, Self::Approved)
+    }
+
+    /// 못 쓸 때 사람에게 보여 줄 이유. 막힌 사실만 말하면 다음에 뭘 할지 모른다.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Pending => {
+                "이 서버는 아직 봇 주인의 승인을 기다리고 있어요. 승인되면 바로 쓸 수 있어요."
+            }
+            Self::Approved => "",
+            Self::Blocked => "이 서버에서는 봇을 쓸 수 없어요. 봇 주인이 사용을 막아 뒀어요.",
+        }
+    }
+}
+
+/// 승인 대기·사용 중인 서버 한 줄. 운영 패널이 이걸 표로 보여준다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuildApproval {
+    pub guild_id: u64,
+    pub status: GuildApprovalStatus,
+    pub guild_name: Option<String>,
+    pub invited_by: Option<u64>,
+    pub invited_by_name: Option<String>,
+    pub requested_utc: String,
+    pub decided_by: Option<u64>,
+    pub decided_utc: Option<String>,
+    pub note: Option<String>,
 }
 
 /// 재시작 직전에 남겨 둔 재생 지점 (§24).
@@ -1749,6 +1874,10 @@ pub struct RemoteGuildSettings {
     /// 재생목록형은 앞에서부터 이 개수만 쓴다.
     #[serde(default = "default_chart_limit")]
     pub chart_limit: u32,
+    /// 곡이 바뀔 때 Discord 채널에 새 카드를 보낼지 갱신할지 (§25).
+    /// 기본은 갱신 — 여러 서버가 쓰면 새 글 방식은 채널을 금방 도배한다.
+    #[serde(default)]
+    pub now_playing_mode: NowPlayingMode,
 }
 
 fn default_chat_retention_days() -> u32 {
@@ -1983,6 +2112,7 @@ impl Default for RemoteGuildSettings {
         Self {
             guild_id: 0,
             chart_limit: default_chart_limit(),
+            now_playing_mode: NowPlayingMode::default(),
             min_volume: 0,
             max_volume: 200,
             default_volume: 100,

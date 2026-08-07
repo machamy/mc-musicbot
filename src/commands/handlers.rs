@@ -754,6 +754,27 @@ pub async fn handle_command(app: Arc<App>, ctx: Context, cmd: CommandInteraction
         }
     };
 
+    // 승인 안 된 서버는 여기서 멈춘다 (§26). **명령을 처리하기 전에** 봐야 한다 —
+    // 뒤에서 막으면 대기열이 바뀌거나 음성에 들어간 뒤에 거절하게 된다.
+    let approval = app
+        .remote
+        .guild_approval(guild_id)
+        .map(|row| row.status)
+        .unwrap_or_else(|| app.remote.register_guild(guild_id, None));
+    if !approval.is_usable() {
+        let _ = cmd
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(approval.reason())
+                        .ephemeral(true),
+                ),
+            )
+            .await;
+        return;
+    }
+
     app.log.info(
         "Command",
         &format!(
