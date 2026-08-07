@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -332,54 +332,157 @@ const MIGRATION_V14: &str = r#"
      WHERE chart_id IN (SELECT id FROM remote_charts WHERE builtin = 1 AND name IN ('한국 인기곡','전세계 인기곡'));
 "#;
 
+/// 인기곡 두 장은 마이그레이션에서도 같은 값을 써야 해서 상수로 뽑았다.
+/// 여기와 [`MIGRATION_V15`] 가 어긋나면 새 DB 와 기존 DB 의 차트가 서로 달라진다.
+const PL_GLOBAL_SONGS: &str =
+    "https://music.youtube.com/playlist?list=PL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i";
+const PL_KOREA_SONGS: &str =
+    "https://music.youtube.com/playlist?list=PL4fGSI1pDJn6jXS_Tv_N9B8Z0HTRVJE0m";
+
+/// v15 — 검색으로 만들던 차트를 진짜 차트로 바꾼다.
+///
+/// v14 에서 죽은 재생목록을 `ytsearch50:` 로 갈아 끼워 **빈 차트는 면했지만**,
+/// "인기곡"류 검색어는 개별 곡이 아니라 **7시간짜리 모음 영상**을 물어 온다(2026-08-07 확인).
+/// 그대로 담으면 대기열에 몇 시간짜리 영상이 줄줄이 들어간다. 그래서
+///   - 인기곡은 YouTube Music 이 매일 갱신하는 자동 생성 재생목록으로,
+///   - 노래방은 TJ 공식 차트 API 로
+/// 바꾼다. 옛 검색 차트는 지우고 [`BUILTIN_CHARTS`] 시더가 새로 심게 둔다.
+///
+/// **관리자가 손댄 주소는 건드리지 않는다** — 옛 기본값과 정확히 같을 때만 지운다.
+const MIGRATION_V15: &str = r#"
+    UPDATE remote_charts
+       SET url = 'https://music.youtube.com/playlist?list=PL4fGSI1pDJn6jXS_Tv_N9B8Z0HTRVJE0m'
+     WHERE builtin = 1 AND name = '한국 인기곡' AND url = 'ytsearch50:한국 인기곡 최신';
+    UPDATE remote_charts
+       SET url = 'https://music.youtube.com/playlist?list=PL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i'
+     WHERE builtin = 1 AND name = '전세계 인기곡' AND url = 'ytsearch50:global top songs this week';
+
+    -- 옛 검색 기반 기본 차트. 이름이 겹치는 것도 있어서 지운 뒤 시더가 새로 심게 한다.
+    DELETE FROM remote_chart_cache WHERE chart_id IN (
+        SELECT id FROM remote_charts WHERE builtin = 1 AND url IN (
+            'ytsearch50:인기 급상승 음악',
+            'ytsearch50:US top songs this week',
+            'ytsearch50:日本 人気曲 ランキング',
+            'ytsearch50:UK top songs this week',
+            'ytsearch50:K-Pop 인기곡',
+            'ytsearch50:J-Pop 人気曲',
+            'ytsearch50:힙합 인기곡',
+            'ytsearch50:R&B 인기곡',
+            'ytsearch50:록 밴드 인기곡',
+            'ytsearch50:EDM 인기곡',
+            'ytsearch50:TJ노래방 인기차트',
+            'ytsearch50:TJ노래방 발라드',
+            'ytsearch50:TJ노래방 댄스',
+            'ytsearch50:TJ노래방 힙합 랩',
+            'ytsearch50:TJ노래방 일본노래',
+            'ytsearch50:TJ노래방 팝송',
+            'ytsearch50:TJ노래방 락 밴드'
+        )
+    );
+    DELETE FROM remote_charts WHERE builtin = 1 AND url IN (
+        'ytsearch50:인기 급상승 음악',
+        'ytsearch50:US top songs this week',
+        'ytsearch50:日本 人気曲 ランキング',
+        'ytsearch50:UK top songs this week',
+        'ytsearch50:K-Pop 인기곡',
+        'ytsearch50:J-Pop 人気曲',
+        'ytsearch50:힙합 인기곡',
+        'ytsearch50:R&B 인기곡',
+        'ytsearch50:록 밴드 인기곡',
+        'ytsearch50:EDM 인기곡',
+        'ytsearch50:TJ노래방 인기차트',
+        'ytsearch50:TJ노래방 발라드',
+        'ytsearch50:TJ노래방 댄스',
+        'ytsearch50:TJ노래방 힙합 랩',
+        'ytsearch50:TJ노래방 일본노래',
+        'ytsearch50:TJ노래방 팝송',
+        'ytsearch50:TJ노래방 락 밴드'
+    );
+
+    -- 주소가 바뀐 차트의 옛 캐시는 버린다. 안 버리면 6시간 동안 옛 목록이 그대로 나간다.
+    DELETE FROM remote_chart_cache WHERE chart_id IN (
+        SELECT id FROM remote_charts WHERE builtin = 1 AND name IN ('한국 인기곡','전세계 인기곡')
+    );
+
+    -- TJ 곡번호 → 재생 가능한 영상. TJ 는 순위와 곡 정보만 주고 재생 주소는 안 준다.
+    -- 곡번호는 TJ 가 영구히 쓰는 값이라 한 번 찾으면 계속 재사용한다.
+    -- **이 표가 없으면 노래방 차트를 열 때마다 100번 검색한다.**
+    CREATE TABLE IF NOT EXISTS remote_tj_tracks (
+        tj_number   INTEGER PRIMARY KEY,
+        title       TEXT NOT NULL,
+        artist      TEXT NOT NULL,
+        provider    TEXT NULL,
+        content_id  TEXT NULL,
+        source_url  TEXT NULL,
+        duration_ms INTEGER NULL,
+        -- 못 찾은 곡도 기록한다. 안 그러면 없는 곡을 매번 다시 찾는다.
+        resolved_utc TEXT NOT NULL,
+        miss_count  INTEGER NOT NULL DEFAULT 0
+    );
+"#;
+
 /// 기본 제공 차트 (§15.2). `guild_id IS NULL` 이라 모든 서버가 같이 본다.
 ///
-/// **주소가 재생목록 ID 대신 `ytsearchN:` 인 것들이 있다.** 유튜브 뮤직의 장르·노래방 차트는
-/// 공개 재생목록 ID 가 자주 바뀌어서, 바뀔 때마다 코드를 고치느니 검색을 쓰는 편이 안 죽는다.
-/// 더 좋은 재생목록을 아는 관리자는 관리 콘솔에서 주소만 갈아 끼우면 된다.
-/// `internal:` 로 시작하는 것은 바깥에서 가져오지 않고 통계 DB 로 만드는 차트다(§15.2b).
-/// 기본 제공 차트.
-///
-/// **주소는 두 가지 방식이 있다.**
-///   - `ytsearch50:검색어` — yt-dlp 검색. 한 번 호출로 N곡을 가져온다.
-///     재생목록 ID 와 달리 죽지 않아서 기본값으로 쓴다. 앞의 숫자는 설정값(`chart_limit`)으로 갈아 끼운다.
-///   - `https://...playlist?list=...` — 실제 재생목록. 정확하지만 **ID 가 자주 바뀐다.**
-///     실제로 YouTube Music 의 인기곡 재생목록 ID 두 개가 죽어서 차트가 빈 채로 나갔다(2026-08-07 확인).
-///     쓰려면 반드시 yt-dlp 로 곡이 나오는지 확인하고 넣는다.
+/// **주소는 네 가지 방식이 있다.**
+///   - `https://...playlist?list=...` — 실제 재생목록. **지금 인기·나라별·장르가 전부 이것이다.**
+///     아래 인기/나라별/장르 ID 는 전부 `YouTube Music Global Charts`
+///     (채널 `UCrKZcyOJVWnJ60zM1XWllNw`) 가 매일 갱신하는 자동 생성 차트다.
+///     ID 가 바뀔 수 있으니 **넣거나 고칠 때는 반드시 yt-dlp 로 곡 수를 확인한다.**
+///   - `tj:top:N` / `tj:hot` — TJ 노래방 **공식 차트 API** 를 직접 긁는다([`crate::remote::tj`]).
+///     검색으로 흉내내던 것을 진짜 순위로 바꾼 자리다. 순위는 TJ 가 주고, 재생용 영상은
+///     곡명+가수로 한 번 찾아 TJ 번호에 붙여 캐시한다.
+///   - `ytsearchN:검색어` — yt-dlp 검색. 안 죽지만 **"인기곡"류 검색어는 개별 곡이 아니라
+///     몇 시간짜리 모음 영상이 올라온다**(2026-08-07 확인). 그래서 인기 차트에서는 뺐다.
+///     앞의 숫자는 설정값(`chart_limit`)으로 갈아 끼운다.
 ///   - `internal:...` — 우리가 튼 기록으로 만드는 차트(§15.2b). 외부 호출이 없다.
 ///
 /// 관리 콘솔에서 주소를 바꿀 수 있다. 여기 값은 **처음 한 번만** 심어진다.
-const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 26] = [
+const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 41] = [
     // 우리가 실제로 튼 것으로 만드는 차트 — 자동재생으로 나간 곡은 세지 않는다.
     (ChartCategory::Ours, "우리 서버 인기곡", "Internal", "internal:guild-plays"),
     (ChartCategory::Ours, "우리 서버 사랑받은 곡", "Internal", "internal:guild-love"),
     (ChartCategory::Ours, "마참뮤직 전체 인기곡", "Internal", "internal:global-plays"),
     (ChartCategory::Ours, "마참뮤직 전체 사랑받은 곡", "Internal", "internal:global-love"),
-    // 인기
-    // 이 두 개는 원래 YouTube Music 재생목록 ID 였는데 **둘 다 죽어서 빈 차트가 나갔다.**
-    // yt-dlp 로 확인해 보면 0곡이다. 검색은 죽지 않으므로 검색으로 바꿨다.
-    (ChartCategory::Popular, "전세계 인기곡", "YouTube", "ytsearch50:global top songs this week"),
-    (ChartCategory::Popular, "한국 인기곡", "YouTube", "ytsearch50:한국 인기곡 최신"),
-    (ChartCategory::Popular, "오늘 뜨는 곡", "YouTube", "ytsearch50:인기 급상승 음악"),
-    // 나라별
-    (ChartCategory::Region, "미국 인기곡", "YouTube", "ytsearch50:US top songs this week"),
-    (ChartCategory::Region, "일본 인기곡", "YouTube", "ytsearch50:日本 人気曲 ランキング"),
-    (ChartCategory::Region, "영국 인기곡", "YouTube", "ytsearch50:UK top songs this week"),
-    // 장르
-    (ChartCategory::Genre, "K-Pop", "YouTube", "ytsearch50:K-Pop 인기곡"),
-    (ChartCategory::Genre, "J-Pop", "YouTube", "ytsearch50:J-Pop 人気曲"),
-    (ChartCategory::Genre, "힙합", "YouTube", "ytsearch50:힙합 인기곡"),
-    (ChartCategory::Genre, "R&B", "YouTube", "ytsearch50:R&B 인기곡"),
-    (ChartCategory::Genre, "록", "YouTube", "ytsearch50:록 밴드 인기곡"),
-    (ChartCategory::Genre, "일렉트로닉", "YouTube", "ytsearch50:EDM 인기곡"),
-    // 노래방
-    (ChartCategory::Karaoke, "TJ 인기차트", "YouTube", "ytsearch50:TJ노래방 인기차트"),
-    (ChartCategory::Karaoke, "TJ 발라드", "YouTube", "ytsearch50:TJ노래방 발라드"),
-    (ChartCategory::Karaoke, "TJ 댄스", "YouTube", "ytsearch50:TJ노래방 댄스"),
-    (ChartCategory::Karaoke, "TJ 힙합", "YouTube", "ytsearch50:TJ노래방 힙합 랩"),
-    (ChartCategory::Karaoke, "TJ J-Pop", "YouTube", "ytsearch50:TJ노래방 일본노래"),
-    (ChartCategory::Karaoke, "TJ 팝송", "YouTube", "ytsearch50:TJ노래방 팝송"),
-    (ChartCategory::Karaoke, "TJ 록·밴드", "YouTube", "ytsearch50:TJ노래방 락 밴드"),
+    // 인기 — 전부 YouTube Music Global Charts 의 자동 생성 재생목록. 2026-08-07 곡 수 확인함.
+    (ChartCategory::Popular, "전세계 인기곡", "YouTube", PL_GLOBAL_SONGS),
+    (ChartCategory::Popular, "한국 인기곡", "YouTube", PL_KOREA_SONGS),
+    (ChartCategory::Popular, "전세계 뮤직비디오", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5kI81J1fYWK5eZRl1zJ5kM"),
+    (ChartCategory::Popular, "한국 뮤직비디오", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5S09aId3dUGp40ygUqmPGc"),
+    (ChartCategory::Popular, "한국 쇼츠 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4mJcF9T0qw-h-gUobHcNVU"),
+    (ChartCategory::Popular, "전세계 쇼츠 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn6H1adzIM6ez64e8bHXKNTj"),
+    // 나라별 — 같은 채널의 "Top 100 Songs <나라>".
+    (ChartCategory::Region, "미국 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn6O1LS0XSdF3RyO0Rq_LDeI"),
+    (ChartCategory::Region, "일본 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4-UIb6RKHdxam-oAUULIGB"),
+    (ChartCategory::Region, "영국 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn6_f5P3MnzXg9l3GDfnSlXa"),
+    (ChartCategory::Region, "캐나다 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn57Q7WbODbmXjyjgXi0BTyD"),
+    (ChartCategory::Region, "호주 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn7xvYy-bP6UFeG5tITQgScd"),
+    (ChartCategory::Region, "독일 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn6KpOXlp0MH8qA9tngXaUJ-"),
+    (ChartCategory::Region, "프랑스 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn7bK3y1Hx-qpHBqfr6cesNs"),
+    (ChartCategory::Region, "브라질 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn7rGBE8kEC0CqTa1nMh9AKB"),
+    (ChartCategory::Region, "멕시코 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn6fko1AmNa_pdGPZr5ROFvd"),
+    (ChartCategory::Region, "대만 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn68Qgd3kW_hKrqMhxAHz62W"),
+    (ChartCategory::Region, "인도 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4pTWyM3t61lOyZ6_4jcNOw"),
+    (ChartCategory::Region, "인도네시아 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5ObxTlEPlkkornHXUiKX1z"),
+    // 장르 — 같은 채널의 "Top 50 <장르> Music Videos". 미국 기준이라 이름에 나라를 안 붙였다.
+    (ChartCategory::Genre, "팝", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn77aK7sAW2AT0oOzo5inWY8"),
+    (ChartCategory::Genre, "힙합", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4fmCoF1vKHLtivI0f9yHiF"),
+    (ChartCategory::Genre, "록", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5LOptOQixqnzXNGjNXAgYY"),
+    (ChartCategory::Genre, "하드록·메탈", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4w4wTTgOmP_S80PoCtbGrL"),
+    (ChartCategory::Genre, "댄스·일렉트로닉", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4rBU0RHnR6-b1_uE20CzRH"),
+    (ChartCategory::Genre, "라틴", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5O8siDeZuI_4hbk6JWtTX1"),
+    (ChartCategory::Genre, "재즈", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn7Wkr6Ll6ds1AhA42rT8uaU"),
+    (ChartCategory::Genre, "컨트리", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4EBsWVeFpcSAVOFMfhyipg"),
+    // 노래방 — TJ 는 공식 API 를 직접 긁는다. 검색으로 흉내내지 않는다.
+    (ChartCategory::Karaoke, "TJ 인기 100", "TJ", "tj:hot"),
+    (ChartCategory::Karaoke, "TJ 발라드", "TJ", "tj:top:4"),
+    (ChartCategory::Karaoke, "TJ 댄스", "TJ", "tj:top:5"),
+    (ChartCategory::Karaoke, "TJ 트로트", "TJ", "tj:top:6"),
+    (ChartCategory::Karaoke, "TJ 인디·어쿠스틱", "TJ", "tj:top:7"),
+    (ChartCategory::Karaoke, "TJ 팝송", "TJ", "tj:top:2"),
+    (ChartCategory::Karaoke, "TJ J-POP", "TJ", "tj:top:3"),
+    (ChartCategory::Karaoke, "일본 노래방 히트", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kW4l3hmtC_Aq2XCvin1b3h6tziPMH0tsk"),
+    // 금영은 공개 API 를 못 찾아서 검색으로 남긴다. 노래방 채널은 개별 곡을 올리므로
+    // 인기곡 검색과 달리 모음 영상이 안 잡힌다(2026-08-07 실측: 6/6 개별 반주).
     (ChartCategory::Karaoke, "금영 인기차트", "YouTube", "ytsearch50:금영노래방 인기차트"),
     // SoundCloud
     (
@@ -2419,6 +2522,109 @@ impl RemoteStore {
             .find(|chart| chart.id == chart_id)
     }
 
+    // ───────── TJ 곡번호 → 재생 주소 (§15.2c) ─────────
+
+    /// 이 TJ 곡번호로 저장해 둔 재생 가능한 트랙. 못 찾았던 곡이면 `None`.
+    pub fn tj_track(&self, tj_number: i64) -> Option<TrackRef> {
+        let conn = self.conn.lock().unwrap();
+        let (provider, content_id, source_url, title, artist, duration_ms): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT provider, content_id, source_url, title, artist, duration_ms
+                   FROM remote_tj_tracks WHERE tj_number = ?1",
+                params![tj_number],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        // content_id 가 비어 있으면 "찾아봤지만 없더라" 는 기록이다. 트랙이 아니다.
+        let content_id = content_id.filter(|value| !value.is_empty())?;
+        Some(TrackRef {
+            provider: crate::remote::tj::provider_from_str(provider.as_deref().unwrap_or("")),
+            content_id,
+            source_url: source_url.unwrap_or_default(),
+            title: Some(title),
+            artist: (!artist.is_empty()).then_some(artist),
+            duration: duration_ms.map(|ms| crate::models::CsTimeSpan::from_secs_f64(ms as f64 / 1000.0)),
+            variant_key: None,
+        })
+    }
+
+    /// 이 곡을 몇 번이나 못 찾았는지. 반주 영상이 아예 없는 곡에 검색을 계속 쓰지 않으려고 센다.
+    pub fn tj_miss_count(&self, tj_number: i64) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT miss_count FROM remote_tj_tracks WHERE tj_number = ?1",
+            params![tj_number],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+    }
+
+    /// 찾은 결과를 저장한다. `track` 이 `None` 이면 "못 찾음" 으로 기록하고 횟수를 올린다.
+    /// **못 찾은 것도 반드시 남긴다** — 안 남기면 없는 곡을 차트 열 때마다 다시 찾는다.
+    pub fn save_tj_track(
+        &self,
+        tj_number: i64,
+        title: &str,
+        artist: &str,
+        track: Option<&TrackRef>,
+    ) {
+        let conn = self.conn.lock().unwrap();
+        let now = Self::now_iso();
+        let result = match track {
+            Some(track) => conn.execute(
+                "INSERT INTO remote_tj_tracks
+                     (tj_number, title, artist, provider, content_id, source_url, duration_ms, resolved_utc, miss_count)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+                 ON CONFLICT(tj_number) DO UPDATE SET
+                     title = excluded.title, artist = excluded.artist,
+                     provider = excluded.provider, content_id = excluded.content_id,
+                     source_url = excluded.source_url, duration_ms = excluded.duration_ms,
+                     resolved_utc = excluded.resolved_utc, miss_count = 0",
+                params![
+                    tj_number,
+                    title,
+                    artist,
+                    track.provider.as_str(),
+                    track.content_id,
+                    track.source_url,
+                    track.duration.map(|d| (d.as_secs_f64() * 1000.0) as i64),
+                    now
+                ],
+            ),
+            None => conn.execute(
+                "INSERT INTO remote_tj_tracks
+                     (tj_number, title, artist, provider, content_id, source_url, duration_ms, resolved_utc, miss_count)
+                 VALUES(?1, ?2, ?3, NULL, NULL, NULL, NULL, ?4, 1)
+                 ON CONFLICT(tj_number) DO UPDATE SET
+                     resolved_utc = excluded.resolved_utc,
+                     miss_count = remote_tj_tracks.miss_count + 1",
+                params![tj_number, title, artist, now],
+            ),
+        };
+        let _ = result;
+    }
+
     /// 캐시된 곡 목록. `stale`이면 TTL(6시간)이 지난 것이라 다시 받아야 한다 —
     /// 그래도 일단 보여 주는 편이 빈 화면보다 낫다.
     pub fn chart_cache(&self, chart_id: i64) -> Option<ChartSnapshot> {
@@ -2747,6 +2953,12 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             13 => {
                 tx.execute_batch(MIGRATION_V14)?;
                 // 새로 늘린 노래방·장르 차트를 기존 DB 에도 심는다.
+                seed_builtin_charts(&tx)?;
+            }
+            14 => {
+                // 지우기가 먼저다. 시더를 먼저 돌리면 이름이 겹치는 새 차트가 INSERT OR IGNORE 에
+                // 걸려 조용히 안 들어가고, 그 뒤 DELETE 가 옛 줄을 지워 차트가 통째로 사라진다.
+                tx.execute_batch(MIGRATION_V15)?;
                 seed_builtin_charts(&tx)?;
             }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.

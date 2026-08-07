@@ -8618,6 +8618,13 @@ impl Drop for ChartFetchGuard {
     }
 }
 
+/// 차트에 넣어 줄 한 곡의 최대 길이(초).
+///
+/// 15분을 넘는 것은 사실상 전부 모음·메들리·라이브 전곡 영상이다. 실제로 겪은 것:
+/// 검색형 인기 차트의 7시간짜리 플레이리스트, TJ 노래방 1위였던 86분짜리 임영웅메들리.
+/// 진짜 긴 곡(프로그레시브 록 등)이 잘릴 수 있지만, 대기열 한 칸이 몇 시간 잠기는 쪽이 더 나쁘다.
+const CHART_MAX_TRACK_SECS: f64 = 15.0 * 60.0;
+
 async fn fetch_chart_tracks(
     state: &Arc<WebState>,
     guild_id: u64,
@@ -8664,8 +8671,55 @@ async fn fetch_chart_tracks(
         .remote
         .load_guild_settings(guild_id)
         .chart_limit();
-    let url = crate::remote::models::chart_url_with_limit(&chart.url, limit);
-    let mut tracks = state.app.ytdlp().expand_collection(&url, provider).await;
+
+    // TJ 노래방은 yt-dlp 로 펼칠 주소가 아니다. 공식 API 로 순위를 받아 곡마다 반주를 찾는다.
+    let mut tracks = if let Some(tj_chart) = crate::remote::tj::TjChart::parse(&chart.url) {
+        match crate::remote::tj::fetch(
+            tj_chart,
+            limit as usize,
+            &state.app.remote,
+            &state.app.ytdlp(),
+            &http_client(state),
+            crate::remote::tj::default_resolve_budget(),
+        )
+        .await
+        {
+            Ok(tracks) => tracks,
+            Err(reason) => {
+                let _ = state.app.remote.mark_chart_failure(chart.id, &reason);
+                return state
+                    .app
+                    .remote
+                    .chart_cache(chart.id)
+                    .ok_or(reason);
+            }
+        }
+    } else {
+        let url = crate::remote::models::chart_url_with_limit(&chart.url, limit);
+        state.app.ytdlp().expand_collection(&url, provider).await
+    };
+    // **차트에는 곡이 아닌 것이 섞여 들어온다.** 실제로 겪은 두 가지다.
+    //   - 검색형 인기 차트가 7시간짜리 "노래모음 플레이리스트" 영상을 물어 왔다.
+    //   - TJ 노래방 차트 1위가 86분짜리 `임영웅메들리` 였다.
+    // 둘 다 한 곡처럼 들어와서 대기열 한 칸을 몇 시간 동안 차지한다.
+    // 길이를 모르는 항목은 남긴다 — 모른다고 버리면 멀쩡한 곡까지 사라진다.
+    let before = tracks.len();
+    tracks.retain(|track| {
+        track
+            .duration
+            .is_none_or(|duration| duration.as_secs_f64() <= CHART_MAX_TRACK_SECS)
+    });
+    if tracks.len() < before {
+        state.app.log.info(
+            "Chart",
+            &format!(
+                "차트 '{}' 에서 {}분 넘는 항목 {}개를 뺐어요(모음·메들리).",
+                chart.name,
+                (CHART_MAX_TRACK_SECS / 60.0) as i64,
+                before - tracks.len()
+            ),
+        );
+    }
     // 재생목록형은 URL 로 개수를 못 줄이므로 여기서 자른다.
     tracks.truncate(limit as usize);
     if tracks.is_empty() {

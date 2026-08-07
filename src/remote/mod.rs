@@ -12,6 +12,7 @@
 pub mod models;
 pub mod ranking;
 pub mod store;
+pub mod tj;
 
 pub use models::*;
 pub use store::RemoteStore;
