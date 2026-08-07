@@ -683,6 +683,11 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/api/guilds/{guild_id}/autoplay/reroll",
             post(api_autoplay_reroll),
         )
+        // 추천 바구니 비우기 (V3 §8.7). 기준 곡 권한과 같은 규칙 — 기본값은 모든 멤버.
+        .route(
+            "/music/api/guilds/{guild_id}/autoplay/reset",
+            post(api_autoplay_reset),
+        )
         // 서버 관리 콘솔 API — 전부 Manager 이상
         .route(
             "/music/api/guilds/{guild_id}/admin/settings",
@@ -6159,7 +6164,133 @@ fn autoplay_payload(state: &WebState, guild_id: u64, can_edit: bool) -> Value {
         // 선택 줄 자체를 안 그려서 `autoplay_genres` 가 영원히 비고, 폴백 사슬이 곧장 내려간다.
         // 관리 콘솔은 `/charts` 폴백이 있어 살아 있었지만 유저 UI 에는 그 폴백이 없다.
         "genreOptions": genre_options(state, guild_id),
+        // **무엇이 추천 근거로 쌓이고 있는지** (V3 §8.7). 화면이 이걸 그대로 보여준다.
+        // 이게 없으면 자동재생은 "어디서 나온지 모를 곡을 트는 기계"로 보인다.
+        "basket": autoplay_basket(state, guild_id, &settings),
     })
+}
+
+/// 추천 바구니의 지금 상태. 담긴 것 · 자동으로 쌓인 것 · 빼 둔 것 세 칸이다.
+fn autoplay_basket(
+    state: &WebState,
+    guild_id: u64,
+    settings: &RemoteGuildSettings,
+) -> Value {
+    // 추천이 실제로 참고하는 만큼만 보여준다. 설정값보다 많이 보여주면
+    // "이 곡도 참고하나 보다" 하고 오해한다.
+    let window = settings.autoplay_recent_count.max(1) as usize;
+    let recent: Vec<Value> = state
+        .app
+        .remote
+        .list_recent(guild_id, window)
+        .iter()
+        .map(|item| {
+            json!({
+                "title": item.track.title.clone().unwrap_or_else(|| "제목 없음".into()),
+                "artist": item.track.artist,
+                "playedUtc": item.played_utc,
+                "cacheKey": item.track.cache_key(),
+            })
+        })
+        .collect();
+
+    let blocked: Vec<Value> = state
+        .app
+        .remote
+        .list_blocked_autoplay(guild_id)
+        .into_iter()
+        .map(|(cache_key, reason, until)| {
+            json!({
+                "cacheKey": cache_key,
+                "reason": reason.unwrap_or_else(|| "이 곡 말고를 눌렀어요".into()),
+                "untilUtc": until,
+            })
+        })
+        .collect();
+
+    json!({
+        "recent": recent,
+        "recentWindow": window,
+        "blocked": blocked,
+        // 지금 방식이 무엇을 실제로 참고하는지. 방식에 따라 안 쓰는 칸이 생긴다.
+        "usesSeeds": matches!(settings.autoplay_mode, AutoplayMode::Seed),
+        "usesRecent": matches!(settings.autoplay_mode, AutoplayMode::Recent),
+        "usesGenres": matches!(settings.autoplay_mode, AutoplayMode::Genre),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoplayResetRequest {
+    /// `seeds` · `recent` · `blocked` · `all`
+    scope: String,
+}
+
+/// `POST .../autoplay/reset` — 추천 바구니를 비운다 (V3 §8.7).
+///
+/// 기준 곡 편집과 같은 권한을 쓴다. 바구니를 비우는 건 기준 곡을 하나씩 빼는 것과
+/// 결과가 같아서, 권한을 따로 두면 "하나씩은 되는데 전부는 안 되는" 이상한 상태가 된다.
+async fn api_autoplay_reset(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<AutoplayResetRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = autoplay_gate(&ctx) {
+        return response;
+    }
+
+    let scope = request.scope.trim();
+    let all = scope == "all";
+    if !all && !matches!(scope, "seeds" | "recent" | "blocked") {
+        return json_error(StatusCode::BAD_REQUEST, "비울 대상을 알 수 없어요.".to_string());
+    }
+
+    let mut cleared: Vec<String> = Vec::new();
+    if all || scope == "seeds" {
+        let n = state.app.remote.clear_autoplay_seeds(guild_id);
+        if n > 0 {
+            cleared.push(format!("기준 곡 {n}개"));
+        }
+    }
+    if all || scope == "recent" {
+        let n = state.app.remote.clear_recent(guild_id);
+        if n > 0 {
+            cleared.push(format!("최근 재생 {n}개"));
+        }
+    }
+    if all || scope == "blocked" {
+        let n = state.app.remote.clear_autoplay_blocked(guild_id);
+        if n > 0 {
+            cleared.push(format!("빼 둔 곡 {n}개"));
+        }
+    }
+
+    let summary = if cleared.is_empty() {
+        "이미 비어 있었어요.".to_string()
+    } else {
+        format!("{} 를 비웠어요.", cleared.join(", "))
+    };
+    // 바구니를 비우면 추천 성향이 통째로 바뀐다. 사람 피드에 반드시 남긴다 —
+    // 남이 비웠는데 아무 말도 없으면 "추천이 갑자기 이상해졌다"로만 보인다.
+    audit_ok(
+        &state,
+        guild_id,
+        &ctx.session,
+        "autoplay.reset",
+        Some(scope),
+        Some(&summary),
+    );
+
+    let can_edit = ctx.allows("autoplay", ctx.settings.autoplay_rule);
+    let mut payload = autoplay_payload(&state, guild_id, can_edit);
+    payload["message"] = json!(summary);
+    json_ok(payload)
 }
 
 /// 자동 재생 `genre` 모드가 고를 수 있는 차트 (§8.2). 키는 차트 ID 문자열이다 —

@@ -2913,6 +2913,7 @@ async function loadSeeds() {
       genreOptions: Array.isArray(data?.genreOptions) ? data.genreOptions : [],
       policy: data?.policy || 'balanced',
       canEdit: !!data?.canEdit,
+      basket: data?.basket || null,
     };
     seedState = {
       seeds: Array.isArray(data?.seeds) ? data.seeds : [],
@@ -2958,6 +2959,80 @@ const AUTOPLAY_POLICIES = [
 async function saveAutoplay(patch) {
   const result = await call(() => api('/autoplay', { method: 'PUT', body: patch }), '자동 재생 설정을 바꿨어요.');
   if (result) loadSeeds();
+}
+
+async function resetBasket(scope, confirmText) {
+  if (!window.confirm(confirmText)) return;
+  const result = await call(() => api('/autoplay/reset', { body: { scope } }));
+  if (result) {
+    toast(result.message || '비웠어요.', 'ok');
+    loadSeeds();
+  }
+}
+
+/* 추천 바구니 (§8.7).
+ *
+ * 자동재생이 **무엇을 근거로** 곡을 고르는지 안 보이면, 이상한 곡이 나왔을 때
+ * 손댈 데가 없다. 세 칸을 그대로 펼쳐 두고 각각 비울 수 있게 한다.
+ * 담긴 것(내가 넣은 기준 곡) · 쌓인 것(최근 재생) · 빼 둔 것(막힌 후보).
+ */
+function basketPanel() {
+  const basket = autoplayState?.basket;
+  if (!basket) return null;
+  const editable = !!autoplayState.canEdit && canAutoplay();
+  const reason = lockReason('autoplay');
+
+  const recent = Array.isArray(basket.recent) ? basket.recent : [];
+  const blocked = Array.isArray(basket.blocked) ? basket.blocked : [];
+  const seeds = seedState?.seeds?.length || 0;
+
+  // 지금 방식이 실제로 안 보는 칸은 흐리게 둔다. 켜져 있는데 영향이 없는 걸
+  // 모르면 "비웠는데 왜 그대로냐" 가 된다.
+  const shelf = (used, icon, name, count, unit, detail, scope, confirmText) => {
+    const wipe = bindAct(h('button', {
+      class: 'btn btn--sm btn--ghost', type: 'button',
+      tip: count ? `${name}을(를) 비워요.` : `${name}이(가) 이미 비어 있어요.`,
+    }, '비우기'), () => resetBasket(scope, confirmText));
+    setLock(wipe, !editable || !count, !editable ? reason : `${name}이(가) 이미 비어 있어요.`);
+    return h('div', { class: `basket__shelf${used ? '' : ' basket__shelf--idle'}` },
+      h('div', { class: 'basket__head' },
+        h('span', { class: 'basket__icon', 'aria-hidden': 'true' }, icon),
+        h('span', { class: 'basket__name' }, name),
+        h('span', { class: 'basket__count' }, `${count}${unit}`),
+        h('span', { class: 'queue__spacer' }),
+        wipe),
+      detail ? h('div', { class: 'basket__detail' }, detail) : null,
+      used ? null : h('div', { class: 'basket__idle' }, '지금 방식에서는 참고하지 않아요'));
+  };
+
+  const chips = (items, render) => items.length
+    ? h('div', { class: 'basket__chips' }, ...items.slice(0, 12).map(render),
+      items.length > 12 ? h('span', { class: 'basket__more' }, `외 ${items.length - 12}개`) : null)
+    : null;
+
+  return h('div', { class: 'basket' },
+    h('div', { class: 'basket__top' },
+      h('span', { class: 'basket__title' }, '🧺 추천 바구니'),
+      h('span', { class: 'hint' }, '자동 재생이 지금 참고하고 있는 것들이에요'),
+      h('span', { class: 'queue__spacer' }),
+      setLock(bindAct(h('button', {
+        class: 'btn btn--sm btn--ghost btn--danger', type: 'button',
+        tip: '세 칸을 한 번에 비워요. 추천을 처음부터 다시 시작해요.',
+      }, '전부 비우기'), () => resetBasket('all',
+        '기준 곡, 최근 재생, 빼 둔 곡을 전부 비울까요?\n추천이 처음부터 다시 시작돼요. (재생 기록 통계와 차트는 그대로예요)')),
+      !editable, reason)),
+
+    shelf(basket.usesSeeds, '📻', '담은 기준 곡', seeds, '곡',
+      seeds ? null : '곡 옆의 📻를 누르면 여기에 담겨요.',
+      'seeds', '담아 둔 기준 곡을 전부 뺄까요?'),
+
+    shelf(basket.usesRecent, '🕘', '최근 튼 곡', recent.length, '곡',
+      chips(recent, (item) => h('span', { class: 'basket__chip', tip: item.artist || '' }, item.title)),
+      'recent', '최근 재생 기록을 비울까요?\n추천만 초기화되고 통계와 차트는 그대로예요.'),
+
+    shelf(true, '🚫', '빼 둔 곡', blocked.length, '곡',
+      chips(blocked, (item) => h('span', { class: 'basket__chip basket__chip--off', tip: item.reason }, item.cacheKey)),
+      'blocked', '빼 둔 곡을 전부 풀까요?\n다시 추천에 나올 수 있어요.'));
 }
 
 /** 방식·정책·최근 N곡·장르 — 권한이 있으면 유저 UI에서도 바꾼다 (§8.3). */
@@ -3050,6 +3125,8 @@ function renderSeeds() {
   clear(el.seedBody);
   const controls = autoplayControls();
   if (controls) el.seedBody.appendChild(controls);
+  const basket = basketPanel();
+  if (basket) el.seedBody.appendChild(basket);
 
   if (!seedState.seeds.length) {
     el.seedBody.appendChild(h('p', { class: 'hint' },

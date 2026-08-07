@@ -957,6 +957,49 @@ body[data-dragging="tab"] { user-select: none; }
 .vol__tag { flex: none; color: var(--text-3); font-size: var(--fs-xs); white-space: nowrap; }
 .vol--me .vol__tag { color: var(--accent); font-weight: var(--fw-semi); }
 
+/* 추천 바구니 (§8.7). 세 칸을 나란히 두고 각각 비운다. */
+.basket {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+.basket__top { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.basket__title { font-weight: var(--fw-semi); color: var(--text-1); }
+.basket__shelf {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
+}
+/* 지금 방식이 안 보는 칸. 지우지 않고 흐리게만 둔다 — 없애 버리면
+ * 방식을 바꿨을 때 어디서 나타나는지 알 수가 없다. */
+.basket__shelf--idle { opacity: 0.62; }
+.basket__head { display: flex; align-items: center; gap: var(--sp-2); }
+.basket__icon { flex: none; }
+.basket__name { font-weight: var(--fw-semi); color: var(--text-2); }
+.basket__count { color: var(--text-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.basket__detail, .basket__idle { margin-top: var(--sp-1); color: var(--text-3); font-size: var(--fs-xs); }
+.basket__chips { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-top: var(--sp-2); }
+.basket__chip {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px var(--sp-2);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-full);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+}
+.basket__chip--off { color: var(--text-4); text-decoration: line-through; }
+.basket__more { align-self: center; color: var(--text-4); font-size: var(--fs-xs); }
+
 /* 싱크 보정. 볼륨 칩과 같은 줄에 서지만 슬라이더가 아니라 ± 버튼이라 폭이 훨씬 작다. */
 .sync {
   display: flex;

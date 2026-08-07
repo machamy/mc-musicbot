@@ -2481,6 +2481,72 @@ impl RemoteStore {
         Ok(changed > 0)
     }
 
+    // ───────── 추천 바구니 비우기 (§8.7) ─────────
+    //
+    // 자동재생은 **세 가지**를 근거로 곡을 고른다. 하나만 비워서는 추천 성향이 안 바뀐다.
+    //   1. 기준 곡(seeds) — 내가 직접 담은 것
+    //   2. 최근 재생(recent) — 봇이 자동으로 쌓은 것
+    //   3. 막힌 후보(blocked) — 건너뛰거나 싫어요를 받아 한동안 빼 둔 것
+    // 그래서 각각 따로도, 한 번에도 비울 수 있게 한다.
+
+    /// 담아 둔 기준 곡을 전부 뺀다. 몇 개를 뺐는지 돌려준다.
+    pub fn clear_autoplay_seeds(&self, guild_id: u64) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM remote_autoplay_seeds WHERE guild_id = ?1",
+            params![guild_id as i64],
+        )
+        .unwrap_or(0)
+    }
+
+    /// 막아 둔 후보를 전부 푼다. "왜 이 곡이 다시 안 나오지" 를 되돌리는 자리다.
+    pub fn clear_autoplay_blocked(&self, guild_id: u64) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM remote_autoplay_blocked WHERE guild_id = ?1",
+            params![guild_id as i64],
+        )
+        .unwrap_or(0)
+    }
+
+    /// 최근 재생 이력을 지운다.
+    ///
+    /// **통계와 우리 차트는 건드리지 않는다.** 그쪽은 별도 DB(`musicbot-stats.sqlite`)라
+    /// 여기서 지워도 개인 통계와 재생 횟수 차트는 그대로 남는다. 추천이 참고하는
+    /// 이력만 리셋된다 — 사람들이 원하는 건 "추천을 새로 시작" 이지 "기록을 지움" 이 아니다.
+    pub fn clear_recent(&self, guild_id: u64) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM remote_recent_tracks WHERE guild_id = ?1",
+            params![guild_id as i64],
+        )
+        .unwrap_or(0)
+    }
+
+    /// 지금 막혀 있는 후보들. 화면이 "무엇이 왜 빠져 있는지" 를 보여줄 때 쓴다.
+    /// 만료된 것은 [`Self::blocked_autoplay_keys`] 처럼 지나는 길에 치운다.
+    pub fn list_blocked_autoplay(&self, guild_id: u64) -> Vec<(String, Option<String>, String)> {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            r#"DELETE FROM remote_autoplay_blocked
+               WHERE guild_id = ?1 AND julianday(until_utc) <= julianday('now')"#,
+            params![guild_id as i64],
+        );
+        let mut statement = match conn.prepare(
+            r#"SELECT cache_key, reason, until_utc FROM remote_autoplay_blocked
+               WHERE guild_id = ?1 ORDER BY created_utc DESC LIMIT 100"#,
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+        statement
+            .query_map(params![guild_id as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
     /// 최근 재생 이력을 자동추천이 쓰기 좋은 모양으로. (§8.5-1·2)
     /// `cache_key → 재생 후 지난 시간(시간 단위)` 과 **최신순 아티스트 목록**을 같이 돌려준다.
     /// 한 번의 조회로 둘 다 만든다 — 추천 한 번에 쿼리를 두 번 돌 이유가 없다.
