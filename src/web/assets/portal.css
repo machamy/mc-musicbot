@@ -408,6 +408,22 @@ body[data-dragging="tab"] { user-select: none; }
 .banner--warn { background: var(--warn-soft); color: var(--warn); }
 .banner--danger { background: var(--danger-soft); color: var(--danger); }
 .banner--info { background: var(--info-soft); color: var(--info); }
+
+/* 재시작 배너의 회전 표시. 멈춘 게 아니라 진행 중임을 알린다. */
+.spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+/* 회전을 싫어하는 설정이면 점만 남긴다 — 없애면 진행 중인지 알 수 없다. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; border-right-color: currentColor; opacity: 0.5; }
+}
 .banner--accent { background: var(--accent-soft); color: var(--accent); }
 .banner b { font-variant-numeric: tabular-nums; }
 

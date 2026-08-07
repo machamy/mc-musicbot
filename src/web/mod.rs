@@ -215,6 +215,14 @@ pub async fn serve(app: Arc<App>) {
         }));
     }
 
+    // 재시작이 시작되면 접속 중인 모든 창에 알린다 (§24).
+    {
+        let hook_state = state.clone();
+        let _ = app.on_restarting.set(Box::new(move || {
+            remote::broadcast_restarting(&hook_state);
+        }));
+    }
+
     let router = Router::new()
         .route("/", get(pages::index))
         .route("/login", get(pages::login_page).post(pages::login_post))

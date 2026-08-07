@@ -63,39 +63,34 @@ pub fn watch(app: Arc<App>) {
 /// 상태 저장 → 브라우저 안내 → 음성 이탈. 순서가 중요하다.
 /// **저장이 먼저다** — 음성에서 먼저 빠지면 재생 위치를 읽을 수 없다.
 async fn drain(app: &Arc<App>) {
-    let guild_ids = app.db.list_known_guild_ids();
-    for guild_id in guild_ids {
+    // 브라우저가 오류 화면 대신 안내를 띄우게 **먼저** 알린다. 음성에서 빠진 뒤에 보내면
+    // 사람은 "봇이 나갔다" 를 먼저 겪고 설명은 나중에 듣는다.
+    if let Some(hook) = app.on_restarting.get() {
+        hook();
+    }
+
+    for guild_id in app.db.list_known_guild_ids() {
         let player = app.player.get_state(guild_id).await;
-        let Some(item) = player.current_item.clone() else {
+        let Some(item) = player.current_item.as_ref() else {
             // 틀고 있지 않았으면 이어 붙일 것도 없다. 옛 기록은 지운다 —
             // 안 지우면 다음 기동에 엉뚱한 옛날 곡이 되살아난다.
             app.remote.clear_resume(guild_id);
             continue;
         };
+        // 음성에서 빠지기 **전에** 읽어야 한다. 빠진 뒤에는 위치를 알 수 없다.
         let position = app
             .coordinator
             .current_position(guild_id)
             .await
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let channel = app.player.voice_channel_id(guild_id).await;
-
-        app.remote.save_resume(
-            guild_id,
-            channel,
-            &item,
-            position,
-            player.is_paused,
-        );
+        app.remote
+            .save_resume(guild_id, Some(&item.id), position, player.is_paused);
         app.log.info(
             "Shutdown",
-            &format!("길드 {guild_id}: {:.0}초 지점을 저장했어요.", position),
+            &format!("길드 {guild_id}: {position:.0}초 지점을 저장했어요."),
         );
     }
-
-    // 브라우저가 오류 화면 대신 안내를 띄우게. 음성에서 빠지기 전에 보내야
-    // 사람이 "왜 봇이 나갔지" 를 먼저 겪지 않는다.
-    app.notify_restarting();
 
     for guild_id in app.db.list_known_guild_ids() {
         app.coordinator.leave_voice(app, guild_id).await;
@@ -142,16 +137,28 @@ pub async fn resume_after_restart(app: &Arc<App>) {
             continue;
         };
         // 너무 오래된 기록은 버린다. 어제 껐던 곡이 오늘 아침에 갑자기 나오면 안 된다.
-        if saved.age_hours() > 6.0 {
+        if saved.age_hours > RESUME_MAX_AGE_HOURS {
             app.log.info(
                 "Shutdown",
                 &format!("길드 {guild_id}: 저장 지점이 오래돼서 이어 붙이지 않아요."),
             );
             continue;
         }
-        let Some(channel_id) = saved.voice_channel_id else {
+        let player = app.player.get_state(guild_id).await;
+        // 음성 채널과 현재 곡은 `guild_states` 가 이미 되살려 놨다. 우리는 위치만 얹는다.
+        if player.voice_channel_id.is_none() {
             continue;
-        };
+        }
+        // 껐을 때 틀던 곡과 지금 첫 곡이 다르면 잇지 않는다. 다른 곡을 그 지점으로
+        // 밀어 버리면 엉뚱한 데서 시작한다.
+        let same_song = player
+            .current_item
+            .as_ref()
+            .is_some_and(|item| Some(&item.id) == saved.item_id.as_ref());
+        if !same_song {
+            continue;
+        }
+
         app.log.info(
             "Shutdown",
             &format!(
@@ -159,6 +166,16 @@ pub async fn resume_after_restart(app: &Arc<App>) {
                 saved.position_seconds
             ),
         );
-        app.resume_playback(guild_id, channel_id, saved).await;
+        let _ = app
+            .player
+            .set_current_start_offset(
+                guild_id,
+                crate::models::CsTimeSpan::from_secs_f64(saved.position_seconds),
+            )
+            .await;
+        app.coordinator.sync_guild(app, guild_id).await;
     }
 }
+
+/// 이 시간이 지난 기록으로는 잇지 않는다.
+const RESUME_MAX_AGE_HOURS: f64 = 6.0;

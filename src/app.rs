@@ -140,6 +140,9 @@ pub struct App {
     /// 웹이 `web::serve()`에서 걸어 두면 `queue.set` 이벤트를 그때만 broadcast 할 수 있다.
     /// 비어 있으면 정렬만 하고 아무도 깨우지 않는다.
     pub on_queue_sorted: OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
+    /// 종료가 시작됐음을 접속 중인 브라우저에 알리는 훅. `web::serve` 가 채운다.
+    /// 이게 없으면 사람은 오류 화면만 보고 무슨 일인지 모른다.
+    pub on_restarting: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// 마지막 재정렬 tick 시각(길드 무관). 웹이 nextSortAt 을 계산해 카운트다운을 그린다.
     /// 순서가 바뀌었는지와 무관하게 매 tick 갱신된다 — 카운트다운은 "다음 검사 시각"이지
     /// "다음에 순서가 바뀌는 시각"이 아니다. 아직 한 번도 안 돌았으면 `None`.
@@ -238,6 +241,7 @@ impl App {
             intent_status: RwLock::new(IntentStatus::default()),
             owner_user_ids: RwLock::new(Vec::new()),
             on_queue_sorted: OnceLock::new(),
+            on_restarting: OnceLock::new(),
             last_queue_sort: RwLock::new(None),
             queue_sort_last: Mutex::new(HashMap::new()),
             announce_channels: Mutex::new(HashMap::new()),

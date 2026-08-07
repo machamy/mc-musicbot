@@ -544,6 +544,25 @@ fn emit(state: &WebState, guild_id: u64, topic: &str, data: Value) {
     });
 }
 
+/// 재시작이 시작됐다고 모든 창에 알린다 (§24).
+///
+/// **길드마다 따로 쏜다.** 이벤트는 `guild_id` 로 걸러져 나가므로 전체 방송용 통로가
+/// 따로 없다. 여기서 길드를 도는 편이 필터에 특수한 예외를 뚫는 것보다 안전하다.
+pub fn broadcast_restarting(state: &Arc<WebState>) {
+    for guild_id in state.app.db.list_known_guild_ids() {
+        emit(
+            state,
+            guild_id,
+            "server.restarting",
+            json!({
+                // 화면이 "곧 돌아와요" 를 띄우고 재연결을 기다리게 하는 신호다.
+                "message": "업데이트 중이에요. 몇 초 뒤에 자동으로 다시 연결돼요.",
+                "resumes": true,
+            }),
+        );
+    }
+}
+
 /// 한 사람에게만 보낸다. 개인화된 payload(내 표·내 보관함)는 전체로 뿌리면 안 된다.
 fn emit_to(state: &WebState, guild_id: u64, user_id: u64, topic: &str, data: Value) {
     let _ = state.remote_events.send(RemoteEvent {

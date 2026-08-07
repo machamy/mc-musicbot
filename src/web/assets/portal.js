@@ -6094,7 +6094,14 @@ function renderBanners(state) {
   clear(el.banners);
   el.portal.dataset.conn = state.conn;
 
-  if (state.conn === 'reconnecting' || state.conn === 'down') {
+  // 업데이트로 끊기는 건 사고가 아니다. 빨간 배너 대신 "곧 돌아와요" 를 띄운다.
+  if (state.conn === 'restarting') {
+    el.banners.appendChild(h('div', { class: 'banner banner--info', role: 'status' },
+      h('span', { class: 'banner__icon' }, '🛠'),
+      h('div', { class: 'banner__text' },
+        state.restartNote || '업데이트 중이에요. 몇 초 뒤에 자동으로 다시 연결돼요.'),
+      h('span', { class: 'spinner', 'aria-hidden': 'true' })));
+  } else if (state.conn === 'reconnecting' || state.conn === 'down') {
     el.banners.appendChild(h('div', { class: `banner banner--${state.conn === 'down' ? 'danger' : 'warn'}`, role: 'status' },
       h('span', { class: 'banner__icon' }, state.conn === 'down' ? '⛔' : '⏳'),
       h('div', { class: 'banner__text' }, state.conn === 'down'

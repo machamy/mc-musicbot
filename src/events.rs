@@ -54,6 +54,10 @@ impl EventHandler for Handler {
         // 로그 보관 정리.
         let retention = app.db.load_global_settings().log_retention_days as i64;
         app.log.prune(retention);
+
+        // 업데이트로 껐다면 끊긴 지점부터 잇는다 (§24).
+        // **여기여야 한다** — 길드 캐시와 음성 상태가 준비된 뒤라야 다시 들어갈 수 있다.
+        crate::shutdown::resume_after_restart(&app).await;
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {

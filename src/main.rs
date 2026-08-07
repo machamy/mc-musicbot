@@ -13,6 +13,8 @@ mod media;
 mod models;
 mod player;
 mod remote;
+/// 끊김을 줄이는 종료·복구 (V3 §24).
+mod shutdown;
 /// 개인 통계와 우리 차트. **musicbot.sqlite 와 파일이 분리된 별도 DB**를 쓴다 (V3 §22.1).
 mod stats;
 mod web;
@@ -159,6 +161,10 @@ async fn main() {
             web::serve(app2).await;
         });
     }
+
+    // 종료 신호를 지켜본다 (§24). `web::serve` 가 재시작 알림 훅을 채운 뒤에 띄운다 —
+    // 먼저 띄우면 훅이 아직 비어 있어서 브라우저가 안내를 못 받는다.
+    shutdown::watch(app.clone());
 
     // 게이트웨이가 죽어도(토큰 오류/네트워크 단절) 웹 UI 는 살아 있어야 운영자가 로그를 본다.
     // 30초 간격으로 클라이언트를 재생성/재접속한다.

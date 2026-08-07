@@ -956,7 +956,12 @@ export function connect(guildId, handlers = {}) {
         return;
       }
       if (!downSince) downSince = Date.now();
-      store.patch({ conn: Date.now() - downSince > 30000 ? 'down' : 'reconnecting' });
+      // 재시작 예고를 받은 직후의 끊김은 사고가 아니다. `down` 으로 바꿔서 빨간 배너를
+      // 띄우면 "고장났다" 로 읽힌다 — 돌아올 때까지 안내를 유지한다.
+      const expected = store.get().conn === 'restarting' && Date.now() - downSince < 60000;
+      if (!expected) {
+        store.patch({ conn: Date.now() - downSince > 30000 ? 'down' : 'reconnecting' });
+      }
       schedule();
     };
   };
@@ -1007,6 +1012,15 @@ function merge(type, data, handlers) {
         sampledAtUtc: data.sampledAtUtc,
         isPaused: data.isPaused,
         durationSeconds: data.durationSeconds ?? (data.current ? data.current.durationSeconds : undefined),
+      });
+      break;
+    }
+    case 'server.restarting': {
+      // 업데이트로 곧 끊긴다는 예고. **이걸 안 받으면 사람은 오류 화면만 본다.**
+      // 소켓은 곧 닫히고 기존 백오프 재연결이 알아서 붙는다 — 여기서는 알리기만 한다.
+      store.patch({
+        conn: 'restarting',
+        restartNote: data?.message || '업데이트 중이에요. 곧 다시 연결돼요.',
       });
       break;
     }
