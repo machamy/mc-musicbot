@@ -1064,8 +1064,9 @@ fn session_cookie_token(cookies: &Cookies) -> Option<String> {
 }
 
 /// 메모리에 없으면 DB(`remote_web_sessions`)에서 복구한다 — 봇을 재시작해도 로그인이 유지된다.
-/// 스키마에 `username`/`csrf_token`/`is_developer` 컬럼이 없으므로 복구 시
-/// CSRF 토큰은 새로 만들고, username은 display_name으로 대신하며, dev 세션은 복구하지 않는다.
+/// username 컬럼이 없어 display_name으로 대신하고, dev 세션은 복구하지 않는다.
+/// **CSRF 토큰은 반드시 저장된 값을 그대로 쓴다** (v17) — 새로 만들면 브라우저의 옛 토큰과
+/// 어긋나 로그인은 유지된 채 누르는 것마다 CSRF 실패가 난다.
 fn current_session(state: &WebState, cookies: &Cookies) -> Option<RemoteSession> {
     let token = session_cookie_token(cookies)?;
     {
@@ -1117,7 +1118,12 @@ fn restore_session(state: &WebState, token: &str) -> Option<RemoteSession> {
         guilds,
         access_token: stored.access_token.unwrap_or_default(),
         refresh_token: stored.refresh_token,
-        csrf_token: crate::models::uuid_like(),
+        // v17 이전에 저장된 세션은 컬럼이 비어 있다. 그때만 새로 만든다 —
+        // 그 세션은 어차피 옛 토큰을 되살릴 방법이 없어서 한 번은 새로고침이 필요하다.
+        csrf_token: stored
+            .csrf_token
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(crate::models::uuid_like),
         created,
         token_expires: Instant::now(),
         // dev 세션은 애초에 저장하지 않으므로 복구본은 항상 일반 세션이다.
@@ -1142,6 +1148,8 @@ fn persist_session(state: &WebState, token: &str, session: &RemoteSession) {
         expires_utc: expires.to_rfc3339(),
         refreshed_utc: Some(now_utc()),
         created_utc: now_utc(),
+        // 재시작 뒤에도 같은 토큰이어야 브라우저의 페이지 셸과 맞는다.
+        csrf_token: Some(session.csrf_token.clone()),
     };
     if let Err(error) = state.app.remote.save_session(token, &stored) {
         state

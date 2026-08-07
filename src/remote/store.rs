@@ -432,6 +432,12 @@ const MIGRATION_V15: &str = r#"
         SELECT id FROM remote_charts WHERE builtin = 1 AND name IN ('한국 인기곡','전세계 인기곡')
     );
 
+    -- CSRF 토큰을 세션과 함께 남긴다.
+    -- **이게 없어서 재시작하면 일시정지조차 "CSRF 검증에 실패했어요" 로 막혔다.**
+    -- 세션은 DB 에서 되살아나는데 토큰만 새로 만들어져서, 브라우저가 들고 있는
+    -- 페이지 셸의 옛 토큰과 영원히 어긋났다. 로그인은 멀쩡해 보여서 더 헷갈렸다.
+    ALTER TABLE remote_web_sessions ADD COLUMN csrf_token TEXT;
+
     -- TJ 곡번호 → 재생 가능한 영상. TJ 는 순위와 곡 정보만 주고 재생 주소는 안 준다.
     -- 곡번호는 TJ 가 영구히 쓰는 값이라 한 번 찾으면 계속 재사용한다.
     -- **이 표가 없으면 노래방 차트를 열 때마다 100번 검색한다.**
@@ -1674,13 +1680,14 @@ impl RemoteStore {
         conn.execute(
             r#"INSERT INTO remote_web_sessions
                (token_hash, user_id, display_name, avatar_url, guilds_json,
-                access_token, refresh_token, expires_utc, refreshed_utc, created_utc)
-               VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                access_token, refresh_token, expires_utc, refreshed_utc, created_utc, csrf_token)
+               VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                ON CONFLICT(token_hash) DO UPDATE SET
                  user_id = excluded.user_id, display_name = excluded.display_name,
                  avatar_url = excluded.avatar_url, guilds_json = excluded.guilds_json,
                  access_token = excluded.access_token, refresh_token = excluded.refresh_token,
-                 expires_utc = excluded.expires_utc, refreshed_utc = excluded.refreshed_utc"#,
+                 expires_utc = excluded.expires_utc, refreshed_utc = excluded.refreshed_utc,
+                 csrf_token = excluded.csrf_token"#,
             params![
                 Self::session_token_hash(token),
                 session.user_id as i64,
@@ -1692,6 +1699,7 @@ impl RemoteStore {
                 session.expires_utc,
                 session.refreshed_utc,
                 session.created_utc,
+                session.csrf_token,
             ],
         )?;
         Ok(())
@@ -1702,7 +1710,8 @@ impl RemoteStore {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             r#"SELECT user_id, display_name, avatar_url, guilds_json,
-                      access_token, refresh_token, expires_utc, refreshed_utc, created_utc
+                      access_token, refresh_token, expires_utc, refreshed_utc, created_utc,
+                      csrf_token
                FROM remote_web_sessions
                WHERE token_hash = ?1 AND julianday(expires_utc) > julianday('now')"#,
             params![Self::session_token_hash(token)],
@@ -1717,6 +1726,7 @@ impl RemoteStore {
                     expires_utc: row.get(6)?,
                     refreshed_utc: row.get(7)?,
                     created_utc: row.get(8)?,
+                    csrf_token: row.get(9)?,
                 })
             },
         )
@@ -3969,12 +3979,17 @@ mod tests {
             expires_utc: (chrono::Utc::now() + chrono::Duration::hours(12)).to_rfc3339(),
             refreshed_utc: None,
             created_utc: chrono::Utc::now().to_rfc3339(),
+            csrf_token: Some("csrf-abc".into()),
         };
         store.save_session(token, &session).unwrap();
         let loaded = store.load_session(token).expect("세션 유실");
         assert_eq!(loaded.user_id, 10);
         assert_eq!(loaded.refresh_token.as_deref(), Some("refresh"));
         assert!(store.load_session("wrong-token").is_none());
+
+        // 회귀: CSRF 토큰이 그대로 돌아와야 한다. 복구할 때 새로 만들면 브라우저가 든
+        // 옛 토큰과 어긋나서 **일시정지조차 CSRF 실패로 막힌다.**
+        assert_eq!(loaded.csrf_token.as_deref(), Some("csrf-abc"));
 
         // 원문 토큰은 어디에도 남지 않는다.
         {
@@ -4006,6 +4021,7 @@ mod tests {
             expires_utc: (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
             refreshed_utc: None,
             created_utc: chrono::Utc::now().to_rfc3339(),
+            csrf_token: None,
         };
         store.save_session("dead", &session).unwrap();
         assert!(store.load_session("dead").is_none());

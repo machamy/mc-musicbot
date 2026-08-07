@@ -284,6 +284,25 @@ export class ApiError extends Error {
   }
 }
 
+/** 페이지 셸을 다시 받아 거기 박힌 CSRF 토큰만 꺼낸다. 실패하면 `null`. */
+async function refetchCsrf() {
+  try {
+    const response = await fetch(location.pathname, {
+      credentials: 'same-origin',
+      headers: { Accept: 'text/html' },
+      cache: 'no-store',
+    });
+    if (!response.ok) return null;
+    const html = await response.text();
+    // 셸은 `window.MACHAM = {...}` 한 줄로 심는다. JSON 만 떼어 읽는다.
+    const match = html.match(/window\.MACHAM\s*=\s*(\{[\s\S]*?\});/);
+    if (!match) return null;
+    return JSON.parse(match[1])?.csrf || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function api(path, opts = {}) {
   const url = /^(https?:)?\/\//.test(path) || path.startsWith('/music') ? path : API_BASE() + path;
   const headers = Object.assign({ 'X-CSRF-Token': ctx.csrf, Accept: 'application/json' }, opts.headers);
@@ -311,6 +330,17 @@ export async function api(path, opts = {}) {
   if (type.includes('json')) { try { data = await response.json(); } catch { data = null; } }
 
   if (response.ok) return data;
+
+  // CSRF 가 어긋나면 사람이 할 수 있는 게 없다. 페이지 셸에 박힌 토큰이 서버 것과
+  // 다르다는 뜻이라 **몇 번을 눌러도 계속 실패한다.** 셸을 다시 받아 토큰만 갈아 끼우고
+  // 한 번 다시 시도한다. 그래도 안 되면 그때 사람에게 말한다.
+  if (response.status === 403 && /CSRF/i.test(String(data?.error || '')) && !opts._csrfRetried) {
+    const fresh = await refetchCsrf();
+    if (fresh && fresh !== ctx.csrf) {
+      ctx.csrf = fresh;
+      return api(path, Object.assign({}, opts, { _csrfRetried: true }));
+    }
+  }
 
   const retryAfter = Number(response.headers.get('retry-after')) || Number(data?.retryAfter) || 0;
   let message = (data && (data.error || data.message)) || STATUS_TEXT[response.status] || `요청 실패 (${response.status})`;

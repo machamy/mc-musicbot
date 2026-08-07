@@ -1558,6 +1558,9 @@ pub struct StoredSession {
     pub expires_utc: String,
     pub refreshed_utc: Option<String>,
     pub created_utc: String,
+    /// **재시작을 넘겨야 하는 값.** 복구할 때 새로 만들면 브라우저가 들고 있는
+    /// 옛 토큰과 어긋나서, 로그인은 유지되는데 누르는 것마다 CSRF 실패가 난다.
+    pub csrf_token: Option<String>,
 }
 
 /// 보존 정리 기준값. 길드 설정이 있으면 길드 설정이 이긴다.
