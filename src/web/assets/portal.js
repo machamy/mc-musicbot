@@ -501,7 +501,7 @@ let acState = null;            // 자동완성 { kind, from, to, items, index }
 let serverSkewMs = 0;          // 서버 시계 − 내 시계. 카운트다운을 서버 기준으로 맞추는 데 쓴다
 let lastBotState = null;       // presence.bot — WS 이벤트가 안 실어 보내도 잃어버리지 않게 따로 보관
 let seedState = null;          // { seeds, max, canEdit } — 없으면 서버가 아직 시드곡을 모른다는 뜻
-let seedOpen = false;
+let autoplaySheet = null;      // 열려 있는 자동 재생 시트 { handle, body } — 갱신이 오면 안을 다시 그린다
 let autoplayState = null;      // { mode, recentCount, genres, policy, genreOptions, canEdit }
 let myScore = null;            // 마참 점수 (§22.4)
 let chartState = null;         // 차트 화면 상태 — 없으면 서버가 차트를 모른다는 뜻
@@ -2905,23 +2905,33 @@ function tickSuperButtons() {
   }
 }
 
-/* ── 자동 재생 기준 곡 (§8.5) ──
- * 서버가 이 API를 모르면(404) 섹션과 버튼을 통째로 숨긴다. 새 기능이 실패해도 기본 동작은 살아 있어야 한다.
+/* ── 자동 재생 (§8) ──
+ * 서버가 이 API를 모르면(404) 막대와 📻 버튼을 통째로 숨긴다. 새 기능이 실패해도 기본 동작은 살아 있어야 한다.
+ *
+ * 설정은 **대기열 탭 안이 아니라 별도 시트**에 있다. 예전에는 대기열 위 접이식 상자 하나에
+ * 방식·정책·기준 곡·최근 곡·빼 둔 곡을 전부 욱여넣었는데, 폭이 레일 하나뿐이라
+ * 무엇 하나 제대로 안 보였다(칩 12개로 잘린 목록, 260px 짜리 속 스크롤).
+ * 시트는 배치 6종 어디서나 같은 크기로 열리고 좁은 화면에서는 화면 전체를 쓴다 —
+ * 배치별로 다른 화면을 만들지 않고 자리를 넓히는 유일한 방법이다.
+ * 대기열 탭에는 "지금 무엇을 근거로 고르는지" 한 줄 요약만 남긴다.
  */
 
 function buildSeedBox() {
+  el.seedSummary = h('span', { class: 'seedbar__sum' });
   el.seedCount = h('span', { class: 'chip' }, '0곡');
-  el.seedToggle = h('button', {
-    class: 'seedbox__head', type: 'button', 'aria-expanded': 'false',
-    tip: '자동 재생이 이 곡들과 비슷한 노래를 골라 와요',
-    onClick: () => { seedOpen = !seedOpen; renderSeeds(); },
-  },
-    h('span', { class: 'seedbox__caret', 'aria-hidden': 'true' }, '▸'),
-    h('span', null, '📻 자동 재생 기준 곡'),
-    h('span', { class: 'queue__spacer' }),
-    el.seedCount);
-  el.seedBody = h('div', { class: 'seedbox__body', hidden: true });
-  el.seedBox = h('section', { class: 'seedbox', hidden: true }, el.seedToggle, el.seedBody);
+  // 막대 자체는 잠그지 않는다. 읽기 전용이어도 **무엇을 근거로 고르는지는 볼 수 있어야** 한다.
+  // 못 바꾸는 것은 시트 안에서 버튼별로 비활성 + 이유로 알려 준다 (§23.3).
+  el.seedBox = h('section', { class: 'seedbar', hidden: true },
+    bindAct(h('button', {
+      class: 'seedbar__btn', type: 'button', 'aria-haspopup': 'dialog',
+      tip: '자동 재생이 무엇을 근거로 다음 곡을 고르는지 보고 바꿔요',
+    },
+      h('span', { class: 'seedbar__icon', 'aria-hidden': 'true' }, '📻'),
+      h('span', { class: 'seedbar__label' }, '자동 재생'),
+      el.seedSummary,
+      h('span', { class: 'queue__spacer' }),
+      el.seedCount,
+      h('span', { class: 'seedbar__go', 'aria-hidden': 'true' }, '⚙')), openAutoplaySheet));
   return el.seedBox;
 }
 
@@ -2993,137 +3003,348 @@ async function resetBasket(scope, confirmText) {
   }
 }
 
-/* 추천 바구니 (§8.7).
- *
- * 자동재생이 **무엇을 근거로** 곡을 고르는지 안 보이면, 이상한 곡이 나왔을 때
- * 손댈 데가 없다. 세 칸을 그대로 펼쳐 두고 각각 비울 수 있게 한다.
- * 담긴 것(내가 넣은 기준 곡) · 쌓인 것(최근 재생) · 빼 둔 것(막힌 후보).
- */
-function basketPanel() {
-  const basket = autoplayState?.basket;
-  if (!basket) return null;
-  const editable = !!autoplayState.canEdit && canAutoplay();
-  const reason = lockReason('autoplay');
-
-  const recent = Array.isArray(basket.recent) ? basket.recent : [];
-  const blocked = Array.isArray(basket.blocked) ? basket.blocked : [];
-  const seeds = seedState?.seeds?.length || 0;
-
-  // 지금 방식이 실제로 안 보는 칸은 흐리게 둔다. 켜져 있는데 영향이 없는 걸
-  // 모르면 "비웠는데 왜 그대로냐" 가 된다.
-  const shelf = (used, icon, name, count, unit, detail, scope, confirmText) => {
-    const wipe = bindAct(h('button', {
-      class: 'btn btn--sm btn--ghost', type: 'button',
-      tip: count ? `${name}을(를) 비워요.` : `${name}이(가) 이미 비어 있어요.`,
-    }, '비우기'), () => resetBasket(scope, confirmText));
-    setLock(wipe, !editable || !count, !editable ? reason : `${name}이(가) 이미 비어 있어요.`);
-    return h('div', { class: `basket__shelf${used ? '' : ' basket__shelf--idle'}` },
-      h('div', { class: 'basket__head' },
-        h('span', { class: 'basket__icon', 'aria-hidden': 'true' }, icon),
-        h('span', { class: 'basket__name' }, name),
-        h('span', { class: 'basket__count' }, `${count}${unit}`),
-        h('span', { class: 'queue__spacer' }),
-        wipe),
-      detail ? h('div', { class: 'basket__detail' }, detail) : null,
-      used ? null : h('div', { class: 'basket__idle' }, '지금 방식에서는 참고하지 않아요'));
-  };
-
-  const chips = (items, render) => items.length
-    ? h('div', { class: 'basket__chips' }, ...items.slice(0, 12).map(render),
-      items.length > 12 ? h('span', { class: 'basket__more' }, `외 ${items.length - 12}개`) : null)
-    : null;
-
-  return h('div', { class: 'basket' },
-    h('div', { class: 'basket__top' },
-      h('span', { class: 'basket__title' }, '🧺 추천 바구니'),
-      h('span', { class: 'hint' }, '자동 재생이 지금 참고하고 있는 것들이에요'),
-      h('span', { class: 'queue__spacer' }),
-      setLock(bindAct(h('button', {
-        class: 'btn btn--sm btn--ghost btn--danger', type: 'button',
-        tip: '세 칸을 한 번에 비워요. 추천을 처음부터 다시 시작해요.',
-      }, '전부 비우기'), () => resetBasket('all',
-        '기준 곡, 최근 재생, 빼 둔 곡을 전부 비울까요?\n추천이 처음부터 다시 시작돼요. (재생 기록 통계와 차트는 그대로예요)')),
-      !editable, reason)),
-
-    shelf(basket.usesSeeds, '📻', '담은 기준 곡', seeds, '곡',
-      seeds ? null : '곡 옆의 📻를 누르면 여기에 담겨요.',
-      'seeds', '담아 둔 기준 곡을 전부 뺄까요?'),
-
-    shelf(basket.usesRecent, '🕘', '최근 튼 곡', recent.length, '곡',
-      chips(recent, (item) => h('span', { class: 'basket__chip', tip: item.artist || '' }, item.title)),
-      'recent', '최근 재생 기록을 비울까요?\n추천만 초기화되고 통계와 차트는 그대로예요.'),
-
-    shelf(true, '🚫', '빼 둔 곡', blocked.length, '곡',
-      chips(blocked, (item) => h('span', { class: 'basket__chip basket__chip--off', tip: item.reason }, item.cacheKey)),
-      'blocked', '빼 둔 곡을 전부 풀까요?\n다시 추천에 나올 수 있어요.'));
+function autoplayModeMeta(id) {
+  return AUTOPLAY_MODES.find((row) => row[0] === id) || AUTOPLAY_MODES[1];
 }
 
-/** 방식·정책·최근 N곡·장르 — 권한이 있으면 유저 UI에서도 바꾼다 (§8.3). */
-function autoplayControls() {
-  if (!autoplayState) return null;
-  const editable = !!autoplayState.canEdit && canAutoplay();
+function autoplayPolicyMeta(id) {
+  return AUTOPLAY_POLICIES.find((row) => row[0] === id) || AUTOPLAY_POLICIES[1];
+}
+
+/** 자동 재생을 지금 바꿀 수 있는가. 서버의 canEdit 과 권한(`autoplay`)은 다른 문제라 둘 다 본다.
+ *  최종 판정은 언제나 서버다 — 여기서 규칙을 다시 구현하지 않는다. */
+function autoplayEditable() {
+  return !!autoplayState?.canEdit && canAutoplay();
+}
+
+/* ── 자동 재생 시트 (§8.7) ──
+ *
+ * 자동재생이 **무엇을 근거로** 곡을 고르는지 안 보이면, 이상한 곡이 나왔을 때 손댈 데가 없다.
+ * 방식·정책·기준 곡·최근 튼 곡·빼 둔 곡을 한 화면에 전부 펼쳐 두고, 지금 쓰이지 않는 칸도
+ * 지우지 않고 흐리게만 둔다 — 없애 버리면 방식을 바꿨을 때 그게 어디서 나타나는지 알 수가 없다.
+ *
+ * 시트는 배치와 무관하다. 3단이든 패널이든 모바일이든 같은 노드가 같은 크기로 열린다.
+ */
+
+function openAutoplaySheet() {
+  if (autoplaySheet) { return; }        // 이미 열려 있으면 한 장 더 띄우지 않는다
+  const body = h('div', { class: 'ap' });
+  const handle = sheet({
+    title: '📻 자동 재생',
+    desc: '대기열이 비면 봇이 알아서 곡을 골라요. 무엇을 근거로 고를지 여기서 정해요.',
+    wide: true,
+    body,
+    dismissValue: null,
+    actions: [{ label: '닫기', kind: 'primary', value: null }],
+  });
+  autoplaySheet = { handle, body };
+  renderAutoplaySheet();
+  handle.result.then(() => { autoplaySheet = null; });
+}
+
+/** 서버 갱신(`loadSeeds`)이나 WS `autoplay` 이벤트가 올 때마다 시트 속을 통째로 다시 그린다.
+ *  시트는 한 화면짜리라 부분 갱신을 아껴 봐야 얻는 게 없고, 어긋난 화면이 훨씬 비싸다. */
+function renderAutoplaySheet() {
+  if (!autoplaySheet) return;
+  const body = autoplaySheet.body;
+  clear(body);
+  if (!seedState) {
+    body.appendChild(emptyState('📻', '이 서버는 아직 자동 재생 설정을 몰라요',
+      '봇을 최신 버전으로 올리면 여기서 바꿀 수 있어요.'));
+    return;
+  }
+  put(body,
+    apModeSection(),
+    apSeedSection(),
+    apRecentSection(),
+    apGenreSection(),
+    apBlockedSection(),
+    apPolicySection());
+}
+
+/** 시트 안 카드 한 장. `used === false` 면 지금 방식이 참고하지 않는 칸이라 흐리게 둔다. */
+function apSection(opts) {
+  return h('section', { class: `ap__sec${opts.used === false ? ' ap__sec--idle' : ''}` },
+    h('div', { class: 'ap__head' },
+      h('span', { class: 'ap__icon', 'aria-hidden': 'true' }, opts.icon),
+      h('h3', { class: 'ap__title' }, opts.name),
+      opts.count === undefined || opts.count === null
+        ? null
+        : h('span', { class: 'ap__count' }, String(opts.count)),
+      h('span', { class: 'queue__spacer' }),
+      opts.action || null),
+    opts.desc ? h('p', { class: 'ap__note' }, opts.desc) : null,
+    opts.used === false
+      ? h('p', { class: 'ap__note ap__note--idle' }, '지금 방식에서는 참고하지 않아요')
+      : null,
+    ...(opts.children || []).filter(Boolean));
+}
+
+/** 기준 곡으로 보낼 수 있는 모양인가. 서버의 TrackRef 는 sourceUrl(또는 provider+contentId)이
+ *  없으면 본문 해석 자체가 실패해서 422 가 돌아온다. 바구니의 최근 목록처럼 요약만 온 항목은
+ *  담기 버튼을 아예 안 만든다 — 눌러도 "입력값을 확인해 주세요" 밖에 안 나온다. */
+function seedableTrack(track) {
+  if (!track || typeof track !== 'object') return false;
+  return !!(track.sourceUrl || (track.provider && track.contentId));
+}
+
+/** 곡 한 줄. 시트 안에서는 버튼이 hover 로 나타나면 안 된다(터치 화면에서 찾을 수가 없다). */
+function apRow(track, sub, acts, idle, idleTip) {
+  const attrs = { class: `aprow${idle ? ' aprow--idle' : ''}` };
+  // 빈 tip 을 달면 툴팁 대상이 되어 아무 글자도 없는 말풍선이 뜬다. 있을 때만 붙인다.
+  if (idle && idleTip) attrs.tip = idleTip;
+  return h('div', attrs,
+    h('img', { class: 'row__art aprow__art', src: artUrl(track) || '', alt: '', loading: 'lazy' }),
+    h('div', { class: 'aprow__main' },
+      h('div', { class: 'aprow__title' }, trackTitle(track)),
+      h('div', { class: 'row__sub' }, sub || trackSub(track))),
+    (acts || []).filter(Boolean).length ? h('div', { class: 'aprow__acts' }, ...acts.filter(Boolean)) : null);
+}
+
+/** 칸 하나를 통째로 비우는 버튼. 개별 삭제가 되는 칸에도 남겨 둔다 — 20곡을 하나씩 지우게 하면 안 된다. */
+function apWipe(scope, name, count, confirmText) {
+  const editable = autoplayEditable();
   const reason = lockReason('autoplay');
+  const button = bindAct(h('button', {
+    class: 'btn btn--sm btn--ghost btn--danger', type: 'button',
+    tip: `${name}을(를) 한 번에 비워요.`,
+  }, '전부 비우기'), () => resetBasket(scope, confirmText));
+  return setLock(button, !editable || !count, !editable ? reason : `${name}이(가) 이미 비어 있어요.`);
+}
 
-  const segRow = (label, tip, options, current, onPick) => {
-    const row = h('div', { class: 'lib__seg lib__seg--wrap', style: { padding: '0' }, role: 'group', 'aria-label': label },
-      ...options.map(([id, text, hint]) => {
-        const button = h('button', {
-          class: 'seg', type: 'button', 'aria-pressed': String(id === current), dataset: { seg: id },
-          tip: hint || text,
-          onClick: () => onPick(id),
-        }, text);
-        return setLock(button, !editable, reason);
-      }));
-    return h('div', { class: 'autoplay__row' }, h('div', { class: 'hint', tip }, label), row);
-  };
+/** 세그먼트 한 줄. 잠겨도 숨기지 않는다 — 무엇을 고를 수 있는 화면인지는 보여야 한다. */
+function apSeg(label, tip, options, current, onPick) {
+  const editable = autoplayEditable();
+  const reason = lockReason('autoplay');
+  const row = h('div', {
+    class: 'lib__seg lib__seg--wrap', style: { padding: '0' },
+    role: 'group', 'aria-label': label,
+  },
+    ...options.map(([id, text, hint]) => setLock(bindAct(h('button', {
+      class: 'seg', type: 'button', 'aria-pressed': String(id === current), dataset: { seg: id },
+      tip: hint || text,
+    }, text), () => onPick(id)), !editable, reason)));
+  return h('div', { class: 'autoplay__row' }, h('div', { class: 'hint', tip }, label), row);
+}
 
-  const recentInput = h('input', {
+function apModeSection() {
+  if (!autoplayState) return null;
+  const meta = autoplayModeMeta(autoplayState.mode);
+  return apSection({
+    icon: '🎛', name: '무엇을 기준으로 고를까요', desc: meta[2],
+    children: [apSeg('추천 방식', '자동 재생이 무엇을 기준으로 곡을 고를지 정해요',
+      AUTOPLAY_MODES, autoplayState.mode, (id) => saveAutoplay({ mode: id }))],
+  });
+}
+
+function apPolicySection() {
+  if (!autoplayState) return null;
+  const meta = autoplayPolicyMeta(autoplayState.policy);
+  return apSection({
+    icon: '🎚', name: '어떤 느낌으로 고를까요', desc: meta[2],
+    children: [apSeg('추천 정책', '같은 기준에서도 얼마나 비슷한 곡을 집을지 정해요',
+      AUTOPLAY_POLICIES, autoplayState.policy, (id) => saveAutoplay({ policy: id }))],
+  });
+}
+
+/* ── 기준 곡 ──
+ * 예전에는 대기열·검색에서 📻 를 누르는 길 하나뿐이라, 설정을 열어 놓고도
+ * "여기서 담을 수가 없네" 로 끝났다. 지금 재생 중인 곡과 대기열 앞쪽을 시트 안에서 바로 담는다.
+ * 순서는 라운드로빈 순번이라(§8.2) 눈에 보여야 하고, 기존 `/autoplay/seeds/reorder` 로 바꾼다.
+ */
+function apSeedSection() {
+  const editable = seedEditable();
+  const reason = lockReason('autoplay');
+  const seeds = seedState.seeds || [];
+  const max = Number(seedState.max) || 0;
+  const full = max > 0 && seeds.length >= max;
+
+  const rows = seeds.map((seed, index) => {
+    const track = seed.track || {};
+    const up = setLock(bindAct(h('button', {
+      class: 'iconbtn', type: 'button', tip: '앞으로 옮기기', 'aria-label': '앞으로 옮기기',
+    }, '↑'), () => moveSeed(index, -1)), !editable || index === 0,
+    !editable ? reason : '맨 앞이에요');
+    const down = setLock(bindAct(h('button', {
+      class: 'iconbtn', type: 'button', tip: '뒤로 옮기기', 'aria-label': '뒤로 옮기기',
+    }, '↓'), () => moveSeed(index, 1)), !editable || index === seeds.length - 1,
+    !editable ? reason : '맨 뒤예요');
+    const remove = setLock(bindAct(h('button', {
+      class: 'iconbtn iconbtn--danger', type: 'button',
+      tip: '이 곡만 기준에서 빼요', 'aria-label': '기준 곡에서 빼기',
+    }, '✕'), () => removeSeed(seed.cacheKey)), !editable, reason);
+    const sub = [seed.addedByDisplayName, fmtAgo(seed.addedUtc)].filter(Boolean).join(' · ');
+    const row = apRow(track, sub || trackSub(track), [up, down, remove]);
+    row.insertBefore(h('span', {
+      class: 'aprow__no', tip: `${index + 1}번째로 참고해요`,
+    }, String(index + 1)), row.firstChild);
+    return row;
+  });
+
+  // 담을 수 있는 후보. 이미 담긴 곡과 중복은 뺀다 — 눌러 봐야 중복이라고 400 이 돌아온다.
+  const have = new Set(seeds.map((seed) => String(seed.cacheKey)));
+  const state = store.get();
+  const picks = [];
+  if (state.current?.track) picks.push(['지금 곡', state.current.track]);
+  for (const item of state.queue.slice(0, 8)) if (item.track) picks.push([null, item.track]);
+  const pickable = picks.filter(([, track]) => {
+    const key = trackKey(track);
+    if (!seedableTrack(track) || have.has(key)) return false;
+    have.add(key);                       // 지금 곡이 대기열에도 있으면 칩이 두 개 생긴다
+    return true;
+  });
+
+  const pickBox = pickable.length
+    ? h('div', { class: 'ap__pick' },
+      h('span', { class: 'hint' }, '바로 담기'),
+      ...pickable.slice(0, 8).map(([tag, track]) => setLock(bindAct(h('button', {
+        class: 'ap__chip', type: 'button',
+        tip: `📻 ${trackTitle(track)} 을(를) 기준 곡으로 담아요`,
+      }, `📻 ${tag || trackTitle(track)}`), () => addSeed(track)),
+      !editable || full, !editable ? reason : `기준 곡은 ${max}곡까지예요. 하나 빼고 담아 주세요.`)))
+    : null;
+
+  // "지금 이 칸을 보고 있는가" 는 서버가 바구니에 담아 준다. 방식이 `seed` 여도 시드가 없으면
+  // 폴백 사슬(§8.2)을 타고 최근 곡으로 내려가므로, 모드만 보고 판단하면 화면이 거짓말을 한다.
+  const basket = autoplayState?.basket;
+  const usesSeeds = basket ? !!basket.usesSeeds : (!autoplayState || autoplayState.mode === 'seed');
+
+  return apSection({
+    icon: '📻', name: '기준 곡',
+    used: usesSeeds,
+    count: `${seeds.length} / ${fmtLimit(max, '곡')}`,
+    action: apWipe('seeds', '기준 곡', seeds.length, '담아 둔 기준 곡을 전부 뺄까요?'),
+    desc: seeds.length
+      ? '위에서부터 돌아가며 참고해요. ↑↓ 로 순서를, ✕ 로 한 곡씩 뺄 수 있어요.'
+      : '아직 담은 곡이 없어요. 곡 옆의 📻 를 누르거나 아래에서 바로 담아 보세요.',
+    children: [rows.length ? h('div', { class: 'ap__rows' }, ...rows) : null, pickBox],
+  });
+}
+
+/* ── 최근 튼 곡 ──
+ * 서버에는 한 곡씩 빼는 경로가 없다(`/autoplay/reset` 은 칸 단위 scope 하나뿐).
+ * 그래서 "몇 곡까지 참고하는지"를 목록 위에 붙여 두고, 그 범위를 벗어난 줄은 흐리게 만든다 —
+ * 지울 수 없다면 최소한 **무엇이 지금 영향을 주고 있는지**는 눈에 보여야 한다.
+ */
+function apRecentSection() {
+  const basket = autoplayState?.basket;
+  if (!basket) return null;
+  const recent = Array.isArray(basket.recent) ? basket.recent : [];
+  const editable = seedEditable();
+  const reason = lockReason('autoplay');
+  const limit = Number(autoplayState.recentCount) || 0;
+  const have = new Set((seedState.seeds || []).map((seed) => String(seed.cacheKey)));
+
+  const input = h('input', {
     class: 'field field--num', type: 'number', min: '0', max: '20',
     value: String(autoplayState.recentCount ?? 5),
     'aria-label': '최근 몇 곡을 참고할지',
-    onChange: () => saveAutoplay({ recentCount: Number(recentInput.value) || 0 }),
+    onChange: () => saveAutoplay({ recentCount: Number(input.value) || 0 }),
   });
-  setLock(recentInput, !editable, reason);
+  setLock(input, !autoplayEditable(), lockReason('autoplay'));
 
-  const genreBox = h('div', { class: 'lib__seg lib__seg--wrap', style: { padding: '0' } },
-    ...(autoplayState.genreOptions || []).map((option) => {
-      const on = autoplayState.genres.includes(option.key);
-      const button = h('button', {
-        class: 'seg', type: 'button', 'aria-pressed': String(on), dataset: { seg: option.key },
-        tip: `${option.label} 차트에서 곡을 골라 와요`,
-        onClick: () => {
-          const next = on
-            ? autoplayState.genres.filter((key) => key !== option.key)
-            : autoplayState.genres.concat(option.key);
-          saveAutoplay({ genres: next });
-        },
-      }, option.label);
-      return setLock(button, !editable, reason);
-    }));
+  const rows = recent.slice(0, 12).map((item, index) => {
+    const track = item.track || item;
+    const idle = limit > 0 && index >= limit;
+    const seedable = seedableTrack(track) && !have.has(trackKey(track));
+    const toSeed = seedable
+      ? setLock(bindAct(h('button', {
+        class: 'iconbtn', type: 'button',
+        tip: '📻 이 곡을 기준 곡으로 담아요', 'aria-label': '기준 곡으로 담기',
+      }, '📻'), () => addSeed(track)), !editable, reason)
+      : null;
+    const sub = [fmtAgo(item.playedUtc), item.artist || track.artist].filter(Boolean).join(' · ');
+    return apRow(track, sub, [toSeed], idle, `최근 ${limit}곡만 참고해서 이 곡은 지금 영향이 없어요`);
+  });
 
-  return h('div', { class: 'autoplay' },
-    segRow('무엇을 기준으로 고를까요', '자동 재생이 무엇을 기준으로 곡을 고를지 정해요',
-      AUTOPLAY_MODES, autoplayState.mode, (id) => saveAutoplay({ mode: id })),
-    autoplayState.mode === 'recent'
-      ? h('div', { class: 'autoplay__row' },
+  return apSection({
+    icon: '🕘', name: '최근 튼 곡',
+    used: !!basket.usesRecent,
+    count: `${recent.length}곡`,
+    action: apWipe('recent', '최근 재생 기록', recent.length,
+      '최근 재생 기록을 비울까요?\n추천만 초기화되고 통계와 차트는 그대로예요.'),
+    desc: '자동 재생이 이 목록에서 골라요. 한 곡씩 지우는 건 아직 서버가 못 해서, 대신 참고 범위를 조절해요.',
+    children: [
+      h('div', { class: 'autoplay__row' },
         h('div', { class: 'hint', tip: '0을 넣으면 최근에 튼 곡 전부를 참고해요' }, '최근 몇 곡을 참고할까요'),
-        h('div', { class: 'autoplay__num' }, recentInput,
-          h('span', { class: 'hint' }, fmtLimit(autoplayState.recentCount, '곡'))))
-      : null,
-    // 장르 목록이 비면 행을 통째로 숨기지 않는다 — `🎸 장르` 를 골랐는데 아무것도 안 나오면
-    // 고장인지 내가 뭘 잘못한 건지 알 수가 없다 (§23.3).
-    autoplayState.mode === 'genre'
-      ? h('div', { class: 'autoplay__row' },
-        h('div', { class: 'hint' }, '어떤 장르로 고를까요'),
-        (autoplayState.genreOptions || []).length
-          ? genreBox
-          : h('p', {
-            class: 'hint',
-            tip: '장르 차트가 준비되면 여기에 고를 수 있는 장르가 나와요',
-          }, '고를 수 있는 장르가 아직 없어요. 관리 콘솔에서 장르 차트를 켜면 여기에 나와요.'))
-      : null,
-    segRow('어떤 느낌으로 고를까요', '같은 기준에서도 얼마나 비슷한 곡을 집을지 정해요',
-      AUTOPLAY_POLICIES, autoplayState.policy, (id) => saveAutoplay({ policy: id })));
+        h('div', { class: 'autoplay__num' }, input,
+          h('span', { class: 'hint' }, fmtLimit(autoplayState.recentCount, '곡')))),
+      rows.length ? h('div', { class: 'ap__rows' }, ...rows) : h('p', { class: 'ap__note' }, '아직 튼 곡이 없어요.'),
+      recent.length > 12 ? h('p', { class: 'ap__note' }, `외 ${recent.length - 12}곡`) : null,
+    ],
+  });
+}
+
+function apGenreSection() {
+  if (!autoplayState) return null;
+  const editable = autoplayEditable();
+  const reason = lockReason('autoplay');
+  const options = autoplayState.genreOptions || [];
+  // 장르 목록이 비어도 칸을 통째로 숨기지 않는다 — `🎸 장르` 를 골랐는데 아무것도 안 나오면
+  // 고장인지 내가 뭘 잘못한 건지 알 수가 없다 (§23.3).
+  const box = options.length
+    ? h('div', { class: 'lib__seg lib__seg--wrap', style: { padding: '0' } },
+      ...options.map((option) => {
+        const on = autoplayState.genres.includes(option.key);
+        return setLock(bindAct(h('button', {
+          class: 'seg', type: 'button', 'aria-pressed': String(on), dataset: { seg: option.key },
+          tip: `${option.label} 차트에서 곡을 골라 와요`,
+        }, option.label), () => saveAutoplay({
+          genres: on
+            ? autoplayState.genres.filter((key) => key !== option.key)
+            : autoplayState.genres.concat(option.key),
+        })), !editable, reason);
+      }))
+    : h('p', {
+      class: 'ap__note', tip: '장르 차트가 준비되면 여기에 고를 수 있는 장르가 나와요',
+    }, '고를 수 있는 장르가 아직 없어요. 관리 콘솔에서 장르 차트를 켜면 여기에 나와요.');
+
+  return apSection({
+    icon: '🎸', name: '장르',
+    used: autoplayState.mode === 'genre',
+    count: `${autoplayState.genres.length}개`,
+    children: [box],
+  });
+}
+
+function apBlockedSection() {
+  const basket = autoplayState?.basket;
+  if (!basket) return null;
+  const blocked = Array.isArray(basket.blocked) ? basket.blocked : [];
+  const rows = blocked.slice(0, 12).map((item) => {
+    const track = item.track || item;
+    const title = item.title || track.title || item.cacheKey || '알 수 없는 곡';
+    return h('div', { class: 'aprow aprow--flat' },
+      h('div', { class: 'aprow__main' },
+        h('div', { class: 'aprow__title aprow__title--off' }, title),
+        h('div', { class: 'row__sub' }, item.reason || '자동 재생에서 빠져 있어요')));
+  });
+
+  return apSection({
+    icon: '🚫', name: '빼 둔 곡',
+    count: `${blocked.length}곡`,
+    action: apWipe('blocked', '빼 둔 곡', blocked.length,
+      '빼 둔 곡을 전부 풀까요?\n다시 추천에 나올 수 있어요.'),
+    desc: '`📻 이 곡 말고` 로 뺐거나 재생에 실패한 곡이에요. 한동안 다시 안 뽑아요.',
+    children: [
+      rows.length ? h('div', { class: 'ap__rows' }, ...rows) : h('p', { class: 'ap__note' }, '빼 둔 곡이 없어요.'),
+      blocked.length > 12 ? h('p', { class: 'ap__note' }, `외 ${blocked.length - 12}곡`) : null,
+    ],
+  });
+}
+
+/** 순서 바꾸기는 관리 콘솔에만 있던 `/autoplay/seeds/reorder` 를 그대로 쓴다. 새 API 를 만들지 않는다. */
+async function moveSeed(index, delta) {
+  const keys = (seedState?.seeds || []).map((seed) => String(seed.cacheKey));
+  const to = index + delta;
+  if (to < 0 || to >= keys.length) return;
+  const [moved] = keys.splice(index, 1);
+  keys.splice(to, 0, moved);
+  await call(() => api('/autoplay/seeds/reorder', { body: { cacheKeys: keys } }),
+    '기준 곡 순서를 바꿨어요.');
+  // 성공이든 실패든 서버가 가진 순서로 다시 맞춘다. 실패했는데 화면만 바뀐 채로 두면
+  // 다음 ↑↓ 가 엉뚱한 자리를 옮긴다.
+  loadSeeds();
 }
 
 function renderSeeds() {
@@ -3136,46 +3357,23 @@ function renderSeeds() {
 
   if (!seedState) { el.seedBox.hidden = true; return; }
   el.seedBox.hidden = false;
-  el.seedToggle.setAttribute('aria-expanded', String(seedOpen));
-  el.seedToggle.dataset.open = seedOpen ? '1' : '0';
-  el.seedCount.textContent = `${seedState.seeds.length} / ${fmtLimit(seedState.max, '곡')}`;
+
+  // 대기열 탭에 남는 것은 한 줄 요약뿐이다. "지금 무엇을 근거로 고르는지" 를 읽을 수 있으면
+  // 설정을 열지 않아도 되고, 이상하면 그때 눌러서 시트를 연다.
+  const mode = autoplayState ? autoplayModeMeta(autoplayState.mode) : null;
+  const policy = autoplayState ? autoplayPolicyMeta(autoplayState.policy) : null;
+  const seeds = seedState.seeds.length;
+  el.seedSummary.textContent = mode
+    ? `· ${mode[1]}${policy ? ` · ${policy[1]}` : ''}`
+    : '· 기준 곡';
+  el.seedCount.textContent = mode && mode[0] !== 'seed'
+    ? `기준 곡 ${seeds}곡`
+    : `${seeds} / ${fmtLimit(seedState.max, '곡')}`;
   el.seedCount.setAttribute('data-tip', seedState.max > 0
     ? `기준 곡은 ${seedState.max}곡까지 넣을 수 있어요`
     : '기준 곡은 몇 곡이든 넣을 수 있어요');
-  el.seedBody.hidden = !seedOpen;
-  if (!seedOpen) return;
 
-  clear(el.seedBody);
-  const controls = autoplayControls();
-  if (controls) el.seedBody.appendChild(controls);
-  const basket = basketPanel();
-  if (basket) el.seedBody.appendChild(basket);
-
-  if (!seedState.seeds.length) {
-    el.seedBody.appendChild(h('p', { class: 'hint' },
-      '기준 곡이 없어서 최근에 튼 곡을 참고해요. 곡 옆의 📻를 누르면 여기에 쌓여요.'));
-    return;
-  }
-  for (const seed of seedState.seeds) {
-    const track = seed.track || {};
-    const remove = seedState.canEdit
-      ? bindAct(h('button', {
-        class: 'iconbtn iconbtn--danger', type: 'button',
-        tip: '기준 곡에서 빼기', 'aria-label': '기준 곡에서 빼기',
-      }, '✕'), () => removeSeed(seed.cacheKey))
-      : null;
-    el.seedBody.appendChild(h('div', { class: 'seedrow', dataset: { mqRow: '1' } },
-      h('img', { class: 'row__art', src: artUrl(track) || '', alt: '', loading: 'lazy' }),
-      h('div', { class: 'row__main' },
-        mqText(trackTitle(track), 'row__title'),
-        h('div', { class: 'row__sub' }, [seed.addedByDisplayName, fmtAgo(seed.addedUtc)].filter(Boolean).join(' · '))),
-      remove));
-  }
-  el.seedBody.appendChild(h('p', { class: 'hint' },
-    seedState.max > 0
-      ? `기준 곡을 돌아가며 참고해서 다음 곡을 골라요. ${seedState.max}곡까지 넣을 수 있어요.`
-      : '기준 곡을 돌아가며 참고해서 다음 곡을 골라요. 개수 제한은 없어요.'));
-  marquee.scan(el.seedBody);
+  renderAutoplaySheet();
 }
 
 /** 대기열·검색 결과에 붙는 '기준으로 삼기'. 권한이 없으면 CSS가 통째로 숨긴다. */
@@ -3214,7 +3412,9 @@ function seedButton(track, wide) {
 async function addSeed(track) {
   if (!seedState) return;
   const result = await call(() => api('/autoplay/seeds', { body: { track } }), '자동 재생 기준 곡에 담았어요.');
-  if (result) { seedOpen = true; loadSeeds(); }
+  // 예전에는 여기서 접이식 상자를 펼쳤다. 지금은 시트가 따로 있으니 목록만 다시 받는다 —
+  // 시트가 열려 있으면 renderSeeds() 가 그 안까지 같이 고친다.
+  if (result) loadSeeds();
 }
 
 async function removeSeed(cacheKey) {
@@ -6195,13 +6395,20 @@ async function openMoreSheet() {
     h('button', {
       class: 'dd__item', type: 'button', tip: '내 기록을 봐요',
       onClick: () => handle?.close('modal:stats'),
-    }, h('span', null, '📊'), h('span', null, '내 기록')));
+    }, h('span', null, '📊'), h('span', null, '내 기록')),
+    // 자동 재생 설정은 대기열 위 막대에도 있지만, 좁은 화면에서는 대기열 탭까지 가야 보인다.
+    // 여기 한 줄을 더 두는 값이 그 왕복보다 싸다.
+    h('button', {
+      class: 'dd__item', type: 'button', tip: '자동 재생이 무엇을 근거로 고르는지 보고 바꿔요',
+      onClick: () => handle?.close('modal:autoplay'),
+    }, h('span', null, '📻'), h('span', null, '자동 재생')));
 
   handle = sheet({ title: '더 보기', body, dismissValue: null, actions: [] });
   const id = await handle.result;
   if (!id) return;
   if (id === 'modal:suggest') { openSuggestModal(); return; }
   if (id === 'modal:stats') { openStatsModal(null); return; }
+  if (id === 'modal:autoplay') { openAutoplaySheet(); return; }
   if (id.startsWith('rail:')) {
     document.body.dataset.pane = 'rail';
     setRailTab(id.slice(5));
@@ -7038,6 +7245,8 @@ function queueHeadMenu() {
   const manager = tierOf() !== 'member' && tierOf() !== 'viewer';
   return [
     { icon: '🔀', label: '정렬 방식 보기', onPick: openModeSheet },
+    // 대기열이 비면 여기서 나가는 곡을 자동 재생이 고른다. 그 설정으로 가는 길을 대기열 머리에도 둔다.
+    { icon: '📻', label: '자동 재생 설정', disabled: !seedState, reason: '이 서버는 아직 자동 재생 설정을 몰라요', onPick: openAutoplaySheet },
     { icon: '🧹', label: '대기열 비우기', danger: true, disabled: !manager || !can('queueEdit'), reason: lockReason('queueEdit'), onPick: clearQueue },
     { icon: '↻', label: '새로고침', onPick: () => { loadHot().catch(() => {}); toast('대기열을 다시 받아 왔어요.', 'ok'); } },
   ];

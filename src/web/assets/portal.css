@@ -630,46 +630,33 @@ body[data-dragging="tab"] { user-select: none; }
 }
 
 /* ── 자동 재생 기준 곡 ── */
-.seedbox {
+/* 대기열 탭에 남는 자동 재생 **요약 막대** 한 줄. 설정 알맹이는 시트(.ap)로 갔다 —
+ * 레일 폭(기본 320px) 안에 방식·정책·기준 곡·최근 곡·빼 둔 곡을 다 넣으려니
+ * 260px 짜리 속 스크롤에 칩 12개로 잘린 목록이 되어 어느 것도 제대로 안 보였다. */
+.seedbar {
   flex: none;
   margin: 0 var(--sp-3) var(--sp-2);
-  border: 1px solid var(--line-1);
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
 }
-.seedbox__head {
+.seedbar__btn {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
   width: 100%;
   padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
   color: var(--text-2);
   font-size: var(--fs-sm);
   text-align: left;
+  transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
 }
-.seedbox__head:hover { color: var(--text-1); }
-.seedbox__caret {
-  color: var(--text-4);
-  transition: transform var(--t-fast) var(--ease);
-}
-.seedbox__head[data-open="1"] .seedbox__caret { transform: rotate(90deg); }
-.seedbox__body {
-  display: grid;
-  gap: 2px;
-  max-height: 260px;
-  overflow-y: auto;
-  padding: 0 var(--sp-2) var(--sp-2);
-}
-.seedbox__body .hint { padding: var(--sp-2); }
-.seedrow {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: var(--sp-1) var(--sp-2);
-  border-radius: var(--r-sm);
-}
-.seedrow:hover { background: var(--surface-3); }
-.seedrow .row__art { width: 32px; height: 32px; }
+.seedbar__btn:hover { background: var(--surface-3); border-color: var(--line-2); color: var(--text-1); }
+.seedbar__icon, .seedbar__label, .seedbar__go { flex: none; }
+.seedbar__label { color: var(--text-1); font-weight: var(--fw-semi); }
+.seedbar__go { color: var(--text-4); }
+/* 요약 문구만 줄어든다. 곡 수 칩은 끝까지 읽혀야 해서 flex: none 인 chip 그대로 둔다. */
+.seedbar__sum { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 시드곡 API가 없거나 권한이 없으면 버튼 자체를 내보내지 않는다.
  * .vote / .iconbtn 이 뒤에서 display를 다시 잡으므로 특이도를 한 칸 올려 둔다. */
@@ -1124,47 +1111,87 @@ body[data-dragging="tab"] { user-select: none; }
 }
 
 /* 추천 바구니 (§8.7). 세 칸을 나란히 두고 각각 비운다. */
-.basket {
-  display: flex;
-  flex-direction: column;
+/* ── 자동 재생 시트 (§8.7) ──
+ *
+ * 시트 본문(.sheet__body)이 이미 자기 스크롤을 가진다. 여기 안에 또 overflow 상자를 두면
+ * .chat__log 때와 똑같은 사고가 난다 — 높이가 안 잡힌 스크롤 상자가 휠을 자기가 삼키고
+ * 부모로도 안 넘긴다. 그래서 이 아래에는 스크롤 상자를 **하나도** 만들지 않고,
+ * 긴 목록은 12줄에서 끊고 "외 N곡" 으로 알려 준다. */
+.ap { display: grid; gap: var(--sp-4); }
+.ap__sec {
+  display: grid;
   gap: var(--sp-2);
-  margin: var(--sp-3) 0;
   padding: var(--sp-3);
   border: 1px solid var(--line-1);
   border-radius: var(--r-md);
   background: var(--surface-2);
 }
-.basket__top { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
-.basket__title { font-weight: var(--fw-semi); color: var(--text-1); }
-.basket__shelf {
-  padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--line-1);
-  border-radius: var(--r-sm);
-  background: var(--surface-1);
-}
-/* 지금 방식이 안 보는 칸. 지우지 않고 흐리게만 둔다 — 없애 버리면
- * 방식을 바꿨을 때 어디서 나타나는지 알 수가 없다. */
-.basket__shelf--idle { opacity: 0.62; }
-.basket__head { display: flex; align-items: center; gap: var(--sp-2); }
-.basket__icon { flex: none; }
-.basket__name { font-weight: var(--fw-semi); color: var(--text-2); }
-.basket__count { color: var(--text-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
-.basket__detail, .basket__idle { margin-top: var(--sp-1); color: var(--text-3); font-size: var(--fs-xs); }
-.basket__chips { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-top: var(--sp-2); }
-.basket__chip {
-  max-width: 220px;
+/* 지금 방식이 참고하지 않는 칸. 지우지 않고 흐리게만 둔다 — 없애 버리면
+ * 방식을 바꿨을 때 그게 어디서 나타나는지 알 수가 없다. */
+.ap__sec--idle { opacity: 0.62; }
+.ap__head { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.ap__icon { flex: none; }
+.ap__title { font-size: var(--fs-md); color: var(--text-1); }
+.ap__count { color: var(--text-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.ap__note { color: var(--text-3); font-size: var(--fs-xs); line-height: var(--lh-base); }
+.ap__note--idle { color: var(--text-4); }
+.ap__rows { display: grid; gap: 2px; }
+.ap__pick { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-1); }
+.ap__chip {
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   padding: 2px var(--sp-2);
   border: 1px solid var(--line-1);
   border-radius: var(--r-full);
-  background: var(--surface-2);
+  background: var(--surface-1);
   color: var(--text-2);
   font-size: var(--fs-xs);
 }
-.basket__chip--off { color: var(--text-4); text-decoration: line-through; }
-.basket__more { align-self: center; color: var(--text-4); font-size: var(--fs-xs); }
+.ap__chip:hover { background: var(--accent-soft); border-color: var(--accent-line); color: var(--text-1); }
+
+.aprow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
+}
+.aprow:hover { background: var(--surface-3); }
+/* 설정한 개수를 벗어나 지금은 추천에 영향이 없는 줄 */
+.aprow--idle { opacity: 0.5; }
+.aprow--flat { background: none; }
+.aprow__no {
+  flex: none;
+  min-width: 18px;
+  color: var(--text-4);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.aprow__art { width: 32px; height: 32px; }
+.aprow__main { flex: 1; min-width: 0; }
+.aprow__title {
+  color: var(--text-1);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.aprow__title--off { color: var(--text-3); text-decoration: line-through; }
+/* 목록 행의 .row__acts 는 hover 로만 나타난다. 시트 안에서는 그러면 안 된다 —
+ * 터치 화면에는 hover 가 없어서 ✕ 를 영영 못 찾는다. */
+.aprow__acts { display: flex; align-items: center; gap: 2px; flex: none; }
+
+/* 좁은 화면에서는 여백만 줄인다. 기능은 그대로다 — 화면 크기별로 다른 앱을 만들지 않는다. */
+@media (max-width: 560px) {
+  .ap { gap: var(--sp-3); }
+  .ap__sec { padding: var(--sp-2); }
+  .aprow__art { width: 28px; height: 28px; }
+}
 
 /* 싱크 보정. 볼륨 칩과 같은 줄에 서지만 슬라이더가 아니라 ± 버튼이라 폭이 훨씬 작다. */
 .sync {
@@ -2538,7 +2565,6 @@ body.gate {
 [data-on="1"] .sw--sm i { transform: translateX(11px); }
 
 /* ── 자동 재생 설정 (§8.7) ── */
-.autoplay { display: grid; gap: var(--sp-3); padding: var(--sp-2); }
 .autoplay__row { display: grid; gap: var(--sp-1); }
 .autoplay__num { display: flex; align-items: center; gap: var(--sp-2); }
 .field--num { width: 84px; }
