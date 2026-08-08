@@ -121,6 +121,9 @@ async fn main() {
         std::process::exit(2);
     }
 
+    // botsettings.json 보다 먼저 읽는다 — 로그·웹 호스트·OAuth 가 전부 환경변수를 본다.
+    let env_file = config::load_env_file();
+
     let mut config = match config::Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -146,6 +149,10 @@ async fn main() {
         "Bot",
         &format!("Starting mc-musicbot (build {}).", app.build_id),
     );
+    if let Some(path) = env_file {
+        app.log
+            .info("Bot", &format!("환경변수 파일을 읽었습니다: {}", path.display()));
+    }
 
     // 우리가 관리하는 yt-dlp 를 백그라운드로 주기 자동 업데이트 (설정으로 끌 수 있음).
     media::tools::spawn_auto_update(app.clone());

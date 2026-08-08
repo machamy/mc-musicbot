@@ -69,6 +69,19 @@ fn candidate_paths(file_name: &str) -> Vec<PathBuf> {
     v
 }
 
+/// `.env` 를 찾아 환경변수로 올린다. 찾는 자리는 `botsettings.json` 과 같다
+/// (exe 폴더 → exe/../bot → exe 상위 → cwd). 파일이 없으면 조용히 넘어간다 — `.env` 는 선택이다.
+///
+/// **이미 설정된 변수는 덮지 않는다.** `START-MK2.cmd` → `bot\remote.env.cmd` 로 이어지는
+/// 기존 우선순위를 지켜야 해서다. 프로세스 환경이 `.env` 파일을 이긴다.
+///
+/// 읽은 파일 경로를 돌려준다. 호출부가 로그에 남겨 "왜 이 값이 먹었는지"를 추적할 수 있게.
+pub fn load_env_file() -> Option<PathBuf> {
+    candidate_paths(".env")
+        .into_iter()
+        .find(|path| path.is_file() && dotenvy::from_path(path).is_ok())
+}
+
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> T {
     match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),

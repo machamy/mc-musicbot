@@ -8,6 +8,7 @@ license-file = "LICENSE"
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
 chrono = { version = "0.4.45", features = ["serde"] }
+dotenvy = "0.15.7"
 rand = "0.10.1"
 regex = "1.12.4"
 # yt-dlp 자동 다운로드용 HTTP 클라이언트 (serenity 가 이미 reqwest+rustls 를 끌어옴).

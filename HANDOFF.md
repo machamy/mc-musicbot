@@ -221,6 +221,9 @@ ssh $remote "powershell -NoProfile -Command \"Start-ScheduledTask -TaskName 'Mus
 - 웹 비밀번호 해시: `data\web-auth.hash`
 
 비밀값은 아니지만 **배포마다 다른 값**도 저장소에 박지 않는다. 전부 환경변수다.
+`.env.sample` 이 전체 목록이고, `config::load_env_file()` 이 `botsettings.json` 과 같은
+후보 경로에서 `.env` 를 찾아 올린다. **이미 설정된 변수는 덮지 않으므로**
+`START-MK2.cmd` → `bot\remote.env.cmd` 우선순위는 그대로다.
 
 | 환경변수 | 어디에 | 없으면 |
 |---|---|---|

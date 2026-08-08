@@ -167,6 +167,20 @@ MUSICBOT_REMOTE_HOST=music.example.com      # 웹 리모컨. Discord 로그인�
 
 이걸 주면 리모컨 도메인에서는 `/music/*`와 `/healthz` 외의 모든 경로가 404가 됩니다. **주지 않으면 분리가 꺼져서 한 호스트에서 관리자 화면까지 전부 열립니다** — 리모컨을 외부에 공개할 거라면 반드시 설정하세요.
 
+### 9) 환경변수와 `.env`
+
+Discord OAuth, 공개 주소, 호스트 분리처럼 **설치마다 달라지는 값**은 전부 환경변수입니다. `.env.sample`을 복사해 쓰면 됩니다.
+
+```bash
+cp .env.sample .env      # Windows: copy .env.sample .env
+```
+
+봇은 `botsettings.json`과 같은 자리에서 `.env`를 찾습니다(exe 폴더 → `exe/../bot` → exe 상위 → 현재 폴더). 없으면 그냥 넘어갑니다.
+
+**이미 설정된 환경변수는 `.env`가 덮지 않습니다.** 포터블 배포는 `START-MK2.cmd`가 `bot\remote.env.cmd`를 먼저 읽으므로 그쪽이 이깁니다. `.env`는 직접 빌드해서 돌릴 때 쓰세요. 어느 파일이 읽혔는지는 기동 로그의 `환경변수 파일을 읽었습니다:` 줄로 확인합니다.
+
+> 봇 토큰은 `.env`가 아니라 `botsettings.json`의 `token` 필드입니다.
+
 ---
 
 ## 슬래시 명령
