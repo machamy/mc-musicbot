@@ -6817,7 +6817,12 @@ async fn api_autoplay_put(
     // 안 그러면 다음 곡이 시작될 때까지 바뀐 게 먹었는지 확인할 방법이 없다.
     // 이미 잡혀 있던 후보를 차단하지는 않는다 — 사용자가 싫다고 한 게 아니라 규칙이 바뀐 것뿐이다.
     if recompute {
-        crate::player::side_effects::refresh_preview(state.app.clone(), guild_id).await;
+        // 여기도 기다리면 안 된다 — 추천은 yt-dlp 를 타서 10~20초씩 걸리고, 그동안 이 응답이
+        // 안 나가 화면은 저장이 멈춘 것처럼 보인다. 다시 뽑히면 WS 로 따로 알려 준다.
+        let app = state.app.clone();
+        tokio::spawn(async move {
+            crate::player::side_effects::refresh_preview(app, guild_id).await;
+        });
     }
     broadcast_autoplay(&state, guild_id);
     emit_bare(&state, guild_id, "settings");
@@ -7933,7 +7938,14 @@ async fn admin_settings_put(
         || settings.autoplay_recent_decay_hours != ctx.settings.autoplay_recent_decay_hours
         || settings.autoplay_genres != ctx.settings.autoplay_genres
     {
-        crate::player::side_effects::refresh_preview(state.app.clone(), guild_id).await;
+        // **기다리지 않는다.** `refresh_preview` 는 `resolve_preview` 를 통해 yt-dlp 추천을
+        // 통째로 돌린다. 그걸 요청 안에서 await 하면 저장 응답이 추천이 끝날 때까지 안 나가고,
+        // 추천은 직렬화돼 있어 10~20초씩 걸린다. 화면에서는 저장 버튼이 영영 도는 것으로 보인다
+        // (실제로는 바로 위에서 이미 저장이 끝났는데도). 곡 시작 훅과 같은 방식으로 떼어 던진다.
+        let app = state.app.clone();
+        tokio::spawn(async move {
+            crate::player::side_effects::refresh_preview(app, guild_id).await;
+        });
     }
     // 아래 refresh_scored_order 가 캐시된 모드를 읽으므로 반드시 그 전에 맞춘다.
     state.app.player.set_sort_mode(guild_id, settings.sort_mode);
