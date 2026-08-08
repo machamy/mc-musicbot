@@ -7074,8 +7074,8 @@ let devHistory = [];
 let devHistoryAt = -1;
 
 /** `get` 이 완성해 주는 경로. 실제로 열려 있는 GET 라우트만 적는다 (remote.rs 기준).
- *  쓰기 경로(`/control`, `*/action`, `*/remove` …)는 넣지 않는다 — Tab 한 번에 서버 상태가
- *  바뀌면 안 된다. `api()` 가 body 를 주면 POST 로 바꾸므로 여기 것들은 전부 읽기다. */
+ *  쓰기 경로(`/control`, `/queue/action`, `/autoplay/seeds/remove` 같은 것)는 넣지 않는다 —
+ *  Tab 한 번에 서버 상태가 바뀌면 안 된다. 여기 것들은 전부 읽기 전용이다. */
 const DEV_GET_PATHS = [
   '/state', '/state/hot', '/state/cold', '/queue', '/settings', '/public',
   '/charts', '/autoplay', '/autoplay/seeds', '/library', '/lyrics', '/search',
