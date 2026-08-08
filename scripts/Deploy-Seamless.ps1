@@ -34,7 +34,8 @@ $ErrorActionPreference = 'Stop'
 # 인앱 패치노트(§30)도 이 파일을 그대로 읽으므로 화면에서도 빈칸이 된다.
 if (-not (Test-Path $ChangelogPath)) { throw "패치노트 파일이 없어요: $ChangelogPath" }
 $changelog = [IO.File]::ReadAllText((Resolve-Path $ChangelogPath), [Text.Encoding]::UTF8)
-if ($changelog -notmatch [Regex]::Escape("## $Version")) {
+# 줄 단위로 본다. 부분 문자열로 찾으면 `## v4.30` 만 있어도 `v4.3` 배포가 통과한다.
+if ($changelog -notmatch "(?m)^##\s+$([Regex]::Escape($Version))(\s|$)") {
     throw @"
 패치노트에 '## $Version' 항목이 없어요.
 docs/CHANGELOG.md 맨 위에 이 버전 항목을 먼저 쓰고 다시 실행하세요.
@@ -93,19 +94,34 @@ while ((Get-Date) -lt `$deadline -and (Get-Process mc-musicbot -ErrorAction Sile
 if (`$left) { `$left | Stop-Process -Force; Start-Sleep -Milliseconds 400 }
 
 # **`Move-Item -Force` 만으로는 부족하다.** 방금 죽인 프로세스가 exe 핸들을 잠깐 더 쥐고 있어
-# `파일이 이미 있으므로 만들 수 없습니다` 로 실패한다(실측). 먼저 지우고, 몇 번 기다려 준다.
+# `파일이 이미 있으므로 만들 수 없습니다` 로 실패한다(실측).
+#
+# 그렇다고 **지우고 나서 옮기면 안 된다.** 지운 뒤 이동이 끝까지 실패하면 옛 exe 까지
+# 사라져서 되돌아갈 곳이 없어진다. 그래서 지우는 대신 **옆으로 치워 두고**,
+# 실패하면 치워 둔 것을 제자리에 돌려놓는다.
+`$prev = "`$exe.prev"
+if (Test-Path `$prev) { Remove-Item `$prev -Force -ErrorAction SilentlyContinue }
 `$moved = `$false
 foreach (`$try in 1..10) {
     try {
-        if (Test-Path `$exe) { Remove-Item `$exe -Force }
+        if (Test-Path `$exe) { Move-Item -Path `$exe -Destination `$prev -Force }
         Move-Item -Path `$next -Destination `$exe -Force
         `$moved = `$true
         break
     } catch {
+        # 옛 것을 이미 치웠는데 새 것을 못 놨으면 그대로 되돌린다.
+        if ((Test-Path `$prev) -and -not (Test-Path `$exe)) {
+            try { Move-Item -Path `$prev -Destination `$exe -Force } catch {}
+        }
         Start-Sleep -Milliseconds 300
     }
 }
-if (-not `$moved) { throw '새 exe 로 교체하지 못했어요. 옛 빌드가 그대로예요.' }
+if (-not `$moved) {
+    if ((Test-Path `$prev) -and -not (Test-Path `$exe)) { Move-Item -Path `$prev -Destination `$exe -Force }
+    throw '새 exe 로 교체하지 못했어요. 옛 빌드를 그대로 되돌렸어요.'
+}
+# 교체가 끝나야 옛 것을 버린다. 여기까지 왔으면 되돌릴 일이 없다.
+Remove-Item `$prev -Force -ErrorAction SilentlyContinue
 [IO.File]::WriteAllText((Join-Path `$root 'BUILD_ID.txt'), '$BuildId', (New-Object Text.UTF8Encoding(`$false)))
 Start-ScheduledTask -TaskName '$TaskName'
 

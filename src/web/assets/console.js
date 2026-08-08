@@ -266,6 +266,18 @@ const NUM_SPECS = {
     label: '참고할 최근 곡 수', min: 1, max: 20, step: 1, unit: '곡',
     desc: '"최근 튼 곡" 방식일 때 최근 몇 곡 중에서 기준을 고를지예요. 적어도 한 곡은 봐야 기준을 뽑을 수 있어서 무제한이 없어요.',
   },
+  webSyncOffsetMs: {
+    label: '전역 싱크 보정', min: -5000, max: 5000, step: 50, unit: 'ms',
+    desc: '디스코드가 웹보다 늘 일정하게 늦거나 빠를 때 여기서 한 번에 맞춰요. 양수는 웹을 늦춰요.',
+  },
+  skipLeadMs: {
+    label: '스킵 여유', min: 0, max: 5000, step: 100, unit: 'ms',
+    desc: '스킵·되감기 때 몇 ms 뒤를 시작 시각으로 잡을지예요. 0이면 "지금부터"인데, 그 말이 사람마다 다른 시각에 도착해서 각자 다른 지점에서 시작해요.',
+  },
+  seekLockoutMs: {
+    label: '진행바 잠금 구간', min: 0, max: 10000, step: 500, unit: 'ms',
+    desc: '곡이 끝나기 이만큼 전부터는 위치를 못 옮겨요. 옮긴 게 반영되기 전에 다음 곡으로 넘어가면 웹만 옛 곡에 남아요.',
+  },
   autoplayArtistCooldown: {
     // **0 은 "무제한"이 아니라 "끔"이다.** 이 값은 *막을 곡 수*라 0이면 아무도 안 막는다
     // (`autoplay.rs` 의 decay_factor 주석과 같은 이야기). 무제한이라고 적어 두면
@@ -307,6 +319,8 @@ const SECTION_KEYS = {
     'autoplayMode', 'autoplayRecentCount', 'autoplayGenres',
     'autoplayPolicy', 'autoplayArtistCooldown', 'autoplayRecentDecayHours', 'autoplaySeedMax',
     'chartSuperWeight', 'chartLimit',
+    // 재생 동작 (§31 · §36)
+    'requireVoiceForPlayback', 'publicNowPlaying', 'webSyncOffsetMs', 'skipLeadMs', 'seekLockoutMs',
   ],
   perms:  PERM_FIELDS.map((field) => field.key).concat(['ruleRoleIds', 'managerRoleIds']),
   limits: ['minVolume', 'maxVolume', 'maxQueuePerUser', 'maxQueuePerGuild', 'maxTrackSeconds', 'bulkEnqueueLimit', 'auditRetentionDays', 'chatRetentionDays'],
@@ -804,6 +818,7 @@ function sectionOrder() {
     voteSkipGroup(),
     superLikeGroup(),
     playbackGroup(),
+    syncGroup(),
     autoplayGroup(),
     chartsGroup(),
     clearQueueGroup(),
@@ -900,6 +915,31 @@ function playbackGroup() {
       REPEAT_MODES.find((item) => item.value === S.draft.repeatMode)?.desc || null,
       segmentControl('repeatMode', REPEAT_MODES)),
     numberField('defaultVolume', { min: Number(S.draft.minVolume), max: Number(S.draft.maxVolume) }),
+    // 봇이 음성에 없을 때 조작을 받을지 (§36).
+    fieldShell('requireVoiceForPlayback', '봇이 음성 채널에 있어야만 조작',
+      '켜 두면 봇이 음성에 없을 때 재생·스킵이 거절돼요. 눌러도 아무 일이 안 나는 상태를 막아요. ' +
+      '끄면 조작을 미리 받아 두고 봇이 들어오는 순간부터 이어 가요.',
+      toggleControl('requireVoiceForPlayback', '없으면 거절해요', '미리 받아 둬요')),
+    // 로그인 없이 지금 곡 보기 (§29).
+    fieldShell('publicNowPlaying', '로그인 없이 지금 곡 보기',
+      '켜면 로그인하지 않은 사람도 지금 무슨 곡인지 볼 수 있어요. ' +
+      '곡 제목과 가수만 나가고 신청한 사람·채팅·멤버는 안 나가요.',
+      toggleControl('publicNowPlaying', '누구나 곡만 볼 수 있어요', '로그인해야 보여요')),
+  );
+}
+
+/* ── 재생 싱크 (§31) ──
+ * 값이 세 개뿐이지만 화면에 없으면 **존재하지 않는 설정**이 된다.
+ * 실제로 저장 핸들러만 만들어 두고 화면에 안 올려서 켜고 끌 방법이 없었다. */
+function syncGroup() {
+  return h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '⏱ 재생 싱크'),
+    h('p', { class: 'grp__desc' },
+      '디스코드 소리와 웹에서 듣기가 어긋날 때 맞춰요. 여기 값은 서버 전체에 적용되고, ' +
+      '사람마다 남는 차이는 각자 리모컨에서 다듬어요.'),
+    numberField('webSyncOffsetMs'),
+    numberField('skipLeadMs'),
+    numberField('seekLockoutMs'),
   );
 }
 

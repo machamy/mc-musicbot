@@ -306,6 +306,12 @@ pub async fn resolve_preview(app: Arc<App>, guild_id: u64) {
                 "Autoplay",
                 &format!("AutoplayPreview 채움 guild={guild_id} title={title}"),
             );
+            // **정해졌으면 알린다** (§38). 전에는 저장만 하고 끝이라, 웹은 다음에 무슨 곡이
+            // 올지 알면서도 새로고침해야 보였다. 이 훅이 `queue.set` 을 다시 쏘고
+            // 그 프레임에 `next` 가 실려 나간다.
+            if let Some(hook) = app.on_queue_sorted.get() {
+                hook(guild_id);
+            }
         } else {
             app.log.info(
                 "Autoplay",

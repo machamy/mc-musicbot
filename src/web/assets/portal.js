@@ -7793,10 +7793,24 @@ async function loadHot() {
     presence: data.presence || store.get().presence,
     hotAt: Date.now(),
   });
+  // 서버가 정한 일정 (§31). 진입·재연결 직후부터 정확히 맞아야 한다.
+  store.patch({
+    schedule: {
+      startedUtc: data.startedUtc ?? null,
+      nextStartUtc: data.nextStartUtc ?? null,
+      skipLeadMs: Number(data.skipLeadMs) || 0,
+      seekLockoutMs: Number(data.seekLockoutMs) || 0,
+      webSyncOffsetMs: Number(data.webSyncOffsetMs) || 0,
+    },
+  });
   clock.sync({
     positionSeconds: data.positionSeconds,
     sampledAtUtc: data.sampledAtUtc,
+    startedUtc: data.startedUtc,
     isPaused: data.player?.isPaused,
+    // **진입 로드에서도 멈춤 여부를 넘긴다** (§36). 이게 없으면 새로고침 직후에는
+    // 봇이 음성에 없어도 진행바가 다시 흐르기 시작한다.
+    stopped: data.player?.voiceConnected === false || !data.current,
     durationSeconds: data.current?.durationSeconds ?? trackSeconds(data.current?.track),
   });
 }

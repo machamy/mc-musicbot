@@ -773,10 +773,16 @@ pub fn router() -> Router<Arc<WebState>> {
             put(admin_settings_put),
         )
         .route("/music/api/guilds/{guild_id}/admin/roles", get(admin_roles))
-        // 특정 역할로 보기 (§37) — 관리자 이상. Discord 의 "역할로 보기"와 같은 목적이다.
+        // 인원수 미리보기 — "이 규칙이면 지금 몇 명이 통과하나".
         .route(
             "/music/api/guilds/{guild_id}/admin/preview",
             get(admin_permission_preview),
+        )
+        // 특정 역할로 보기 (§37) — 관리자 이상. Discord 의 "역할로 보기"와 같은 목적이다.
+        // **위 `preview` 와 다른 화면이다.** 저쪽은 인원수, 이쪽은 "그 사람에게 뭐가 열리나".
+        .route(
+            "/music/api/guilds/{guild_id}/admin/roleview",
+            get(admin_role_view),
         )
         .route(
             "/music/api/guilds/{guild_id}/admin/queue-preview",
@@ -1284,9 +1290,10 @@ async fn refresh_session_guilds(
     // 같은 사람이 없는 서버를 계속 두드려도 조회는 이 간격으로만 나간다.
     {
         let mut seen = state.guild_refresh_at.lock().unwrap();
-        if let Some(at) = seen.get(&session.user_id)
-            && at.elapsed() < GUILD_REFRESH_INTERVAL
-        {
+        // 넣을 때 지난 것도 같이 걷어낸다. 안 그러면 사람 수만큼 프로세스 수명 내내 쌓인다
+        // (`oauth_states` 가 쓰는 방식과 같다).
+        seen.retain(|_, at| at.elapsed() < GUILD_REFRESH_INTERVAL);
+        if seen.contains_key(&session.user_id) {
             return false;
         }
         seen.insert(session.user_id, Instant::now());
@@ -2127,8 +2134,12 @@ fn ensure_guild_watcher(state: &Arc<WebState>, guild_id: u64) {
                 .map(|value| value.as_secs_f64())
                 .unwrap_or(0.0);
             let sampled_at = now_utc();
+            // **음성 연결 여부도 변화로 센다** (§36). 이게 없으면 곡이 그대로인 채로
+            // 봇만 음성에서 빠졌을 때 아무 프레임도 안 나가고, 화면은 계속 재생 중으로 남는다.
+            // 다음 추천곡도 마찬가지다 — 대기열 ID 는 그대로라 `next` 만 바뀐 경우를 놓친다.
+            let voice_connected = bot_voice_status(&state, guild_id).in_voice();
             let signature = format!(
-                "{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}",
                 player
                     .current_item
                     .as_ref()
@@ -2137,6 +2148,12 @@ fn ensure_guild_watcher(state: &Arc<WebState>, guild_id: u64) {
                 player.is_paused,
                 player.effective_volume,
                 player.repeat_mode.as_str(),
+                voice_connected,
+                player
+                    .autoplay_preview
+                    .as_ref()
+                    .map(|item| item.id.as_str())
+                    .unwrap_or(""),
                 player
                     .upcoming
                     .iter()
@@ -3604,9 +3621,8 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
         ("sortMode", "정렬 모드 변경", PermissionRule::Administrator, true, "sortMode"),
         ("blacklist", "차단 목록 관리", PermissionRule::Administrator, true, "blacklist"),
         ("console", "서버 관리 콘솔", PermissionRule::Administrator, true, "console"),
-        // 화면이 `can('ops')` 로 물어보는데 이 줄이 없어서 **늘 false** 였다.
-        // 그래서 봇 주인에게도 운영 패널 링크가 영영 안 보였다. 봇 주인 전용이다.
-        ("ops", "봇 운영 패널", PermissionRule::Administrator, true, "ops"),
+        // `ops` 는 여기 넣지 않는다. 아래에 봇 주인 전용 항목이 따로 있고,
+        // 둘 다 넣으면 같은 권한이 응답에 두 번 실린다(규칙 설명도 서로 다르게).
     ];
 
     // "누가 되는지"는 서버가 센다 (V3 §23.3). 클라이언트가 역할과 인원을 다시 세면
@@ -3617,12 +3633,7 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
     let mut entries: Vec<Value> = Vec::with_capacity(rows.len() + 1);
     for (key, label, rule, gate, role_key) in rows {
         let base = rule_base_allowed(role_key, rule, settings, member);
-        // 운영 패널은 **봇 주인 전용**이다. 서버 관리자가 남의 봇 운영 화면을 볼 이유가 없다.
-        let allowed = if key == "ops" {
-            ctx.tier.is_owner()
-        } else {
-            !viewer && gate && permission_allowed(role_key, rule, settings, member)
-        };
+        let allowed = !viewer && gate && permission_allowed(role_key, rule, settings, member);
         let via_admin = allowed && !base;
         let role_names_for_rule = if rule == PermissionRule::ConfiguredRole {
             role_names(state, ctx.guild_id(), settings.roles_for(role_key))
@@ -7404,6 +7415,14 @@ async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value 
         // ── V3 §15.2b · §18.2 ──
         "chartSuperWeight": settings.chart_super_weight,
         "bulkEnqueueLimit": settings.bulk_enqueue_limit,
+        // ── 재생 동작 (§31 · §36) ──
+        // **읽어올 수 있어야 켜고 끌 수 있다.** 저장 핸들러만 만들어 두고 스냅샷에 안 실어서
+        // 화면에서는 존재하지도 않는 설정이 됐던 자리다.
+        "requireVoiceForPlayback": settings.require_voice_for_playback,
+        "publicNowPlaying": settings.public_now_playing,
+        "skipLeadMs": settings.skip_lead_ms,
+        "seekLockoutMs": settings.seek_lockout_ms,
+        "webSyncOffsetMs": settings.web_sync_offset_ms,
         // 화면이 `∞` 칸을 그리려면 어떤 항목이 무제한을 받는지 알아야 한다 (§23.1).
         "unlimitedKeys": UNLIMITED_KEYS,
     });
