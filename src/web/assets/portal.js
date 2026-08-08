@@ -7073,15 +7073,48 @@ let consoleOpen = false;
 let devHistory = [];
 let devHistoryAt = -1;
 
+/** `get` 이 완성해 주는 경로. 실제로 열려 있는 GET 라우트만 적는다 (remote.rs 기준).
+ *  쓰기 경로(`/control`, `*/action`, `*/remove` …)는 넣지 않는다 — Tab 한 번에 서버 상태가
+ *  바뀌면 안 된다. `api()` 가 body 를 주면 POST 로 바꾸므로 여기 것들은 전부 읽기다. */
+const DEV_GET_PATHS = [
+  '/state', '/state/hot', '/state/cold', '/queue', '/settings', '/public',
+  '/charts', '/autoplay', '/autoplay/seeds', '/library', '/lyrics', '/search',
+  '/audit', '/stats/me', '/chat', '/mention-candidates',
+  '/admin/settings', '/admin/roles', '/admin/roleview', '/admin/audit',
+  '/admin/diagnostics', '/admin/participants', '/admin/reports',
+  '/admin/suggestions', '/admin/suspensions', '/admin/blacklist',
+  '/admin/queue-preview', '/admin/preview', '/admin/permission-preview',
+];
+
+/** 점으로 이어진 상태 경로를 한 칸씩 완성한다. `player.` 까지 쳤으면 그 아래 키를 준다. */
+function completeStatePath(prefix) {
+  const state = store.get();
+  const cut = String(prefix || '').lastIndexOf('.');
+  const base = cut < 0 ? '' : prefix.slice(0, cut);
+  const node = base
+    ? base.split('.').reduce((acc, key) => (acc == null ? acc : acc[key]), state)
+    : state;
+  if (node == null || typeof node !== 'object') return [];
+  return Object.keys(node).map((key) => (base ? `${base}.${key}` : key));
+}
+
 const DEV_COMMANDS = {
-  help: { args: '', desc: '명령 목록을 보여줘요', run: () => Object.entries(DEV_COMMANDS)
-    .map(([name, spec]) => `${name}${spec.args ? ' ' + spec.args : ''}\n    ${spec.desc}`).join('\n') },
+  help: { args: '[명령]', desc: '명령 목록을 보여줘요',
+    run: (arg) => {
+      const spec = arg && DEV_COMMANDS[arg];
+      if (spec) return `${arg}${spec.args ? ' ' + spec.args : ''}\n    ${spec.desc}`;
+      if (arg) return `모르는 명령이에요. ${Object.keys(DEV_COMMANDS).join(', ')}`;
+      return Object.entries(DEV_COMMANDS)
+        .map(([name, s]) => `${name}${s.args ? ' ' + s.args : ''}\n    ${s.desc}`).join('\n');
+    },
+    complete: () => Object.keys(DEV_COMMANDS) },
   state: { args: '[키]', desc: '지금 상태를 찍어요. 키를 주면 그 부분만',
     run: (arg) => {
       const state = store.get();
       const value = arg ? arg.split('.').reduce((acc, k) => (acc == null ? acc : acc[k]), state) : Object.keys(state);
       return JSON.stringify(value, null, 2);
-    } },
+    },
+    complete: completeStatePath },
   now: { args: '', desc: '재생 중인 곡과 위치',
     run: () => {
       const s = store.get();
@@ -7124,7 +7157,8 @@ const DEV_COMMANDS = {
     run: async (arg) => {
       if (!arg) return '경로를 주세요. 예: get /state/hot';
       return JSON.stringify(await api(arg), null, 2);
-    } },
+    },
+    complete: () => DEV_GET_PATHS },
   clearlog: { args: '', desc: '콘솔 화면을 비워요', run: () => ' clear' },
 };
 
@@ -7136,7 +7170,9 @@ function devComplete(line) {
   const spec = DEV_COMMANDS[parts[0]];
   if (!spec || !spec.complete) return [];
   const prefix = parts[parts.length - 1];
-  return spec.complete().filter((value) => value.startsWith(prefix))
+  // **후보를 만들 때 지금 입력값을 넘긴다.** `state player.` 처럼 앞부분이 정해져야
+  // 다음 후보를 알 수 있는 명령이 있다. 인자를 안 받는 옛 `complete` 는 그냥 무시한다.
+  return spec.complete(prefix).filter((value) => value.startsWith(prefix))
     .map((value) => [...parts.slice(0, -1), value].join(' '));
 }
 
