@@ -1073,6 +1073,10 @@ function merge(type, data, handlers) {
         shuffleEnabled: data.shuffleEnabled ?? state.player?.shuffleEnabled,
         voiceChannelId: data.voiceChannelId ?? state.player?.voiceChannelId,
         botOnline: data.botOnline ?? state.player?.botOnline,
+        // 서버는 `playback_payload` 에 이 값을 담아 보내는데 여기서 안 읽고 있었다.
+        // 그래서 자동 재생을 켜고 꺼도 화면의 📻/🚫 가 영영 그대로였다 —
+        // 다른 이유로 전체 재조회가 일어날 때만 우연히 맞았다.
+        autoplayEnabled: data.autoplayEnabled ?? state.player?.autoplayEnabled,
       });
       const patch = { player };
       if (data.current !== undefined) patch.current = data.current;

@@ -3548,9 +3548,12 @@ function createQueueItem(item) {
   const p = node.__parts;
   node.append(p.rank, p.art, h('div', { class: 'qitem__main' }, p.title, p.who, p.score), p.acts);
 
-  p.like = bindAct(h('button', { class: 'vote', type: 'button', tip: '좋아요' }), () => vote(node.dataset.id, 'like'));
-  p.superLike = bindAct(h('button', { class: 'vote', type: 'button', tip: '슈퍼 좋아요' }), () => vote(node.dataset.id, 'superLike'));
-  p.dislike = bindAct(h('button', { class: 'vote vote--down', type: 'button', tip: '싫어요' }), () => vote(node.dataset.id, 'dislike'));
+  // 투표 3종은 `vote--primary` 로 키운다. 점수로 순서가 정해지는 대기열에서 **투표가 주된 행동**인데
+  // 보관·핀·빼기 같은 보조 버튼과 같은 크기라 눈에 안 들어왔다. 보조 버튼은 그대로 둔다 —
+  // 다 키우면 줄 높이가 두 배가 되고 한 화면에 들어가는 곡이 반으로 준다.
+  p.like = bindAct(h('button', { class: 'vote vote--primary', type: 'button', tip: '좋아요' }), () => vote(node.dataset.id, 'like'));
+  p.superLike = bindAct(h('button', { class: 'vote vote--primary', type: 'button', tip: '슈퍼 좋아요' }), () => vote(node.dataset.id, 'superLike'));
+  p.dislike = bindAct(h('button', { class: 'vote vote--primary vote--down', type: 'button', tip: '싫어요' }), () => vote(node.dataset.id, 'dislike'));
   p.save = bindAct(h('button', { class: 'vote', type: 'button', tip: '보관함에 담기', 'aria-label': '보관함에 담기' }, '🔖'),
     () => toggleSaved(node.__item.track, true));
   p.seed = bindAct(h('button', {
@@ -4216,9 +4219,17 @@ function buildStage() {
     class: 'pbtn', type: 'button', tip: '자동 재생 켜기/끄기', 'aria-label': '자동 재생',
   }, '📻'), async () => {
     const on = autoplayIsOn(store.get().player);
-    // **서버 응답을 기다렸다 알린다.** 먼저 띄우면 권한이 없어 거절당해도
-    // "켰어요" 가 뜨고 버튼은 그대로라, 눌렀는데 아무 일도 안 난 것처럼 보인다.
-    await control('autoplay', on ? 0 : 1);
+    /* 화면을 먼저 뒤집고 서버에 보낸다. WS 로 확인이 오기 전까지 버튼이 옛 상태로 남아 있으면
+     * "눌렀는데 아무 일도 안 난다" 로 보이기 때문이다.
+     *
+     * 다만 **먼저 알리지는 않는다.** 권한이 없어 거절당해도 "켰어요" 가 떠 버린다.
+     * 실패하면 화면을 원래대로 되돌린다 — 서버가 진실이고 화면은 앞당겨 보여 줄 뿐이다. */
+    const rollback = () => store.patch({
+      player: Object.assign({}, store.get().player, { autoplayEnabled: on }),
+    });
+    store.patch({ player: Object.assign({}, store.get().player, { autoplayEnabled: !on }) });
+    const result = await control('autoplay', on ? 0 : 1);
+    if (result === null) { rollback(); return; }
     toast(on ? '자동 재생을 껐어요. 대기열이 비면 조용해져요.' : '자동 재생을 켰어요. 대기열이 비면 알아서 골라 와요.', 'ok');
   });
 
@@ -4421,9 +4432,11 @@ async function rerollAutoplay() {
   if (result) refetchHot();
 }
 
+/** 서버 응답을 그대로 돌려준다. 실패면 `call()` 이 토스트를 띄우고 `null` 을 준다 —
+ *  화면을 미리 바꿔 둔 호출부가 그걸 보고 되돌릴 수 있어야 한다. */
 async function control(action, value, extra) {
   const state = store.get();
-  await call(() => api('/control', {
+  return call(() => api('/control', {
     body: Object.assign({ action, value: value ?? null, expectedItemId: state.current?.id || null }, extra),
   }));
 }

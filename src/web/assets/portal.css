@@ -768,6 +768,35 @@ body[data-dragging="tab"] { user-select: none; }
   font-variant-numeric: tabular-nums;
   transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
 }
+
+/* ── 투표 버튼은 다른 액션과 무게가 다르다 ──
+ *
+ * 점수로 대기열 순서가 정해지는 제품에서 **투표가 주된 행동**인데, 보관·핀·빼기 같은
+ * 보조 버튼과 똑같이 24px `fs-xs` 라 존재감이 없었다. 재생 컨트롤(`.pbtn` 38px)과
+ * 견줄 만큼 키우되, 줄 높이가 무너지지 않게 32px 로 둔다(대기열은 한 화면에 여러 곡이
+ * 보여야 하는 목록이다). 테두리를 줘서 "누르는 것" 임을 분명히 한다. */
+.vote--primary {
+  height: 32px;
+  padding: 0 var(--sp-3);
+  gap: var(--sp-1);
+  border: 1px solid var(--line-2);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+}
+.vote--primary:hover { background: var(--surface-4); color: var(--text-1); }
+.vote--primary:active { transform: scale(0.94); }
+/* 내가 누른 것은 한눈에. 예전에는 눌렀는지 안 눌렀는지가 미묘한 색차뿐이었다. */
+.vote--primary[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+.vote--primary.vote--down[aria-pressed="true"] {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
+}
 .vote:hover { background: var(--surface-4); color: var(--text-1); }
 .vote[aria-pressed="true"] { background: var(--accent); color: var(--text-on-accent); }
 .vote--danger:hover { background: var(--danger-soft); color: var(--danger); }
