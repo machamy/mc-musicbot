@@ -7525,6 +7525,10 @@ function dailyChart(daily) {
  */
 
 let chartView = { level: 'categories', category: null, chart: null, period: 'month' };
+/* 차트 한 장을 받는 데 yt-dlp 가 도느라 몇 초씩 걸린다. 그동안 사람은 뒤로 가거나 다른 차트를
+ * 누른다. 응답이 그때 도착해서 그대로 그리면 **보고 있던 화면을 남의 결과가 덮는다.**
+ * 요청마다 번호를 매기고, 돌아왔을 때 내가 아직 최신 요청인지 확인한다. */
+let chartLoadSeq = 0;
 
 function buildChartsPane() {
   el.chartBack = h('button', {
@@ -7585,6 +7589,9 @@ function hideChartsTab() {
 }
 
 function chartBack() {
+  // 진행 중인 차트 로드를 무효로 만든다. 이게 없으면 뒤로 간 뒤에 도착한 응답이
+  // 목록 화면 위에 곡을 그려 버린다 (번호를 안 올리면 `token === chartLoadSeq` 라 통과한다).
+  chartLoadSeq += 1;
   if (chartView.level === 'tracks') chartView = { ...chartView, level: 'charts', chart: null };
   else chartView = { ...chartView, level: 'categories', category: null };
   renderCharts();
@@ -7647,6 +7654,7 @@ function renderCharts() {
 async function openChart(chart, keepLevel) {
   // 이전 차트의 줄이 남아 있으면 로드에 실패했을 때 남의 숫자가 그려진다.
   chartView = { ...chartView, level: 'tracks', chart, rows: null, tracks: [] };
+  const token = ++chartLoadSeq;
   if (!keepLevel) pushChartHistory();
   renderCharts();
   clear(el.chartBody).appendChild(skeletonRows(6));      // yt-dlp가 도는 몇 초 동안 빈 화면이면 고장으로 보인다
@@ -7656,12 +7664,16 @@ async function openChart(chart, keepLevel) {
     const value = encodeURIComponent(chartView.period);
     const query = chartView.category === 'ours' ? `?window=${value}&period=${value}` : '';
     const data = await api(`/charts/${encodeURIComponent(chart.id)}${query}`);
+    // 기다리는 사이에 뒤로 갔거나 다른 차트를 눌렀으면 여기서 끝낸다.
+    if (token !== chartLoadSeq) return;
     // 우리 차트는 통계가 붙은 `rows` 와 맨 트랙 배열 `tracks` 를 둘 다 준다.
     // `tracks` 만 읽으면 §15.2b 가 요구한 숫자·계산식이 하나도 안 나온다 (그냥 곡 목록이 된다).
     chartView.rows = Array.isArray(data?.rows) ? data.rows : null;
     chartView.tracks = data?.tracks || [];
     chartView.fetchedUtc = data?.fetchedUtc || null;
   } catch (error) {
+    // 실패 화면도 마찬가지다 — 늦게 온 실패가 지금 보고 있는 차트를 지우면 안 된다.
+    if (token !== chartLoadSeq) return;
     clear(el.chartBody).appendChild(emptyState('📈', '이 차트를 못 가져왔어요', error.message));
     return;
   }

@@ -1008,6 +1008,21 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
 }
 
 /* 특정 역할로 보기 (§37). */
+/* 셸은 `tokens.css` 다음에 화면별 CSS 를 **하나만** 링크한다. 콘솔은 portal.css 를 안 받으므로
+ * 거기 있는 `.chipbtn` 을 그대로 쓸 수 없다 — 역할 칩이 아무 모양 없이 나오던 이유가 이것이다.
+ * 색은 전부 토큰이라 두 벌이어도 테마가 갈라지지 않는다. */
+.chipbtn {
+  height: 24px; padding: 0 var(--sp-2);
+  border-radius: var(--r-full);
+  border: 1px solid var(--line-2);
+  background: transparent;
+  color: var(--text-4);
+  font-size: var(--fs-xs);
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.chipbtn:hover { color: var(--text-2); border-color: var(--line-3); }
+.chipbtn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent); }
+
 .roleview__pick { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin: var(--sp-2) 0; }
 .roleview__grid { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-2); }
 .roleview__row {

@@ -9308,14 +9308,14 @@ impl Drop for ChartFetchGuard {
 pub fn spawn_chart_prefetch(state: &Arc<WebState>) {
     let state = state.clone();
     tokio::spawn(async move {
-        // 재생 중이면 건너뛴다. 사람이 듣고 있을 때 백그라운드가 자원을 다투면 안 된다.
+        // 재생 중이면 건너뛴다. 사람이 듣고 있을 때 백그라운드가 yt-dlp 를 다투면 안 된다.
         if !state.app.coordinator.active_guild_ids().await.is_empty() {
             return;
         }
-        // 보고 있는 사람이 있어도 미룬다 — 그 사람이 곧 무언가를 누를 참이다.
-        if !state.presence.lock().unwrap().is_empty() {
-            return;
-        }
+        // **화면을 열어 둔 사람이 있다는 이유로는 미루지 않는다.**
+        // 예전엔 여기서도 건너뛰었는데, 리모컨을 켜 두는 게 정상 사용이라 프리페치가 사실상
+        // 영영 안 돌았다("차트가 늘 비어 있다"). 한 tick 에 한 장이고 재생 중에는 어차피
+        // 건너뛰므로, 사람이 검색할 때 밀릴 위험은 차트가 늘 식어 있는 것보다 작다.
 
         let guild_ids = state.app.db.list_known_guild_ids();
         for guild_id in guild_ids {

@@ -4940,9 +4940,10 @@ mod tests {
         cleanup(store, path);
     }
 
-    /// 캐시는 6시간짜리고, 실패는 숨기지 않고 그대로 남는다 (§15.1 · §15.2).
+    /// 캐시는 TTL 이 지나면 낡은 것이 되고, 실패는 숨기지 않고 그대로 남는다 (§15.1 · §15.2).
+    /// **시간을 상수에서 끌어온다** — 예전엔 6시간이 테스트에 박혀 있어서 TTL 을 늘리자 깨졌다.
     #[test]
-    fn chart_cache_expires_after_six_hours_and_records_failures() {
+    fn chart_cache_goes_stale_after_the_ttl_and_records_failures() {
         let (store, path) = temp_store("chart-cache");
         let chart_id = store
             .add_chart(1, ChartCategory::Genre, "우리 장르", "YouTube", "ytsearch10:테스트")
@@ -4957,12 +4958,14 @@ mod tests {
         assert!(!snapshot.stale, "방금 받은 캐시가 낡았다고 나온다");
         assert_eq!(store.get_chart(1, chart_id).unwrap().track_count, 2);
 
-        // 6시간을 넘기면 낡은 것으로 보되 내용은 그대로 준다 — 빈 화면보다 낫다.
+        // TTL 을 넘기면 낡은 것으로 보되 내용은 그대로 준다 — 빈 화면보다 낫다.
         {
             let conn = store.conn.lock().unwrap();
             conn.execute(
                 "UPDATE remote_chart_cache SET fetched_utc = ?1",
-                params![(chrono::Utc::now() - chrono::Duration::hours(7)).to_rfc3339()],
+                params![(chrono::Utc::now()
+                    - chrono::Duration::hours(crate::remote::models::CHART_CACHE_TTL_HOURS + 1))
+                .to_rfc3339()],
             )
             .unwrap();
         }
