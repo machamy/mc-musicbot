@@ -3323,8 +3323,13 @@ function apBlockedSection() {
   const editable = autoplayEditable();
   const reason = lockReason('autoplay');
   const rows = blocked.slice(0, 12).map((item) => {
-    const track = item.track || item;
-    const title = item.title || track.title || item.cacheKey || '알 수 없는 곡';
+    const track = item.track || null;
+    /* **코드를 제목처럼 보여주지 않는다.** 서버가 트랙을 못 찾으면 `track` 이 없다
+     * (v20 이전에 빼 뒀고 그 뒤로 한 번도 안 튼 곡은 어디에도 흔적이 없다).
+     * 예전에는 그럴 때 `youtube:dQw4w9WgXcQ` 를 제목 자리에 그대로 박아서, 사용자에게는
+     * 곡 이름이 코드로 나오는 것으로 보였다. 모르면 모른다고 말하는 편이 낫다. */
+    const known = item.title || track?.title;
+    const title = known || '제목을 못 찾은 곡';
     // 한 곡만 풀기. 전부 풀기는 옆에 그대로 두되, 하나만 되돌리고 싶을 때가 더 흔하다.
     const free = item.cacheKey
       ? setLock(bindAct(h('button', {
@@ -3332,10 +3337,16 @@ function apBlockedSection() {
         tip: '이 곡만 다시 추천에 나오게 해요', 'aria-label': '이 곡만 풀기',
       }, '↩'), () => unblockCandidate(String(item.cacheKey))), !editable, reason)
       : null;
+    // 왜 빠졌는지가 먼저다. 제목을 못 찾은 줄에는 그 사정을 덧붙인다 —
+    // 아무 설명 없이 "제목을 못 찾은 곡" 만 있으면 고장으로 보인다.
+    const why = item.reason || '자동 재생에서 빠져 있어요';
+    const sub = known
+      ? [why, track?.artist].filter(Boolean).join(' · ')
+      : `${why} · 오래돼서 곡 정보가 안 남아 있어요`;
     return h('div', { class: 'aprow aprow--flat' },
       h('div', { class: 'aprow__main' },
         h('div', { class: 'aprow__title aprow__title--off' }, title),
-        h('div', { class: 'row__sub' }, item.reason || '자동 재생에서 빠져 있어요')),
+        h('div', { class: 'row__sub' }, sub)),
       free ? h('div', { class: 'aprow__acts' }, free) : null);
   });
 

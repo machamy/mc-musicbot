@@ -6657,11 +6657,15 @@ fn autoplay_basket(
         .remote
         .list_blocked_autoplay(guild_id)
         .into_iter()
-        .map(|(cache_key, reason, until)| {
+        .map(|(cache_key, reason, until, track)| {
             json!({
                 "cacheKey": cache_key,
                 "reason": reason.unwrap_or_else(|| "이 곡 말고를 눌렀어요".into()),
                 "untilUtc": until,
+                // v20 부터 트랙을 같이 저장한다. 그 전에 빼 둔 곡은 백필로 채우는데,
+                // 어디에도 흔적이 없으면 끝내 `null` 이다 — 화면이 그 사정을 말해야 한다.
+                "track": track.as_ref().map(track_json),
+                "title": track.as_ref().and_then(|t| t.title.clone()),
             })
         })
         .collect();

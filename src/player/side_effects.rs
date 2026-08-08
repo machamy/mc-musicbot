@@ -404,10 +404,9 @@ pub async fn reject_preview(app: Arc<App>, guild_id: u64, reason: &str) -> bool 
     let Some(preview) = app.player.take_preview(guild_id) else {
         return false;
     };
-    let cache_key = preview.track.cache_key();
     let _ = app
         .remote
-        .block_autoplay_candidate(guild_id, &cache_key, Some(reason));
+        .block_autoplay_candidate(guild_id, &preview.track, Some(reason));
     app.log.info(
         "Autoplay",
         &format!(

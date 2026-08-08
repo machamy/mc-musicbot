@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -2627,20 +2627,28 @@ impl RemoteStore {
     // ───────── 자동재생 차단 후보 (§8.5-3) ─────────
 
     /// `📻 이 곡 말고`로 뺀 곡과 재생에 실패한 곡을 7일간 기억한다.
+    /// 후보 하나를 한동안 안 뽑게 막는다.
+    ///
+    /// **트랙을 통째로 같이 남긴다.** 예전에는 `cache_key` 만 저장해서, 화면이 빼 둔 곡을
+    /// `youtube:dQw4w9WgXcQ` 같은 코드로 보여 줄 수밖에 없었다. 호출부가 어차피 트랙을
+    /// 들고 있으니 여기서 받아 두면 나중에 어디서도 다시 찾을 필요가 없다.
     pub fn block_autoplay_candidate(
         &self,
         guild_id: u64,
-        cache_key: &str,
+        track: &TrackRef,
         reason: Option<&str>,
     ) -> rusqlite::Result<()> {
+        let cache_key = track.cache_key();
+        let track_json = serde_json::to_string(track).unwrap_or_default();
         let conn = self.conn.lock().unwrap();
         let until = (Utc::now() + ChronoDuration::days(AUTOPLAY_BLOCK_DAYS)).to_rfc3339();
         conn.execute(
-            r#"INSERT INTO remote_autoplay_blocked(guild_id, cache_key, until_utc, reason, created_utc)
-               VALUES(?1, ?2, ?3, ?4, ?5)
+            r#"INSERT INTO remote_autoplay_blocked(guild_id, cache_key, until_utc, reason, created_utc, track_json)
+               VALUES(?1, ?2, ?3, ?4, ?5, ?6)
                ON CONFLICT(guild_id, cache_key) DO UPDATE SET
-                 until_utc = excluded.until_utc, reason = excluded.reason"#,
-            params![guild_id as i64, cache_key, until, reason, Self::now_iso()],
+                 until_utc = excluded.until_utc, reason = excluded.reason,
+                 track_json = excluded.track_json"#,
+            params![guild_id as i64, cache_key, until, reason, Self::now_iso(), track_json],
         )?;
         Ok(())
     }
@@ -2737,7 +2745,14 @@ impl RemoteStore {
 
     /// 지금 막혀 있는 후보들. 화면이 "무엇이 왜 빠져 있는지" 를 보여줄 때 쓴다.
     /// 만료된 것은 [`Self::blocked_autoplay_keys`] 처럼 지나는 길에 치운다.
-    pub fn list_blocked_autoplay(&self, guild_id: u64) -> Vec<(String, Option<String>, String)> {
+    /// 아직 살아 있는 차단 목록. `(cache_key, reason, until_utc, track)`.
+    ///
+    /// `track` 은 v20 이전에 쌓인 줄이나 백필로도 못 찾은 줄에서 `None` 이다.
+    /// 그때 화면이 코드를 그대로 보여 주면 안 된다 — 호출부가 그 사정을 말해 줘야 한다.
+    pub fn list_blocked_autoplay(
+        &self,
+        guild_id: u64,
+    ) -> Vec<(String, Option<String>, String, Option<TrackRef>)> {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
             r#"DELETE FROM remote_autoplay_blocked
@@ -2745,7 +2760,7 @@ impl RemoteStore {
             params![guild_id as i64],
         );
         let mut statement = match conn.prepare(
-            r#"SELECT cache_key, reason, until_utc FROM remote_autoplay_blocked
+            r#"SELECT cache_key, reason, until_utc, track_json FROM remote_autoplay_blocked
                WHERE guild_id = ?1 ORDER BY created_utc DESC LIMIT 100"#,
         ) {
             Ok(statement) => statement,
@@ -2753,7 +2768,11 @@ impl RemoteStore {
         };
         statement
             .query_map(params![guild_id as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                let raw: Option<String> = row.get(3)?;
+                let track = raw
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<TrackRef>(json).ok());
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, track))
             })
             .map(|rows| rows.flatten().collect())
             .unwrap_or_default()
@@ -3503,6 +3522,15 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             17 => migrate_v17_grandfather_guilds(&tx)?,
             // 장르에 J-POP 계열이 통째로 없었다. 새 차트를 기존 DB 에도 심는다.
             18 => seed_builtin_charts(&tx)?,
+            // 빼 둔 곡이 화면에 `youtube:dQw4w9WgXcQ` 같은 코드로만 나왔다. 이 표만
+            // `cache_key` 하나로 살고 있어서 제목을 줄 방법이 아예 없었다
+            // (이웃인 `remote_autoplay_seeds`·`remote_recent_tracks` 는 `track_json` 을 갖고 있다).
+            19 => {
+                add_column(&tx, "remote_autoplay_blocked", "track_json", "TEXT")?;
+                // **이미 쌓인 줄이 문제의 전부다.** 컬럼만 붙이면 지금 빼 둔 곡들은
+                // 그대로 코드로 남는다. 같은 길드의 이웃 표에서 찾아 채운다.
+                backfill_blocked_tracks(&tx)?;
+            }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -3530,6 +3558,67 @@ fn seed_builtin_charts(conn: &Connection) -> rusqlite::Result<()> {
                 now_order + index as i64
             ],
         )?;
+    }
+    Ok(())
+}
+
+/// v19 이전에 빼 둔 곡에 제목을 채운다.
+///
+/// `remote_autoplay_blocked` 는 `cache_key` 만 들고 있었다. 같은 `cache_key` 로 트랙 정보를
+/// 갖고 있는 표가 둘 있다 — 기준 곡과 최근 재생. **길드까지 같은 줄만** 본다(캐시 키는 곡
+/// 식별자라 서버가 달라도 겹치는데, 남의 서버 데이터를 끌어다 쓸 이유가 없다).
+///
+/// 못 찾는 줄이 남는 것은 정상이다. 오래 전에 빼 두고 그 뒤로 한 번도 안 튼 곡은 어디에도
+/// 흔적이 없다. 그때는 화면이 코드 대신 "제목을 못 찾았어요" 라고 말한다.
+fn backfill_blocked_tracks(conn: &Connection) -> rusqlite::Result<()> {
+    // 1) 기준 곡은 `cache_key` 를 컬럼으로 갖고 있어 SQL 만으로 맞출 수 있다.
+    conn.execute(
+        r#"UPDATE remote_autoplay_blocked
+           SET track_json = (
+               SELECT s.track_json FROM remote_autoplay_seeds s
+               WHERE s.guild_id = remote_autoplay_blocked.guild_id
+                 AND s.cache_key = remote_autoplay_blocked.cache_key
+               LIMIT 1)
+           WHERE track_json IS NULL
+             AND EXISTS (
+               SELECT 1 FROM remote_autoplay_seeds s
+               WHERE s.guild_id = remote_autoplay_blocked.guild_id
+                 AND s.cache_key = remote_autoplay_blocked.cache_key)"#,
+        [],
+    )?;
+
+    // 2) 최근 재생에는 `cache_key` 컬럼이 없다(트랙 JSON 만 있다). 키는 파생값이라
+    //    SQL 로는 못 만든다 — 여기서 계산해서 맞춘다.
+    let still_missing: Vec<(i64, String)> = {
+        let mut statement = conn.prepare(
+            "SELECT guild_id, cache_key FROM remote_autoplay_blocked WHERE track_json IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.flatten().collect()
+    };
+    if still_missing.is_empty() {
+        return Ok(());
+    }
+    for (guild_id, cache_key) in still_missing {
+        let candidates: Vec<String> = {
+            let mut statement = conn.prepare(
+                "SELECT track_json FROM remote_recent_tracks WHERE guild_id = ?1 ORDER BY id DESC",
+            )?;
+            let rows = statement.query_map(params![guild_id], |row| row.get::<_, String>(0))?;
+            rows.flatten().collect()
+        };
+        let found = candidates.into_iter().find(|json| {
+            serde_json::from_str::<TrackRef>(json)
+                .map(|track| track.cache_key() == cache_key)
+                .unwrap_or(false)
+        });
+        if let Some(track_json) = found {
+            conn.execute(
+                "UPDATE remote_autoplay_blocked SET track_json = ?3
+                 WHERE guild_id = ?1 AND cache_key = ?2",
+                params![guild_id, cache_key, track_json],
+            )?;
+        }
     }
     Ok(())
 }
@@ -4934,7 +5023,7 @@ mod tests {
         let (store, path) = temp_store("blocked");
         let track = test_track("싫은곡");
         store
-            .block_autoplay_candidate(1, &track.cache_key(), Some("이 곡 말고"))
+            .block_autoplay_candidate(1, &track, Some("이 곡 말고"))
             .unwrap();
         assert!(store.blocked_autoplay_keys(1).contains(&track.cache_key()));
         // 길드끼리 섞이지 않는다.
@@ -4952,7 +5041,7 @@ mod tests {
         assert!(store.blocked_autoplay_keys(1).is_empty());
 
         store
-            .block_autoplay_candidate(1, &track.cache_key(), None)
+            .block_autoplay_candidate(1, &track, None)
             .unwrap();
         assert!(store.unblock_autoplay_candidate(1, &track.cache_key()).unwrap());
         assert!(!store.unblock_autoplay_candidate(1, "없는키").unwrap());
@@ -4961,6 +5050,86 @@ mod tests {
 
     /// 이력 감쇠·아티스트 쿨다운이 쓸 입력을 한 번의 조회로 만든다 (§8.5-1·2).
     #[test]
+    /// 빼 둔 곡은 **제목이 같이 남아야** 한다 (§8.7).
+    ///
+    /// 예전에는 `cache_key` 만 저장해서 화면이 `youtube:xxx` 를 제목 자리에 그렸다.
+    /// 이제 차단할 때 트랙을 통째로 남긴다.
+    #[test]
+    fn blocking_keeps_the_track_so_the_screen_can_name_it() {
+        let (store, path) = temp_store("blocked-title");
+        let track = test_track("빼둘곡");
+        store.block_autoplay_candidate(1, &track, Some("이 곡 말고")).unwrap();
+
+        let rows = store.list_blocked_autoplay(1);
+        assert_eq!(rows.len(), 1);
+        let (key, reason, _until, saved) = &rows[0];
+        assert_eq!(key, &track.cache_key());
+        assert_eq!(reason.as_deref(), Some("이 곡 말고"));
+        assert_eq!(
+            saved.as_ref().and_then(|t| t.title.clone()),
+            track.title.clone(),
+            "차단 시점에 제목이 같이 남아야 한다"
+        );
+        cleanup(store, path);
+    }
+
+    /// v20 이전에 쌓인 줄은 트랙이 없다. **이미 빼 둔 곡이 문제의 전부**라
+    /// 컬럼만 붙이고 끝내면 화면은 그대로 코드를 보여 준다. 이웃 표에서 찾아 채운다.
+    #[test]
+    fn old_blocked_rows_get_their_titles_back_from_neighbours() {
+        let (store, path) = temp_store("blocked-backfill");
+        let from_seed = test_track("기준곡에있던곡");
+        let from_recent = test_track("최근에튼곡");
+        let orphan = test_track("어디에도없는곡");
+
+        // 이웃 표에 흔적을 만든다.
+        store
+            .add_autoplay_seed(1, &from_seed, 10)
+            .expect("기준 곡 추가");
+        let mut item = QueueItem::new_user(from_recent.clone(), "민수".into(), Some(10));
+        item.id = "recent".into();
+        store.record_recent(1, &item, "completed").unwrap();
+
+        // v20 이전 상태를 흉내낸다 — 트랙 없이 키만 있는 줄.
+        {
+            let conn = store.conn.lock().unwrap();
+            for track in [&from_seed, &from_recent, &orphan] {
+                conn.execute(
+                    "INSERT INTO remote_autoplay_blocked(guild_id, cache_key, until_utc, reason, created_utc, track_json)
+                     VALUES(1, ?1, ?2, NULL, ?3, NULL)",
+                    params![
+                        track.cache_key(),
+                        (Utc::now() + ChronoDuration::days(3)).to_rfc3339(),
+                        RemoteStore::now_iso()
+                    ],
+                )
+                .unwrap();
+            }
+            backfill_blocked_tracks(&conn).unwrap();
+        }
+
+        let found: std::collections::HashMap<String, Option<String>> = store
+            .list_blocked_autoplay(1)
+            .into_iter()
+            .map(|(key, _, _, track)| (key, track.and_then(|t| t.title)))
+            .collect();
+        assert_eq!(
+            found.get(&from_seed.cache_key()).cloned().flatten().as_deref(),
+            Some("기준곡에있던곡"),
+            "기준 곡에서 제목을 찾아야 한다"
+        );
+        assert_eq!(
+            found.get(&from_recent.cache_key()).cloned().flatten().as_deref(),
+            Some("최근에튼곡"),
+            "최근 재생에서도 찾아야 한다 (cache_key 컬럼이 없어 계산으로 맞춘다)"
+        );
+        assert!(
+            found.get(&orphan.cache_key()).cloned().flatten().is_none(),
+            "흔적이 없으면 못 찾는 게 맞다 — 화면이 그 사정을 말한다"
+        );
+        cleanup(store, path);
+    }
+
     /// 최근 재생은 **한 줄씩** 지워야 한다 (§8.7).
     ///
     /// 같은 곡을 여러 번 틀면 같은 `cache_key` 로 여러 줄이 쌓인다. 키로 지우면
