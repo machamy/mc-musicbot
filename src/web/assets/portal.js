@@ -3334,7 +3334,12 @@ function createQueueItem(item) {
       });
       if (ok) call(() => api('/queue/action', { body: { action: 'remove', itemId: node.dataset.id } }), '대기열에서 뺐어요.');
     });
-  p.acts.append(p.like, p.superLike, p.dislike, p.save, p.seed, p.pin, p.remove);
+  // 원본 링크 (§34). 버튼이 아니라 링크라서 새 탭·복사 같은 브라우저 기능이 그대로 먹는다.
+  p.link = h('a', {
+    class: 'vote vote--link', target: '_blank', rel: 'noreferrer noopener',
+    tip: '원본에서 열기', 'aria-label': '원본에서 열기',
+  }, '↗');
+  p.acts.append(p.like, p.superLike, p.dislike, p.save, p.link, p.seed, p.pin, p.remove);
 
   // 우클릭 / 롱프레스 — 곡 하나에 할 수 있는 걸 전부 한자리에 (§24.1)
   bindContextTarget(node, () => trackMenu(node.__item.track, {
@@ -3357,6 +3362,11 @@ function updateQueueItem(node, item, index, rounds) {
   p.rank.textContent = String(index + 1);
   const art = artUrl(item.track);
   if (p.art.getAttribute('src') !== art) p.art.setAttribute('src', art);
+
+  // 원본 링크 (§34). 주소를 모르면 숨긴다 — 눌러도 아무 데도 안 가는 버튼이 제일 나쁘다.
+  const rowUrl = trackUrl(item.track);
+  p.link.hidden = !rowUrl;
+  if (rowUrl) p.link.href = rowUrl;
 
   const titleInner = p.title.firstElementChild;
   const title = trackTitle(item.track);
@@ -3928,6 +3938,12 @@ function buildStage() {
   el.nowArt = h('img', { class: 'now__art', alt: '', loading: 'eager', src: ART_PLACEHOLDER });
   el.nowEyebrow = h('div', { class: 'now__eyebrow' });
   el.nowTitle = mqText('', 'now__title');
+  // 원본 열기 (§34). 우클릭 메뉴에만 있으면 모바일에서는 사실상 없는 기능이다.
+  // 제목 옆에 조용히 붙여 두고, 주소를 모르는 곡에서는 아예 숨긴다.
+  el.nowLink = h('a', {
+    class: 'now__link', target: '_blank', rel: 'noreferrer noopener', hidden: true,
+    tip: '원본에서 열기', 'aria-label': '원본에서 열기',
+  }, '↗');
   el.nowBy = h('div', { class: 'now__by' });
   el.viz = h('canvas', { class: 'viz', 'aria-hidden': 'true' });
 
@@ -4013,7 +4029,7 @@ function buildStage() {
     h('div', { class: 'now__artwrap' }, el.nowArt),
     h('div', { class: 'now__side' },
       el.nowEyebrow,
-      el.nowTitle,
+      h('div', { class: 'now__titlerow' }, el.nowTitle, el.nowLink),
       el.nowBy,
       el.nowVoters,
       el.viz,
@@ -4787,6 +4803,10 @@ function renderNow(state) {
       player.isPaused ? '일시정지' : '재생 중');
     const title = trackTitle(current.track);
     if (el.nowTitle.firstElementChild.textContent !== title) el.nowTitle.firstElementChild.textContent = title;
+    // 원본 링크 (§34). 주소를 모르는 곡에서는 숨긴다 — 눌러도 아무 데도 안 가는 버튼이 제일 나쁘다.
+    const nowUrl = trackUrl(current.track);
+    el.nowLink.hidden = !nowUrl;
+    if (nowUrl) el.nowLink.href = nowUrl;
     put(clear(el.nowBy),
       current.track?.artist ? h('span', null, current.track.artist) : null,
       current.track?.artist ? h('span', { class: 'row__sub' }, '·') : null,
@@ -6783,6 +6803,12 @@ function bindContextTarget(node, build) {
   let timer = 0;
   let startX = 0;
   let startY = 0;
+  // iOS 사파리는 길게 누르면 **글자 선택 말풍선**을 먼저 띄워서 메뉴를 덮는다.
+  // 여기 붙는 요소는 어차피 조작 대상이라 글자를 끌어 선택할 일이 없다.
+  node.style.webkitUserSelect = 'none';
+  node.style.userSelect = 'none';
+  node.style.webkitTouchCallout = 'none';
+
   node.addEventListener('pointerdown', (event) => {
     if (event.pointerType !== 'touch') return;
     startX = event.clientX;
@@ -6794,6 +6820,8 @@ function bindContextTarget(node, build) {
       // 롱프레스는 조상 타이머도 같이 돌고 있다. 안쪽이 이겼다는 표시를 남겨 조상이 덮어쓰지 않게 한다.
       if (event.__mmLongPressTaken) return;
       event.__mmLongPressTaken = true;
+      // 눌린 게 먹혔다는 신호. 손가락은 커서가 없어서 이게 없으면 메뉴가 갑자기 튀어나온 것처럼 느껴진다.
+      try { navigator.vibrate?.(12); } catch { /* 지원 안 하면 그만 */ }
       openContextMenu(items, { x: startX, y: startY });
     }, 500);
   }, { passive: true });
@@ -6880,6 +6908,9 @@ function trackMenu(track, opts = {}) {
 function trackUrl(track) {
   if (!track) return '';
   if (track.url) return track.url;
+  // 서버가 주는 정식 주소. **이걸 안 보면 사운드클라우드는 영영 빈 값**이다 —
+  // 그쪽은 ID 로 주소를 만들 수 없어서 sourceUrl 말고는 알 방법이 없다.
+  if (track.sourceUrl && /^https?:\/\//.test(track.sourceUrl)) return track.sourceUrl;
   const provider = String(track.provider || '');
   if (provider.startsWith('YouTube') && track.contentId) return `https://www.youtube.com/watch?v=${encodeURIComponent(track.contentId)}`;
   return '';
@@ -6996,7 +7027,166 @@ function backgroundMenu() {
       icon: '·', label: def.label, onPick: () => setLayout(id),
     })) },
     { icon: '📊', label: '내 기록', onPick: () => openStatsModal(null) },
+    // 개발자 콘솔 (§33). 기본은 숨김이라 여기서만 켠다.
+    {
+      icon: '⌨',
+      label: consoleOpen ? '개발자 콘솔 닫기' : '개발자 콘솔 열기',
+      onPick: () => toggleDevConsole(),
+    },
   ];
+}
+
+/* ═══════════════════════ 개발자 콘솔 (§33) ═══════════════════════
+ *
+ * 화면을 다 만들어 두고도 "이 값이 지금 뭐지"를 확인하려면 개발자 도구를 열어야 했다.
+ * 여기서 상태를 바로 찍어 보고 명령도 날린다. **기본은 숨김**이고 빈 배경 우클릭으로만 연다.
+ *
+ * 명령은 한 곳(`DEV_COMMANDS`)에만 적는다. 자동완성·도움말·실행이 전부 이 표를 읽으므로
+ * 명령을 추가하면 Tab 완성과 `help` 가 저절로 따라온다 — 세 군데에 나눠 적으면 어긋난다.
+ */
+let consoleOpen = false;
+let devHistory = [];
+let devHistoryAt = -1;
+
+const DEV_COMMANDS = {
+  help: { args: '', desc: '명령 목록을 보여줘요', run: () => Object.entries(DEV_COMMANDS)
+    .map(([name, spec]) => `${name}${spec.args ? ' ' + spec.args : ''}\n    ${spec.desc}`).join('\n') },
+  state: { args: '[키]', desc: '지금 상태를 찍어요. 키를 주면 그 부분만',
+    run: (arg) => {
+      const state = store.get();
+      const value = arg ? arg.split('.').reduce((acc, k) => (acc == null ? acc : acc[k]), state) : Object.keys(state);
+      return JSON.stringify(value, null, 2);
+    } },
+  now: { args: '', desc: '재생 중인 곡과 위치',
+    run: () => {
+      const s = store.get();
+      if (!s.current) return '재생 중인 곡이 없어요.';
+      return [
+        `곡      ${trackTitle(s.current.track)}`,
+        `위치    ${fmtTime(clock.position())} / ${fmtTime(clock.duration)}`,
+        `일시정지 ${s.player?.isPaused ? '예' : '아니오'}`,
+        `시작시각 ${s.schedule?.startedUtc || '(없음)'}`,
+        `보정    개인 ${webOffset.toFixed(1)}초 + 서버 ${(s.schedule?.webSyncOffsetMs || 0) / 1000}초`,
+      ].join('\n');
+    } },
+  sync: { args: '[±초]', desc: '내 싱크 보정을 보거나 바꿔요',
+    run: (arg) => {
+      if (!arg) return `지금 ${offsetLabel(webOffset)}`;
+      const next = Number(arg);
+      if (!Number.isFinite(next)) return '숫자를 넣어 주세요. 예: sync -0.3';
+      setWebOffset(next);
+      return `${offsetLabel(webOffset)} 로 바꿨어요.`;
+    } },
+  theme: { args: '[이름]', desc: '테마를 바꿔요',
+    run: (arg) => {
+      if (!arg) return Object.keys(THEMES).join(', ');
+      if (!THEMES[arg]) return `모르는 테마예요. ${Object.keys(THEMES).join(', ')}`;
+      commitTheme(arg);
+      return `${arg} 로 바꿨어요.`;
+    },
+    complete: () => Object.keys(THEMES) },
+  layout: { args: '[이름]', desc: '화면 배치를 바꿔요',
+    run: (arg) => {
+      if (!arg) return Object.keys(LAYOUTS).join(', ');
+      if (!LAYOUTS[arg]) return `모르는 배치예요. ${Object.keys(LAYOUTS).join(', ')}`;
+      setLayout(arg);
+      return `${arg} 로 바꿨어요.`;
+    },
+    complete: () => Object.keys(LAYOUTS) },
+  perms: { args: '', desc: '내 권한을 전부 찍어요',
+    run: () => JSON.stringify(store.get().permissions, null, 2) },
+  get: { args: '<경로>', desc: 'API 를 GET 해요. 예: get /state/hot',
+    run: async (arg) => {
+      if (!arg) return '경로를 주세요. 예: get /state/hot';
+      return JSON.stringify(await api(arg), null, 2);
+    } },
+  clearlog: { args: '', desc: '콘솔 화면을 비워요', run: () => ' clear' },
+};
+
+function devComplete(line) {
+  const parts = line.split(/\s+/);
+  if (parts.length <= 1) {
+    return Object.keys(DEV_COMMANDS).filter((name) => name.startsWith(parts[0] || ''));
+  }
+  const spec = DEV_COMMANDS[parts[0]];
+  if (!spec || !spec.complete) return [];
+  const prefix = parts[parts.length - 1];
+  return spec.complete().filter((value) => value.startsWith(prefix))
+    .map((value) => [...parts.slice(0, -1), value].join(' '));
+}
+
+function buildDevConsole() {
+  el.devOut = h('pre', { class: 'dev__out', tabindex: '0' });
+  el.devHint = h('div', { class: 'dev__hint' });
+  el.devIn = h('input', {
+    class: 'dev__in', type: 'text', spellcheck: 'false', autocomplete: 'off',
+    'aria-label': '개발자 명령', placeholder: 'help 를 치면 목록이 나와요 · Tab 으로 자동완성',
+  });
+
+  const print = (text) => {
+    if (text === ' clear') { el.devOut.textContent = ''; return; }
+    el.devOut.textContent += (el.devOut.textContent ? '\n' : '') + text;
+    el.devOut.scrollTop = el.devOut.scrollHeight;
+  };
+
+  const repaintHint = () => {
+    const matches = devComplete(el.devIn.value);
+    el.devHint.textContent = matches.length && el.devIn.value ? matches.slice(0, 8).join('  ') : '';
+  };
+
+  el.devIn.addEventListener('input', repaintHint);
+  el.devIn.addEventListener('keydown', async (event) => {
+    if (event.key === 'Tab') {
+      // Tab 은 브라우저 기본이 포커스 이동이라 반드시 막는다.
+      event.preventDefault();
+      const matches = devComplete(el.devIn.value);
+      if (matches.length === 1) { el.devIn.value = matches[0] + ' '; repaintHint(); }
+      else if (matches.length > 1) print(matches.join('  '));
+      return;
+    }
+    // 위/아래로 이전 명령을 꺼낸다. 같은 걸 다시 치게 만들면 콘솔로 쓸 수가 없다.
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      if (!devHistory.length) return;
+      event.preventDefault();
+      devHistoryAt = event.key === 'ArrowUp'
+        ? Math.min(devHistory.length - 1, devHistoryAt + 1)
+        : Math.max(-1, devHistoryAt - 1);
+      el.devIn.value = devHistoryAt < 0 ? '' : devHistory[devHistory.length - 1 - devHistoryAt];
+      return;
+    }
+    if (event.key !== 'Enter') return;
+    const line = el.devIn.value.trim();
+    if (!line) return;
+    el.devIn.value = '';
+    el.devHint.textContent = '';
+    devHistory.push(line);
+    devHistoryAt = -1;
+    print(`› ${line}`);
+    const [name, ...rest] = line.split(/\s+/);
+    const spec = DEV_COMMANDS[name];
+    if (!spec) { print(`모르는 명령이에요: ${name} — help 를 쳐 보세요.`); return; }
+    try {
+      print(String(await spec.run(rest.join(' '))));
+    } catch (error) {
+      print(`오류: ${error?.message || error}`);
+    }
+  });
+
+  el.devBox = h('section', { class: 'dev', hidden: true, role: 'region', 'aria-label': '개발자 콘솔' },
+    h('div', { class: 'dev__bar' },
+      h('span', null, '⌨ 개발자 콘솔'),
+      h('span', { class: 'queue__spacer' }),
+      bindAct(h('button', { class: 'btn btn--sm btn--ghost', type: 'button', tip: '닫아요' }, '✕'),
+        () => toggleDevConsole(false))),
+    el.devOut, el.devHint, el.devIn);
+  document.body.appendChild(el.devBox);
+}
+
+function toggleDevConsole(force) {
+  if (!el.devBox) buildDevConsole();
+  consoleOpen = force === undefined ? !consoleOpen : !!force;
+  el.devBox.hidden = !consoleOpen;
+  if (consoleOpen) setTimeout(() => el.devIn.focus(), 20);
 }
 
 /** 관리자가 곡을 보고 있을 때가 실제로 차단하고 싶어지는 순간이다 (§19.3). */

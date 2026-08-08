@@ -988,6 +988,97 @@ body[data-dragging="tab"] { user-select: none; }
 .md__t { width: 100%; border-collapse: collapse; }
 .md__t td { padding: 2px var(--sp-2); border-bottom: 1px solid var(--line-1); vertical-align: top; }
 
+/* 대기열 행의 원본 링크. 다른 액션 버튼과 같은 크기로 서되 링크라서 밑줄을 뗀다. */
+.vote--link { text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
+.vote--link:hover, .vote--link:focus-visible { color: var(--accent); border-color: var(--accent-line); }
+
+/* 원본 링크 (§34). 제목 옆에 조용히 붙어 있다가 올리면 또렷해진다.
+ * 제목을 통째로 링크로 만들면 길게 눌러 메뉴를 여는 동작과 부딪힌다. */
+.now__titlerow { display: flex; align-items: baseline; gap: var(--sp-2); min-width: 0; }
+.now__titlerow .now__title { min-width: 0; }
+.now__link {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-sm);
+  color: var(--text-4);
+  text-decoration: none;
+  opacity: 0.75;
+  transition: color .12s ease, background .12s ease, opacity .12s ease;
+}
+.now__link:hover, .now__link:focus-visible {
+  color: var(--accent);
+  background: var(--accent-soft);
+  opacity: 1;
+}
+/* 손가락으로도 누를 수 있어야 한다. 26px 은 눈에는 맞지만 손에는 작다. */
+@media (pointer: coarse) {
+  .now__link { width: 34px; height: 34px; opacity: 1; }
+}
+
+/* 개발자 콘솔 (§33). 기본은 숨김이고 빈 배경 우클릭으로만 연다.
+ * 화면 위에 떠 있되 조작을 가리지 않게 아래쪽 구석에 붙인다. */
+.dev {
+  position: fixed;
+  right: var(--sp-3);
+  bottom: var(--sp-3);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  width: min(560px, calc(100vw - var(--sp-4)));
+  max-height: min(46vh, 420px);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.35);
+  overflow: hidden;
+}
+.dev__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--line-1);
+  background: var(--surface-2);
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+}
+.dev__out {
+  flex: 1;
+  min-height: 80px;
+  margin: 0;
+  padding: var(--sp-2);
+  overflow: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--text-2);
+}
+/* 자동완성 후보 줄. 비어 있으면 자리를 안 차지한다. */
+.dev__hint:not(:empty) {
+  padding: 2px var(--sp-2);
+  border-top: 1px solid var(--line-1);
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: var(--fs-xs);
+}
+.dev__in {
+  border: 0;
+  border-top: 1px solid var(--line-1);
+  padding: var(--sp-2);
+  background: var(--surface-2);
+  color: var(--text-1);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: var(--fs-sm);
+}
+.dev__in:focus { outline: 2px solid var(--accent-line); outline-offset: -2px; }
+
 /* 서버 승인 목록 (§26.2). */
 .aprlist { display: flex; flex-direction: column; gap: var(--sp-2); max-height: 60vh; overflow: auto; overscroll-behavior: contain; }
 .apr {
