@@ -1085,6 +1085,13 @@ body[data-dragging="tab"] { user-select: none; }
   color: var(--text-2);
 }
 /* 자동완성 후보 줄. 비어 있으면 자리를 안 차지한다. */
+/* 제목줄이 창 손잡이다. 끌 수 있다는 걸 커서로 알린다.
+ * `touch-action: none` 이 없으면 터치에서 끌기 대신 페이지가 스크롤된다. */
+.dev__bar { cursor: grab; touch-action: none; user-select: none; }
+.dev[data-drag="1"] .dev__bar { cursor: grabbing; }
+/* 끄는 동안은 그림자를 키워 "떠 있다"를 알린다. 위치만 바뀌면 움직였는지 알기 어렵다. */
+.dev[data-drag="1"] { box-shadow: var(--shadow-2); }
+
 .dev__hint:not(:empty) {
   padding: 2px var(--sp-2);
   border-top: 1px solid var(--line-1);

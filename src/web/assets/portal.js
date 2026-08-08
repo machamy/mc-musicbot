@@ -7568,14 +7568,82 @@ function buildDevConsole() {
     }
   });
 
+  const bar = h('div', { class: 'dev__bar', tip: '끌어서 옮겨요 · 두 번 누르면 제자리로' },
+    h('span', null, '⌨ 개발자 콘솔'),
+    h('span', { class: 'queue__spacer' }),
+    bindAct(h('button', { class: 'btn btn--sm btn--ghost', type: 'button', tip: '닫아요' }, '✕'),
+      () => toggleDevConsole(false)));
+  el.devBar = bar;
   el.devBox = h('section', { class: 'dev', hidden: true, role: 'region', 'aria-label': '개발자 콘솔' },
-    h('div', { class: 'dev__bar' },
-      h('span', null, '⌨ 개발자 콘솔'),
-      h('span', { class: 'queue__spacer' }),
-      bindAct(h('button', { class: 'btn btn--sm btn--ghost', type: 'button', tip: '닫아요' }, '✕'),
-        () => toggleDevConsole(false))),
-    el.devOut, el.devHint, el.devIn);
+    bar, el.devOut, el.devHint, el.devIn);
   document.body.appendChild(el.devBox);
+  makeDevDraggable(bar);
+  restoreDevPos();
+}
+
+/* ── 창처럼 끌어서 옮기기 ──
+ *
+ * 콘솔은 오른쪽 아래에 고정돼 있었다. 그런데 확인하려는 것이 하필 그 자리에 있으면
+ * 콘솔을 닫았다 열었다 하는 수밖에 없었다. 진짜 창처럼 옮길 수 있으면 그럴 일이 없다.
+ *
+ * 자리는 `left/top` 으로 잡는다. 원래 `right/bottom` 고정이라 그대로 두면 끄는 방향과
+ * 실제로 움직이는 방향이 반대가 된다. 화면 밖으로 나가면 되돌릴 방법이 없으므로 항상 가둔다.
+ */
+function makeDevDraggable(handle) {
+  let from = null;
+  handle.addEventListener('pointerdown', (event) => {
+    // 닫기 버튼 위에서 시작한 끌기는 무시한다 — 누르려던 것이지 옮기려던 게 아니다.
+    if (event.target.closest('button')) return;
+    const rect = el.devBox.getBoundingClientRect();
+    from = { dx: event.clientX - rect.left, dy: event.clientY - rect.top };
+    handle.setPointerCapture(event.pointerId);
+    el.devBox.dataset.drag = '1';
+    event.preventDefault();
+  });
+  handle.addEventListener('pointermove', (event) => {
+    if (!from) return;
+    placeDev(event.clientX - from.dx, event.clientY - from.dy);
+  });
+  const end = () => {
+    if (!from) return;
+    from = null;
+    delete el.devBox.dataset.drag;
+    const rect = el.devBox.getBoundingClientRect();
+    prefSet('devPos', `${Math.round(rect.left)},${Math.round(rect.top)}`);
+  };
+  handle.addEventListener('pointerup', end);
+  handle.addEventListener('pointercancel', end);
+  // 제목줄을 두 번 누르면 원래 자리로. 화면 밖으로 보냈을 때의 탈출구다.
+  handle.addEventListener('dblclick', () => {
+    prefSet('devPos', '');
+    for (const side of ['left', 'top', 'right', 'bottom']) el.devBox.style[side] = '';
+  });
+  // 창을 줄이면 콘솔이 화면 밖에 남을 수 있다. 그때마다 다시 가둔다.
+  window.addEventListener('resize', () => {
+    if (!el.devBox || !el.devBox.style.left) return;
+    const rect = el.devBox.getBoundingClientRect();
+    placeDev(rect.left, rect.top);
+  });
+}
+
+/** 화면 안에 가둬서 놓는다. 최소한 제목줄은 늘 잡을 수 있어야 한다. */
+function placeDev(x, y) {
+  const rect = el.devBox.getBoundingClientRect();
+  const maxX = Math.max(0, window.innerWidth - rect.width);
+  const maxY = Math.max(0, window.innerHeight - 36);
+  // **`right`/`bottom` 을 꺼야 한다.** 기본값이 오른쪽 아래 고정이라, `left`/`top` 만 주면
+  // 위아래가 동시에 묶여 박스가 화면 높이만큼 늘어난다(높이를 따로 안 잡았기 때문이다).
+  el.devBox.style.right = 'auto';
+  el.devBox.style.bottom = 'auto';
+  el.devBox.style.left = `${Math.min(Math.max(0, x), maxX)}px`;
+  el.devBox.style.top = `${Math.min(Math.max(0, y), maxY)}px`;
+}
+
+function restoreDevPos() {
+  const saved = String(prefGet('devPos') || '').split(',');
+  const x = Number(saved[0]);
+  const y = Number(saved[1]);
+  if (Number.isFinite(x) && Number.isFinite(y) && saved.length === 2) placeDev(x, y);
 }
 
 function toggleDevConsole(force) {
