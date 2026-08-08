@@ -4865,15 +4865,27 @@ function renderNow(state) {
     [el.repeatBtn, 'playback'], [el.shuffleBtn, 'queueEdit']]) {
     setLock(node, offline || !can(key), offline ? offlineReason : lockReason(key));
   }
-  setLock(el.autoplayBtn, offline || !canAutoplay(), offline ? offlineReason : lockReason('autoplay'));
-  if (!offline && canAutoplay()) {
+  /* 자동 재생만 음성 연결을 안 따진다. 저장되는 설정이라 봇이 음성에 없을 때야말로
+   * 켜 두려는 값이다 — 여기서 `offline` 을 그대로 쓰면 "재생 중인 곡이 없을 때
+   * 아무리 눌러도 안 켜짐"이 된다. 봇 프로세스가 꺼져 있으면 저장 자체가 안 되니 그때만 잠근다. */
+  const autoplayOffline = !online;
+  setLock(el.autoplayBtn, autoplayOffline || !canAutoplay(),
+    autoplayOffline ? offlineReason : lockReason('autoplay'));
+  if (!autoplayOffline && canAutoplay()) {
     el.autoplayBtn.setAttribute('data-tip', autoplayOn
       ? '자동 재생이 켜져 있어요 · 대기열이 비면 알아서 골라 와요'
       : '자동 재생이 꺼져 있어요 · 대기열이 비면 조용해져요');
   }
   renderSkipButton(offline, offlineReason);
   renderNextRow(state);
-  setLock(el.seekTrack, offline || !can('seek') || !clock.duration, offline ? offlineReason : lockReason('seek'));
+  /* 잠기는 이유가 셋인데 메시지를 하나로 뭉치면 안 된다. 권한은 멀쩡한데 길이를 모르는 곡이면
+   * `lockReason` 이 마지막 분기까지 내려가 "이 서버의 멤버여야 눌러요" 라는 엉뚱한 말을 한다
+   * (일시정지는 되는데 위치 이동만 안 되는 것처럼 보여서 두 배로 헷갈린다). 사유별로 갈라 준다. */
+  const seekLock = offline ? offlineReason
+    : !can('seek') ? lockReason('seek')
+    : !clock.duration ? '길이를 알 수 없는 곡이라 위치를 옮길 수 없어요'
+    : '';
+  setLock(el.seekTrack, !!seekLock, seekLock);
   el.volume.disabled = offline || !can('volume');
   el.volumeWrap.setAttribute('data-tip', el.volume.disabled
     ? (offline ? offlineReason : lockReason('volume'))

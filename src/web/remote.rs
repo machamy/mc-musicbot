@@ -1544,6 +1544,15 @@ pub fn permission_allowed(
     }
 }
 
+/// 이 조작이 "봇이 음성 채널에 있어야 한다"는 제한(`require_voice_for_playback`)을 받는지.
+///
+/// **자동 재생만 예외다.** 나머지는 지금 나오는 소리를 건드리는 명령이라 봇이 음성에 없으면
+/// 아무 일도 안 일어나는 유령 조작이 된다(V3 §16 B1). 반면 자동 재생 On/Off 는 DB 에 저장되는
+/// 설정이고, 봇이 음성에 없을 때야말로 "다음에 들어오면 알아서 틀어" 를 켜 두려는 순간이다.
+fn action_requires_voice(action: &str) -> bool {
+    action != "autoplay"
+}
+
 /// 이 사람이 그 권한 키의 지정 역할을 하나라도 갖고 있는지.
 fn has_configured_role(
     key: &str,
@@ -4682,7 +4691,13 @@ async fn api_control(
     // 조작이 통과해서 아무 일도 안 일어나는 유령 상태가 된다.
     //
     // 서버마다 끌 수 있다 (§36). 끄면 조작을 받아 두고 봇이 들어오는 순간부터 이어 간다.
-    if ctx.settings.require_voice_for_playback && !bot_voice_status(&state, guild_id).in_voice() {
+    // **자동 재생은 재생 명령이 아니라 저장되는 설정이다.** 봇이 음성에 없을 때야말로
+    // "다음에 들어오면 알아서 틀어" 를 켜 두려는 순간이라, 여기에 음성 연결을 요구하면
+    // 정작 켜야 할 때 못 켠다. 나머지 조작만 캐시 기준으로 막는다.
+    if action_requires_voice(&request.action)
+        && ctx.settings.require_voice_for_playback
+        && !bot_voice_status(&state, guild_id).in_voice()
+    {
         return json_error(
             StatusCode::CONFLICT,
             "봇이 음성 채널에 안 들어가 있어요. `/입장` 으로 부르거나, 서버 설정에서 이 제한을 끌 수 있어요.",
@@ -10608,6 +10623,19 @@ mod tests {
             &settings,
             &admin
         ));
+    }
+
+    /// 제안 #3 — 재생 중인 곡이 없을 때 자동 재생을 못 켜던 문제.
+    /// 자동 재생은 저장되는 설정이라 봇이 음성에 없어도 켜져야 한다.
+    #[test]
+    fn only_autoplay_escapes_the_voice_requirement() {
+        assert!(!action_requires_voice("autoplay"));
+        for action in ["pause", "resume", "seek", "skip", "volume", "shuffle", "repeat"] {
+            assert!(
+                action_requires_voice(action),
+                "{action} 은 봇이 음성에 있어야 하는 조작이다"
+            );
+        }
     }
 
     #[test]
