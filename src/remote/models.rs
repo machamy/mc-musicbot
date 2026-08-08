@@ -1205,6 +1205,7 @@ fn settings_label(key: &str) -> &str {
         "chartSuperWeight" => "차트 슈퍼 좋아요 가중치",
         "bulkEnqueueLimit" => "한 번에 담기 상한",
         "chartLimit" => "차트에서 가져올 곡 수",
+        "publicNowPlaying" => "로그인 없이 지금 곡 보기",
         other => other,
     }
 }
@@ -2289,6 +2290,171 @@ impl Default for RemoteGuildSettings {
             bulk_enqueue_limit: default_bulk_enqueue_limit(),
             chart_super_weight: default_chart_super_weight(),
         }
+    }
+}
+
+// ───────── 봇 주인 전역 강제값 (오버라이드) ─────────
+
+/// 강제된 항목을 서버에서 못 바꾼다고 알릴 때 쓰는 한 문장.
+/// `EmptyVoiceRule::lock_reason` 과 같은 톤이다 — 잠긴 사실만 보이면 고장으로 읽힌다.
+pub const OVERRIDE_LOCK_REASON: &str =
+    "봇 주인이 이 항목을 모든 서버에 같은 값으로 걸어 뒀어요. 서버에서는 바꿀 수 없어요.";
+
+/// `GlobalOverrides` 를 통째로 만든다.
+///
+/// **손으로 쓰지 않는 이유가 있다.** 강제값 하나를 다루는 데 필요한 자리가 여섯 곳
+/// (필드 · 키 목록 · 잠긴 키 · 잠긴 값 · 실제 적용 · 되돌리기)인데, 그중 `apply` 한 곳만
+/// 빠져도 "설정은 잠갔는데 실제로는 안 먹는" 상태가 된다. 화면에는 자물쇠가 그려지고
+/// 서버 관리자는 못 바꾸는데 동작만 옛 값으로 도는, 제일 찾기 어려운 종류의 버그다.
+/// 항목을 한 줄로 선언하면 여섯 자리가 같이 생겨서 애초에 어긋날 수가 없다.
+///
+/// 한 줄의 형식은 `필드: 타입 = "camelCase키", |v| 조이기;` 다.
+/// 조이기 식은 길드 설정 `sanitize()` 와 **같은 범위**를 쓴다 — 봇 주인이라고 해서
+/// 서버가 못 받는 값을 넣을 수 있으면 안 되고, `0 = 무제한`(§23.1)도 그대로 살아 있어야 한다.
+macro_rules! define_global_overrides {
+    ($(
+        $(#[$doc:meta])*
+        $field:ident : $ty:ty = $key:literal, |$v:ident| $clamp:expr;
+    )+) => {
+        /// 봇 주인이 **모든 서버에 강제로 거는 값** (전역 오버라이드).
+        ///
+        /// 길드 설정과 **다른 키**(`settings` 테이블의 `remote_global_overrides`)에 따로 산다.
+        /// 길드 JSON 에 섞으면 길드 저장 한 번에 강제값이 통째로 날아간다.
+        ///
+        /// 항목마다 `Option` 인 것도 이유가 있다: **"강제 안 함"과 "강제로 false" 는 다른 상태다.**
+        /// `None` 이면 서버가 정한 값을 그대로 쓰고, `Some(false)` 면 서버가 켜 뒀어도 꺼진다.
+        /// 전부 `None`(기본)이면 이 구조체는 아무 일도 하지 않는다 — 도입 전과 완전히 같다.
+        #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", default)]
+        pub struct GlobalOverrides {
+            $(
+                $(#[$doc])*
+                // 강제 안 하는 항목은 JSON 에 아예 안 남긴다. 저장된 파일만 봐도
+                // "무엇이 잠겼는지" 가 한눈에 보여야 운영 중에 사고를 덜 친다.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub $field: Option<$ty>,
+            )+
+        }
+
+        impl GlobalOverrides {
+            /// 강제할 수 있는 항목 전부 (camelCase). 봇 주인 화면이 이 목록으로 줄을 그린다.
+            pub const LOCKABLE_KEYS: &'static [&'static str] = &[$($key),+];
+
+            /// 강제값이 하나도 없는가. 이때는 어떤 경로도 길드 설정을 건드리지 않는다.
+            pub fn is_empty(&self) -> bool {
+                true $(&& self.$field.is_none())+
+            }
+
+            /// 지금 잠긴 항목의 camelCase 키. 선언 순서를 그대로 따른다.
+            pub fn locked_keys(&self) -> Vec<&'static str> {
+                let mut keys: Vec<&'static str> = Vec::new();
+                $(if self.$field.is_some() { keys.push($key); })+
+                keys
+            }
+
+            /// 그 항목에 강제로 걸린 값. 안 잠겨 있으면 `None`.
+            /// 잠겼는지만 알고 싶으면 `locked_value(key).is_some()` 이다.
+            /// 화면이 자물쇠 옆에 "무엇으로 잠겼는지" 를 적을 때 쓴다.
+            pub fn locked_value(&self, key: &str) -> Option<serde_json::Value> {
+                match key {
+                    $($key => self.$field.map(|value| serde_json::json!(value)),)+
+                    _ => None,
+                }
+            }
+
+            /// 강제값 자체도 길드 설정과 같은 범위로 조인다 (§23.1).
+            /// 봇 주인이 넣었다고 해서 서버가 못 받는 값이 동작에 쓰이면 안 된다.
+            pub fn sanitize(&mut self) {
+                $(self.$field = self.$field.map(|$v| $clamp);)+
+            }
+
+            fn apply_fields(&self, settings: &mut RemoteGuildSettings) {
+                $(if let Some(value) = self.$field { settings.$field = value; })+
+            }
+
+            /// **강제된 항목만** 저장돼 있던 길드 값으로 되돌린다.
+            ///
+            /// 저장 직전에 한 번 부르면 강제된 항목이 길드 JSON 에 절대 안 쓰인다.
+            /// 그래야 봇 주인이 나중에 강제를 풀었을 때 서버가 원래 쓰던 값이 되살아난다 —
+            /// 강제값을 길드 JSON 에 그대로 구워 버리면 풀어도 옛 설정이 안 돌아온다.
+            pub fn restore(&self, target: &mut RemoteGuildSettings, stored: &RemoteGuildSettings) {
+                $(if self.$field.is_some() { target.$field = stored.$field; })+
+            }
+        }
+    };
+}
+
+// 무엇을 넣고 뺐는지는 세 가지 기준이다.
+//   1. **리소스 상한** — 한 서버가 봇 전체(디스크·yt-dlp·대기열)를 먹어 치우는 것을 막는다.
+//   2. **안전·남용** — 볼륨 상한, 연타 제한, 바깥으로 나가는 정보.
+//   3. **기능 on/off** — 봇 주인이 통째로 닫아야 할 수 있는 기능.
+// 취향에 가까운 것(정렬 방식, 투표 점수, 붐따, 자동 재생 방식, 권한 규칙, 싱크 보정)은
+// **일부러 뺐다.** 그건 서버마다 달라야 하는 값이고, 잠가 봐야 얻는 게 없이 서버만 답답해진다.
+// 빈 채널 규칙(§27)도 뺐다 — 이미 `GlobalSettings::empty_voice_forced` 가 같은 일을 한다.
+// 두 군데서 강제하면 어느 쪽이 이기는지 아무도 모르게 된다.
+define_global_overrides! {
+    // ── 1. 리소스 상한 ──
+    /// 1인 대기열 수. `0` 이면 무제한(§23.1).
+    max_queue_per_user: i32 = "maxQueuePerUser", |v| v.clamp(0, 1_000);
+    /// 서버 대기열 수. `0` 이면 무제한.
+    max_queue_per_guild: i32 = "maxQueuePerGuild", |v| v.clamp(0, 10_000);
+    /// 곡 최대 길이(초). `0` 이면 무제한. 8시간짜리 라이브 녹화로 대기열을 막는 것을 막는다.
+    max_track_seconds: i32 = "maxTrackSeconds", |v| v.clamp(0, 86_400);
+    /// 한 번에 담기 상한. 클릭 한 번이 대기열을 수천 곡으로 만드는 것을 막는다.
+    bulk_enqueue_limit: u32 = "bulkEnqueueLimit", |v| v.min(10_000);
+    /// 차트에서 가져올 곡 수. 이 값이 그대로 yt-dlp 호출 수라 봇 전체의 부하가 된다.
+    chart_limit: u32 = "chartLimit", |v| v.clamp(10, 100);
+    /// 기준 곡 최대 수. `0` 이면 무제한.
+    autoplay_seed_max: u32 = "autoplaySeedMax", |v| v.min(100);
+    /// 로그 보관일. `0` 이면 무제한 — DB 가 무한히 커지는 쪽이라 상한을 걸 수 있어야 한다.
+    audit_retention_days: i32 = "auditRetentionDays", |v| v.clamp(0, 3650);
+    /// 채팅 보관일. `0` 이면 무제한.
+    chat_retention_days: u32 = "chatRetentionDays", |v| v.min(3650);
+
+    // ── 2. 안전·남용 ──
+    /// 최대 볼륨. 서버 하나가 200 을 켜 두면 그 채널에 있는 사람 귀가 상한다.
+    max_volume: i32 = "maxVolume", |v| v.clamp(0, 200);
+    /// 슈퍼 좋아요 쿨타임(초). `0` 이면 없음.
+    super_like_cooldown_sec: u32 = "superLikeCooldownSec", |v| v.min(3_600);
+    /// 슈퍼 좋아요 하루 횟수. `0` 이면 무제한.
+    super_like_daily_limit: u32 = "superLikeDailyLimit", |v| v.min(100);
+    /// 로그인 없이 지금 곡을 볼 수 있게 할지 (§29). **바깥으로 나가는 정보**라 봇 주인이
+    /// 전부 닫을 수 있어야 한다. 서버 관리자가 실수로 켜 두는 것과 성격이 다르다.
+    public_now_playing: bool = "publicNowPlaying", |v| v;
+
+    // ── 3. 기능 on/off ──
+    /// 웹 채팅. 신고 처리를 감당 못 하면 봇 주인이 통째로 닫을 수 있어야 한다.
+    chat_enabled: bool = "chatEnabled", |v| v;
+    /// 제안 게시판.
+    suggestion_enabled: bool = "suggestionEnabled", |v| v;
+    /// 비주얼라이저. 장식이지만 느린 기기에서 눈에 띄게 무겁다.
+    visualizer_enabled: bool = "visualizerEnabled", |v| v;
+}
+
+impl GlobalOverrides {
+    /// **유효값 해석은 여기 하나뿐이다.** 저장된 길드 설정 위에 강제값을 덮어
+    /// 실제로 동작에 쓰일 값을 만든다.
+    ///
+    /// `RemoteStore::load_guild_settings` 가 이 함수를 부르므로 길드 설정을 읽는 모든 경로가
+    /// 자동으로 이걸 지난다 — 새 호출부가 생겨도 빼먹을 자리가 없다. 강제값을 그냥
+    /// 무시하고 지나가는 경로가 하나라도 있으면 "잠갔는데 안 먹는" 상태가 되기 때문에,
+    /// 옵트인(부르는 쪽이 챙기기)이 아니라 옵트아웃(날것이 필요하면 `_raw` 를 부르기)으로 뒀다.
+    pub fn apply(&self, settings: &mut RemoteGuildSettings) {
+        if self.is_empty() {
+            return;
+        }
+        self.apply_fields(settings);
+        // 볼륨만 값끼리 묶여 있다. `sanitize()` 는 `max < min` 이면 **max 를 올려서** 맞추는데,
+        // 그러면 강제로 내린 상한이 도로 풀린다. 강제값이 이기도록 아래쪽을 먼저 내려 둔다.
+        if let Some(max) = self.max_volume {
+            settings.min_volume = settings.min_volume.min(max);
+            settings.default_volume = settings.default_volume.clamp(settings.min_volume, max);
+        }
+    }
+
+    /// 설정 키의 한국어 이름. 거절 메시지와 봇 주인 화면이 같은 문구를 쓴다.
+    pub fn label_for(key: &str) -> &str {
+        settings_label(key)
     }
 }
 

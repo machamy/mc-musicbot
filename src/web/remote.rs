@@ -12,8 +12,9 @@ use crate::models::{
 use crate::remote::ranking;
 use crate::remote::store::is_valid_pref;
 use crate::remote::{
-    AuditKind, AutoplaySeed, ChatTrackTag, LyricsCacheHit, LyricsDocument, LyricsLine,
-    MAX_AUTOPLAY_SEEDS, MAX_VOTER_IDS, PERMISSION_KEYS, PermissionRule, QueueScore, QueueSortMode,
+    AuditKind, AutoplaySeed, ChatTrackTag, GlobalOverrides, LyricsCacheHit, LyricsDocument,
+    LyricsLine, MAX_AUTOPLAY_SEEDS,
+    MAX_VOTER_IDS, PERMISSION_KEYS, PermissionRule, QueueScore, QueueSortMode,
     QueueVoteKind, RemoteGuildSettings, SeedAddOutcome, StoredSession, SuggestionStatus,
     SuperLikeStatus, Suspension, SuspensionScope, UserTrackKind, VotePoints, VoteSkipBasis,
     as_limit, as_limit_u32,
@@ -765,6 +766,12 @@ pub fn router() -> Router<Arc<WebState>> {
         // 아직 승인 안 된 서버가 대상이라 길드 게이트를 통과할 수 없기 때문이다.
         .route("/music/api/owner/guilds", get(api_owner_guilds))
         .route("/music/api/owner/guilds/decide", post(api_owner_decide))
+        // 전역 강제값 — **봇 주인 전용**. 승인 라우트와 같은 이유로 길드 인가를 안 태운다:
+        // 대상이 특정 서버가 아니라 모든 서버다.
+        .route(
+            "/music/api/owner/overrides",
+            get(api_owner_overrides_get).put(api_owner_overrides_put),
+        )
         // 서버 관리 콘솔 API — 전부 Manager 이상
         .route(
             "/music/api/guilds/{guild_id}/admin/settings",
@@ -7372,6 +7379,24 @@ async fn api_settings(
     {
         return json_error(StatusCode::BAD_REQUEST, "설정 값이 허용 범위를 벗어났어요.");
     }
+    // 잠긴 항목을 바꾸려 하면 거절한다. 이 레거시 라우트는 본문에 전 항목을 항상 실어 보내므로
+    // 섹션 저장과 같은 판정("값이 실제로 다를 때만")을 쓰려고 키-값 표로 옮겨 넣는다.
+    let overrides = state.app.remote.load_global_overrides();
+    let sent: serde_json::Map<String, Value> = [
+        ("maxVolume", json!(request.max_volume)),
+        ("chatEnabled", json!(request.chat_enabled)),
+        ("maxQueuePerUser", json!(request.max_queue_per_user)),
+        ("maxQueuePerGuild", json!(request.max_queue_per_guild)),
+        ("maxTrackSeconds", json!(request.max_track_seconds)),
+        ("auditRetentionDays", json!(request.audit_retention_days)),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect();
+    if let Some(response) = override_lock_response(&overrides, &sent) {
+        return response;
+    }
+
     let before = serde_json::to_string(&settings).unwrap_or_default();
     settings.min_volume = request.min_volume;
     settings.max_volume = request.max_volume;
@@ -7555,6 +7580,10 @@ async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value 
         "webSyncOffsetMs": settings.web_sync_offset_ms,
         // 화면이 `∞` 칸을 그리려면 어떤 항목이 무제한을 받는지 알아야 한다 (§23.1).
         "unlimitedKeys": UNLIMITED_KEYS,
+        // **봇 주인이 잠근 항목** — UI 는 이걸 보고 자물쇠를 그리고 입력을 잠근다.
+        // 위 값들은 이미 강제값이 덮인 **유효값**이다(`load_guild_settings` 가 덮는다).
+        // 그래서 화면에 보이는 값과 실제로 도는 값이 갈라질 수 없다.
+        "ownerOverrides": owner_overrides_json(state),
     });
     if let (Some(base), Some(extra)) = (snapshot.as_object_mut(), extra.as_object()) {
         for (key, value) in extra {
@@ -7562,6 +7591,11 @@ async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value 
         }
     }
     snapshot
+}
+
+/// 관리 콘솔에 실어 보낼 잠금 정보. 봇 주인 화면과 **같은 모양**이다.
+fn owner_overrides_json(state: &Arc<WebState>) -> Value {
+    overrides_json(&state.app.remote.load_global_overrides())
 }
 
 /// `0` 을 무제한으로 받는 숫자 설정 (V3 §23.1). 관리 콘솔이 슬라이더 끝에 `∞` 칸을 붙일 때 쓴다.
@@ -7647,6 +7681,14 @@ async fn admin_settings_put(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    // **봇 주인이 잠근 항목을 바꾸려 하면 여기서 거절한다.**
+    let overrides = state.app.remote.load_global_overrides();
+    if let Some(fields) = body.as_object()
+        && let Some(response) = override_lock_response(&overrides, fields)
+    {
+        return response;
+    }
+
     let mut settings = ctx.settings.clone();
     let before = serde_json::to_string(&settings).unwrap_or_default();
     let mut sort_mode_changed = false;
@@ -9716,6 +9758,183 @@ async fn api_owner_decide(
     json_ok(json!({ "ok": true, "status": status.as_str() }))
 }
 
+// ───────────────────────── 전역 강제값 (봇 주인 오버라이드) ─────────────────────────
+
+/// 강제값 묶음을 화면이 그대로 쓸 수 있는 모양으로. 봇 주인 화면과 서버 관리 콘솔이
+/// **같은 함수**를 쓴다 — 두 화면이 다른 모양을 받으면 자물쇠가 한쪽에만 그려진다.
+fn overrides_json(overrides: &GlobalOverrides) -> Value {
+    let locked = overrides.locked_keys();
+    let values: serde_json::Map<String, Value> = locked
+        .iter()
+        .filter_map(|key| {
+            overrides
+                .locked_value(key)
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect();
+    let labels: serde_json::Map<String, Value> = GlobalOverrides::LOCKABLE_KEYS
+        .iter()
+        .map(|key| ((*key).to_string(), json!(GlobalOverrides::label_for(key))))
+        .collect();
+    json!({
+        // 지금 잠긴 항목. 화면은 이 배열만 보고 자물쇠를 그리면 된다.
+        "lockedKeys": locked,
+        // 잠긴 항목 → 강제된 값. 자물쇠 옆에 "무엇으로 잠겼는지" 를 적을 때 쓴다.
+        "values": Value::Object(values),
+        // 강제할 수 있는 항목 전부. 봇 주인 화면이 줄을 이걸로 그린다.
+        "lockableKeys": GlobalOverrides::LOCKABLE_KEYS,
+        // 항목 → 한국어 이름. 화면이 라벨 표를 따로 들고 있다가 어긋나지 않게 서버가 준다.
+        "labels": Value::Object(labels),
+        // 왜 못 바꾸는지. 잠긴 사실만 보이면 고장으로 읽힌다.
+        "reason": crate::remote::OVERRIDE_LOCK_REASON,
+    })
+}
+
+/// 보낸 본문이 잠긴 항목을 **실제로 바꾸려 하는지**. 바꾸려는 키의 camelCase 이름을 돌려준다.
+///
+/// **값이 실제로 다를 때만** 시도로 친다. 관리 콘솔은 섹션의 키를 통째로 실어 보내므로
+/// "키가 들어 있으면 시도" 로 보면 잠긴 항목 하나 때문에 그 섹션 전체가 저장 불능이 된다.
+/// 화면이 보여 준 강제값을 그대로 되보내는 것은 바꾸려는 시도가 아니다.
+fn attempted_locked_keys(
+    overrides: &GlobalOverrides,
+    body: &serde_json::Map<String, Value>,
+) -> Vec<&'static str> {
+    overrides
+        .locked_keys()
+        .into_iter()
+        .filter(|key| {
+            body.get(*key)
+                .is_some_and(|sent| overrides.locked_value(key).as_ref() != Some(sent))
+        })
+        .collect()
+}
+
+/// 잠긴 항목을 건드렸으면 403. 아니면 `None`.
+///
+/// **조용히 무시하지 않는다.** 저장된 척하면 화면은 바뀐 값을 보여 주다가 새로고침하면
+/// 되돌아간다 — 제일 헷갈리는 실패다 (빈 채널 규칙 §27 이 같은 이유로 이미 거절한다).
+fn override_lock_response(
+    overrides: &GlobalOverrides,
+    body: &serde_json::Map<String, Value>,
+) -> Option<Response> {
+    let blocked = attempted_locked_keys(overrides, body);
+    if blocked.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = blocked
+        .iter()
+        .map(|key| GlobalOverrides::label_for(key))
+        .collect();
+    Some(json_error(
+        StatusCode::FORBIDDEN,
+        format!(
+            "{} — {}",
+            names.join(", "),
+            crate::remote::OVERRIDE_LOCK_REASON
+        ),
+    ))
+}
+
+/// `GET /music/api/owner/overrides` — 지금 걸린 전역 강제값.
+async fn api_owner_overrides_get(State(state): State<Arc<WebState>>, cookies: Cookies) -> Response {
+    if let Err(response) = require_owner(&state, &cookies, None) {
+        return response;
+    }
+    let overrides = state.app.remote.load_global_overrides();
+    json_ok(json!({
+        "overrides": overrides_json(&overrides),
+        // 화면이 `∞` 칸을 그리려면 어떤 항목이 무제한을 받는지 알아야 한다 (§23.1).
+        "unlimitedKeys": UNLIMITED_KEYS,
+    }))
+}
+
+/// `PUT /music/api/owner/overrides` — 부분 갱신.
+///
+/// 규약은 관리 콘솔의 섹션 저장과 같다: **보낸 키만** 바뀐다.
+/// - 값을 보내면 그 값으로 강제한다.
+/// - `null` 을 보내면 강제를 푼다 (서버가 정한 값이 되살아난다).
+/// - 아예 안 보낸 키는 건드리지 않는다.
+///
+/// "강제 안 함" 과 "강제로 false" 가 다른 상태라서 `null` 이 꼭 필요하다.
+/// 안 보낸 키를 해제로 치면, 한 항목을 켜려고 보낸 요청이 나머지를 전부 풀어 버린다.
+async fn api_owner_overrides_put(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let session = match require_owner(&state, &cookies, Some(&headers)) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Some(body) = body.as_object() else {
+        return json_error(StatusCode::BAD_REQUEST, "본문은 객체여야 해요.");
+    };
+    // 모르는 키를 조용히 버리면 봇 주인은 저장된 줄 알고 화면을 닫는다.
+    for key in body.keys() {
+        if !GlobalOverrides::LOCKABLE_KEYS.contains(&key.as_str()) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!("{key}: 강제할 수 없는 항목이에요."),
+            );
+        }
+    }
+
+    // 지금 값 위에 보낸 키만 얹는다. `null` 은 해제라서 `serde_json::from_value` 로
+    // 한 번에 못 받는다 — `Option` 필드에 `null` 을 넣으면 "없음" 과 구분이 안 된다.
+    let current = state.app.remote.load_global_overrides();
+    let mut merged = serde_json::to_value(&current).unwrap_or_else(|_| json!({}));
+    let Some(map) = merged.as_object_mut() else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "강제값을 읽지 못했어요.");
+    };
+    for (key, value) in body {
+        if value.is_null() {
+            map.remove(key);
+        } else {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    let Ok(mut next) = serde_json::from_value::<GlobalOverrides>(merged) else {
+        return json_error(StatusCode::BAD_REQUEST, "값의 형식이 올바르지 않아요.");
+    };
+    // 봇 주인이라고 해서 서버가 못 받는 값을 넣을 수 있으면 안 된다 (§23.1).
+    next.sanitize();
+
+    if let Err(error) = state.app.remote.save_global_overrides(&next) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    }
+
+    // **캐시를 안 버리면 강제값이 재시작 전까지 안 먹는다.**
+    // `PlayerManager` 는 길드 설정을 길드마다 캐시하는데, 그 캐시가 채워진 시점의
+    // 유효값을 들고 있다. 길드 설정 저장은 그 길드만 무효화하면 되지만 전역 강제값은
+    // **모든 길드**의 유효값을 한꺼번에 바꾼다. 아는 길드를 전부 턴다.
+    let mut touched: HashSet<u64> = state.app.remote.remote_guild_ids().into_iter().collect();
+    if let Some(cache) = state.app.discord_cache.get() {
+        touched.extend(cache.guilds().into_iter().map(|id| id.get()));
+    }
+    for guild_id in &touched {
+        state.app.player.invalidate_settings(*guild_id);
+        // 화면도 다시 읽게 한다 — 열어 둔 관리 콘솔이 옛 값을 그대로 보여 주면 안 된다.
+        emit_bare(&state, *guild_id, "settings");
+    }
+
+    let locked = next.locked_keys();
+    state.app.log.info(
+        "Bot",
+        &format!(
+            "{}님이 전역 강제값을 바꿨어요 — 잠긴 항목 {}개: {}",
+            session.display_name,
+            locked.len(),
+            if locked.is_empty() {
+                "없음".to_string()
+            } else {
+                locked.join(", ")
+            }
+        ),
+    );
+    json_ok(json!({ "ok": true, "overrides": overrides_json(&next) }))
+}
+
 /// 차트에 넣어 줄 한 곡의 최대 길이(초).
 ///
 /// 15분을 넘는 것은 사실상 전부 모음·메들리·라이브 전곡 영상이다. 실제로 겪은 것:
@@ -11637,5 +11856,115 @@ mod tests {
             crate::remote::audit_text("playback.volume", "지훈", None, None, Some("150%"), 1);
         assert!(text.contains("150%"), "{text}");
         assert!(!text.contains("volume:"), "{text}");
+    }
+
+    // ───────── 봇 주인 전역 강제값 ─────────
+
+    fn body(pairs: &[(&str, Value)]) -> serde_json::Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect()
+    }
+
+    /// 강제값이 없으면 무엇을 보내도 안 막힌다 — 도입 전과 완전히 같아야 한다.
+    #[test]
+    fn nothing_is_blocked_when_the_owner_forced_nothing() {
+        let overrides = GlobalOverrides::default();
+        let sent = body(&[("maxQueuePerUser", json!(9)), ("chatEnabled", json!(true))]);
+        assert!(attempted_locked_keys(&overrides, &sent).is_empty());
+        assert!(override_lock_response(&overrides, &sent).is_none());
+    }
+
+    /// 잠긴 항목을 **다른 값으로** 바꾸려 하면 막고, 이름과 이유를 말한다.
+    /// 조용히 저장된 척하면 화면은 새로고침 전까지 거짓말을 한다.
+    #[test]
+    fn changing_a_locked_setting_is_refused_but_resending_the_same_value_is_not() {
+        let overrides = GlobalOverrides {
+            max_queue_per_user: Some(3),
+            chat_enabled: Some(false),
+            ..Default::default()
+        };
+
+        // 바꾸려는 시도 → 막힌다.
+        let changing = body(&[("maxQueuePerUser", json!(9))]);
+        assert_eq!(
+            attempted_locked_keys(&overrides, &changing),
+            vec!["maxQueuePerUser"]
+        );
+        assert!(override_lock_response(&overrides, &changing).is_some());
+
+        // 화면이 보여 준 강제값을 그대로 되보내는 것은 시도가 아니다.
+        // 이걸 막으면 잠긴 항목 하나 때문에 그 섹션 전체가 저장 불능이 된다.
+        let unchanged = body(&[
+            ("maxQueuePerUser", json!(3)),
+            ("chatEnabled", json!(false)),
+            // 안 잠긴 항목은 자유롭게 같이 실려 온다.
+            ("maxQueuePerGuild", json!(500)),
+        ]);
+        assert!(attempted_locked_keys(&overrides, &unchanged).is_empty());
+        assert!(override_lock_response(&overrides, &unchanged).is_none());
+
+        // 잠긴 항목을 아예 안 보내면 당연히 안 막힌다.
+        let elsewhere = body(&[("maxTrackSeconds", json!(600))]);
+        assert!(attempted_locked_keys(&overrides, &elsewhere).is_empty());
+    }
+
+    /// **"강제 안 함"과 "강제로 false" 는 다른 상태다.** `Option` 을 쓰는 이유 그 자체다.
+    #[test]
+    fn not_forced_and_forced_false_are_different_states() {
+        let free = GlobalOverrides::default();
+        let forced_off = GlobalOverrides {
+            chat_enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(free.locked_value("chatEnabled").is_none());
+        assert_eq!(
+            forced_off.locked_value("chatEnabled"),
+            Some(json!(false)),
+            "강제로 끈 것과 안 건드린 것이 구분되지 않는다"
+        );
+        // 켜려는 시도는 강제로 껐을 때만 막힌다.
+        let turning_on = body(&[("chatEnabled", json!(true))]);
+        assert!(attempted_locked_keys(&free, &turning_on).is_empty());
+        assert_eq!(
+            attempted_locked_keys(&forced_off, &turning_on),
+            vec!["chatEnabled"]
+        );
+    }
+
+    /// UI 와의 계약. 키 이름이 바뀌면 자물쇠가 안 그려지므로 여기서 못 박는다.
+    #[test]
+    fn the_lock_payload_keeps_its_shape() {
+        let payload = overrides_json(&GlobalOverrides {
+            max_queue_per_user: Some(3),
+            ..Default::default()
+        });
+        assert_eq!(payload["lockedKeys"], json!(["maxQueuePerUser"]));
+        assert_eq!(payload["values"]["maxQueuePerUser"], json!(3));
+        assert_eq!(payload["labels"]["maxQueuePerUser"], json!("1인 대기열 수"));
+        assert!(payload["reason"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(
+            payload["lockableKeys"]
+                .as_array()
+                .is_some_and(|keys| keys.len() == GlobalOverrides::LOCKABLE_KEYS.len())
+        );
+        // 강제값이 없으면 빈 목록이다 — 화면은 자물쇠를 하나도 안 그린다.
+        let empty = overrides_json(&GlobalOverrides::default());
+        assert_eq!(empty["lockedKeys"], json!([]));
+        assert_eq!(empty["values"], json!({}));
+    }
+
+    /// 강제할 수 있는 항목은 전부 관리 콘솔이 실제로 쓰는 키여야 한다.
+    /// 오타 하나면 그 항목은 영영 안 잠기고 아무도 눈치채지 못한다.
+    #[test]
+    fn every_lockable_key_has_a_korean_label() {
+        for key in GlobalOverrides::LOCKABLE_KEYS {
+            assert_ne!(
+                GlobalOverrides::label_for(key),
+                *key,
+                "{key} 에 한국어 이름이 없어요 — 거절 메시지에 기계 키가 그대로 나가요"
+            );
+        }
     }
 }

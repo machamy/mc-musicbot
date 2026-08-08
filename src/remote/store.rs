@@ -1,8 +1,8 @@
 use super::{
     AUDIT_MERGE_WINDOW_SECS, AuditEntry, AuditKind, AutoplaySeed, CHART_CACHE_TTL_HOURS,
     ChartCategory, ChartDef, ChartSnapshot, ChatMessage, ChatReactionSummary, ChatReplyPreview,
-    ChatReport, ChatTrackTag, GuildApproval, GuildApprovalStatus, LyricsCacheHit, LyricsDocument,
-    KARAOKE_CACHE_TTL_HOURS, MAX_VOTER_IDS, Participant,
+    ChatReport, ChatTrackTag, GlobalOverrides, GuildApproval, GuildApprovalStatus, LyricsCacheHit,
+    LyricsDocument, KARAOKE_CACHE_TTL_HOURS, MAX_VOTER_IDS, Participant,
     PruneReport, QueueScore, QueueVoteKind, RecentTrack, RemoteGuildSettings, ResumePoint,
     RetentionConfig,
     SeedAddOutcome, StoredSession, Suggestion, SuggestionStatus, SuperLikeStatus, SuperLikeVerdict,
@@ -758,7 +758,28 @@ impl RemoteStore {
             .collect()
     }
 
+    /// **이 서버에 실제로 적용되는 설정.** 저장된 길드 값 위에 봇 주인의 전역 강제값을 덮는다.
+    ///
+    /// 강제값 해석을 여기 넣은 이유: 길드 설정을 읽는 자리는 이미 스무 곳이 넘고
+    /// (권한 판정 · 플레이어 · 대기열 상한 · 화면 응답) 앞으로도 늘어난다. 부르는 쪽이
+    /// "강제값도 챙겨서 덮어라" 를 기억해야 하는 구조면 언젠가 한 곳이 빠지고,
+    /// 그 순간 **잠갔는데 안 먹는** 상태가 된다. 그래서 기본 경로가 곧 유효값이고,
+    /// 날것이 필요한 자리만 `load_guild_settings_raw` 를 명시적으로 부른다.
     pub fn load_guild_settings(&self, guild_id: u64) -> RemoteGuildSettings {
+        let mut settings = self.load_guild_settings_raw(guild_id);
+        // 뮤텍스를 겹쳐 잡지 않는다 — 둘 다 `self.conn` 을 잠그므로 순서대로 부른다.
+        let overrides = self.load_global_overrides();
+        overrides.apply(&mut settings);
+        // 강제값이 범위를 벗어나 들어와도 `0 = 무제한` 규약은 지켜져야 한다 (§23.1).
+        settings.sanitize();
+        settings
+    }
+
+    /// **저장된 길드 값 그대로.** 강제값을 안 덮는다.
+    ///
+    /// 서버 관리자가 원래 무엇을 골라 뒀는지 알아야 하는 자리 전용이다 —
+    /// 강제가 풀렸을 때 되살릴 값이고, 판정에 쓰면 안 된다.
+    pub fn load_guild_settings_raw(&self, guild_id: u64) -> RemoteGuildSettings {
         let key = format!("remote_guild_settings:{guild_id}");
         let conn = self.conn.lock().unwrap();
         let json = conn
@@ -781,9 +802,21 @@ impl RemoteStore {
 
     /// **저장 직전에 `sanitize`를 강제한다** (§23.1). 어느 라우트를 거쳐 들어와도
     /// `0 = 무제한` 규약과 허용 범위가 실제로 지켜진다.
+    ///
+    /// 강제된 항목은 여기서 **저장돼 있던 길드 값으로 되돌린다.** 부르는 쪽 대부분이
+    /// `ctx.settings`(= 이미 강제값이 덮인 유효값)를 고쳐서 그대로 넘기기 때문에,
+    /// 그냥 쓰면 강제값이 길드 JSON 에 구워져 강제를 풀어도 옛 설정이 안 돌아온다.
+    /// API 층의 거절(§요구4)과 별개로 여기서도 한 번 더 막는다 — 새 라우트가 생겨도 안전하다.
     pub fn save_guild_settings(&self, settings: &RemoteGuildSettings) -> rusqlite::Result<()> {
         let mut settings = settings.clone();
         settings.sanitize();
+        let overrides = self.load_global_overrides();
+        if !overrides.is_empty() {
+            let stored = self.load_guild_settings_raw(settings.guild_id);
+            overrides.restore(&mut settings, &stored);
+            // 되돌리면서 볼륨 세 값이 다시 어긋날 수 있다.
+            settings.sanitize();
+        }
         let settings = &settings;
         let key = format!("remote_guild_settings:{}", settings.guild_id);
         let json = serde_json::to_string(settings).unwrap_or_else(|_| "{}".into());
@@ -791,6 +824,46 @@ impl RemoteStore {
         conn.execute(
             "INSERT INTO settings(key, json) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET json = excluded.json",
             params![key, json],
+        )?;
+        Ok(())
+    }
+
+    // ───────── 봇 주인 전역 강제값 ─────────
+
+    /// 전역 강제값이 사는 `settings` 테이블 키. **길드 키와 완전히 분리돼 있다** —
+    /// 길드 JSON 에 섞으면 길드 저장 한 번에 강제값이 통째로 날아간다.
+    const GLOBAL_OVERRIDES_KEY: &'static str = "remote_global_overrides";
+
+    /// 봇 주인이 걸어 둔 전역 강제값. 아직 아무것도 안 걸었으면 전부 `None` 이라
+    /// `apply` 가 아무 일도 하지 않는다 — 도입 전과 완전히 같은 동작이다.
+    pub fn load_global_overrides(&self) -> GlobalOverrides {
+        let conn = self.conn.lock().unwrap();
+        let json = conn
+            .query_row(
+                "SELECT json FROM settings WHERE key = ?1",
+                params![Self::GLOBAL_OVERRIDES_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let mut overrides: GlobalOverrides = json
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        // 읽을 때도 조인다. 옛 버전이나 손으로 고친 JSON 이 범위 밖 값을 들고 있어도
+        // 그게 그대로 모든 서버의 동작이 되면 안 된다.
+        overrides.sanitize();
+        overrides
+    }
+
+    pub fn save_global_overrides(&self, overrides: &GlobalOverrides) -> rusqlite::Result<()> {
+        let mut overrides = overrides.clone();
+        overrides.sanitize();
+        let json = serde_json::to_string(&overrides).unwrap_or_else(|_| "{}".into());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings(key, json) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET json = excluded.json",
+            params![Self::GLOBAL_OVERRIDES_KEY, json],
         )?;
         Ok(())
     }
@@ -5178,6 +5251,184 @@ mod tests {
             store.lookup_lyrics("youtube:unknown"),
             Some(LyricsCacheHit::Found(_))
         ));
+        cleanup(store, path);
+    }
+
+    // ───────── 봇 주인 전역 강제값 ─────────
+
+    /// **강제값이 하나도 없으면 도입 전과 완전히 같아야 한다.**
+    /// 이게 깨지면 모든 서버의 동작이 조용히 바뀐다.
+    #[test]
+    fn without_overrides_nothing_changes() {
+        let (store, path) = temp_store("ovr-none");
+        with_legacy_settings_table(&store);
+        let saved = RemoteGuildSettings {
+            guild_id: 1,
+            max_queue_per_user: 7,
+            chat_enabled: false,
+            max_volume: 150,
+            ..Default::default()
+        };
+        store.save_guild_settings(&saved).unwrap();
+
+        assert!(store.load_global_overrides().is_empty(), "기본은 강제 안 함");
+        let effective = store.load_guild_settings(1);
+        let raw = store.load_guild_settings_raw(1);
+        assert_eq!(effective.max_queue_per_user, 7);
+        assert!(!effective.chat_enabled);
+        assert_eq!(effective.max_volume, 150);
+        // 유효값과 날것이 한 글자도 다르지 않아야 한다.
+        assert_eq!(
+            serde_json::to_string(&effective).unwrap(),
+            serde_json::to_string(&raw).unwrap(),
+        );
+        cleanup(store, path);
+    }
+
+    /// 강제하면 **실제로 쓰이는 값**이 바뀐다. `0 = 무제한`도 그대로 살아 있어야 한다 (§23.1) —
+    /// 여기서 `0`이 `1`이 되면 봇 주인이 "무제한"을 걸었는데 모든 서버가 1곡 제한이 된다.
+    #[test]
+    fn forcing_a_value_wins_over_the_guild_and_keeps_zero_unlimited() {
+        let (store, path) = temp_store("ovr-apply");
+        with_legacy_settings_table(&store);
+        store
+            .save_guild_settings(&RemoteGuildSettings {
+                guild_id: 1,
+                max_queue_per_user: 50,
+                autoplay_seed_max: 10,
+                chat_enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        store
+            .save_global_overrides(&GlobalOverrides {
+                max_queue_per_user: Some(3),
+                // "강제 안 함"과 "강제로 false"는 다른 상태다.
+                chat_enabled: Some(false),
+                autoplay_seed_max: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let effective = store.load_guild_settings(1);
+        assert_eq!(effective.max_queue_per_user, 3, "강제값이 안 먹었다");
+        assert!(!effective.chat_enabled, "강제로 끈 기능이 켜져 있다");
+        assert_eq!(effective.autoplay_seed_max, 0);
+        assert!(effective.seed_limit().is_none(), "0이 무제한이 아니게 됐다");
+        // 안 건드린 항목은 서버 값 그대로다.
+        assert_eq!(effective.max_queue_per_guild, 100);
+
+        let overrides = store.load_global_overrides();
+        assert_eq!(
+            overrides.locked_keys(),
+            vec!["maxQueuePerUser", "autoplaySeedMax", "chatEnabled"],
+            "잠긴 키 목록이 선언 순서를 안 따른다",
+        );
+        assert_eq!(
+            overrides.locked_value("chatEnabled"),
+            Some(serde_json::json!(false)),
+        );
+        assert!(overrides.locked_value("maxVolume").is_none());
+        cleanup(store, path);
+    }
+
+    /// **길드 저장이 강제값을 지우면 안 된다.** 별도 키에 사는 이유가 이것이고,
+    /// 동시에 강제값이 길드 JSON 에 구워지지도 않아야 한다 — 구워지면 풀어도 안 돌아온다.
+    #[test]
+    fn saving_guild_settings_neither_erases_nor_bakes_in_the_override() {
+        let (store, path) = temp_store("ovr-keep");
+        with_legacy_settings_table(&store);
+        store
+            .save_guild_settings(&RemoteGuildSettings {
+                guild_id: 1,
+                max_queue_per_user: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_global_overrides(&GlobalOverrides {
+                max_queue_per_user: Some(3),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // 관리 콘솔이 하는 그대로: 유효값을 읽어 다른 항목만 고쳐서 되저장한다.
+        let mut edited = store.load_guild_settings(1);
+        assert_eq!(edited.max_queue_per_user, 3);
+        edited.max_queue_per_guild = 42;
+        store.save_guild_settings(&edited).unwrap();
+
+        assert_eq!(
+            store.load_global_overrides().max_queue_per_user,
+            Some(3),
+            "길드 저장이 강제값을 지웠다",
+        );
+        assert_eq!(store.load_guild_settings(1).max_queue_per_guild, 42);
+        assert_eq!(
+            store.load_guild_settings_raw(1).max_queue_per_user,
+            50,
+            "강제값이 길드 JSON 에 구워졌다",
+        );
+
+        // 강제를 풀면 서버가 원래 쓰던 값이 되살아난다.
+        store
+            .save_global_overrides(&GlobalOverrides::default())
+            .unwrap();
+        assert_eq!(store.load_guild_settings(1).max_queue_per_user, 50);
+        cleanup(store, path);
+    }
+
+    /// 강제값도 길드 설정과 같은 범위로 조인다. 봇 주인이라고 해서 서버가 못 받는 값을
+    /// 모든 서버에 뿌릴 수 있으면 안 된다 (§23.1).
+    #[test]
+    fn override_values_are_clamped_like_guild_settings() {
+        let (store, path) = temp_store("ovr-clamp");
+        with_legacy_settings_table(&store);
+        store
+            .save_global_overrides(&GlobalOverrides {
+                max_queue_per_user: Some(99_999),
+                max_volume: Some(500),
+                chart_limit: Some(1),
+                // 0 은 무제한이라 잘리면 안 된다.
+                super_like_daily_limit: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        let overrides = store.load_global_overrides();
+        assert_eq!(overrides.max_queue_per_user, Some(1_000));
+        assert_eq!(overrides.max_volume, Some(200));
+        assert_eq!(overrides.chart_limit, Some(10));
+        assert_eq!(overrides.super_like_daily_limit, Some(0), "0이 잘렸다");
+        cleanup(store, path);
+    }
+
+    /// 볼륨 상한을 강제로 내리면 최소·기본도 따라 내려가야 한다.
+    /// `sanitize()` 는 `max < min` 이면 **max 를 올려서** 맞추므로, 그냥 덮으면 강제가 풀린다.
+    #[test]
+    fn forcing_the_volume_ceiling_pulls_the_floor_down_with_it() {
+        let (store, path) = temp_store("ovr-volume");
+        with_legacy_settings_table(&store);
+        store
+            .save_guild_settings(&RemoteGuildSettings {
+                guild_id: 1,
+                min_volume: 120,
+                max_volume: 200,
+                default_volume: 180,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_global_overrides(&GlobalOverrides {
+                max_volume: Some(80),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let effective = store.load_guild_settings(1);
+        assert_eq!(effective.max_volume, 80, "강제 상한이 도로 올라갔다");
+        assert!(effective.min_volume <= 80);
+        assert!(effective.default_volume <= 80);
         cleanup(store, path);
     }
 }
