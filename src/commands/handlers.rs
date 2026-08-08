@@ -336,6 +336,34 @@ fn in_bot_voice_channel(bot_live: Option<u64>, requester_vc: Option<u64>) -> boo
     bot_live.is_some() && bot_live == requester_vc
 }
 
+/// 봇을 이 음성 채널로 실제로 들여보낸다 (없으면 합류, 다른 방이면 **이동**).
+///
+/// songbird 의 `join` 은 이미 붙어 있는 Call 에 부르면 그 자리에서 채널을 옮겨 주고
+/// 재생 중인 트랙은 그대로 유지된다 — 그래서 끊었다 다시 붙이지 않는다.
+/// (`coordinator::play_track` 이 스스로는 절대 안 옮기는 것과 다르다. 거기서 옮기면
+/// stale 한 저장값 때문에 봇이 제멋대로 자리를 뜬다. 여기는 사람이 대놓고 부른 자리다.)
+async fn join_voice_channel(app: &Arc<App>, guild_id: u64, channel_id: u64) -> Result<(), String> {
+    let manager = app
+        .songbird
+        .get()
+        .ok_or("음성 엔진이 아직 준비되지 않았어요. 잠시 뒤에 다시 불러 주세요.")?;
+    let gid = songbird::id::GuildId(
+        std::num::NonZeroU64::new(guild_id).ok_or("서버를 알 수 없어요.")?,
+    );
+    let cid = songbird::id::ChannelId(
+        std::num::NonZeroU64::new(channel_id).ok_or("음성 채널을 알 수 없어요.")?,
+    );
+    manager
+        .join(gid, cid)
+        .await
+        .map_err(|e| format!("음성 채널에 못 들어갔어요: {e}"))?;
+    app.log.info(
+        "Voice",
+        &format!("Joined voice channel {channel_id} in guild {guild_id} on request."),
+    );
+    Ok(())
+}
+
 fn is_admin(cmd: &CommandInteraction) -> bool {
     cmd.member
         .as_ref()
@@ -586,6 +614,52 @@ async fn ensure_autoplay_allowed(
     ))
 }
 
+// ───────── 디스코드 명령 그룹 on/off (서버별) ─────────
+
+/// 이 서버에서 이 명령을 디스코드로 쓸 수 있는지. 막혔으면 **막은 그룹**을 돌려준다.
+///
+/// **판정은 이 함수 하나뿐이고, 부르는 곳도 인터랙션 진입점 한 곳뿐이다.**
+/// 명령 핸들러마다 검사를 흩어 놓으면 새 명령이 추가될 때 반드시 빠지고, 빠진 명령은
+/// 서버가 껐는데도 계속 먹히면서 아무도 눈치채지 못한다. 여기서는 canonical 이름만 보므로
+/// 별칭(`/재생`·`/ㅈㅅ`)도 자동으로 같이 막힌다 — 별칭은 이미 canonical 로 접혀 들어온다.
+///
+/// 그룹은 명령 등록(`build_commands`)에서 거르지 않는다. 명령은 전역으로 한 번 등록되는데
+/// 이 설정은 **서버마다** 다르기 때문이다. 그래서 목록에는 보이고 누르면 이유를 말한다.
+fn command_group_block(
+    settings: &RemoteGuildSettings,
+    canonical: &str,
+) -> Option<&'static catalog::CommandGroup> {
+    let group = catalog::group_of(canonical)?;
+    (!settings.command_group_enabled(group.key)).then_some(group)
+}
+
+/// 그룹이 꺼져 있을 때 하는 말 (§23.3).
+///
+/// `권한 없음` 은 답이 아니다 — **무엇이 꺼졌는지**와 **그럼 어디서 하는지**를 같이 말한다.
+/// 리모컨 주소는 누구에게나 붙인다(그게 대안이니까). 관리 콘솔 링크는 관리자에게만 붙인다 —
+/// 일반 멤버에게 못 들어가는 링크를 보여 주는 건 놀리는 것이다(§23.3-4).
+fn command_group_denied_text(
+    group: &catalog::CommandGroup,
+    canonical: &str,
+    portal: Option<&str>,
+    admin: bool,
+) -> String {
+    let name = catalog::korean_alias(canonical);
+    let where_instead = match portal {
+        Some(url) => format!(" 리모컨에서는 그대로 할 수 있어요 → {url}"),
+        None => " 대신 웹 리모컨에서 할 수 있어요.".to_string(),
+    };
+    let how_to_undo = match (admin, portal) {
+        (true, Some(url)) => format!(" 다시 켜려면 관리 콘솔 → {url}/admin"),
+        (true, None) => " 다시 켜려면 서버 관리 콘솔의 디스코드 명령 설정을 보세요.".to_string(),
+        (false, _) => String::new(),
+    };
+    format!(
+        "`/{name}` 은(는) 이 서버에서 디스코드로 안 쓰기로 했어요 — **{}** 그룹을 통째로 꺼 뒀어요.{where_instead}{how_to_undo}",
+        group.label
+    )
+}
+
 // ───────── 옵션 헬퍼 ─────────
 
 fn opt_str(cmd: &CommandInteraction, name: &str) -> Option<String> {
@@ -775,6 +849,39 @@ pub async fn handle_command(app: Arc<App>, ctx: Context, cmd: CommandInteraction
                 ),
             )
             .await;
+        return;
+    }
+
+    // 이 서버가 디스코드로 안 쓰기로 한 그룹이면 여기서 멈춘다. **승인 검사와 같은 이유로
+    // 명령을 처리하기 전에** 본다 — 뒤에서 막으면 대기열이 바뀐 뒤에 거절하게 된다.
+    //
+    // 설정은 캐시(`player.cached_settings`)가 아니라 저장소에서 바로 읽는다. 캐시는 관리
+    // 콘솔이 저장해도 갱신되지 않아서, 방금 끈 그룹이 봇을 재시작할 때까지 계속 먹힌다.
+    // 슬래시 명령은 초당 수백 번 오는 길이 아니라 매번 읽어도 싸다.
+    let settings = app.remote.load_guild_settings(guild_id);
+    if let Some(group) = command_group_block(&settings, canonical) {
+        let portal = app.public_base_url.get().map(|base| {
+            format!("{}/music/guilds/{guild_id}", base.trim_end_matches('/'))
+        });
+        let text =
+            command_group_denied_text(group, canonical, portal.as_deref(), is_admin(&cmd));
+        let _ = cmd
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(text)
+                        .ephemeral(true),
+                ),
+            )
+            .await;
+        app.log.info(
+            "Command",
+            &format!(
+                "Rejected '{}' => '{canonical}' in guild {guild_id}: command group '{}' is turned off.",
+                cmd.data.name, group.key
+            ),
+        );
         return;
     }
 
@@ -1027,6 +1134,49 @@ async fn dispatch(
                 ctx,
                 cmd,
                 "⏹ 정지하고 대기열을 비웠어요. (음성 채널엔 남아 있어요 — 내보내려면 `/나가기`)",
+                false,
+            )
+            .await;
+            Ok(())
+        }
+        "join" => {
+            // 부른 사람이 **지금 있는 방**으로 간다. 그 사람이 음성에 없으면 갈 곳이 없다.
+            let requester_vc = requester_voice_channel(ctx, guild_id, cmd.user.id.get())
+                .ok_or("먼저 음성 채널에 들어간 뒤에 불러 주세요 — 어디로 갈지 알 수가 없어요.")?;
+            // 봇이 있는 곳은 songbird 라이브 연결로만 판단한다 (v3 §16 B1).
+            let bot_live = bot_live_voice_channel(app, guild_id).await;
+            if bot_live == Some(requester_vc) {
+                respond_text(ctx, cmd, "이미 같은 음성 채널에 있어요.", false).await;
+                return Ok(());
+            }
+            // 봇이 다른 방에 있으면 거기서 듣던 사람들의 소리가 끊긴다. 그래서
+            // **아무도 안 듣고 있을 때만** 누구나 데려올 수 있고, 듣는 사람이 있으면 관리자만.
+            // (부른 사람이 그 방에 있었다면 위 "이미 같은 채널" 에서 이미 끝났다.)
+            if let Some(bot_channel) = bot_live {
+                let listeners = listening_summary(app, ctx, guild_id)
+                    .await
+                    .map(|(_, count)| count)
+                    .unwrap_or(0);
+                if listeners > 0 && !is_admin(cmd) {
+                    return Err(format!(
+                        "봇이 <#{bot_channel}> 에서 {listeners}명이랑 같이 듣고 있어요. 그 사람들 소리가 끊기니까, 데려오는 건 서버 관리자만 할 수 있어요."
+                    ));
+                }
+            }
+            let moved = bot_live.is_some();
+            // 저장 상태를 먼저 새 채널로 맞춘다 — 뒤따르는 sync_guild 가 이 값을 본다.
+            app.player.connect_voice(guild_id, requester_vc).await;
+            join_voice_channel(app, guild_id, requester_vc).await?;
+            // 곡이 걸려 있는데 소리가 안 나던 상태였으면 여기서 이어진다.
+            // 이미 같은 곡을 재생 중이면 sync_guild 는 볼륨·일시정지만 맞추고 지나간다.
+            app.coordinator.sync_guild(app, guild_id).await;
+            respond_text(
+                ctx,
+                cmd,
+                &format!(
+                    "👋 <#{requester_vc}> {}",
+                    if moved { "로 옮겼어요." } else { "에 들어왔어요." }
+                ),
                 false,
             )
             .await;
@@ -2141,7 +2291,114 @@ pub async fn handle_button(app: Arc<App>, ctx: Context, comp: ComponentInteracti
 
 #[cfg(test)]
 mod tests {
-    use super::in_bot_voice_channel;
+    use super::{
+        build_commands, command_group_block, command_group_denied_text, in_bot_voice_channel,
+    };
+    use crate::commands::catalog;
+    use crate::remote::RemoteGuildSettings;
+
+    /// 설정을 한 번도 안 만진 서버는 **모든 명령이 그대로 먹혀야 한다.**
+    /// 이 기능이 기존 동작을 건드리는지 아닌지가 여기서 갈린다.
+    #[test]
+    fn a_guild_without_settings_can_still_use_every_command() {
+        let settings = RemoteGuildSettings::default();
+        for def in catalog::ALL {
+            assert!(
+                command_group_block(&settings, def.canonical).is_none(),
+                "'{}' 이(가) 기본 설정에서 막혔어요",
+                def.name
+            );
+        }
+    }
+
+    /// 한 그룹을 끄면 **그 그룹만** 막히고 나머지는 그대로다.
+    /// 별칭도 canonical 로 접혀 들어오므로 같이 막힌다(`/제거`·`/ㅈㄱ` → `remove`).
+    #[test]
+    fn turning_off_one_group_blocks_only_that_group() {
+        let settings = RemoteGuildSettings {
+            disabled_command_groups: vec!["queueEdit".into()],
+            ..Default::default()
+        };
+
+        for name in ["remove", "제거", "ㅈㄱ", "clear", "비우기", "셔플", "이동", "지정스킵"] {
+            let canonical = catalog::canonical_of(name);
+            assert_eq!(
+                command_group_block(&settings, canonical).map(|group| group.key),
+                Some("queueEdit"),
+                "'{name}' 이(가) 안 막혔어요"
+            );
+        }
+
+        for name in ["play", "재생", "ㅈㅅ", "queue", "스킵", "참여", "나가기", "플리"] {
+            let canonical = catalog::canonical_of(name);
+            assert!(
+                command_group_block(&settings, canonical).is_none(),
+                "'{name}' 이(가) 엉뚱하게 막혔어요"
+            );
+        }
+    }
+
+    /// 그룹을 전부 끄면 전부 막힌다 — `info` 도 예외가 아니다(끌 수 있게 한 값이라서).
+    /// 대신 거절 문구가 리모컨을 안내하므로 완전히 막다른 길은 아니다.
+    #[test]
+    fn every_group_can_be_turned_off_including_info() {
+        let settings = RemoteGuildSettings {
+            disabled_command_groups: catalog::GROUPS
+                .iter()
+                .map(|group| group.key.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        for def in catalog::ALL {
+            assert!(
+                command_group_block(&settings, def.canonical).is_some(),
+                "'{}' 이(가) 안 막혔어요",
+                def.name
+            );
+        }
+        let group = catalog::group_for_key("info").unwrap();
+        let text = command_group_denied_text(group, "remote", Some("https://x/music/guilds/1"), false);
+        assert!(text.contains("https://x/music/guilds/1"), "{text}");
+    }
+
+    /// 거절 문구는 §23.3 — 무엇이 꺼졌는지, 그럼 어디서 하는지를 말한다.
+    /// 관리 콘솔 링크는 **관리자에게만** 붙는다(못 들어가는 링크를 보여 주면 놀리는 것).
+    #[test]
+    fn denial_says_what_is_off_and_where_to_go_instead() {
+        let group = catalog::group_for_key("enqueue").unwrap();
+        let portal = "https://bot.example/music/guilds/7";
+
+        let member = command_group_denied_text(group, "play", Some(portal), false);
+        assert!(member.contains("/재생"), "한국어 이름으로 말해야 해요: {member}");
+        assert!(member.contains("곡 담기"), "{member}");
+        assert!(member.contains(portal), "{member}");
+        assert!(!member.contains("/admin"), "일반 멤버에게 관리 콘솔을 보여 주면 안 돼요: {member}");
+
+        let admin = command_group_denied_text(group, "play", Some(portal), true);
+        assert!(admin.contains("/admin"), "{admin}");
+
+        // 공개 주소가 아직 없어도 문구가 끊기면 안 된다.
+        let no_url = command_group_denied_text(group, "play", None, false);
+        assert!(no_url.contains("리모컨"), "{no_url}");
+    }
+
+    /// 새 `/참여` 가 실제로 등록되는지 — 카탈로그에만 있고 등록이 안 되면 아무도 못 쓴다.
+    #[test]
+    fn join_is_registered_with_its_aliases_but_not_the_chosung_one() {
+        let names: Vec<String> = build_commands()
+            .iter()
+            .map(|cmd| {
+                serde_json::to_value(cmd)
+                    .ok()
+                    .and_then(|value| value.get("name").and_then(|v| v.as_str().map(str::to_string)))
+                    .unwrap_or_default()
+            })
+            .collect();
+        for name in ["join", "참여", "부르기", "입장"] {
+            assert!(names.iter().any(|n| n == name), "'{name}' 이(가) 등록 안 됐어요");
+        }
+        assert!(!names.iter().any(|n| n == "ㅊㅇ"), "초성 별칭은 등록하지 않는다");
+    }
 
     /// "봇과 같은 방인가" 는 라이브 연결로만 판단한다 (v3 §16 B1).
     ///

@@ -4734,7 +4734,9 @@ async fn api_control(
     {
         return json_error(
             StatusCode::CONFLICT,
-            "봇이 음성 채널에 안 들어가 있어요. `/입장` 으로 부르거나, 서버 설정에서 이 제한을 끌 수 있어요.",
+            // 안내하는 명령 이름은 **실제로 있는 것**이어야 한다. 예전엔 없는 `/입장` 을
+            // 안내해서, 시킨 대로 쳐도 아무 일이 안 일어났다.
+            "봇이 음성 채널에 안 들어가 있어요. `/참여` 로 부르거나, 서버 설정에서 이 제한을 끌 수 있어요.",
         );
     }
     if matches!(request.action.as_str(), "skip" | "seek") {
@@ -7578,6 +7580,13 @@ async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value 
         "skipLeadMs": settings.skip_lead_ms,
         "seekLockoutMs": settings.seek_lockout_ms,
         "webSyncOffsetMs": settings.web_sync_offset_ms,
+        // ── 디스코드 명령 그룹 on/off ──
+        // 지금 꺼 둔 그룹의 키. **빈 배열이면 전부 켜져 있다** — 설정을 안 만진 서버는
+        // 항상 빈 배열이고, 그때 봇은 이 기능이 생기기 전과 똑같이 동작한다.
+        "disabledCommandGroups": settings.disabled_command_groups,
+        // 그릴 스위치의 목록. 그룹 이름·설명·속한 명령을 화면이 따로 들고 있으면
+        // 명령이 늘어날 때 서버와 화면이 어긋난다 — 표는 서버 한 곳(`catalog::GROUPS`)에만 있다.
+        "commandGroups": command_groups_json(),
         // 화면이 `∞` 칸을 그리려면 어떤 항목이 무제한을 받는지 알아야 한다 (§23.1).
         "unlimitedKeys": UNLIMITED_KEYS,
         // **봇 주인이 잠근 항목** — UI 는 이걸 보고 자물쇠를 그리고 입력을 잠근다.
@@ -7591,6 +7600,34 @@ async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value 
         }
     }
     snapshot
+}
+
+/// 디스코드 명령 그룹 표를 그대로 실어 보낸다 (`commands::catalog::GROUPS`).
+///
+/// 화면이 그룹 목록을 하드코딩하면 명령이 하나 늘 때마다 두 곳을 고쳐야 하고,
+/// 한쪽만 고치면 **화면에 없는 스위치가 서버에서만 살아 있는** 상태가 된다.
+/// 명령 이름은 canonical 과 한국어를 같이 준다 — 사람에게는 `/재생` 으로 보여야 한다.
+fn command_groups_json() -> Value {
+    Value::Array(
+        crate::commands::catalog::GROUPS
+            .iter()
+            .map(|group| {
+                json!({
+                    "key": group.key,
+                    "label": group.label,
+                    "description": group.description,
+                    "commands": group
+                        .commands
+                        .iter()
+                        .map(|name| json!({
+                            "name": name,
+                            "korean": crate::commands::catalog::korean_alias(name),
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// 관리 콘솔에 실어 보낼 잠금 정보. 봇 주인 화면과 **같은 모양**이다.
@@ -8010,6 +8047,30 @@ async fn admin_settings_put(
                     Ok(ids) => settings.manager_role_ids = ids,
                     Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
                 }
+            }
+            // ── 디스코드 명령 그룹 on/off ──
+            // **꺼 둘 그룹의 전체 목록**을 받는다(보낸 대로 통째로 갈아 끼운다).
+            // 스위치 화면이 늘 전체 상태를 알고 있어서 부분 갱신보다 이쪽이 어긋날 자리가 없다.
+            // 모르는 키는 거절한다 — 오타가 조용히 저장되면 화면에는 꺼진 것으로 보이는데
+            // 실제로는 아무것도 안 막히는, 제일 찾기 어려운 상태가 된다.
+            if let Some(values) = body.get("disabledCommandGroups") {
+                let Some(values) = values.as_array() else {
+                    return json_error(StatusCode::BAD_REQUEST, "꺼 둘 명령 그룹은 배열이어야 해요.");
+                };
+                let mut keys: Vec<String> = Vec::with_capacity(values.len());
+                for value in values {
+                    let key = value.as_str().unwrap_or_default();
+                    let Some(group) = crate::commands::catalog::group_for_key(key) else {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            format!("'{key}': 알 수 없는 명령 그룹이에요."),
+                        );
+                    };
+                    if !keys.iter().any(|existing| existing == group.key) {
+                        keys.push(group.key.to_string());
+                    }
+                }
+                settings.disabled_command_groups = keys;
             }
         }
         "limits" => {
@@ -11856,6 +11917,31 @@ mod tests {
             crate::remote::audit_text("playback.volume", "지훈", None, None, Some("150%"), 1);
         assert!(text.contains("150%"), "{text}");
         assert!(!text.contains("volume:"), "{text}");
+    }
+
+    // ───────── 디스코드 명령 그룹 ─────────
+
+    /// 관리 콘솔과의 **계약**을 못 박는다. 화면은 이 모양만 보고 스위치를 그린다.
+    /// 키 이름 하나가 바뀌면 화면은 그룹이 하나도 없는 것처럼 보이고, 그건 조용히 벌어진다.
+    #[test]
+    fn command_groups_payload_keeps_its_shape() {
+        let payload = command_groups_json();
+        let groups = payload.as_array().expect("배열이어야 해요");
+        assert_eq!(groups.len(), crate::commands::catalog::GROUPS.len());
+        for group in groups {
+            for key in ["key", "label", "description", "commands"] {
+                assert!(group.get(key).is_some(), "'{key}' 가 빠졌어요: {group}");
+            }
+            let commands = group.get("commands").and_then(Value::as_array).unwrap();
+            assert!(!commands.is_empty(), "빈 그룹: {group}");
+            for command in commands {
+                // 화면은 `/play` 가 아니라 `/재생` 을 보여 줘야 한다.
+                assert!(command.get("name").and_then(Value::as_str).is_some());
+                assert!(command.get("korean").and_then(Value::as_str).is_some());
+            }
+        }
+        // 곡 담기 그룹이 실제로 그 이름으로 나가는지 (설정 값이 이 키로 저장된다).
+        assert!(groups.iter().any(|group| group.get("key") == Some(&json!("enqueue"))));
     }
 
     // ───────── 봇 주인 전역 강제값 ─────────

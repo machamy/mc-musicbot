@@ -1206,6 +1206,7 @@ fn settings_label(key: &str) -> &str {
         "bulkEnqueueLimit" => "한 번에 담기 상한",
         "chartLimit" => "차트에서 가져올 곡 수",
         "publicNowPlaying" => "로그인 없이 지금 곡 보기",
+        "disabledCommandGroups" => "꺼 둔 디스코드 명령 그룹",
         other => other,
     }
 }
@@ -1946,6 +1947,20 @@ pub struct RemoteGuildSettings {
     /// 끄면 조작을 받아 두고 봇이 들어오는 순간부터 그대로 이어 간다.
     #[serde(default = "default_true")]
     pub require_voice_for_playback: bool,
+    /// **디스코드로는 쓰지 않을 명령 그룹** (`commands::catalog::GROUPS` 의 키).
+    ///
+    /// "이제 리모컨이 있으니까 디스코드로는 좀 적게 하고 싶다" 를 그대로 담은 값이다.
+    /// 여기 적힌 그룹의 명령은 인터랙션 진입점에서 거절된다(별칭도 canonical 로 접히므로 같이 막힌다).
+    ///
+    /// **켜짐 목록이 아니라 꺼짐 목록인 이유.** 빈 배열 = 전부 켜짐이라, 이 값이 없는
+    /// 기존 저장본과 설정을 한 번도 안 만진 서버가 도입 전과 **완전히 같게** 동작한다.
+    /// 켜짐 목록이었다면 새 그룹이 생길 때마다 "저장본에 그 키가 없다"를 켜짐으로 볼지
+    /// 꺼짐으로 볼지 매번 정해야 하고, 한 번만 틀리면 멀쩡하던 서버의 명령이 조용히 사라진다.
+    ///
+    /// 모르는 키가 섞여 있어도 **아무 일도 안 한다**(어떤 그룹과도 안 맞는다) — 그룹 이름이
+    /// 바뀌어도 최악이 "다시 켜짐"이지 "다 막힘"이 아니어야 한다.
+    #[serde(default)]
+    pub disabled_command_groups: Vec<String>,
     /// 로그인 없이 **지금 무슨 곡인지**만 볼 수 있게 할지 (§29).
     ///
     /// 켜져 있어도 나가는 것은 곡 제목·가수·진행 상태뿐이다. 신청한 사람 이름,
@@ -2145,6 +2160,17 @@ impl RemoteGuildSettings {
         }
     }
 
+    /// 이 디스코드 명령 그룹을 이 서버에서 쓸 수 있는가.
+    ///
+    /// **목록에 없으면 켜짐이다.** 설정을 한 번도 안 만진 서버(=대부분)는 여기서
+    /// 무조건 `true` 라, 그룹 기능이 생기기 전과 완전히 같은 길을 탄다.
+    pub fn command_group_enabled(&self, group_key: &str) -> bool {
+        !self
+            .disabled_command_groups
+            .iter()
+            .any(|key| key == group_key)
+    }
+
     /// 이 서버의 투표 점수표.
     pub fn vote_points(&self) -> VotePoints {
         VotePoints::from_settings(self)
@@ -2289,6 +2315,8 @@ impl Default for RemoteGuildSettings {
             autoplay_seed_max: default_autoplay_seed_max(),
             bulk_enqueue_limit: default_bulk_enqueue_limit(),
             chart_super_weight: default_chart_super_weight(),
+            // 비어 있음 = 전 그룹 켜짐. 기본이 조여지면 안 된다.
+            disabled_command_groups: Vec::new(),
         }
     }
 }
@@ -2392,6 +2420,15 @@ macro_rules! define_global_overrides {
 // **일부러 뺐다.** 그건 서버마다 달라야 하는 값이고, 잠가 봐야 얻는 게 없이 서버만 답답해진다.
 // 빈 채널 규칙(§27)도 뺐다 — 이미 `GlobalSettings::empty_voice_forced` 가 같은 일을 한다.
 // 두 군데서 강제하면 어느 쪽이 이기는지 아무도 모르게 된다.
+//
+// **디스코드 명령 그룹(`disabled_command_groups`)도 일부러 뺐다.** 세 가지 이유다.
+//   1. 성격이 위 세 기준 어디에도 안 맞는다. 어느 서버가 `/재생` 을 디스코드로 받을지는
+//      리소스도 안전도 아니고 **그 서버의 운영 취향**이라, 이미 뺀 "권한 규칙"과 같은 칸이다.
+//   2. 봇 주인이 전역으로 `enqueue` 를 끄면 봇이 봇이 아니게 된다. 한 서버가 남용하면
+//      승인(§26)을 내리거나 상한을 조이면 되고, 그 손잡이는 이미 여기 다 있다.
+//   3. 이 매크로는 `Copy` 값 하나만 강제한다(`Option<T>` 를 `&self` 에서 `map` 한다).
+//      목록형은 "덮어쓰기"인지 "합치기"인지부터 정해야 해서, 넣는 순간 강제 체계 전체가
+//      두 가지 의미를 갖게 된다. 값 하나를 잠그는 도구는 값 하나만 잠그는 게 낫다.
 define_global_overrides! {
     // ── 1. 리소스 상한 ──
     /// 1인 대기열 수. `0` 이면 무제한(§23.1).
@@ -2570,6 +2607,32 @@ mod tests {
         settings.rule_role_ids.insert("search".into(), vec![123]);
         assert_eq!(settings.manager_roles(), &[999]);
         assert_eq!(settings.roles_for("search"), &[123]);
+    }
+
+    /// 명령 그룹 설정이 **없던 시절의 저장본**을 그대로 읽어도 전 그룹이 켜져 있어야 한다.
+    /// 이 계약이 깨지면 업데이트 한 번에 모든 서버의 디스코드 명령이 사라진다.
+    #[test]
+    fn guilds_without_the_setting_keep_every_command_group() {
+        let legacy: RemoteGuildSettings = serde_json::from_str(r#"{"searchRule":"guildMember"}"#)
+            .expect("옛 설정 JSON 을 못 읽으면 그 서버 설정이 통째로 기본값으로 되돌아간다");
+        assert!(legacy.disabled_command_groups.is_empty());
+        for group in crate::commands::catalog::GROUPS {
+            assert!(legacy.command_group_enabled(group.key), "{}", group.key);
+        }
+        assert!(RemoteGuildSettings::default().command_group_enabled("enqueue"));
+    }
+
+    /// 끈 그룹만 막히고, 모르는 키는 아무 일도 안 한다(그룹 이름이 바뀌어도 다 막히면 안 된다).
+    #[test]
+    fn only_the_listed_groups_are_disabled() {
+        let settings = RemoteGuildSettings {
+            disabled_command_groups: vec!["queueEdit".into(), "옛날그룹".into()],
+            ..Default::default()
+        };
+        assert!(!settings.command_group_enabled("queueEdit"));
+        assert!(settings.command_group_enabled("enqueue"));
+        assert!(settings.command_group_enabled("playback"));
+        assert!(settings.command_group_enabled("info"));
     }
 
     #[test]
