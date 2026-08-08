@@ -1062,7 +1062,15 @@ body[data-dragging="tab"] { user-select: none; }
   color: var(--accent);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: var(--fs-xs);
+  /* 후보가 많으면 줄바꿈 대신 가로로 흘린다. 힌트 줄이 세 줄씩 되면 입력칸을 밀어낸다. */
+  white-space: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
+.dev__hint::-webkit-scrollbar { display: none; }
+/* Tab 으로 후보를 고르는 중 — 지금 무엇이 선택돼 있는지가 순환의 전부다.
+ * 고른 항목은 `[이렇게]` 감싸서 표시하므로 여기서는 줄 자체를 살짝 띄워 준다. */
+.dev__hint[data-open] { background: var(--surface-2); color: var(--text-2); }
 .dev__in {
   border: 0;
   border-top: 1px solid var(--line-1);

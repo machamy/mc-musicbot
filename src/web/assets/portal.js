@@ -7430,7 +7430,7 @@ function buildDevConsole() {
   el.devHint = h('div', { class: 'dev__hint' });
   el.devIn = h('input', {
     class: 'dev__in', type: 'text', spellcheck: 'false', autocomplete: 'off',
-    'aria-label': '개발자 명령', placeholder: 'help 를 치면 목록이 나와요 · Tab 으로 자동완성',
+    'aria-label': '개발자 명령', placeholder: 'help · Tab 자동완성 · ↑↓ 이력 · Esc 닫기',
   });
 
   const print = (text) => {
@@ -7439,19 +7439,82 @@ function buildDevConsole() {
     el.devOut.scrollTop = el.devOut.scrollHeight;
   };
 
-  const repaintHint = () => {
-    const matches = devComplete(el.devIn.value);
-    el.devHint.textContent = matches.length && el.devIn.value ? matches.slice(0, 8).join('  ') : '';
+  /* ── 자동완성 ──
+   *
+   * 예전에는 후보가 둘 이상이면 **목록만 출력하고 입력은 그대로 뒀다.** 파라미터는 거의
+   * 항상 후보가 여럿이라, 사용자 입장에서는 "파라미터 자동완성이 아예 안 된다" 였다.
+   *
+   * readline(bash·zsh)과 게임 콘솔이 오래 다듬어 온 규칙을 그대로 따른다.
+   *   Tab        공통 접두사까지 채운다. 더 채울 게 없으면 후보를 띄우고 하나씩 순환한다.
+   *   Shift+Tab  반대로 순환한다.
+   *   ↑ ↓        후보가 떠 있으면 후보를 옮기고, 아니면 예전처럼 명령 이력을 꺼낸다.
+   *   Enter      후보가 떠 있으면 그걸 먼저 확정한다. 한 번 더 눌러야 실행이다.
+   *   Esc        후보를 닫는다.
+   *
+   * 핵심은 **공통 접두사 채우기**다. 후보가 20개라도 한 글자씩은 확실히 나아가야
+   * 목록을 눈으로 훑는 대신 계속 타이핑할 수 있다. */
+  let acItems = [];       // 지금 떠 있는 후보
+  let acAt = -1;          // 그중 고른 것 (-1 이면 아직 안 고름)
+
+  /** 후보들이 공유하는 가장 긴 앞부분. 여기까지는 무조건 채워도 안전하다. */
+  const commonPrefix = (list) => list.reduce((acc, value) => {
+    let i = 0;
+    while (i < acc.length && i < value.length && acc[i] === value[i]) i += 1;
+    return acc.slice(0, i);
+  }, list[0] || '');
+
+  const paintHint = () => {
+    if (!acItems.length) { el.devHint.textContent = ''; el.devHint.removeAttribute('data-open'); return; }
+    el.devHint.setAttribute('data-open', '1');
+    // 고른 것을 눈에 띄게 — 순환하는데 어디쯤인지 모르면 순환이 의미가 없다.
+    el.devHint.textContent = acItems
+      .map((value, index) => {
+        const tail = value.split(/\s+/).pop();
+        return index === acAt ? `[${tail}]` : tail;
+      })
+      .join('  ') + (acItems.length > 12 ? ` … ${acItems.length}개` : '');
   };
 
-  el.devIn.addEventListener('input', repaintHint);
+  const closeAc = () => { acItems = []; acAt = -1; paintHint(); };
+
+  /** 지금 입력 기준으로 후보를 다시 계산한다. 고른 위치는 버린다. */
+  const refreshAc = () => {
+    acItems = el.devIn.value ? devComplete(el.devIn.value).slice(0, 40) : [];
+    acAt = -1;
+    paintHint();
+  };
+
+  const applyAc = (index) => {
+    acAt = ((index % acItems.length) + acItems.length) % acItems.length;
+    el.devIn.value = acItems[acAt];
+    paintHint();
+  };
+
+  el.devIn.addEventListener('input', refreshAc);
   el.devIn.addEventListener('keydown', async (event) => {
     if (event.key === 'Tab') {
       // Tab 은 브라우저 기본이 포커스 이동이라 반드시 막는다.
       event.preventDefault();
+      if (acItems.length && acAt >= 0) { applyAc(acAt + (event.shiftKey ? -1 : 1)); return; }
       const matches = devComplete(el.devIn.value);
-      if (matches.length === 1) { el.devIn.value = matches[0] + ' '; repaintHint(); }
-      else if (matches.length > 1) print(matches.join('  '));
+      if (!matches.length) { closeAc(); return; }
+      if (matches.length === 1) { el.devIn.value = matches[0] + ' '; closeAc(); return; }
+      acItems = matches.slice(0, 40);
+      const shared = commonPrefix(matches);
+      // 아직 채울 게 남았으면 채우기만 한다. 더 못 채울 때 비로소 순환을 시작한다 —
+      // 곧장 첫 후보를 넣어 버리면 사용자가 원하지 않은 값이 입력에 박힌다.
+      if (shared.length > el.devIn.value.length) { el.devIn.value = shared; acAt = -1; paintHint(); return; }
+      applyAc(event.shiftKey ? -1 : 0);
+      return;
+    }
+    if (event.key === 'Escape') {
+      if (acItems.length) { event.preventDefault(); closeAc(); }
+      return;
+    }
+    // 후보가 떠 있으면 방향키는 후보를 옮긴다. 아니면 예전처럼 이력을 꺼낸다.
+    if ((event.key === 'ArrowUp' || event.key === 'ArrowDown') && acItems.length) {
+      event.preventDefault();
+      applyAc((acAt < 0 ? 0 : acAt) + (event.key === 'ArrowDown' ? 1 : -1));
       return;
     }
     // 위/아래로 이전 명령을 꺼낸다. 같은 걸 다시 치게 만들면 콘솔로 쓸 수가 없다.
@@ -7462,14 +7525,24 @@ function buildDevConsole() {
         ? Math.min(devHistory.length - 1, devHistoryAt + 1)
         : Math.max(-1, devHistoryAt - 1);
       el.devIn.value = devHistoryAt < 0 ? '' : devHistory[devHistory.length - 1 - devHistoryAt];
+      closeAc();
+      return;
+    }
+    // 후보를 고른 상태의 Enter 는 **확정만** 한다. 바로 실행하면 잘못 고른 걸 되돌릴 틈이 없다.
+    if (event.key === 'Enter' && acItems.length && acAt >= 0) {
+      event.preventDefault();
+      el.devIn.value = acItems[acAt] + ' ';
+      closeAc();
       return;
     }
     if (event.key !== 'Enter') return;
     const line = el.devIn.value.trim();
     if (!line) return;
     el.devIn.value = '';
-    el.devHint.textContent = '';
-    devHistory.push(line);
+    closeAc();
+    // 같은 명령을 연달아 치면 이력에 두 번 쌓지 않는다 — ↑ 를 두 번 눌러야 이전 것이 나오면
+    // 이력이 아니라 방해물이 된다(readline 의 `ignoredups` 와 같은 이유).
+    if (devHistory[devHistory.length - 1] !== line) devHistory.push(line);
     devHistoryAt = -1;
     print(`› ${line}`);
     const [name, ...rest] = line.split(/\s+/);
