@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 18;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -379,6 +379,63 @@ const MIGRATION_V16: &str = r#"
         saved_utc        TEXT NOT NULL
     );
 "#;
+
+/// v17 — **이미 쓰고 있던 서버는 승인된 것으로 넘긴다** (§26).
+///
+/// v16 이 승인 게이트를 넣으면서 모든 서버가 `pending` 으로 시작했다. 그런데
+/// 게이트는 *앞으로 초대될* 서버를 막으려는 것이지, 어제까지 잘 쓰던 서버를
+/// 잠그려던 게 아니다. 실제로 배포하자마자 쓰던 서버 3개가 통째로 막혔다 —
+/// 봇은 멀쩡히 붙어 있는데 명령어도 리모컨도 전부 거절당했다.
+///
+/// 봇이 이미 알던 서버(재생 상태·메타데이터가 남아 있는 서버)를 승인으로 채운다.
+/// **`INSERT OR IGNORE` 라서 이미 판정이 있는 서버는 안 건드린다** — 차단해 둔 서버가
+/// 이 마이그레이션으로 되살아나면 안 된다.
+///
+/// `guild_states` · `guild_metadata` 는 **레거시(C# 공용) 테이블**이라 이 러너가 만들지
+/// 않는다. 없을 수도 있으므로(새 설치에서 `Db::open` 보다 먼저 열리면) 있는 것만 훑는다.
+/// 처음엔 raw SQL 로 두 테이블을 UNION 했다가, 테이블이 없으면 마이그레이션이 통째로
+/// 실패해 **저장소가 아예 안 열리는** 상태를 만들 뻔했다.
+fn migrate_v17_grandfather_guilds(conn: &Connection) -> rusqlite::Result<()> {
+    let mut ids: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for table in ["guild_states", "guild_metadata"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            continue;
+        }
+        let mut statement =
+            conn.prepare(&format!("SELECT guild_id FROM {table} WHERE guild_id IS NOT NULL"))?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        ids.extend(rows.flatten());
+    }
+    let now = Utc::now().to_rfc3339();
+    for guild_id in ids {
+        conn.execute(
+            r#"INSERT OR IGNORE INTO remote_guild_approval(guild_id, status, requested_utc, note)
+               VALUES(?1, 'approved', ?2, '기존 서버 자동 승인')"#,
+            params![guild_id, now],
+        )?;
+        // **INSERT OR IGNORE 만으로는 부족했다.** 게이트를 켠 빌드가 이미 한 번 떠서
+        // 이 서버들을 `pending` 으로 등록해 둔 상태였고, 그래서 위 INSERT 가 조용히
+        // 무시돼 쓰던 서버 세 개가 계속 잠겨 있었다.
+        //
+        // 이 마이그레이션이 도는 시점에 DB 에 있는 서버는 전부 게이트보다 먼저 있던 서버다.
+        // 그러니 대기 중인 것도 승인으로 올린다. **`blocked` 는 절대 안 건드린다.**
+        conn.execute(
+            r#"UPDATE remote_guild_approval
+                  SET status = 'approved', note = '기존 서버 자동 승인'
+                WHERE guild_id = ?1 AND status = 'pending'"#,
+            params![guild_id],
+        )?;
+    }
+    Ok(())
+}
 
 /// 인기곡 두 장은 마이그레이션에서도 같은 값을 써야 해서 상수로 뽑았다.
 /// 여기와 [`MIGRATION_V15`] 가 어긋나면 새 DB 와 기존 DB 의 차트가 서로 달라진다.
@@ -3343,6 +3400,10 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                 seed_builtin_charts(&tx)?;
             }
             15 => tx.execute_batch(MIGRATION_V16)?,
+            16 => migrate_v17_grandfather_guilds(&tx)?,
+            // v17 은 `INSERT OR IGNORE` 만 해서, 게이트를 켠 빌드가 이미 만들어 둔
+            // `pending` 행을 못 고쳤다. 같은 함수가 이제 대기 상태도 올린다 — 다시 돌린다.
+            17 => migrate_v17_grandfather_guilds(&tx)?,
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -4160,6 +4221,57 @@ mod tests {
         store.register_guild(2, Some("새 서버"));
         let listed = store.list_guild_approvals();
         assert_eq!(listed.first().map(|row| row.guild_id), Some(2));
+        cleanup(store, path);
+    }
+
+    /// 회귀: 승인 게이트를 켠 순간 **쓰던 서버가 통째로 잠겼다.** 실제로 배포하고 나서
+    /// 서버 3개가 명령어도 리모컨도 못 쓰게 됐다. 게이트는 앞으로 초대될 서버용이지
+    /// 어제까지 잘 쓰던 서버를 막으려던 게 아니다.
+    #[test]
+    fn existing_guilds_are_grandfathered_but_decisions_survive() {
+        use crate::remote::GuildApprovalStatus as S;
+        let (store, path) = temp_store("grandfather");
+
+        // 레거시 테이블은 이 러너가 만들지 않는다. 테스트에서만 흉내낸다.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS guild_metadata(guild_id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT OR REPLACE INTO guild_metadata VALUES(4242, '오래된 서버');
+                 INSERT OR REPLACE INTO guild_metadata VALUES(777, '차단된 서버');",
+            )
+            .unwrap();
+        }
+        // 차단해 둔 서버는 마이그레이션이 되살리면 안 된다.
+        store.register_guild(777, Some("차단된 서버"));
+        store.decide_guild(777, S::Blocked, 1, None);
+        // **게이트를 켠 빌드가 이미 대기로 등록해 둔 상태**를 재현한다. 실제로 이랬고,
+        // INSERT OR IGNORE 만 있던 첫 수정본은 이걸 못 고쳐서 서버가 계속 잠겨 있었다.
+        store.register_guild(4242, Some("오래된 서버"));
+        assert_eq!(store.guild_approval(4242).map(|r| r.status), Some(S::Pending));
+
+        {
+            let conn = store.conn.lock().unwrap();
+            migrate_v17_grandfather_guilds(&conn).unwrap();
+        }
+
+        // 알던 서버는 승인으로 넘어온다.
+        assert_eq!(store.guild_approval(4242).map(|r| r.status), Some(S::Approved));
+        // **판정이 있던 서버는 그대로다.**
+        assert_eq!(store.guild_approval(777).map(|r| r.status), Some(S::Blocked));
+        // 모르는 서버는 여전히 없다.
+        assert!(store.guild_approval(9999).is_none());
+        cleanup(store, path);
+    }
+
+    /// 레거시 테이블이 아직 없어도 마이그레이션이 통째로 실패하면 안 된다.
+    /// 실패하면 저장소가 안 열리고 봇이 아예 못 뜬다.
+    #[test]
+    fn grandfathering_survives_missing_legacy_tables() {
+        let (store, path) = temp_store("grandfather-empty");
+        let conn = store.conn.lock().unwrap();
+        assert!(migrate_v17_grandfather_guilds(&conn).is_ok());
+        drop(conn);
         cleanup(store, path);
     }
 

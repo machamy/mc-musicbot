@@ -93,7 +93,11 @@ while ((Get-Date) -lt `$deadline) {
 
 $swap | ForEach-Object { Write-Host "[deploy] $_" }
 
-if ($swap -notmatch 'HEALTHY=True') { throw '새 프로세스가 응답하지 않아요. 로그를 확인하세요.' }
-if ($swap -notmatch [Regex]::Escape("SHA=$localHash")) { throw '교체 뒤 해시가 달라요.' }
+# **배열에 -notmatch 를 쓰면 안 된다.** 배열에서는 필터로 동작해서 "안 맞는 줄들"을
+# 돌려주는데, 그게 비어 있지 않으면 참이 된다. 그래서 배포가 멀쩡히 끝났는데도
+# 실패로 죽었다. 한 문자열로 합쳐서 본다.
+$report = ($swap | Out-String)
+if ($report -notmatch 'HEALTHY=True') { throw '새 프로세스가 응답하지 않아요. 로그를 확인하세요.' }
+if ($report -notmatch [Regex]::Escape("SHA=$localHash")) { throw '교체 뒤 해시가 달라요.' }
 
 Write-Host "[deploy] 완료 — 빌드 $BuildId"
