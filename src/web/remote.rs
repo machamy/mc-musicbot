@@ -370,6 +370,11 @@ pub struct MemberContext {
     /// 관리자 우회 대상인지 — `AccessTier >= Manager`와 같은 값을 넣는다.
     pub is_admin: bool,
     pub same_voice_channel: bool,
+    /// 봇이 지금 이 서버의 음성 채널에 들어가 있는지.
+    ///
+    /// `same_voice_channel` 만으로는 "봇이 다른 채널에 있다"와 "봇이 아예 없다"를 못 가른다.
+    /// 둘은 전혀 다른 상황이다 — 앞은 남의 재생을 흔드는 것이고, 뒤는 흔들 재생 자체가 없다.
+    pub bot_in_voice: bool,
     pub role_ids: Vec<u64>,
 }
 
@@ -1535,10 +1540,23 @@ pub fn permission_allowed(
     }
     match rule {
         PermissionRule::GuildMember => true,
-        PermissionRule::SameVoiceChannel => member.same_voice_channel,
+        PermissionRule::SameVoiceChannel => same_voice_satisfied(settings, member),
         PermissionRule::ConfiguredRole => has_configured_role(key, settings, member),
         PermissionRule::Administrator | PermissionRule::Disabled => false,
     }
+}
+
+/// `SameVoiceChannel` 규칙이 지금 통과하는지.
+///
+/// 규칙의 목적은 **같이 듣고 있는 사람들의 재생을 남이 흔들지 못하게** 하는 것이다.
+/// 그런데 봇이 음성에 아예 없으면 흔들 재생도, 방해받을 사람도 없다. 그 상태에서까지
+/// 막으면 서버가 `봇이 음성 채널에 있어야만 조작` 을 꺼도 아무것도 안 풀린다 —
+/// 리모컨을 웹 재생기로 쓰겠다는 선택이 설정만 있고 효과가 없는 셈이 된다.
+///
+/// 그래서 **봇이 음성에 없고 서버가 그 요구를 껐을 때만** 통과시킨다. 요구가 켜져 있으면
+/// 예전 그대로다(봇이 없으면 조작도 없다).
+fn same_voice_satisfied(settings: &RemoteGuildSettings, member: &MemberContext) -> bool {
+    member.same_voice_channel || (!settings.require_voice_for_playback && !member.bot_in_voice)
 }
 
 /// 이 조작이 "봇이 음성 채널에 있어야 한다"는 제한(`require_voice_for_playback`)을 받는지.
@@ -1569,7 +1587,7 @@ fn rule_base_allowed(
 ) -> bool {
     match rule {
         PermissionRule::GuildMember => true,
-        PermissionRule::SameVoiceChannel => member.same_voice_channel,
+        PermissionRule::SameVoiceChannel => same_voice_satisfied(settings, member),
         PermissionRule::ConfiguredRole => has_configured_role(key, settings, member),
         PermissionRule::Administrator => member.is_admin,
         PermissionRule::Disabled => false,
@@ -1731,6 +1749,7 @@ async fn resolve_tier(
             MemberContext {
                 is_admin: true,
                 same_voice_channel: true,
+                bot_in_voice: true,
                 role_ids: Vec::new(),
             },
             None,
@@ -1739,6 +1758,8 @@ async fn resolve_tier(
     }
 
     let same_voice = same_voice_channel(state, guild_id, session.user_id);
+    // 봇이 음성에 아예 없는 경우를 따로 안다 — `same_voice` 만으로는 구분되지 않는다.
+    let bot_in_voice = bot_voice_status(state, guild_id).in_voice();
     let lookup = fetch_member_roles(state, session, guild_id, fresh).await;
 
     // `roles_known` 이 false 면 "역할이 없다" 가 아니라 **"아직 모른다"** 이다.
@@ -1774,6 +1795,7 @@ async fn resolve_tier(
             MemberContext {
                 is_admin: false,
                 same_voice_channel: same_voice,
+                bot_in_voice,
                 role_ids,
             },
             Some("이 서버에서 나갔거나 추방돼서 읽기 전용이에요.".into()),
@@ -1798,6 +1820,7 @@ async fn resolve_tier(
         MemberContext {
             is_admin: tier.is_manager(),
             same_voice_channel: same_voice,
+            bot_in_voice,
             role_ids,
         },
         None,
@@ -3478,6 +3501,10 @@ async fn api_state_cold(
             "chatEnabled": settings.chat_enabled,
             "suggestionEnabled": settings.suggestion_enabled,
             "visualizerEnabled": settings.visualizer_enabled,
+            // **화면도 이 값을 알아야 한다.** 예전에는 관리 콘솔 응답에만 실려서, 서버가
+            // 이 설정을 꺼도 리모컨은 여전히 "봇이 음성에 없음"만 보고 버튼을 잠갔다.
+            // 설정은 있는데 아무 효과가 없는 상태였다.
+            "requireVoiceForPlayback": settings.require_voice_for_playback,
             "minVolume": settings.min_volume,
             "maxVolume": settings.max_volume,
             "sortMode": settings.sort_mode.as_str(),
@@ -3868,6 +3895,9 @@ async fn admin_role_view(
     let member = MemberContext {
         is_admin: false,
         same_voice_channel: query.same_voice.unwrap_or(false),
+        // 미리보기라도 봇의 실제 음성 상태를 쓴다. 여기서 지어내면 화면이 보여 주는 결과와
+        // 진짜 판정이 갈리는데, 그게 이 화면이 제일 하면 안 되는 일이다.
+        bot_in_voice: bot_voice_status(&state, guild_id).in_voice(),
         role_ids: role_ids.clone(),
     };
     let settings = &ctx.settings;
@@ -8291,6 +8321,7 @@ async fn admin_permission_preview(
                 let context = MemberContext {
                     is_admin: admin,
                     same_voice_channel: same_voice,
+                    bot_in_voice: bot_channel.is_some(),
                     role_ids: member.roles.iter().map(|role| role.get()).collect(),
                 };
                 if !permission_allowed(key, rule, &settings, &context) {
@@ -10477,6 +10508,7 @@ mod tests {
         MemberContext {
             is_admin: false,
             same_voice_channel: false,
+            bot_in_voice: true,
             role_ids,
         }
     }
@@ -10693,6 +10725,7 @@ mod tests {
             let member = MemberContext {
                 is_admin,
                 same_voice_channel: true,
+                bot_in_voice: true,
                 role_ids: vec![777],
             };
             assert!(
@@ -10707,8 +10740,8 @@ mod tests {
     fn disabled_preview_pass_count_is_zero() {
         let settings = settings_with(PermissionRule::Disabled);
         let members = [
-            MemberContext { is_admin: true, same_voice_channel: true, role_ids: vec![777] },
-            MemberContext { is_admin: false, same_voice_channel: true, role_ids: vec![777] },
+            MemberContext { is_admin: true, same_voice_channel: true, bot_in_voice: true, role_ids: vec![777] },
+            MemberContext { is_admin: false, same_voice_channel: true, bot_in_voice: true, role_ids: vec![777] },
             MemberContext::default(),
         ];
         let passed = members
@@ -10724,6 +10757,7 @@ mod tests {
         let admin = MemberContext {
             is_admin: true,
             same_voice_channel: false,
+            bot_in_voice: true,
             role_ids: Vec::new(),
         };
         for rule in [
@@ -10740,6 +10774,51 @@ mod tests {
             &settings,
             &admin
         ));
+    }
+
+    /// `봇이 음성 채널에 있어야만 조작` 을 끄면 **실제로 조작이 풀려야 한다.**
+    ///
+    /// 규칙의 목적은 같이 듣는 사람의 재생을 남이 흔들지 못하게 하는 것인데, 봇이 음성에
+    /// 아예 없으면 흔들 재생도 방해받을 사람도 없다. 그때까지 막으면 설정만 있고 효과가 없다.
+    /// 반대로 요구가 켜져 있으면 예전 그대로 막아야 한다.
+    #[test]
+    fn turning_off_the_voice_requirement_actually_opens_the_controls() {
+        let mut settings = RemoteGuildSettings::default();
+        let outsider = MemberContext {
+            same_voice_channel: false,
+            bot_in_voice: false,
+            ..Default::default()
+        };
+
+        // 요구가 켜져 있으면(기본) 봇이 없을 때 조작도 없다.
+        assert!(settings.require_voice_for_playback);
+        assert!(!permission_allowed("playback", settings.playback_rule, &settings, &outsider));
+        assert!(!permission_allowed("skip", settings.skip_rule, &settings, &outsider));
+
+        // 껐으면 봇이 음성에 없을 때 열린다.
+        settings.require_voice_for_playback = false;
+        for (key, rule) in [
+            ("playback", settings.playback_rule),
+            ("seek", settings.seek_rule),
+            ("skip", settings.skip_rule),
+            ("volume", settings.volume_rule),
+        ] {
+            assert!(
+                permission_allowed(key, rule, &settings, &outsider),
+                "{key} 는 봇이 음성에 없고 요구를 껐으면 열려야 한다"
+            );
+        }
+
+        // **봇이 다른 채널에 들어가 있으면 얘기가 다르다.** 그때는 듣는 사람이 실제로 있다.
+        let bot_elsewhere = MemberContext {
+            same_voice_channel: false,
+            bot_in_voice: true,
+            ..Default::default()
+        };
+        assert!(
+            !permission_allowed("skip", settings.skip_rule, &settings, &bot_elsewhere),
+            "봇이 남의 채널에서 틀고 있으면 밖에서 넘기면 안 된다"
+        );
     }
 
     /// 제안 #3 — 재생 중인 곡이 없을 때 자동 재생을 못 켜던 문제.
@@ -10786,6 +10865,7 @@ mod tests {
         }
         let same_voice = MemberContext {
             same_voice_channel: true,
+            bot_in_voice: true,
             ..Default::default()
         };
         // 음성에 들어오면 막혔던 것들이 전부 열린다.
@@ -10809,6 +10889,7 @@ mod tests {
         let admin_outside_voice = MemberContext {
             is_admin: true,
             same_voice_channel: false,
+            bot_in_voice: true,
             role_ids: Vec::new(),
         };
         assert!(permission_allowed(
@@ -10843,6 +10924,7 @@ mod tests {
         let member = MemberContext {
             is_admin: false,
             same_voice_channel: true,
+            bot_in_voice: true,
             role_ids: Vec::new(),
         };
         // 규칙 자체는 통과한다.

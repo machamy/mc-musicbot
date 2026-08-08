@@ -5091,7 +5091,15 @@ function renderNow(state) {
   // 색만으로 구분하면 흑백·고대비 화면에서 켜짐/꺼짐이 같아 보인다. 아이콘도 바꾼다.
   el.autoplayBtn.textContent = autoplayOn ? '📻' : '🚫';
 
-  const offline = !online || !connected;
+  /* 봇이 음성에 없다고 무조건 잠그지 않는다.
+   *
+   * 서버가 `봇이 음성 채널에 있어야만 조작` 을 끄면 "봇 없이도 리모컨을 쓰겠다"는 뜻이다.
+   * 그런데 화면이 그 설정을 몰라서 `!connected` 만 보고 잠가 버렸고, 그래서 설정을 꺼도
+   * 아무것도 안 풀렸다. 서버 판정(`same_voice_satisfied`)과 같은 기준을 화면도 쓴다.
+   *
+   * 봇 프로세스가 꺼져 있으면(`!online`) 그때는 어느 설정이든 조작이 닿을 곳이 없다. */
+  const needsVoice = store.get().settings?.requireVoiceForPlayback !== false;
+  const offline = !online || (needsVoice && !connected);
   const offlineReason = !online ? '봇이 꺼져 있어요' : '봇이 음성 채널에 없어요';
   for (const [node, key] of [[el.playBtn, 'playback'], [el.restartBtn, 'seek'],
     [el.repeatBtn, 'playback'], [el.shuffleBtn, 'queueEdit']]) {

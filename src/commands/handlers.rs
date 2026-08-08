@@ -413,6 +413,9 @@ async fn member_context(
     MemberContext {
         is_admin: admin,
         same_voice_channel: in_bot_voice_channel(bot_live, requester_vc),
+        // 슬래시 명령도 같은 판정을 쓴다. 봇이 음성에 없다는 사실을 웹과 똑같이 알아야
+        // "웹에서는 되는데 명령어로는 안 된다" 같은 갈림이 안 생긴다.
+        bot_in_voice: bot_live.is_some(),
         role_ids,
     }
 }
