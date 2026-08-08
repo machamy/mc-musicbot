@@ -363,6 +363,9 @@ export const clock = {
   _raf: 0,
   _last: -1,
 
+  /** 봇이 음성에 없어서 실제로는 아무것도 안 나오는 상태 (§36). */
+  stopped: false,
+
   /** 서버 시계와 내 시계의 차이(초). `startedUtc` 를 쓰려면 이걸 먼저 빼야 한다.
    * 기기 시계가 몇 초씩 틀어져 있는 경우가 흔해서, 절대 시각을 그냥 믿으면 그만큼 어긋난다. */
   skew: 0,
@@ -370,13 +373,19 @@ export const clock = {
   /** `startedUtc` 가 있을 때만 채워진다. 곡의 0초에 해당하는 **내 시계** 기준 epoch(ms). */
   startedAtLocal: 0,
 
-  /** { positionSeconds, sampledAtUtc, isPaused, durationSeconds, startedUtc } */
+  /** { positionSeconds, sampledAtUtc, isPaused, durationSeconds, startedUtc, stopped } */
   sync(payload) {
     if (!payload) return;
     if (payload.durationSeconds !== undefined && payload.durationSeconds !== null) {
       clock.duration = Number(payload.durationSeconds) || 0;
     }
+    /* **봇이 음성에 없으면 아무것도 안 흐른다** (§36).
+     * 전에는 `isPaused` 만 봤는데, 봇이 음성에서 빠져도 그 값은 false 라서
+     * 진행바가 혼자 계속 갔다. 화면은 재생 중인데 실제로는 아무 소리도 안 나는,
+     * 제일 헷갈리는 상태였다. 멈춘 건 멈춘 것으로 보여야 한다. */
+    if (payload.stopped !== undefined) clock.stopped = !!payload.stopped;
     if (payload.isPaused !== undefined) clock.paused = !!payload.isPaused;
+    if (clock.stopped) clock.paused = true;
 
     // 서버 표본 시각으로 시계 차이를 계속 다듬는다. 전송 지연도 여기 섞이지만,
     // 지연은 한 방향(서버→나)이라 몇십 ms 수준이고 곡 전체에서 일정하다.
@@ -1081,6 +1090,8 @@ function merge(type, data, handlers) {
         sampledAtUtc: data.sampledAtUtc,
         startedUtc: data.startedUtc,
         isPaused: data.isPaused,
+        // 봇이 음성에 없으면 실제로는 아무것도 안 나온다 (§36).
+        stopped: data.voiceConnected === false || !data.current,
         durationSeconds: data.durationSeconds ?? (data.current ? data.current.durationSeconds : undefined),
       });
       break;

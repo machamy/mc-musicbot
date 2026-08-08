@@ -1902,6 +1902,7 @@ function sectionPerms() {
 
   PERM_FIELDS.forEach((field) => group.append(permField(field)));
   body.append(group);
+  body.append(roleViewBox());
 
   // 관리자 지정 역할 — 기능 권한과 완전히 분리한다 (v3 §1).
   const managerIds = S.draft.managerRoleIds || [];
@@ -1931,6 +1932,85 @@ function sectionPerms() {
 }
 
 /** 권한 한 줄 — 규칙 드롭다운 + 그 항목만의 역할 선택기 + 통과 인원 미리보기. */
+/* 특정 역할로 보기 (§37).
+ *
+ * 관리자는 **자기 화면만** 볼 수 있다. 관리자는 모든 규칙을 우회하니까 뭘 잠가 놔도
+ * 자기한테는 다 열려 보인다. 그래서 "일반 멤버한테 실제로 어떻게 보이지"를 확인할 방법이
+ * 없었다. Discord 의 "역할로 보기"와 같은 목적이다.
+ *
+ * 판정은 **서버가 실제 경로로** 한다. 여기서 규칙을 다시 구현하면 미리보기와 실제가
+ * 갈라져서, 미리보기를 믿고 설정한 게 틀리는 최악이 된다.
+ */
+function roleViewBox() {
+  const picked = new Set();
+  let sameVoice = false;
+  const out = h('div', { class: 'roleview__out' });
+
+  const refresh = async () => {
+    out.replaceChildren(h('div', { class: 'skel', style: 'height:60px' }));
+    try {
+      const params = new URLSearchParams();
+      if (picked.size) params.set('roles', [...picked].join(','));
+      if (sameVoice) params.set('sameVoice', 'true');
+      const data = await api(`/admin/roleview?${params.toString()}`);
+      const rows = (data.permissions || []).map((row) => h('div', {
+        class: 'roleview__row' + (row.allowed ? ' is-on' : ''),
+      },
+        h('span', null, row.allowed ? '✅' : '🚫'),
+        h('span', { class: 'roleview__key' }, PERM_LABEL[row.key] || row.key),
+        h('span', { class: 'roleview__rule' }, row.ruleLabel)));
+      out.replaceChildren(
+        h('p', { class: 'hint' },
+          picked.size
+            ? `${(data.roleNames || []).map((n) => '@' + n).join(' · ')} 역할만 가진 사람이 보는 화면이에요.`
+            : '역할이 하나도 없는 사람이 보는 화면이에요.'),
+        h('div', { class: 'roleview__grid' }, ...rows));
+    } catch (error) {
+      out.replaceChildren(h('p', { class: 'hint' }, `못 불러왔어요 — ${error.message}`));
+    }
+  };
+
+  const chips = (S.roles || []).map((role) => {
+    const chip = h('button', {
+      class: 'chipbtn', type: 'button', 'aria-pressed': 'false',
+      onClick: () => {
+        const id = String(role.id);
+        if (picked.has(id)) picked.delete(id); else picked.add(id);
+        chip.setAttribute('aria-pressed', String(picked.has(id)));
+        refresh();
+      },
+    }, `@${role.name}`);
+    return chip;
+  });
+
+  const voiceToggle = h('button', {
+    class: 'chipbtn', type: 'button', 'aria-pressed': 'false',
+    // 같은 음성 채널 규칙은 역할과 무관하게 결과를 바꾼다. 같이 켜 봐야 진짜가 보인다.
+    title: '봇과 같은 음성 채널에 있다고 치고 봐요',
+    onClick: () => {
+      sameVoice = !sameVoice;
+      voiceToggle.setAttribute('aria-pressed', String(sameVoice));
+      refresh();
+    },
+  }, '🔊 같은 음성 채널에 있음');
+
+  refresh();
+  return h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '👁 특정 역할로 보기'),
+    h('p', { class: 'grp__desc' },
+      '고른 역할만 가진 사람에게 무엇이 열리는지 그대로 보여줘요. ' +
+      '관리자는 모든 규칙을 우회하기 때문에 자기 화면만 봐서는 확인이 안 돼요.'),
+    h('div', { class: 'roleview__pick' }, ...chips, voiceToggle),
+    out);
+}
+
+/** 권한 키 → 사람이 읽는 이름. 미리보기 표에서 쓴다. */
+const PERM_LABEL = {
+  search: '곡 검색·신청', vote: '좋아요·싫어요', playback: '재생 / 일시정지',
+  skip: '곡 넘기기', seek: '재생 위치 이동', volume: '서버 볼륨', queueEdit: '대기열 편집',
+  chat: '채팅 쓰기', autoplay: '자동 재생', bulkEnqueue: '전부 담기',
+};
+
 function permField(field) {
   const value = S.draft[field.key];
   const preview = h('div', { class: 'permprev' });

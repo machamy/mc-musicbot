@@ -4276,7 +4276,7 @@ function syncOffsetSeconds() {
 
 function webTargetPosition() {
   const startedAt = clock.startedAt();
-  const raw = startedAt && !store.get().player?.isPaused
+  const raw = startedAt && !clock.paused && !clock.stopped
     ? (Date.now() - startedAt) / 1000
     : clock.position();
   return Math.max(0, raw - syncOffsetSeconds());
@@ -4636,6 +4636,13 @@ const WEB_PRELOAD_LEAD = 8000;  // 다음 곡을 준비하기 시작하는 시�
 /** 매 프레임 맞추면 소리가 튄다. 2초 이상 벌어졌을 때만 조용히 옮긴다. */
 function webTick() {
   if (!webOn || !webSource) return;
+  // 봇이 음성에서 빠졌는데 웹만 계속 트는 상태를 막는다 (§36).
+  // 리모컨은 멈춰 있는데 내 브라우저에서만 노래가 나오면 상황이 전혀 안 읽힌다.
+  if (clock.stopped) {
+    try { ytPlayer?.pauseVideo?.(); } catch { /* 무시 */ }
+    try { scWidget?.pause?.(); } catch { /* 무시 */ }
+    return;
+  }
   preloadNext();
   if (store.get().player?.isPaused) return;
   const there = webTargetPosition();
@@ -4799,8 +4806,8 @@ function renderNow(state) {
       artColor(art).then(readVizColors);
     }
     put(clear(el.nowEyebrow),
-      h('span', { class: player.isPaused ? 'dot dot--idle' : 'dot dot--listening' }),
-      player.isPaused ? '일시정지' : '재생 중');
+      h('span', { class: clock.stopped ? 'dot dot--offline' : player.isPaused ? 'dot dot--idle' : 'dot dot--listening' }),
+      clock.stopped ? '멈춤 · 봇이 음성 채널에 없어요' : player.isPaused ? '일시정지' : '재생 중');
     const title = trackTitle(current.track);
     if (el.nowTitle.firstElementChild.textContent !== title) el.nowTitle.firstElementChild.textContent = title;
     // 원본 링크 (§34). 주소를 모르는 곡에서는 숨긴다 — 눌러도 아무 데도 안 가는 버튼이 제일 나쁘다.
@@ -4829,6 +4836,9 @@ function renderNow(state) {
 
   el.playBtn.textContent = player.isPaused ? '▶' : '⏸';
   el.playBtn.setAttribute('aria-label', player.isPaused ? '재생' : '일시정지');
+  // 봇이 음성에 없으면 **멈춤으로 확실히 보여준다** (§36). 진행바가 혼자 가면
+  // 재생 중인 줄 알고 왜 소리가 안 나는지 찾게 된다.
+  el.nowCard.classList.toggle('now--stopped', !!clock.stopped);
 
   const repeat = String(player.repeatMode || 'off').toLowerCase();
   el.repeatBtn.setAttribute('aria-pressed', String(repeat !== 'off'));

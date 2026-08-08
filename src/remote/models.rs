@@ -1932,6 +1932,13 @@ pub struct RemoteGuildSettings {
     /// 늦거나 빠르면 여기서 한 번에 맞추고, 사람마다 남는 차이만 개인 설정으로 다듬는다.
     #[serde(default)]
     pub web_sync_offset_ms: i32,
+    /// **봇이 음성 채널에 있어야만 재생 조작을 받을지** (§36). 기본은 켬.
+    ///
+    /// 켜 두면 봇이 음성에 없을 때 재생·스킵 같은 조작을 아예 거절한다 —
+    /// 눌러도 아무 일이 안 일어나는 유령 상태를 막는다.
+    /// 끄면 조작을 받아 두고 봇이 들어오는 순간부터 그대로 이어 간다.
+    #[serde(default = "default_true")]
+    pub require_voice_for_playback: bool,
     /// 로그인 없이 **지금 무슨 곡인지**만 볼 수 있게 할지 (§29).
     ///
     /// 켜져 있어도 나가는 것은 곡 제목·가수·진행 상태뿐이다. 신청한 사람 이름,
@@ -2216,6 +2223,7 @@ impl Default for RemoteGuildSettings {
             skip_lead_ms: default_skip_lead_ms(),
             seek_lockout_ms: default_seek_lockout_ms(),
             web_sync_offset_ms: 0,
+            require_voice_for_playback: true,
             public_now_playing: true,
             min_volume: 0,
             max_volume: 200,

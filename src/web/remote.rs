@@ -773,6 +773,11 @@ pub fn router() -> Router<Arc<WebState>> {
             put(admin_settings_put),
         )
         .route("/music/api/guilds/{guild_id}/admin/roles", get(admin_roles))
+        // 특정 역할로 보기 (§37) — 관리자 이상. Discord 의 "역할로 보기"와 같은 목적이다.
+        .route(
+            "/music/api/guilds/{guild_id}/admin/preview",
+            get(admin_permission_preview),
+        )
         .route(
             "/music/api/guilds/{guild_id}/admin/queue-preview",
             get(admin_queue_preview),
@@ -3599,6 +3604,9 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
         ("sortMode", "정렬 모드 변경", PermissionRule::Administrator, true, "sortMode"),
         ("blacklist", "차단 목록 관리", PermissionRule::Administrator, true, "blacklist"),
         ("console", "서버 관리 콘솔", PermissionRule::Administrator, true, "console"),
+        // 화면이 `can('ops')` 로 물어보는데 이 줄이 없어서 **늘 false** 였다.
+        // 그래서 봇 주인에게도 운영 패널 링크가 영영 안 보였다. 봇 주인 전용이다.
+        ("ops", "봇 운영 패널", PermissionRule::Administrator, true, "ops"),
     ];
 
     // "누가 되는지"는 서버가 센다 (V3 §23.3). 클라이언트가 역할과 인원을 다시 세면
@@ -3609,7 +3617,12 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
     let mut entries: Vec<Value> = Vec::with_capacity(rows.len() + 1);
     for (key, label, rule, gate, role_key) in rows {
         let base = rule_base_allowed(role_key, rule, settings, member);
-        let allowed = !viewer && gate && permission_allowed(role_key, rule, settings, member);
+        // 운영 패널은 **봇 주인 전용**이다. 서버 관리자가 남의 봇 운영 화면을 볼 이유가 없다.
+        let allowed = if key == "ops" {
+            ctx.tier.is_owner()
+        } else {
+            !viewer && gate && permission_allowed(role_key, rule, settings, member)
+        };
         let via_admin = allowed && !base;
         let role_names_for_rule = if rule == PermissionRule::ConfiguredRole {
             role_names(state, ctx.guild_id(), settings.roles_for(role_key))
@@ -3801,6 +3814,66 @@ impl PermissionAudience {
 
 /// 역할 ID를 사람이 읽는 이름으로. 캐시에 없는 역할(지워졌거나 아직 못 받은)은
 /// ID를 그대로 보여 준다 — 조용히 빼면 "역할 3개 지정했는데 2개만 보이는" 상황이 된다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewQuery {
+    /// 쉼표로 이은 역할 ID. 비면 "역할 하나도 없는 사람".
+    roles: Option<String>,
+    /// 봇과 같은 음성 채널에 있다고 칠지.
+    same_voice: Option<bool>,
+}
+
+/// `GET .../admin/preview?roles=1,2&sameVoice=true` — **이 역할이면 뭘 할 수 있나** (§37).
+///
+/// Discord 의 "역할로 보기"와 같은 목적이다. 관리자는 자기 화면만 보이므로,
+/// 권한을 바꿔 놓고도 **일반 멤버에게 실제로 어떻게 보이는지** 확인할 방법이 없었다.
+///
+/// **판정은 실제 경로를 그대로 쓴다**(`permission_allowed`). 여기서 따로 계산하면
+/// 미리보기와 실제가 갈라져서, 미리보기를 믿고 설정한 게 틀리는 최악이 된다.
+async fn admin_role_view(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    Query(query): Query<PreviewQuery>,
+) -> Response {
+    let ctx = match authorize_admin(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let role_ids: Vec<u64> = query
+        .roles
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+    // **관리자 우회를 끈 채로 본다.** 그게 이 화면의 존재 이유다 —
+    // is_admin 을 켜 두면 전부 통과로 나와서 아무것도 확인이 안 된다.
+    let member = MemberContext {
+        is_admin: false,
+        same_voice_channel: query.same_voice.unwrap_or(false),
+        role_ids: role_ids.clone(),
+    };
+    let settings = &ctx.settings;
+    let rows: Vec<Value> = PERMISSION_KEYS
+        .iter()
+        .filter_map(|key| {
+            let rule = settings.rule_for(key)?;
+            Some(json!({
+                "key": key,
+                "rule": rule_key(rule),
+                "ruleLabel": rule_label(rule),
+                "allowed": permission_allowed(key, rule, settings, &member),
+            }))
+        })
+        .collect();
+    json_ok(json!({
+        "roleIds": role_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "roleNames": role_names(&state, guild_id, &role_ids),
+        "sameVoice": member.same_voice_channel,
+        "permissions": rows,
+    }))
+}
+
 fn role_names(state: &WebState, guild_id: u64, role_ids: &[u64]) -> Vec<String> {
     let guild = state
         .app
@@ -4596,10 +4669,12 @@ async fn api_control(
     }
     // V3 §16 B1 — 저장값이 아니라 캐시가 진실이다. 저장값을 보면 봇이 이미 나갔는데도
     // 조작이 통과해서 아무 일도 안 일어나는 유령 상태가 된다.
-    if !bot_voice_status(&state, guild_id).in_voice() {
+    //
+    // 서버마다 끌 수 있다 (§36). 끄면 조작을 받아 두고 봇이 들어오는 순간부터 이어 간다.
+    if ctx.settings.require_voice_for_playback && !bot_voice_status(&state, guild_id).in_voice() {
         return json_error(
             StatusCode::CONFLICT,
-            "봇이 음성 채널에 안 들어가 있어요.",
+            "봇이 음성 채널에 안 들어가 있어요. `/입장` 으로 부르거나, 서버 설정에서 이 제한을 끌 수 있어요.",
         );
     }
     if matches!(request.action.as_str(), "skip" | "seek") {
@@ -7676,6 +7751,12 @@ async fn admin_settings_put(
                     );
                 }
                 settings.web_sync_offset_ms = value;
+            }
+            if let Some(value) = body.get("requireVoiceForPlayback").and_then(|v| v.as_bool()) {
+                settings.require_voice_for_playback = value;
+            }
+            if let Some(value) = body.get("publicNowPlaying").and_then(|v| v.as_bool()) {
+                settings.public_now_playing = value;
             }
         }
         "perms" => {

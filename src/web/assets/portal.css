@@ -988,6 +988,12 @@ body[data-dragging="tab"] { user-select: none; }
 .md__t { width: 100%; border-collapse: collapse; }
 .md__t td { padding: 2px var(--sp-2); border-bottom: 1px solid var(--line-1); vertical-align: top; }
 
+/* 봇이 음성에 없어서 멈춰 있는 상태 (§36). 진행바를 죽여 "안 가고 있다"를 눈으로 알린다. */
+.now--stopped .seek__fill { background: var(--text-4); }
+.now--stopped .seek__knob { background: var(--text-4); }
+.now--stopped .now__art { filter: grayscale(0.7); opacity: 0.75; }
+.now--stopped .viz { opacity: 0.25; }
+
 /* 대기열 행의 원본 링크. 다른 액션 버튼과 같은 크기로 서되 링크라서 밑줄을 뗀다. */
 .vote--link { text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
 .vote--link:hover, .vote--link:focus-visible { color: var(--accent); border-color: var(--accent-line); }

@@ -1006,3 +1006,22 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
   font-size: var(--fs-sm);
   line-height: var(--lh-base);
 }
+
+/* 특정 역할로 보기 (§37). */
+.roleview__pick { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin: var(--sp-2) 0; }
+.roleview__grid { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-2); }
+.roleview__row {
+  display: grid;
+  grid-template-columns: 20px 1fr auto;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 4px var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  font-size: var(--fs-sm);
+  color: var(--text-3);
+}
+/* 되는 것만 또렷하게. 대부분 막혀 있을 때 표가 전부 진하면 무엇이 열렸는지 안 읽힌다. */
+.roleview__row.is-on { background: var(--accent-soft); color: var(--text-2); }
+.roleview__key { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.roleview__rule { color: var(--text-4); }
