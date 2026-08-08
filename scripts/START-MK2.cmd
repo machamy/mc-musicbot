@@ -18,12 +18,15 @@ if not exist "bot\botsettings.json" (
 REM Web admin bind address. On the FIRST launch, open http://localhost:8693
 REM and set the admin password (first-time setup is allowed from localhost only).
 set MUSICBOT_WEB_URLS=http://0.0.0.0:8693
-set MUSICBOT_PUBLIC_BASE_URL=https://music.example.com
+REM Public hostnames are per-deployment. Set them in bot\remote.env.cmd, which is
+REM called below and wins over anything set here. Leaving the two *_HOST values
+REM empty disables the admin/remote split (see src\web\mod.rs host_scope_guard).
 REM Keep OAuth secrets outside the update manifest. Create bot\remote.env.cmd from
 REM bot\remote.env.sample.cmd on the host; updates preserve the local file.
 if exist "bot\remote.env.cmd" call "bot\remote.env.cmd"
-if "%MUSICBOT_DISCORD_CLIENT_ID%"=="" set MUSICBOT_DISCORD_CLIENT_ID=100000000000000001
+if "%MUSICBOT_DISCORD_CLIENT_ID%"=="" echo [i] Set MUSICBOT_DISCORD_CLIENT_ID in bot\remote.env.cmd to enable Discord login.
 if "%MUSICBOT_DISCORD_CLIENT_SECRET%"=="" echo [i] Discord OAuth Secret can be configured in the admin UI or bot\remote.env.cmd.
+if "%MUSICBOT_ADMIN_HOST%"=="" echo [!] MUSICBOT_ADMIN_HOST / MUSICBOT_REMOTE_HOST not set - admin and remote share one host.
 
 REM Register both the admin and remote hostnames to this PC. The host-local
 REM data\registrar.json is preserved by updates and is never in the manifest.
@@ -35,8 +38,8 @@ echo.
 echo ============================================================
 echo  MusicBot (Rust / songbird) started.
 echo    Web admin: http://localhost:8693
-echo    Admin: https://musicbot.example.com
-echo    Remote: https://music.example.com/music
+if not "%MUSICBOT_ADMIN_HOST%"=="" echo    Admin: https://%MUSICBOT_ADMIN_HOST%
+if not "%MUSICBOT_REMOTE_HOST%"=="" echo    Remote: https://%MUSICBOT_REMOTE_HOST%/music
 echo    First run: open the web admin to set your password.
 echo  Stop: STOP-MK2.cmd
 echo ============================================================

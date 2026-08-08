@@ -4,9 +4,9 @@
 
 ## 기준 저장소와 역할
 
-- Rust MK2 원본: `<workspace>\musicbot-mk2` (브랜치 `feat/macham-music-remote`)
-- C# 본체/포터블 패키징: `<workspace>\discord-my-music-bot`
-- NAS 운영 문서: `C:\Users\<user>\NAS-Hub\projects\musicbot-web\README.md`
+- Rust MK2 원본: 이 저장소 (브랜치 `feat/macham-music-remote`)
+- C# 본체/포터블 패키징: 별도 저장소 `discord-my-music-bot`
+- NAS 운영 문서: NAS 운영 저장소의 `projects/musicbot-web/README.md`
 - **리모컨 사양(단일 기준)**
   - `docs/REMOTE-UI-V2.md` — 기본 사양(권한 모델·성능 계약·화면 구조)
   - `docs/REMOTE-API-V2.md` — API 계약
@@ -21,6 +21,8 @@ MK2는 봇 호스트 PC에서 실행한다. NAS에서 musicbot 컨테이너를 �
 
 **이걸 모르면 배포가 조용히 깨진다.**
 
+아래 주소는 **예시**다. 실제 호스트명은 저장소에 없고 환경변수로 준다(바로 아래 참고).
+
 | 주소 | 무엇 | 문지기 |
 |---|---|---|
 | `musicbot.example.com` | 봇 주인용 **운영 패널** (대시보드·캐시·블랙리스트·OAuth·로그) | Cloudflare Access + 웹 비밀번호 |
@@ -30,6 +32,14 @@ MK2는 봇 호스트 PC에서 실행한다. NAS에서 musicbot 컨테이너를 �
 - 리모컨 도메인에서 `/music/*` 와 `/healthz` 외 경로는 **404**
 - 리모컨 도메인의 `/` 는 `/music` 으로
 - 관리자 도메인의 `/music/*` 는 리모컨 도메인으로 리다이렉트
+
+### 호스트명은 `MUSICBOT_ADMIN_HOST` · `MUSICBOT_REMOTE_HOST` 로 준다
+
+저장소가 공개라 개인 도메인을 코드에 박지 않는다. `bot\remote.env.cmd` 에 둘 다 넣는다.
+
+**둘 중 하나라도 비면 호스트 분리가 통째로 꺼진다.** 전부 `Internal` 로 떨어져서
+리모컨 도메인에서도 `/botsettings` 와 `/logs` 가 열린다. 기동 로그에 경고가 찍히니
+배포 후 `[Web]` 줄에 `호스트 분리: ...` 가 보이는지 확인한다.
 
 **리모컨에 Cloudflare Access 를 걸면 안 된다.** Discord 길드 멤버가 쓰는 곳이라
 Access 허용목록으로 이중 차단하면 정작 팀원이 못 들어온다.
@@ -60,9 +70,9 @@ Discord 개발자 포털의 Redirect URI 도 `https://music.example.com/music/oa
 - 봇 호스트 빌드 ID: `20260807-remote-ui-v3`
 - `mc-musicbot.exe` SHA256: `8DAA51057DB8DFE9F0DE6F755796648908F073A93731CB6051985271F6E2C63B`
   (32,197,120 bytes)
-- 설치 경로: `<portable-root>\`
+- 설치 경로: 봇 호스트의 포터블 루트 (`$PORTABLE_ROOT`)
 - 기동: 예약 작업 `MusicBot Portable` → 루트 `START-MK2.cmd` (로그온 트리거)
-- `cargo test`: **179 passed / 0 failed**
+- `cargo test`: **199 passed / 0 failed**
 
 2026-08-07 배포 검증:
 - `music.example.com` 의 `/login` `/botsettings` `/logs` → **404** (도메인 분리 동작)
@@ -153,20 +163,21 @@ sw.js        서비스워커        manifest.webmanifest · icon-*.png · favico
 ## 빌드와 배포
 
 ```powershell
-cd <workspace>\musicbot-mk2
-cargo test              # 179 passed 여야 한다
+cd <이 저장소 경로>
+cargo test              # 199 passed 여야 한다
 cargo build --release
 ```
 
-봇 호스트(보조 PC `bot-host-pc`, ssh 별칭 `bot-host`)에 올리기:
+봇 호스트(별도 PC. 아래 `$remote` 는 ssh config 의 별칭)에 올리기:
 
 ```powershell
 # 반드시 PowerShell 로. Git Bash 의 ssh 는 Windows ssh-agent 를 못 봐서 publickey 거부가 난다.
-$root = "<portable-root>"
-ssh bot-host "powershell -NoProfile -Command \"Stop-ScheduledTask -TaskName 'MusicBot Portable'; Get-Process mc-musicbot -EA SilentlyContinue | Stop-Process -Force\""
-scp "<workspace>\musicbot-mk2\target\release\mc-musicbot.exe" "bot-host:$root/bot-mk2/mc-musicbot.exe"
+$remote = "<ssh 별칭>"
+$root   = "<봇 호스트의 포터블 루트>"
+ssh $remote "powershell -NoProfile -Command \"Stop-ScheduledTask -TaskName 'MusicBot Portable'; Get-Process mc-musicbot -EA SilentlyContinue | Stop-Process -Force\""
+scp ".\target\release\mc-musicbot.exe" "${remote}:$root/bot-mk2/mc-musicbot.exe"
 # 양쪽 SHA256 을 대조한 뒤에만 기동한다
-ssh bot-host "powershell -NoProfile -Command \"Start-ScheduledTask -TaskName 'MusicBot Portable'\""
+ssh $remote "powershell -NoProfile -Command \"Start-ScheduledTask -TaskName 'MusicBot Portable'\""
 ```
 
 **exe 를 덮어쓰기 전에 프로세스를 반드시 죽인다.** 잠긴 파일은 복사도 `cargo build` 도 실패한다.
@@ -208,3 +219,12 @@ ssh bot-host "powershell -NoProfile -Command \"Start-ScheduledTask -TaskName 'Mu
 - OAuth Client ID/Secret, 공개 URL, 봇 주인 ID: `data\remote-oauth.json`
 - host-registrar 시크릿: `data\registrar.json` (`scripts\registrar.sample.json` 을 복사해 만든다)
 - 웹 비밀번호 해시: `data\web-auth.hash`
+
+비밀값은 아니지만 **배포마다 다른 값**도 저장소에 박지 않는다. 전부 환경변수다.
+
+| 환경변수 | 어디에 | 없으면 |
+|---|---|---|
+| `MUSICBOT_ADMIN_HOST` · `MUSICBOT_REMOTE_HOST` | `bot\remote.env.cmd` | 호스트 분리가 꺼진다 |
+| `MUSICBOT_PUBLIC_BASE_URL` | `bot\remote.env.cmd` | OAuth redirect 가 틀어진다 |
+| `MUSICBOT_DISCORD_CLIENT_ID` · `_SECRET` | `bot\remote.env.cmd` 또는 운영 패널 | Discord 로그인이 꺼진다 |
+| `MUSICBOT_DEPLOY_REMOTE` · `MUSICBOT_DEPLOY_ROOT` | 배포하는 PC 의 `setx` | `Deploy-Seamless.ps1` 이 엉뚱한 곳을 본다 |

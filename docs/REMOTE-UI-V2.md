@@ -1,8 +1,8 @@
 # 마참뮤직 리모컨 v2 — 구현 사양서
 
-작성: 2026-08-06 · 브랜치 `feat/remote-ui-v2` · 워크트리 `<worktree>`
+작성: 2026-08-06 · 브랜치 `feat/remote-ui-v2` · 워크트리 `musicbot-mk2-remote-ui`
 
-벤치마크 레퍼런스: `C:\Users\<user>\NAS-Hub\projects\musicbot-web\references\office-jukebox-changelog.md`
+벤치마크 레퍼런스: NAS 운영 저장소의 `projects/musicbot-web/references/office-jukebox-changelog.md`
 
 > **배포 규칙**: 빌드와 로컬 테스트는 자유. **보조 PC / NAS 반영은 사용자 허락 후에만.**
 

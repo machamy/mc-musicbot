@@ -17,6 +17,10 @@ registrar.json
 /bot/.musicbot-data/
 /tools/
 
+# Agent/editor workspace state
+.claude/
+.playwright-mcp/
+
 # Local logs and OS/editor noise
 *.log
 Thumbs.db

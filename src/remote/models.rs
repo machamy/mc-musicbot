@@ -1275,7 +1275,7 @@ fn settings_value(key: &str, value: &serde_json::Value) -> String {
 /// 설정 변경을 사람이 읽는 문장으로.
 ///
 /// **여기가 없으면 사람 피드에 설정 JSON 통째가 그대로 나간다.**
-/// `마참 님이 limits 을 {"guildId":497...,"minVolume":0,...} → {...} 로 바꿨어요` 가
+/// `마참 님이 limits 을 {"guildId":100...,"minVolume":0,...} → {...} 로 바꿨어요` 가
 /// 실제로 화면에 나갔던 문장이다. 무엇이 바뀌었는지만 짚어 준다.
 fn settings_change_text(actor: &str, section: &str, before: Option<&str>, after: Option<&str>) -> String {
     let parse = |raw: Option<&str>| -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -2604,7 +2604,7 @@ mod tests {
     /// `POST /control` 이 남기는 `키:값` 결과와 옛 액션명이 사람 피드에 그대로 새면 안 된다.
     /// (`민수님이 playback.autoplay 을 했어요` · `서버 볼륨을 volume:150으로 바꿨어요`)
     /// 실제로 화면에 나갔던 문장:
-    /// `마참 님이 limits 을 {"guildId":497...,"minVolume":0,...} → {...} 로 바꿨어요`
+    /// `마참 님이 limits 을 {"guildId":100...,"minVolume":0,...} → {...} 로 바꿨어요`
     #[test]
     fn settings_changes_never_dump_json_into_the_feed() {
         let before = r#"{"guildId":100000000000000002,"minVolume":0,"maxVolume":100,

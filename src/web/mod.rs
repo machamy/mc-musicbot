@@ -27,8 +27,42 @@ use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
 
 /// 세션 유효 기간 — 12시간 쿠키.
 const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
-const ADMIN_HOST: &str = "musicbot.example.com";
-const REMOTE_HOST: &str = "music.example.com";
+/// 관리자 패널과 리모컨의 공개 호스트명. **배포마다 다르므로 저장소에 박지 않는다.**
+/// `MUSICBOT_ADMIN_HOST` / `MUSICBOT_REMOTE_HOST` 로 기동 시 한 번 읽는다.
+///
+/// 둘 다 비어 있으면 호스트 분리를 끄고 단일 호스트로 동작한다(로컬 개발 기본값).
+/// **운영에서 이 값을 비워 두면 리모컨 도메인에서도 `/botsettings` `/logs` 가 열린다.**
+/// 그래서 `spawn_web` 이 기동 로그에 경고를 남긴다.
+static ADMIN_HOST: OnceLock<Option<String>> = OnceLock::new();
+static REMOTE_HOST: OnceLock<Option<String>> = OnceLock::new();
+
+fn host_from_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| normalize_host(&value))
+        .filter(|value| !value.is_empty())
+}
+
+/// 포트와 대소문자를 떼어 낸 비교용 호스트명.
+fn normalize_host(raw: &str) -> String {
+    raw.split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn admin_host() -> Option<&'static str> {
+    ADMIN_HOST
+        .get_or_init(|| host_from_env("MUSICBOT_ADMIN_HOST"))
+        .as_deref()
+}
+
+fn remote_host() -> Option<&'static str> {
+    REMOTE_HOST
+        .get_or_init(|| host_from_env("MUSICBOT_REMOTE_HOST"))
+        .as_deref()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSurface {
@@ -37,19 +71,23 @@ enum WebSurface {
     Internal,
 }
 
-fn web_surface(host: Option<&str>) -> WebSurface {
-    let host = host
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    match host.as_str() {
-        ADMIN_HOST => WebSurface::Admin,
-        REMOTE_HOST => WebSurface::Remote,
-        _ => WebSurface::Internal,
+/// 호스트 분류의 순수 함수 부분. 환경변수를 읽지 않으므로 테스트가 값을 직접 준다.
+fn classify_host(host: Option<&str>, admin: Option<&str>, remote: Option<&str>) -> WebSurface {
+    let host = normalize_host(host.unwrap_or_default());
+    if host.is_empty() {
+        return WebSurface::Internal;
     }
+    if admin == Some(host.as_str()) {
+        WebSurface::Admin
+    } else if remote == Some(host.as_str()) {
+        WebSurface::Remote
+    } else {
+        WebSurface::Internal
+    }
+}
+
+fn web_surface(host: Option<&str>) -> WebSurface {
+    classify_host(host, admin_host(), remote_host())
 }
 
 fn is_remote_path(path: &str) -> bool {
@@ -70,13 +108,15 @@ async fn host_scope_guard(request: Request<Body>, next: Next) -> Response {
             (StatusCode::NOT_FOUND, "리모컨 도메인에서는 이 경로를 제공하지 않습니다.")
                 .into_response()
         }
-        WebSurface::Admin if is_remote_path(path) => {
+        // 리모컨 호스트가 설정되어 있을 때만 넘긴다. 없으면 보낼 곳이 없으므로 그대로 처리한다.
+        WebSurface::Admin if is_remote_path(path) && remote_host().is_some() => {
+            let remote = remote_host().unwrap_or_default();
             let suffix = request
                 .uri()
                 .path_and_query()
                 .map(|value| value.as_str())
                 .unwrap_or(path);
-            Redirect::temporary(&format!("https://{REMOTE_HOST}{suffix}")).into_response()
+            Redirect::temporary(&format!("https://{remote}{suffix}")).into_response()
         }
         _ => next.run(request).await,
     }
@@ -280,6 +320,17 @@ pub async fn serve(app: Arc<App>) {
     let addr = urls.trim_start_matches("http://").to_string();
     app.log
         .info("Web", &format!("Web admin listening on {addr}."));
+    match (admin_host(), remote_host()) {
+        (Some(admin), Some(remote)) => app.log.info(
+            "Web",
+            &format!("호스트 분리: 관리자 {admin} · 리모컨 {remote}."),
+        ),
+        _ => app.log.warn(
+            "Web",
+            "MUSICBOT_ADMIN_HOST / MUSICBOT_REMOTE_HOST 가 없어 호스트 분리를 끕니다. \
+             공개 배포라면 리모컨 도메인에서도 /botsettings · /logs 가 열립니다.",
+        ),
+    }
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
             // ConnectInfo<SocketAddr> 로 피어 IP 를 받아 /setup 의 localhost 게이트에 사용.
@@ -354,14 +405,44 @@ fn spawn_sweeper(state: Arc<WebState>) {
 mod host_scope_tests {
     use super::*;
 
+    const ADMIN: Option<&str> = Some("musicbot.example.com");
+    const REMOTE: Option<&str> = Some("music.example.com");
+
     #[test]
     fn separates_admin_remote_and_internal_hosts() {
-        assert_eq!(web_surface(Some("musicbot.example.com")), WebSurface::Admin);
-        assert_eq!(web_surface(Some("MUSIC.MACHAM.NET:443")), WebSurface::Remote);
-        assert_eq!(web_surface(Some("localhost:8693")), WebSurface::Internal);
+        assert_eq!(
+            classify_host(Some("musicbot.example.com"), ADMIN, REMOTE),
+            WebSurface::Admin
+        );
+        assert_eq!(
+            classify_host(Some("MUSIC.EXAMPLE.COM:443"), ADMIN, REMOTE),
+            WebSurface::Remote
+        );
+        assert_eq!(
+            classify_host(Some("localhost:8693"), ADMIN, REMOTE),
+            WebSurface::Internal
+        );
         assert!(is_remote_path("/music"));
         assert!(is_remote_path("/music/oauth/callback"));
         assert!(!is_remote_path("/botsettings"));
+    }
+
+    /// 호스트명을 설정하지 않으면 분리가 꺼진다 — 전부 Internal 로 떨어져 단일 호스트로 돈다.
+    #[test]
+    fn unset_hosts_disable_the_split() {
+        assert_eq!(
+            classify_host(Some("musicbot.example.com"), None, None),
+            WebSurface::Internal
+        );
+        assert_eq!(classify_host(Some("localhost:8693"), None, None), WebSurface::Internal);
+    }
+
+    /// 빈 Host 헤더가 `None` 설정과 우연히 같아져서 Admin 으로 분류되면 안 된다.
+    #[test]
+    fn empty_host_never_matches_an_unset_setting() {
+        assert_eq!(classify_host(Some(""), None, None), WebSurface::Internal);
+        assert_eq!(classify_host(None, None, None), WebSurface::Internal);
+        assert_eq!(classify_host(Some(":8693"), None, None), WebSurface::Internal);
     }
 }
 

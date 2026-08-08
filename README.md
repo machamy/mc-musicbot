@@ -158,6 +158,15 @@ cp botsettings.sample.json botsettings.json
 
 집 밖에서 웹 관리자에 접속하려면 `8693` 포트를 직접 열기보다 **Cloudflare Tunnel**이나 리버스 프록시 뒤에 두고, 가능하면 별도 인증(Access 등)을 한 겹 더 두는 것을 권장합니다. 봇 자체의 비밀번호는 그 안쪽의 방어선입니다.
 
+**관리자 패널과 웹 리모컨을 서로 다른 도메인으로 갈라놓고 싶다면** 호스트명 두 개를 환경변수로 줍니다.
+
+```
+MUSICBOT_ADMIN_HOST=musicbot.example.com    # 운영 패널. Access 등으로 한 겹 더 막는 곳
+MUSICBOT_REMOTE_HOST=music.example.com      # 웹 리모컨. Discord 로그인만으로 들어오는 곳
+```
+
+이걸 주면 리모컨 도메인에서는 `/music/*`와 `/healthz` 외의 모든 경로가 404가 됩니다. **주지 않으면 분리가 꺼져서 한 호스트에서 관리자 화면까지 전부 열립니다** — 리모컨을 외부에 공개할 거라면 반드시 설정하세요.
+
 ---
 
 ## 슬래시 명령

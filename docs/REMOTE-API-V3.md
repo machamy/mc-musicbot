@@ -1392,14 +1392,14 @@ FLIP 애니메이션은 **화면에 보이는 항목에만** 적용해요.
 
 | 문서 | 갱신할 내용 |
 |---|---|
-| `<workspace>\musicbot-mk2\HANDOFF.md` | 새 기능 전체, 배포 기준 빌드/SHA, 마이그레이션 v8→v11, 권한 10종 |
-| `<workspace>\musicbot-mk2\README.md` | 기능 목록, 리모컨 주소가 `music.example.com` 인 것 |
+| `HANDOFF.md` | 새 기능 전체, 배포 기준 빌드/SHA, 마이그레이션 v8→v11, 권한 10종 |
+| `README.md` | 기능 목록, 리모컨 주소가 `music.example.com` 인 것 |
 | `docs/REMOTE-UI-V2.md` | v3 에서 바뀐 결정(권한 10종, 배치 6종, 테마 7종)을 반영하거나 v3 로 넘긴다고 명시 |
 | `docs/REMOTE-API-V2.md` | v3 에서 바뀐 계약(권한 키, 큐 페이지네이션, presence.bot) 갱신 |
 | `docs/REMOTE-API-V3.md` | §0 체크리스트를 전부 ✅ 로. 구현하며 달라진 결정은 그 자리에서 고쳐요 |
-| `C:\Users\<user>\NAS-Hub\projects\musicbot-web\README.md` | 도메인 분리, 새 배포 빌드 ID/SHA, 리모컨 기능 요약 |
-| `C:\Users\<user>\NAS-Hub\projects\README.md` | musicbot-web 한 줄 상태 갱신 |
-| `C:\Users\<user>\NAS-Hub\docs\bot-host-ssh.md` | (해당하면) PowerShell 로 접속해야 하는 이유 |
+| NAS 운영 저장소 `projects/musicbot-web/README.md` | 도메인 분리, 새 배포 빌드 ID/SHA, 리모컨 기능 요약 |
+| NAS 운영 저장소 `projects/README.md` | musicbot-web 한 줄 상태 갱신 |
+| NAS 운영 저장소 `docs/ssh.md` | (해당하면) PowerShell 로 접속해야 하는 이유 |
 
 **문서에 쓰면 안 되는 것**: 토큰·Client Secret·비밀번호·API 키·개인키.
 지금까지처럼 값이 아니라 **어디에 있는지**만 적어요.

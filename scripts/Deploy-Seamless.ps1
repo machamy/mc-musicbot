@@ -3,7 +3,7 @@
 # 예전 방식은 이랬다.
 #     Stop-Process -Force  →  scp exe  →  Start-ScheduledTask
 # 이러면 **복사하는 내내 서버가 죽어 있다.** 실측으로 cloudflared 가
-# `dial tcp <bot-host-ip>:8693: i/o timeout` 을 2분 넘게 뱉었다.
+# `dial tcp <봇 호스트>:8693: i/o timeout` 을 2분 넘게 뱉었다.
 #
 # 여기서는 순서를 바꾼다.
 #     1. 새 exe 를 옆자리(.next)에 먼저 복사한다 — 봇은 계속 돌고 있다.
@@ -21,8 +21,11 @@ param(
     # **버전은 반드시 준다.** 규칙이다 — 모든 빌드·배포에는 버전 번호와 패치노트가 있어야 한다.
     # 날짜 자동값을 쓰면 "무엇이 바뀐 배포인지"가 아무 데도 안 남는다.
     [Parameter(Mandatory = $true)][string]$Version,
-    [string]$Remote  = 'bot-host',
-    [string]$Root    = '<portable-root>',
+    # 배포 대상은 호스트마다 다르다. 저장소에 개인 경로를 박지 않고 환경변수로 받는다.
+    # 봇 호스트 PC 에서 한 번만: setx MUSICBOT_DEPLOY_REMOTE "<ssh 별칭>"
+    #                            setx MUSICBOT_DEPLOY_ROOT   "<포터블 루트>"
+    [string]$Remote  = $(if ($env:MUSICBOT_DEPLOY_REMOTE) { $env:MUSICBOT_DEPLOY_REMOTE } else { 'bot-host' }),
+    [string]$Root    = $(if ($env:MUSICBOT_DEPLOY_ROOT) { $env:MUSICBOT_DEPLOY_ROOT } else { 'C:\musicbot-portable' }),
     [string]$TaskName = 'MusicBot Portable',
     [string]$ChangelogPath = "$PSScriptRoot\..\docs\CHANGELOG.md"
 )
