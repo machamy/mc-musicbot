@@ -24,17 +24,17 @@ const MODES = {
   score: {
     icon: '⭐', label: '점수제',
     desc: '좋아요를 많이 받은 곡이 먼저 나가요. 기다린 시간도 점수로 쌓여요.',
-    formula: '관리자 우선 → (대기 + 👍 + ⭐×2) 높은 순 → 신청 순',
+    formula: '📌 로 올린 곡 → (대기 + 👍 + ⭐×2) 높은 순 → 신청 순',
   },
   fifo: {
     icon: '⏱', label: '시간제',
     desc: '먼저 신청한 곡이 먼저 나가요. 좋아요는 표시만 되고 순서를 바꾸지 않아요.',
-    formula: '관리자 우선 → 신청 순',
+    formula: '📌 로 올린 곡 → 신청 순',
   },
   fair: {
     icon: '⚖', label: '공평제',
     desc: '사람별로 돌아가며 한 곡씩 재생해요. 미리 여러 곡을 넣어도 새치기가 안 되고, 늦게 온 사람도 금방 차례가 와요.',
-    formula: '관리자 우선 → 라운드 → 마지막으로 재생된 지 오래된 사람 순',
+    formula: '📌 로 올린 곡 → 라운드 → 마지막으로 재생된 지 오래된 사람 순',
   },
 };
 
@@ -3571,8 +3571,6 @@ function createQueueItem(item) {
     class: 'vote seedbtn', type: 'button',
     tip: '📻 기준으로 삼기 — 자동 재생이 이 곡과 비슷한 노래를 골라 와요', 'aria-label': '기준으로 삼기',
   }, '📻 기준'), () => addSeed(node.__item.track));
-  p.pin = bindAct(h('button', { class: 'vote', type: 'button', tip: '관리자 우선으로 올리기', 'aria-label': '관리자 우선' }, '📌'),
-    () => call(() => api('/queue/action', { body: { action: 'togglePin', itemId: node.dataset.id } })));
   p.remove = bindAct(h('button', { class: 'vote vote--danger', type: 'button', tip: '대기열에서 빼기', 'aria-label': '대기열에서 빼기' }, '✕'),
     async () => {
       const ok = await confirmSheet({
@@ -3585,7 +3583,10 @@ function createQueueItem(item) {
     class: 'vote vote--link', target: '_blank', rel: 'noreferrer noopener',
     tip: '원본에서 열기', 'aria-label': '원본에서 열기',
   }, '↗');
-  p.acts.append(p.like, p.superLike, p.dislike, p.save, p.link, p.seed, p.pin, p.remove);
+  // 📌 는 줄에서 뺐다. 우클릭 메뉴의 `맨 앞으로 올리기` 와 같은 일을 하는데, 관리자만 쓰고
+  // 그나마 드문 기능이 투표 버튼 옆에 상시 노출돼 있었다. 이름도 `관리자 우선` 이라
+  // "관리자가 담은 곡은 먼저 나간다" 는 특권처럼 읽혔다 — 실제로는 그런 규칙이 없다.
+  p.acts.append(p.like, p.superLike, p.dislike, p.save, p.link, p.seed, p.remove);
 
   // 우클릭 / 롱프레스 — 곡 하나에 할 수 있는 걸 전부 한자리에 (§24.1)
   bindContextTarget(node, () => trackMenu(node.__item.track, {
@@ -3679,8 +3680,6 @@ function updateQueueItem(node, item, index, rounds) {
   // 📻 는 숨기지 않는다 — 기능이 있는 서버라면 비활성 + 이유로 남긴다 (§23.3).
   setLock(p.seed, !seedEditable(), lockReason('autoplay'));
 
-  p.pin.hidden = !can('queueEdit') || tierOf() === 'member';
-  p.pin.setAttribute('aria-pressed', String(score.manualPriority !== null && score.manualPriority !== undefined));
   const canRemove = item.isMine ? can('queueEdit') || can('search') : can('queueEdit');
   // 내 곡은 `queueEdit` 이나 `search` 중 하나만 있어도 뺄 수 있다. 둘 다 막혔을 때 빈 문자열을
   // 넘기면 setLock 이 기본 문구로 떨어져 §23.3("왜 막혔는지")을 못 지킨다.
@@ -6491,7 +6490,7 @@ function openModeSheet() {
   const points = votePoints();
   // 배점이 설정으로 바뀌었으면 설명도 같이 바뀌어야 한다 (§10.1)
   const formulaOf = (id) => (id === 'score'
-    ? `관리자 우선 → (대기×${points.wait} + 👍×${points.like} + ⭐×${points.superLike} + 👎×${points.dislike}) 높은 순 → 신청 순`
+    ? `📌 로 올린 곡 → (대기×${points.wait} + 👍×${points.like} + ⭐×${points.superLike} + 👎×${points.dislike}) 높은 순 → 신청 순`
     : MODES[id].formula);
 
   sheet({
