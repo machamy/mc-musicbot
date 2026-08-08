@@ -7424,9 +7424,12 @@ async fn api_settings(
     if let Err(error) = state.app.remote.save_guild_settings(&settings) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
     }
-    // PlayerManager 는 정렬 모드를 캐시한다. 저장만 하고 캐시를 안 맞추면
-    // 봇을 재시작할 때까지 옛 모드로 정렬된다.
-    state.app.player.set_sort_mode(guild_id, settings.sort_mode);
+    // **설정 캐시를 통째로 버린다.** `PlayerManager` 는 길드 설정을 캐시하는데 TTL 이 없어서
+    // 한 번 채워지면 무효화 전까지 영구다. 예전에는 여기서 정렬 모드만 갈아 끼웠는데,
+    // 그 방식은 **나머지 필드의 낡은 값을 오히려 되살려 놓는다** — `set_sort_mode` 가
+    // 캐시본을 clone 해서 다시 넣기 때문이다. 실제로 투표 점수(§10.1)가 그렇게 굳어서,
+    // 콘솔은 새 계산식을 보여 주는데 대기열은 옛 점수로 정렬되고 있었다.
+    state.app.player.invalidate_settings(guild_id);
     apply_engine_volume(&state, &ctx, &settings).await;
     let after = serde_json::to_string(&settings).unwrap_or_default();
     let _ = state.app.remote.add_audit(
@@ -8160,8 +8163,9 @@ async fn admin_settings_put(
             crate::player::side_effects::refresh_preview(app, guild_id).await;
         });
     }
-    // 아래 refresh_scored_order 가 캐시된 모드를 읽으므로 반드시 그 전에 맞춘다.
-    state.app.player.set_sort_mode(guild_id, settings.sort_mode);
+    // 아래 `refresh_scored_order` 가 캐시에서 정렬 모드와 투표 점수를 읽으므로 **그 전에** 버린다.
+    // 갈아 끼우기가 아니라 무효화다 — 위 라우트의 주석 참고(정렬 외 필드가 낡은 채로 남는다).
+    state.app.player.invalidate_settings(guild_id);
     if section == "order" || section == "limits" {
         apply_engine_volume(&state, &ctx, &settings).await;
     }

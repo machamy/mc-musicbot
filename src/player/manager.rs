@@ -37,7 +37,7 @@ pub struct PlayerManager {
     ///
     /// 정렬 모드만이 아니라 **투표 점수(v3 §10.1)도 여기서 나온다** — 점수를 읽으려고
     /// DB를 또 치면 방금 없앤 문제가 그대로 되살아난다. 웹이 설정을 저장하면
-    /// `set_sort_mode`/`refresh_settings`/`invalidate_settings` 로 캐시를 맞춘다.
+    /// `set_sort_mode`/`invalidate_settings` 로 캐시를 맞춘다.
     settings: StdMutex<HashMap<u64, Arc<RemoteGuildSettings>>>,
     /// 길드별 셔플 시드. 셔플은 별도 정렬 모드가 아니라 `Fifo` + 무작위 `original_order`이며
     /// (사양서 §3.3), 그 무작위 순서를 시드 하나로 재현한다.
@@ -953,14 +953,6 @@ impl PlayerManager {
             .insert(guild_id, Arc::new(updated));
     }
 
-    /// 웹이 설정을 통째로 저장했을 때. 방금 쓴 값을 그대로 넘겨 주면 DB를 다시 읽지 않는다.
-    pub fn refresh_settings(&self, settings: &RemoteGuildSettings) {
-        self.settings
-            .lock()
-            .unwrap()
-            .insert(settings.guild_id, Arc::new(settings.clone()));
-    }
-
     /// 무엇이 바뀌었는지 모를 때 쓰는 무효화. 다음 조회에서 한 번만 DB를 읽는다.
     pub fn invalidate_settings(&self, guild_id: u64) {
         self.settings.lock().unwrap().remove(&guild_id);
@@ -1380,6 +1372,47 @@ mod tests {
         let seen = wait_for_user(&stats, guild_id, user, |s| s.played + s.skipped >= 2).await;
         assert_eq!(seen.played, 1, "끝까지 재생된 곡");
         assert_eq!(seen.skipped, 1, "바로재생으로 잘린 곡도 스킵으로 남는다");
+        cleanup(player, remote, root);
+    }
+
+    /// 설정 캐시는 **TTL 이 없다.** 무효화하지 않으면 봇을 재시작할 때까지 옛 값이 산다.
+    ///
+    /// 실제로 그래서 사고가 났다. 콘솔에서 투표 점수를 바꿔도 대기열은 옛 점수로 정렬됐다 —
+    /// 저장 라우트가 `set_sort_mode` 로 정렬 모드만 갈아 끼웠는데, 그 함수는 캐시본을
+    /// clone 해서 다시 넣기 때문에 **나머지 필드의 낡은 값을 오히려 되살려 놓는다.**
+    /// 화면은 새 계산식을 보여 주는데 순서는 다른, 제일 나쁜 어긋남이었다.
+    #[test]
+    fn settings_cache_must_be_dropped_to_see_a_save() {
+        let (player, remote, root) = temp_player("settingscache");
+        let guild_id = 1u64;
+
+        let mut settings = remote.load_guild_settings(guild_id);
+        settings.like_points = 1;
+        remote.save_guild_settings(&settings).unwrap();
+        assert_eq!(player.cached_settings(guild_id).like_points, 1);
+
+        // 콘솔에서 저장한 상황.
+        let mut changed = remote.load_guild_settings(guild_id);
+        changed.like_points = 5;
+        remote.save_guild_settings(&changed).unwrap();
+
+        // 무효화 전에는 저장한 값이 안 보인다 — 캐시가 살아 있기 때문이다.
+        assert_eq!(
+            player.cached_settings(guild_id).like_points,
+            1,
+            "캐시는 저장을 스스로 알아채지 못한다"
+        );
+
+        // 정렬 모드만 갈아 끼우는 방식으로는 안 풀린다. 이게 예전 버그의 모양이다.
+        player.set_sort_mode(guild_id, QueueSortMode::Fair);
+        assert_eq!(
+            player.cached_settings(guild_id).like_points,
+            1,
+            "set_sort_mode 는 낡은 값을 되살린다 — 저장 직후에 쓰면 안 된다"
+        );
+
+        player.invalidate_settings(guild_id);
+        assert_eq!(player.cached_settings(guild_id).like_points, 5);
         cleanup(player, remote, root);
     }
 
