@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -548,7 +548,7 @@ const MIGRATION_V15: &str = r#"
 ///   - `internal:...` — 우리가 튼 기록으로 만드는 차트(§15.2b). 외부 호출이 없다.
 ///
 /// 관리 콘솔에서 주소를 바꿀 수 있다. 여기 값은 **처음 한 번만** 심어진다.
-const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 41] = [
+const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 47] = [
     // 우리가 실제로 튼 것으로 만드는 차트 — 자동재생으로 나간 곡은 세지 않는다.
     (ChartCategory::Ours, "우리 서버 인기곡", "Internal", "internal:guild-plays"),
     (ChartCategory::Ours, "우리 서버 사랑받은 곡", "Internal", "internal:guild-love"),
@@ -583,6 +583,15 @@ const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 41] = [
     (ChartCategory::Genre, "라틴", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5O8siDeZuI_4hbk6JWtTX1"),
     (ChartCategory::Genre, "재즈", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn7Wkr6Ll6ds1AhA42rT8uaU"),
     (ChartCategory::Genre, "컨트리", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4EBsWVeFpcSAVOFMfhyipg"),
+    // J-POP 계열은 위 "Top 50 …United States" 묶음에 아예 없다. 그래서 나라별에만 있고
+    // 장르에서는 빠져 있었다. 유튜브 뮤직이 직접 큐레이션한 재생목록(`RDCLAK5uy_…`)으로 채운다.
+    // 2026-08-08 곡 수·길이 확인함.
+    (ChartCategory::Genre, "J-POP", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_nbK9qSkqYZvtMXH1fLCMmC1yn8HEm0W90"),
+    (ChartCategory::Genre, "J-POP 최신", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_lwbizuU3lWX-XkvD8tvEd8phxcIneMvwc"),
+    (ChartCategory::Genre, "J-POP 봄노래", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_lRj2PxRYIUGDG0p0KjsQ62d2lLYLfgXAw"),
+    (ChartCategory::Genre, "애니송", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_mRcc2Y3l-RoZsDt27qu8CBGpKt-5w7v8g"),
+    (ChartCategory::Genre, "시티팝", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_nEjjAWEM3M3fk2tT4Lhb5JOr_HoD0tjnk"),
+    (ChartCategory::Genre, "시티팝 최신", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_muPPezCrTrwoL7Ep_9a69YkIaBjsyKTg0"),
     // 노래방 — TJ 는 공식 API 를 직접 긁는다. 검색으로 흉내내지 않는다.
     (ChartCategory::Karaoke, "TJ 인기 100", "TJ", "tj:hot"),
     (ChartCategory::Karaoke, "TJ 발라드", "TJ", "tj:top:4"),
@@ -3404,6 +3413,8 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             // v17 은 `INSERT OR IGNORE` 만 해서, 게이트를 켠 빌드가 이미 만들어 둔
             // `pending` 행을 못 고쳤다. 같은 함수가 이제 대기 상태도 올린다 — 다시 돌린다.
             17 => migrate_v17_grandfather_guilds(&tx)?,
+            // 장르에 J-POP 계열이 통째로 없었다. 새 차트를 기존 DB 에도 심는다.
+            18 => seed_builtin_charts(&tx)?,
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }

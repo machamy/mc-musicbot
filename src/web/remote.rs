@@ -2068,7 +2068,7 @@ fn ensure_guild_watcher(state: &Arc<WebState>, guild_id: u64) {
                 &state,
                 guild_id,
                 "playback",
-                playback_payload(&state, &player, position, &sampled_at, None),
+                playback_payload(&state, &player, position, &sampled_at, None, state.app.coordinator.schedule(guild_id).await),
             );
             if queue_changed {
                 broadcast_queue(&state, guild_id).await;
@@ -2481,8 +2481,23 @@ fn playback_payload(
     position: f64,
     sampled_at: &str,
     viewer: Option<u64>,
+    schedule: Option<crate::player::coordinator::TrackSchedule>,
 ) -> Value {
     let state_ref = state;
+    let tune = state.app.remote.load_guild_settings(player.guild_id);
+    // 다음 곡이 시작될 시각. 웹이 **미리 준비해 두었다가 그 순간에 바꿔 틀** 수 있어야
+    // 곡 사이가 안 끊긴다. 길이를 모르면 예고할 수 없으므로 `null` 이다.
+    let next_start_utc = schedule.and_then(|s| {
+        player
+            .current_item
+            .as_ref()
+            .and_then(|item| item.track.duration)
+            .map(|duration| {
+                (s.started_utc
+                    + chrono::Duration::milliseconds((duration.as_secs_f64() * 1000.0) as i64))
+                .to_rfc3339()
+            })
+    });
     let current_points = state
         .app
         .remote
@@ -2492,6 +2507,14 @@ fn playback_payload(
         "isPaused": player.is_paused,
         "positionSeconds": position,
         "sampledAtUtc": sampled_at,
+        // **절대 시각 일정** (§31). 클라이언트는 `now - startedUtc` 로 위치를 잡는다.
+        // 전송 지연을 각자 추정하던 방식은 기기마다 결과가 달라 곡마다 미세하게 어긋났다.
+        // `startedUtc` 가 미래면 아직 시작 전이라는 뜻이다(스킵 직후 등).
+        "startedUtc": schedule.map(|s| s.started_utc.to_rfc3339()),
+        "nextStartUtc": next_start_utc,
+        "skipLeadMs": tune.skip_lead_ms,
+        "seekLockoutMs": tune.seek_lockout_ms,
+        "webSyncOffsetMs": tune.web_sync_offset_ms,
         "currentId": player.current_item.as_ref().map(|item| item.id.clone()),
         "current": player
             .current_item
@@ -3241,6 +3264,11 @@ async fn api_state_hot(
             .map(|item| current_json(state_ref, player.guild_id, item, &current_points, viewer)),
         "positionSeconds": position,
         "sampledAtUtc": sampled_at,
+        // 절대 시각 일정 (§31). 진입·재연결 응답에도 실어야 그 순간부터 정확히 맞는다.
+        "startedUtc": state.app.coordinator.schedule(guild_id).await.map(|s| s.started_utc.to_rfc3339()),
+        "skipLeadMs": ctx.settings.skip_lead_ms,
+        "seekLockoutMs": ctx.settings.seek_lockout_ms,
+        "webSyncOffsetMs": ctx.settings.web_sync_offset_ms,
         "queueMode": ctx.settings.sort_mode.as_str(),
         "sortedAt": sorted_at,
         "nextSortAt": next_sort_at,
@@ -3786,6 +3814,10 @@ async fn api_state(
             .map(|item| current_json(state_ref, player.guild_id, item, &current_points, viewer)),
         "positionSeconds": position,
         "sampledAtUtc": sampled_at,
+        "startedUtc": state.app.coordinator.schedule(guild_id).await.map(|s| s.started_utc.to_rfc3339()),
+        "skipLeadMs": ctx.settings.skip_lead_ms,
+        "seekLockoutMs": ctx.settings.seek_lockout_ms,
+        "webSyncOffsetMs": ctx.settings.web_sync_offset_ms,
         "queue": queue,
         "queueTotal": player.upcoming.len(),
         "next": next_up_json(&player),
@@ -4539,6 +4571,16 @@ async fn api_control(
             state.app.player.skip(guild_id).await;
             if !session.is_developer {
                 state.app.coordinator.sync_guild(&state.app, guild_id).await;
+                // 스킵도 모두가 같은 순간에 0초부터 시작하게 조금 미래로 잡는다 (§31).
+                state
+                    .app
+                    .coordinator
+                    .schedule_start_in(
+                        guild_id,
+                        Duration::from_millis(ctx.settings.skip_lead_ms as u64),
+                        Duration::ZERO,
+                    )
+                    .await;
             }
             queue_changed = true;
             Ok("skipped".into())
@@ -4551,8 +4593,23 @@ async fn api_control(
                 .and_then(|item| item.track.duration)
                 .map(|duration| duration.as_secs_f64())
                 .unwrap_or(0.0);
+            // 곡이 끝나기 직전에는 막는다 (§31). 화면에서도 막지만 **서버가 최종 판정**이다 —
+            // 화면만 막으면 다른 창이나 옛 탭에서 그대로 들어온다.
+            let now_position = state
+                .app
+                .coordinator
+                .current_position(guild_id)
+                .await
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let lockout = ctx.settings.seek_lockout_ms as f64 / 1000.0;
             if seconds < 0.0 || duration <= 0.0 || seconds > duration {
                 Err("옮기려는 위치가 곡 길이를 벗어났어요.".into())
+            } else if lockout > 0.0 && duration - now_position <= lockout {
+                Err(format!(
+                    "곡이 끝나기 {}초 전부터는 위치를 못 옮겨요. 다음 곡으로 넘어가는 중이라서요.",
+                    lockout.round() as i64
+                ))
             } else {
                 state
                     .app
@@ -4562,6 +4619,16 @@ async fn api_control(
                 if !session.is_developer {
                     state.app.coordinator.cancel_current(guild_id).await;
                     state.app.coordinator.sync_guild(&state.app, guild_id).await;
+                    // 모두가 같은 순간에 같은 지점을 시작하게 조금 미래로 잡는다 (§31).
+                    state
+                        .app
+                        .coordinator
+                        .schedule_start_in(
+                            guild_id,
+                            Duration::from_millis(ctx.settings.skip_lead_ms as u64),
+                            Duration::from_secs_f64(seconds),
+                        )
+                        .await;
                 }
                 Ok(format!("seek:{seconds:.1}"))
             }
@@ -4653,7 +4720,7 @@ async fn api_control(
                 &state,
                 guild_id,
                 "playback",
-                playback_payload(&state, &player, position, &sampled_at, None),
+                playback_payload(&state, &player, position, &sampled_at, None, state.app.coordinator.schedule(guild_id).await),
             );
             if queue_changed {
                 broadcast_queue(&state, guild_id).await;
@@ -6816,7 +6883,7 @@ async fn api_autoplay_reroll(
         &state,
         guild_id,
         "playback",
-        playback_payload(&state, &player, position, &now_utc(), None),
+        playback_payload(&state, &player, position, &now_utc(), None, state.app.coordinator.schedule(guild_id).await),
     );
     json_ok(json!({ "ok": true }))
 }
@@ -7507,6 +7574,34 @@ async fn admin_settings_put(
                     );
                 }
                 settings.empty_voice_delay_seconds = value as u32;
+            }
+            // ── 재생 싱크 (§31) ──
+            if let Some(value) = json_i32(&body, "skipLeadMs") {
+                if !(0..=5000).contains(&value) {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "스킵 여유 시간은 0~5000ms 사이여야 해요.",
+                    );
+                }
+                settings.skip_lead_ms = value as u32;
+            }
+            if let Some(value) = json_i32(&body, "seekLockoutMs") {
+                if !(0..=10000).contains(&value) {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "진행바 잠금 구간은 0~10000ms 사이여야 해요.",
+                    );
+                }
+                settings.seek_lockout_ms = value as u32;
+            }
+            if let Some(value) = json_i32(&body, "webSyncOffsetMs") {
+                if !(-5000..=5000).contains(&value) {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "전역 싱크 보정은 -5000~5000ms 사이여야 해요.",
+                    );
+                }
+                settings.web_sync_offset_ms = value;
             }
         }
         "perms" => {
@@ -9578,17 +9673,31 @@ async fn admin_blacklist_get(
     cookies: Cookies,
     Path(guild_id): Path<u64>,
 ) -> Response {
-    if let Err(response) = authorize_admin(&state, &cookies, guild_id, None).await {
-        return response;
-    }
-    let items: Vec<Value> = state
-        .app
-        .db
-        .list_blacklist(guild_id)
+    let ctx = match authorize_admin(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    // 전체 차단 규칙은 **봇 주인만 본다** (§19.2). 서버 관리자에게는 목록에서 아예 뺀다.
+    // 여러 서버가 같은 봇을 쓰는 지금, 전체 규칙은 남의 서버 운영 방침이기도 하다.
+    let owner = ctx.session.is_developer || is_owner_user(&state, ctx.session.user_id);
+    let all = state.app.db.list_blacklist(guild_id);
+    let hidden = all
         .iter()
+        .filter(|entry| entry.guild_id == 0)
+        .count();
+    let items: Vec<Value> = all
+        .iter()
+        .filter(|entry| owner || entry.guild_id != 0)
         .map(|entry| blacklist_json(entry, guild_id))
         .collect();
-    json_ok(json!({ "items": items }))
+    json_ok(json!({
+        "items": items,
+        // 내용은 숨기되 **있다는 사실은 숨기지 않는다.** 안 그러면 규칙에 걸렸을 때
+        // 서버 관리자가 자기 목록만 보고 "여긴 아무것도 없는데 왜 막히지" 로 헤맨다.
+        "hasGlobal": hidden > 0 && !owner,
+        "globalNote": (hidden > 0 && !owner)
+            .then_some("봇 전체에 적용되는 차단 규칙이 따로 있어요. 내용은 봇 주인만 볼 수 있어요."),
+    }))
 }
 
 #[derive(Debug, Deserialize)]

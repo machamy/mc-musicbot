@@ -363,18 +363,44 @@ export const clock = {
   _raf: 0,
   _last: -1,
 
-  /** { positionSeconds, sampledAtUtc, isPaused, durationSeconds } */
+  /** 서버 시계와 내 시계의 차이(초). `startedUtc` 를 쓰려면 이걸 먼저 빼야 한다.
+   * 기기 시계가 몇 초씩 틀어져 있는 경우가 흔해서, 절대 시각을 그냥 믿으면 그만큼 어긋난다. */
+  skew: 0,
+
+  /** `startedUtc` 가 있을 때만 채워진다. 곡의 0초에 해당하는 **내 시계** 기준 epoch(ms). */
+  startedAtLocal: 0,
+
+  /** { positionSeconds, sampledAtUtc, isPaused, durationSeconds, startedUtc } */
   sync(payload) {
     if (!payload) return;
     if (payload.durationSeconds !== undefined && payload.durationSeconds !== null) {
       clock.duration = Number(payload.durationSeconds) || 0;
     }
     if (payload.isPaused !== undefined) clock.paused = !!payload.isPaused;
-    if (payload.positionSeconds === undefined || payload.positionSeconds === null) { clock._kick(); return; }
 
-    let position = Number(payload.positionSeconds) || 0;
-    // 표본 시각이 있으면 전송 지연만큼 앞당긴다. 시계 오차가 큰 기기를 위해 0~5초로 자른다.
+    // 서버 표본 시각으로 시계 차이를 계속 다듬는다. 전송 지연도 여기 섞이지만,
+    // 지연은 한 방향(서버→나)이라 몇십 ms 수준이고 곡 전체에서 일정하다.
     const sampled = parseUtc(payload.sampledAtUtc);
+    if (sampled) clock.skew = Date.now() - sampled;
+
+    /* **절대 시각이 오면 그것만 믿는다** (§31).
+     * 예전에는 서버가 "지금 몇 초"를 보내고 각자 지연을 추정해 더했는데, 그 추정이
+     * 기기마다 달라서 사람마다 소리가 어긋났다. 0초 지점의 UTC 를 주면 모두가
+     * 같은 식으로 계산하므로 곡마다 생기던 미세한 차이가 사라진다. */
+    const started = parseUtc(payload.startedUtc);
+    if (started) {
+      clock.startedAtLocal = started + clock.skew;
+      if (!clock.paused) {
+        clock.base = Math.max(0, (Date.now() - clock.startedAtLocal) / 1000);
+        clock.baseAt = performance.now();
+        clock._kick();
+        return;
+      }
+    }
+
+    if (payload.positionSeconds === undefined || payload.positionSeconds === null) { clock._kick(); return; }
+    let position = Number(payload.positionSeconds) || 0;
+    // 절대 시각이 없는 옛 서버용 폴백. 지연을 0~5초로 잘라 더한다.
     if (sampled) {
       const lag = (Date.now() - sampled) / 1000;
       if (lag > 0 && lag < 5) position += lag;
@@ -382,6 +408,11 @@ export const clock = {
     clock.base = Math.max(0, position);
     clock.baseAt = performance.now();
     clock._kick();
+  },
+
+  /** 곡의 0초에 해당하는 내 시계 시각. 웹 재생이 절대 기준으로 쓴다. 없으면 0. */
+  startedAt() {
+    return clock.startedAtLocal;
   },
 
   seekLocal(seconds) {
@@ -1036,10 +1067,19 @@ function merge(type, data, handlers) {
       });
       const patch = { player };
       if (data.current !== undefined) patch.current = data.current;
+      // 서버가 정한 일정 (§31). 웹 재생과 진행바가 둘 다 이걸 기준으로 움직인다.
+      patch.schedule = {
+        startedUtc: data.startedUtc ?? null,
+        nextStartUtc: data.nextStartUtc ?? null,
+        skipLeadMs: Number(data.skipLeadMs) || 0,
+        seekLockoutMs: Number(data.seekLockoutMs) || 0,
+        webSyncOffsetMs: Number(data.webSyncOffsetMs) || 0,
+      };
       store.patch(patch);
       clock.sync({
         positionSeconds: data.positionSeconds,
         sampledAtUtc: data.sampledAtUtc,
+        startedUtc: data.startedUtc,
         isPaused: data.isPaused,
         durationSeconds: data.durationSeconds ?? (data.current ? data.current.durationSeconds : undefined),
       });

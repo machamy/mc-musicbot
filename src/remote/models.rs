@@ -1893,6 +1893,25 @@ pub struct RemoteGuildSettings {
     /// 잠깐 나갔다 오는 사람 때문에 바로 끊기면 안 된다.
     #[serde(default = "default_empty_voice_delay")]
     pub empty_voice_delay_seconds: u32,
+    /// 스킵·되감기 때 **몇 ms 뒤를 시작 시각으로 잡을지** (§31). 0~5000.
+    ///
+    /// 0이면 "지금부터"인데, 그 말이 사람마다 다른 시각에 도착해서 각자 다른 지점에서
+    /// 시작한다. 조금 미래로 잡아 두면 다 같이 그 시각을 기다렸다 출발한다.
+    /// 회선이 느린 사람이 많으면 늘린다.
+    #[serde(default = "default_skip_lead_ms")]
+    pub skip_lead_ms: u32,
+    /// 곡이 끝나기 **몇 ms 전부터 진행바를 못 움직이게** 할지 (§31). 0~10000.
+    ///
+    /// 끝나기 직전에 되감으면 그 이동이 반영되기 전에 다음 곡으로 넘어가서,
+    /// 웹만 엉뚱한 지점에 남고 봇은 다음 곡을 튼다. 그 구간을 아예 막는다.
+    #[serde(default = "default_seek_lockout_ms")]
+    pub seek_lockout_ms: u32,
+    /// 서버 전체에 적용하는 웹 재생 보정(ms) (§31). -5000~5000.
+    ///
+    /// 개인 보정(`webOffset`)과 **더해진다.** 디스코드 송출 경로가 브라우저보다 늘 일정하게
+    /// 늦거나 빠르면 여기서 한 번에 맞추고, 사람마다 남는 차이만 개인 설정으로 다듬는다.
+    #[serde(default)]
+    pub web_sync_offset_ms: i32,
     /// 로그인 없이 **지금 무슨 곡인지**만 볼 수 있게 할지 (§29).
     ///
     /// 켜져 있어도 나가는 것은 곡 제목·가수·진행 상태뿐이다. 신청한 사람 이름,
@@ -1904,6 +1923,14 @@ pub struct RemoteGuildSettings {
 
 fn default_empty_voice_delay() -> u32 {
     300
+}
+
+fn default_skip_lead_ms() -> u32 {
+    1000
+}
+
+fn default_seek_lockout_ms() -> u32 {
+    3000
 }
 
 /// 빈 채널 규칙을 **누가 정했는지**까지 담은 결과 (§27).
@@ -2166,6 +2193,9 @@ impl Default for RemoteGuildSettings {
             now_playing_mode: NowPlayingMode::default(),
             empty_voice_policy: EmptyVoiceChannelPolicy::default(),
             empty_voice_delay_seconds: default_empty_voice_delay(),
+            skip_lead_ms: default_skip_lead_ms(),
+            seek_lockout_ms: default_seek_lockout_ms(),
+            web_sync_offset_ms: 0,
             public_now_playing: true,
             min_volume: 0,
             max_volume: 200,

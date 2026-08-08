@@ -28,6 +28,22 @@ pub struct Session {
     /// ffmpeg -ss 로 건너뛴 시작 오프셋 (진행도 = offset + track position).
     pub start_offset: Duration,
     pub retry_count: u32,
+    /// **이 곡의 0초 지점에 해당하는 UTC 시각** (§31).
+    ///
+    /// 모든 클라이언트가 같은 지점을 계산하게 만드는 기준이다. 전에는 서버가 "지금 몇 초"
+    /// 를 보내고 클라이언트가 전송 지연을 추정해 더했는데, 그 추정이 기기마다 달라서
+    /// 사람마다 소리가 어긋났다. 절대 시각을 주면 각자 `now - started_utc` 로 계산하므로
+    /// **곡마다 생기던 미세한 오차가 사라진다.**
+    ///
+    /// 스킵처럼 서버가 앞으로 잡아 두는 경우 이 값이 미래일 수 있다 — 그때는 아직 시작 전이다.
+    pub started_utc: chrono::DateTime<chrono::Utc>,
+}
+
+/// 웹이 따라갈 재생 일정 (§31).
+#[derive(Debug, Clone, Copy)]
+pub struct TrackSchedule {
+    /// 0초 지점의 UTC. 미래면 아직 시작 전이다.
+    pub started_utc: chrono::DateTime<chrono::Utc>,
 }
 
 pub struct Coordinator {
@@ -50,6 +66,28 @@ impl Coordinator {
             played_counted: Mutex::new(HashMap::new()),
             gen_counter: AtomicU64::new(1),
             play_fail: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 이 곡의 0초 지점 UTC (§31). 웹이 절대 시각으로 따라가게 하는 값이다.
+    pub async fn schedule(&self, guild_id: u64) -> Option<TrackSchedule> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(&guild_id).map(|s| TrackSchedule {
+            started_utc: s.started_utc,
+        })
+    }
+
+    /// 스킵·되감기처럼 **모두가 같은 순간에 같은 지점을 시작해야 할 때** 쓴다 (§31).
+    ///
+    /// 지금 당장이 아니라 `lead` 만큼 미래로 잡는다. 서버가 "지금부터" 라고 하면
+    /// 그 말이 클라이언트마다 다른 시각에 도착해서 각자 다른 지점에서 시작한다.
+    /// 조금 미래로 잡아 두면 모두가 그 시각을 기다렸다 함께 출발한다.
+    pub async fn schedule_start_in(&self, guild_id: u64, lead: Duration, position: Duration) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&guild_id) {
+            session.started_utc = chrono::Utc::now()
+                + chrono::Duration::from_std(lead).unwrap_or_default()
+                - chrono::Duration::from_std(position).unwrap_or_default();
         }
     }
 
@@ -347,6 +385,9 @@ impl Coordinator {
                     generation,
                     start_offset: offset,
                     retry_count: retry,
+                    // 0초 지점의 시각. `-ss` 로 건너뛴 만큼은 이미 흘러간 것으로 친다.
+                    started_utc: chrono::Utc::now()
+                        - chrono::Duration::from_std(offset).unwrap_or_default(),
                 },
             );
         }

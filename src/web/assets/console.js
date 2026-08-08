@@ -267,9 +267,12 @@ const NUM_SPECS = {
     desc: '"최근 튼 곡" 방식일 때 최근 몇 곡 중에서 기준을 고를지예요. 적어도 한 곡은 봐야 기준을 뽑을 수 있어서 무제한이 없어요.',
   },
   autoplayArtistCooldown: {
-    label: '같은 가수 쿨다운', min: 1, max: 20, step: 1, unit: '곡', unlimited: true,
-    zeroLabel: '무제한 · 같은 가수가 바로 또 나올 수 있어요',
-    desc: '최근 이만큼의 곡 안에 나온 가수는 자동 재생 후보에서 빼요. 같은 가수가 연달아 나오는 걸 막아요.',
+    // **0 은 "무제한"이 아니라 "끔"이다.** 이 값은 *막을 곡 수*라 0이면 아무도 안 막는다
+    // (`autoplay.rs` 의 decay_factor 주석과 같은 이야기). 무제한이라고 적어 두면
+    // "0을 넣으면 전부 막힌다"로 읽혀서 아무도 0을 안 쓴다.
+    label: '같은 가수 쿨다운', min: 0, max: 20, step: 1, unit: '곡', unlimited: true,
+    zeroLabel: '끔 · 같은 가수가 연달아 나와도 그냥 둬요',
+    desc: '최근 이만큼의 곡 안에 나온 가수는 자동 재생 후보에서 빼요. 0으로 두면 이 제한을 아예 안 걸어요.',
   },
   autoplayRecentDecayHours: {
     label: '최근 곡 회피 시간', min: 1, max: 168, step: 1, unit: '시간', unlimited: true,
@@ -2231,7 +2234,14 @@ async function loadBlocked() {
   S.blocked.loading = true;
   try {
     const data = await api('/admin/blacklist');
-    S.blocked = { items: data.items || [], error: null, loading: false, kind: S.blocked.kind };
+    S.blocked = {
+      items: data.items || [],
+      // 전체 차단 규칙은 봇 주인만 본다 (§19.2). 여기서는 "있다"는 사실만 받는다.
+      globalNote: data.globalNote || null,
+      error: null,
+      loading: false,
+      kind: S.blocked.kind,
+    };
   } catch (error) {
     S.blocked = { items: [], error: error.message, loading: false, kind: S.blocked.kind };
   }
@@ -2252,14 +2262,21 @@ function paintBlocked(box) {
       `차단 목록을 못 불러왔어요 — ${S.blocked.error}`));
     return;
   }
+  // 전체 규칙이 걸려 있으면 **내용 없이** 그 사실만 알린다. 이걸 빼면 규칙에 걸렸을 때
+  // 자기 목록엔 아무것도 없는데 왜 막히는지 알 길이 없다.
+  const globalHint = S.blocked.globalNote
+    ? h('p', { class: 'hint', style: 'padding:8px 12px' }, `🔒 ${S.blocked.globalNote}`)
+    : null;
   const items = S.blocked.items.filter((item) => item.kind === S.blocked.kind);
   if (!items.length) {
-    box.replaceChildren(h('div', { class: 'empty' },
-      h('div', { class: 'empty__icon' }, '🕊'),
-      h('div', { class: 'empty__title' }, '이 종류로 막아 둔 게 없어요'),
-      h('div', { class: 'empty__desc' },
-        '리모컨의 대기열이나 검색 결과에서 곡의 ⋯ 메뉴를 열면 "차단 목록에 넣기"로 바로 넣을 수도 있어요.'),
-    ));
+    box.replaceChildren(
+      globalHint,
+      h('div', { class: 'empty' },
+        h('div', { class: 'empty__icon' }, '🕊'),
+        h('div', { class: 'empty__title' }, '이 종류로 막아 둔 게 없어요'),
+        h('div', { class: 'empty__desc' },
+          '리모컨의 대기열이나 검색 결과에서 곡의 ⋯ 메뉴를 열면 "차단 목록에 넣기"로 바로 넣을 수도 있어요.'),
+      ));
     return;
   }
   const rows = h('ul', { class: 'rows' });
@@ -2288,7 +2305,7 @@ function paintBlocked(box) {
       }, global ? '못 지워요' : '지우기'),
     ));
   });
-  box.replaceChildren(rows);
+  box.replaceChildren(globalHint, rows);
   tooltip(box);
 }
 

@@ -4189,7 +4189,13 @@ async function control(action, value, extra) {
 
 const WEB_SYNC_GAP = 2;        // 봇과 이만큼 벌어지면 조용히 맞춘다 (초)
 const WEB_OFFSET_LIMIT = 10;   // 싱크 보정 한계 (초). 서버 검증값과 같아야 한다.
-const WEB_OFFSET_STEP = 0.5;
+/* 이 안쪽이면 "방금 시작한 곡"으로 보고 0초부터 튼다 (§31).
+ * 곡이 바뀌는 순간 계산된 위치가 0.3초쯤 나오는데, 거기서 시작하면 도입부가 잘려
+ * 사람에게는 곡이 끊긴 것처럼 들린다. 앞부분은 잘라내지 않는 쪽이 낫다. */
+const WEB_START_SNAP = 1.5;
+/* 0.1초 단위. 0.5초는 "조금만 더" 를 못 맞춘다 — 사람 귀는 100ms 어긋남을 잡아낸다.
+ * 길게 누르면 빨라지므로 ±10초까지 가는 데도 오래 안 걸린다. */
+const WEB_OFFSET_STEP = 0.1;
 
 /* 브라우저 자동재생 정책 때문에 새로고침 뒤에는 반드시 사용자가 한 번 눌러야 한다.
  * 그래서 "켜 두겠다는 뜻"(webWanted)과 "지금 켜져 있다"(webOn)를 나눠 둔다. */
@@ -4213,22 +4219,49 @@ function clampVolume(value) {
   return Math.round(Math.min(100, Math.max(0, n)));
 }
 
-/** 싱크 보정은 음수가 정상이다. 0.5초 단위로 반올림해 표시가 튀지 않게 한다. */
+/** 싱크 보정은 음수가 정상이다. 0.1초 단위로 반올림한다.
+ *
+ * 부동소수 누적을 막으려고 정수(밀리초)로 반올림해서 되돌린다. 0.1 을 그냥 더하면
+ * `0.30000000000000004` 같은 값이 쌓여서 표시가 흔들리고 서버 검증에도 걸린다. */
 function clampOffset(value) {
   const n = Number.isFinite(value) ? value : 0;
-  const stepped = Math.round(n / WEB_OFFSET_STEP) * WEB_OFFSET_STEP;
-  return Math.min(WEB_OFFSET_LIMIT, Math.max(-WEB_OFFSET_LIMIT, stepped));
+  const ms = Math.round(n * 1000 / (WEB_OFFSET_STEP * 1000)) * (WEB_OFFSET_STEP * 1000);
+  const clamped = Math.min(WEB_OFFSET_LIMIT * 1000, Math.max(-WEB_OFFSET_LIMIT * 1000, ms));
+  return Math.round(clamped) / 1000;
 }
 
+/* 부호 뜻을 글자로 못 박는다. `+0.3초` 만 보여 주면 그게 늦추는 건지 당기는 건지
+ * 아무도 모르고, 실제로 툴팁은 "뒤로 미뤄요" 인데 계산은 앞당기고 있었다. */
 function offsetLabel(value) {
   if (!value) return '딱 맞음';
-  const sign = value > 0 ? '+' : '−';
-  return `${sign}${Math.abs(value).toFixed(1)}초`;
+  return value > 0
+    ? `${value.toFixed(1)}초 늦춤`
+    : `${Math.abs(value).toFixed(1)}초 당김`;
 }
 
-/** 봇 위치에 내 보정을 얹은 값. 웹 재생이 참고하는 유일한 시각이다. */
+/** 봇 위치에 보정을 얹은 값. 웹 재생이 참고하는 유일한 시각이다.
+ *
+ * **양수 = 늦춘다** → 웹이 봇보다 앞서 들릴 때 쓰는 값이라, 더 **이른** 지점을 튼다.
+ * 자막 싱크와 같은 규약이다.
+ *
+ * 서버가 준 0초 시각(`startedUtc`)이 있으면 그것으로 계산한다 (§31). 폴링으로 받은
+ * "지금 몇 초"는 표본마다 흔들려서 곡이 바뀔 때마다 조금씩 다르게 맞았다.
+ * 절대 시각은 곡이 바뀌어도 같은 식이라 **곡별 편차가 안 생긴다.**
+ *
+ * 보정은 두 겹이다. 서버 전역(`webSyncOffsetMs`)으로 큰 차이를 한 번에 잡고,
+ * 개인(`webOffset`)이 사람마다 남는 차이를 다듬는다.
+ */
+function syncOffsetSeconds() {
+  const server = (store.get().schedule?.webSyncOffsetMs || 0) / 1000;
+  return webOffset + server;
+}
+
 function webTargetPosition() {
-  return Math.max(0, clock.position() + webOffset);
+  const startedAt = clock.startedAt();
+  const raw = startedAt && !store.get().player?.isPaused
+    ? (Date.now() - startedAt) / 1000
+    : clock.position();
+  return Math.max(0, raw - syncOffsetSeconds());
 }
 
 function buildWebPlayback() {
@@ -4259,10 +4292,10 @@ function buildWebPlayback() {
   el.webOffLabel = h('span', { class: 'sync__value' }, offsetLabel(webOffset));
   const bump = (delta) => bindAct(h('button', {
     class: 'btn btn--sm btn--ghost sync__btn', type: 'button',
-    'aria-label': delta > 0 ? '웹 소리를 뒤로' : '웹 소리를 앞으로',
+    'aria-label': delta > 0 ? '웹 소리 늦추기' : '웹 소리 당기기',
     tip: delta > 0
-      ? '웹이 봇보다 빠를 때. 웹 재생을 뒤로 미뤄요.'
-      : '웹이 봇보다 늦을 때. 웹 재생을 앞으로 당겨요.',
+      ? '웹이 봇보다 빨리 들릴 때. 0.1초씩 늦춰요.'
+      : '웹이 봇보다 늦게 들릴 때. 0.1초씩 당겨요.',
   }, delta > 0 ? '＋' : '－'), () => setWebOffset(webOffset + delta));
 
   el.webSync = h('div', {
@@ -4500,9 +4533,13 @@ function syncWebNow(force) {
     webSource = next;
     if (next.kind === 'yt') {
       try {
-        ytPlayer.loadVideoById({ videoId: next.key, startSeconds: position });
+        // 곡이 방금 시작했으면 **0초부터** 튼다. 절대 시각 기준이라 몇 ms 뒤처져 있어도
+        // `startSeconds` 에 그 값을 넣으면 도입부가 잘려서 "끊긴 것처럼" 들린다 (§31).
+        const from = position < WEB_START_SNAP ? 0 : position;
+        ytPlayer.loadVideoById({ videoId: next.key, startSeconds: from });
         ytPlayer.setVolume(webVolume);
         if (paused) setTimeout(() => { try { ytPlayer.pauseVideo(); } catch { /* 무시 */ } }, 500);
+        webPreloaded = null;
       } catch { /* 다음 틱에서 다시 시도한다 */ }
     } else {
       mountSoundCloud(next.key, position, paused);
@@ -4552,9 +4589,36 @@ function seekWebTo(seconds) {
   } catch { /* 무시 */ }
 }
 
+/* 곡이 바뀔 때 소리가 끊기는 걸 막는다 (§31 최우선).
+ *
+ * 유튜브 플레이어는 `loadVideoById` 로 갈아 끼우는데, 그 사이 몇 초가 무음이다.
+ * 곡이 실제로 끝난 **뒤에** 서버 이벤트를 받고 나서야 로드하면 그 공백이 그대로 들린다.
+ *
+ * 그래서 다음 곡을 미리 **cue** 해 둔다. `cueVideoById` 는 버퍼만 채우고 소리는 안 낸다.
+ * 서버가 알려 준 다음 곡 시작 시각이 되면 이미 준비된 것을 재생만 시작하면 된다.
+ */
+let webPreloaded = null;   // 미리 준비해 둔 다음 곡 키
+
+function preloadNext() {
+  if (!webOn || !ytReady || !ytPlayer) return;
+  const state = store.get();
+  const next = webSourceOf(state.next?.track);
+  // 유튜브끼리일 때만 의미가 있다. 제공자가 바뀌면 어차피 플레이어를 갈아야 한다.
+  if (!next || next.kind !== 'yt' || next.key === webPreloaded) return;
+  const startAt = parseUtc(state.schedule?.nextStartUtc);
+  if (!startAt) return;
+  const left = startAt + clock.skew - Date.now();
+  // 너무 일찍 cue 하면 지금 곡이 끊긴다. 끝나기 직전에만 준비한다.
+  if (left > WEB_PRELOAD_LEAD || left < 0) return;
+  webPreloaded = next.key;
+}
+
+const WEB_PRELOAD_LEAD = 8000;  // 다음 곡을 준비하기 시작하는 시점 (ms)
+
 /** 매 프레임 맞추면 소리가 튄다. 2초 이상 벌어졌을 때만 조용히 옮긴다. */
 function webTick() {
   if (!webOn || !webSource) return;
+  preloadNext();
   if (store.get().player?.isPaused) return;
   const there = webTargetPosition();
 
@@ -4614,6 +4678,18 @@ function syncWebUi() {
 
 let seeking = false;
 
+/** 곡이 끝나기 직전인가 (§31). 서버가 정한 값(`seekLockoutMs`)을 그대로 쓴다. */
+function seekLocked() {
+  const lockMs = store.get().schedule?.seekLockoutMs ?? 0;
+  if (!lockMs || !clock.duration) return false;
+  return (clock.duration - clock.position()) * 1000 <= lockMs;
+}
+
+function seekLockNote() {
+  const seconds = Math.round((store.get().schedule?.seekLockoutMs || 0) / 1000);
+  return `곡이 끝나기 ${seconds}초 전부터는 위치를 못 옮겨요. 다음 곡으로 넘어가는 중이라서요.`;
+}
+
 function bindSeek() {
   const ratioAt = (clientX) => {
     const rect = el.seekTrack.getBoundingClientRect();
@@ -4628,6 +4704,9 @@ function bindSeek() {
   el.seekTrack.addEventListener('pointerdown', (event) => {
     if (el.seekTrack.getAttribute('aria-disabled') === 'true') { toast(lockReason('seek'), 'warn'); return; }
     if (!clock.duration) return;
+    // 끝나기 직전에는 못 움직인다 (§31). 그 이동이 반영되기 전에 다음 곡으로 넘어가서
+    // 웹만 엉뚱한 지점에 남고 봇은 다음 곡을 트는 상태가 된다.
+    if (seekLocked()) { toast(seekLockNote(), 'warn'); return; }
     seeking = true;
     el.seekTrack.dataset.drag = '1';
     el.seekTrack.setPointerCapture(event.pointerId);
