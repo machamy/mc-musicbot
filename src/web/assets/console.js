@@ -61,6 +61,20 @@ const SECTIONS = [
   { id: 'diag',    icon: '🩺', label: '진단',        desc: '봇 연결·인텐트·버전 상태예요. 뭔가 안 될 때 여기부터 보시면 돼요.' },
 ];
 
+/**
+ * 봇 주인 전용 섹션 — 전역 강제값 (`/music/api/owner/overrides`).
+ *
+ * **다른 섹션과 성격이 다르다.** 나머지 여덟 개는 이 서버 하나만 바꾸는데 이 섹션은 봇이
+ * 들어가 있는 **모든 서버**를 한꺼번에 바꾼다. 그래서 맨 뒤에 두고, 이름·설명·저장 버튼까지
+ * 전부 "모든 서버" 라는 말을 달고 다닌다. 서버 하나 고치러 왔다가 실수로 여기를 만지면
+ * 되돌릴 방법이 사람의 기억밖에 없다.
+ */
+const OWNER_SECTION = {
+  id: 'owner', icon: '🌐', label: '전역 강제값',
+  desc: '봇 주인만 보이는 화면이에요. 여기서 고정한 항목은 모든 서버에서 같은 값이 되고, 서버 관리자 화면에서는 자물쇠가 걸려요.',
+};
+if (IS_OWNER) SECTIONS.push(OWNER_SECTION);
+
 /** 권한 규칙 5종. desc 는 드롭다운 옆 한 줄 설명(구림 해소 #1). */
 const RULE_OPTIONS = [
   { value: 'guildMember',      label: '모든 멤버',      desc: '이 Discord 서버에 있는 사람이면 누구나 쓸 수 있어요.' },
@@ -422,6 +436,15 @@ const SEARCH_SPOTS = [
   { section: 'diag',    anchor: '.srvstats', label: '이번 달 서버 기록', desc: '최근 30일 많이 나간 곡과 사랑받은 곡' },
 ];
 
+// 전역 강제값도 이름으로 찾을 수 있어야 한다. 봇 주인에게만 실제로 존재하는 자리라
+// 색인에도 봇 주인일 때만 넣는다 — 없는 섹션으로 데려가면 검색이 고장 난 것처럼 보인다.
+if (IS_OWNER) {
+  SEARCH_SPOTS.push({
+    section: 'owner', anchor: '.ovr', label: '전역 강제값',
+    desc: '모든 서버에 같은 값을 고정하고 서버 관리자가 못 바꾸게 해요',
+  });
+}
+
 /* ═══════════════════════════ 상태 ═══════════════════════════ */
 
 const S = {
@@ -467,6 +490,21 @@ const S = {
    * 새 폴링은 만들지 않는다(§23.2).
    */
   basis: { listeners: null, viewers: null },
+  /**
+   * 봇 주인 전역 강제값 (`GET/PUT /music/api/owner/overrides`).
+   *
+   * `saved`/`draft` 는 **키 → 강제값** 맵이고 `null` 이 "강제 안 함" 이다.
+   * 키를 아예 빼는 방식으로 안 두는 이유: `same()` 이 `undefined` 와 `null` 을 같게 보므로
+   * 어느 쪽이든 비교는 되지만, PUT 본문에 `null` 을 **실어 보내야** 해제가 된다(안 보낸 키는 유지).
+   * 맵에 늘 모든 키가 있으면 "무엇을 보낼지" 를 고민할 자리가 사라진다.
+   */
+  owner: {
+    loading: false, saving: false, error: null,
+    data: null,            // 서버가 준 모양 그대로 (lockableKeys · labels · values · reason)
+    unlimitedKeys: [],
+    saved: null,
+    draft: null,
+  },
 };
 
 /** 섹션 루트 DOM. 한 번에 한 섹션만 DOM에 존재한다(저장 버튼 testid 중복 방지 + 렌더 비용 절감). */
@@ -475,6 +513,8 @@ let navBox = null;
 let dirtyBadge = null;
 /** 상단 배지 안의 숫자만 따로 들고 있는다 — 좁은 화면에서 뒤 글자를 감추기 때문이다. */
 let dirtyCountNode = null;
+/** 전역 강제값 섹션의 목록 컨테이너. 값을 타이핑하는 중에는 여기만 부분 갱신한다. */
+let ownerBox = null;
 
 /* ═══════════════════════════ 유틸 ═══════════════════════════ */
 
@@ -577,17 +617,100 @@ function normalizeSettings(raw, force) {
   return next;
 }
 
+/* ═══════════════════════════ 봇 주인 전역 강제값 — 공통 ═══════════════════════════
+ *
+ * 봇 주인이 어떤 설정을 "모든 서버 같은 값" 으로 못 박아 둘 수 있다. 그 정보는 관리 콘솔의
+ * 설정 스냅샷에 `settings.ownerOverrides` 로 실려 온다(서버의 `overrides_json` 하나가
+ * 봇 주인 화면과 관리 콘솔에 **같은 모양**을 준다).
+ *
+ * 두 가지를 여기서 못 박는다.
+ *   1. **라벨 표를 새로 만들지 않는다.** 이름은 서버가 `labels` 로 준다. 화면이 따로 들고
+ *      있으면 서버에 항목이 하나 늘 때마다 조용히 어긋나고, 어긋난 쪽이 사람에게 보인다.
+ *   2. **스냅샷의 설정 값은 이미 강제값이 덮인 유효값이다.** 화면에서 다시 덮지 않는다 —
+ *      덮는 곳이 둘이 되는 순간 어느 쪽이 이기는지 아무도 모르게 된다.
+ */
+
+/** 서버가 준 잠금 정보. 없으면 "아무것도 안 잠겼다" 로 본다 — 옛 서버와도 그대로 돈다. */
+function ownerOverrides() {
+  return (S.saved && S.saved.ownerOverrides) || {};
+}
+
+/** 이 설정이 봇 주인에게 잠겨 있나. */
+function isLocked(key) {
+  if (!key) return false;
+  const locked = ownerOverrides().lockedKeys;
+  return Array.isArray(locked) && locked.includes(key);
+}
+
+/** 왜 못 바꾸는지. 잠긴 사실만 보이면 고장으로 읽힌다 (§23.3). */
+function lockReason() {
+  return ownerOverrides().reason
+    || '봇 주인이 이 항목을 모든 서버에 같은 값으로 걸어 뒀어요. 서버에서는 바꿀 수 없어요.';
+}
+
+/** 지금 잠긴 값. 안 잠겼으면 `undefined`. */
+function lockedValue(key) {
+  return (ownerOverrides().values || {})[key];
+}
+
+/** 설정 키의 사람 이름. 서버 라벨이 먼저고, 없을 때만 콘솔이 이미 쓰던 이름으로 채운다. */
+function lockLabel(key) {
+  const labels = ownerOverrides().labels || {};
+  if (labels[key]) return labels[key];
+  if (S.owner.data && S.owner.data.labels && S.owner.data.labels[key]) return S.owner.data.labels[key];
+  if (NUM_SPECS[key]) return NUM_SPECS[key].label;
+  return FIELD_LABELS[key] || key;
+}
+
+/**
+ * 이 항목이 `0 = 무제한` 규약(§23.1)을 따르나.
+ * 서버가 `unlimitedKeys` 를 주므로 그 목록이 먼저다. 못 받았을 때만 콘솔의 숫자표로 떨어진다.
+ */
+function isUnlimitedKey(key) {
+  const fromOwner = S.owner.unlimitedKeys;
+  if (Array.isArray(fromOwner) && fromOwner.length) return fromOwner.includes(key);
+  const fromSnapshot = S.saved && S.saved.unlimitedKeys;
+  if (Array.isArray(fromSnapshot) && fromSnapshot.length) return fromSnapshot.includes(key);
+  return Boolean(NUM_SPECS[key] && NUM_SPECS[key].unlimited);
+}
+
+/**
+ * 강제값 하나를 사람 말로. **자물쇠 옆과 봇 주인 화면이 같은 문구를 쓴다.**
+ * 두 화면이 같은 값을 다르게 적으면 그것만으로 "다른 값" 처럼 읽힌다.
+ */
+function overrideValueText(key, value) {
+  if (value === null || value === undefined) return '서버가 정해요';
+  if (typeof value === 'boolean') return value ? '켜기' : '끄기';
+  if (typeof value === 'number') {
+    if (isUnlimitedKey(key) && value === 0) return '무제한(0)';
+    const spec = NUM_SPECS[key];
+    if (!spec) return String(value);
+    return spec.pretty ? `${spec.pretty(value)}(${value}${spec.unit})` : `${value}${spec.unit}`;
+  }
+  return String(value);
+}
+
 /* ═══════════════════════════ 변경 추적 ═══════════════════════════ */
 
 /** 지금 섹션에서 baseline과 달라진 키들. */
 function dirtyKeys(sectionId) {
   const keys = SECTION_KEYS[sectionId] || [];
-  return keys.filter((key) => !same(S.draft[key], S.saved[key]));
+  // 잠긴 항목은 애초에 못 바꾼다. 그래도 여기서 한 번 더 걸러 내는 이유는,
+  // 값이 어쩌다 어긋나면(기본값 채우기·클램프) "저장 안 한 변경" 으로 세어지고
+  // 그 순간 저장 버튼이 켜져서 **서버가 403 으로 거절할 요청**을 사람이 계속 누르게 되기 때문이다.
+  return keys.filter((key) => !isLocked(key) && !same(S.draft[key], S.saved[key]));
 }
 
 /** 전체 섹션 통틀어 변경이 있는지. beforeunload / 네비 가드가 본다. */
 function anyDirty() {
-  return Object.keys(SECTION_KEYS).some((id) => dirtyKeys(id).length > 0);
+  // 전역 강제값은 `SECTION_KEYS` 밖에 있다. 여기 안 세면 저장 안 하고 창을 닫아도 아무 말이 없다.
+  return Object.keys(SECTION_KEYS).some((id) => dirtyKeys(id).length > 0)
+    || ownerDirtyKeys().length > 0;
+}
+
+/** 섹션 하나의 저장 안 한 변경 수 — 전역 강제값만 셈법이 다르다. */
+function sectionDirtyCount(id) {
+  return id === 'owner' ? ownerDirtyKeys().length : dirtyKeys(id).length;
 }
 
 /** 변경된 항목만 강조 + 섹션 푸터 갱신 (구림 해소 #5). */
@@ -620,7 +743,8 @@ function refreshDirty() {
     }
   }
   if (dirtyBadge) {
-    const total = Object.keys(SECTION_KEYS).reduce((sum, id) => sum + dirtyKeys(id).length, 0);
+    const total = Object.keys(SECTION_KEYS).reduce((sum, id) => sum + dirtyKeys(id).length, 0)
+      + ownerDirtyKeys().length;
     dirtyBadge.hidden = total === 0;
     if (dirtyCountNode) dirtyCountNode.textContent = String(total);
     // 좁은 화면에서는 숫자만 남으므로 읽어 주는 이름은 늘 온전한 문장으로 둔다.
@@ -629,8 +753,9 @@ function refreshDirty() {
   // 네비에도 섹션별 변경 점을 찍는다.
   if (navBox) {
     navBox.querySelectorAll('.nav__item').forEach((node) => {
-      const count = (SECTION_KEYS[node.dataset.section] || []).length ? dirtyKeys(node.dataset.section).length : 0;
-      node.classList.toggle('has-change', count > 0);
+      const id = node.dataset.section;
+      const editable = id === 'owner' || (SECTION_KEYS[id] || []).length > 0;
+      node.classList.toggle('has-change', editable && sectionDirtyCount(id) > 0);
     });
   }
 }
@@ -668,6 +793,9 @@ function validate() {
     const ids = (S.draft.ruleRoleIds || {})[field.permKey] || [];
     if (!ids.length) errors[field.key] = '"지정 역할"인데 고른 역할이 없어요. 이대로 저장하면 아무도 못 써요.';
   });
+  // 잠긴 항목에 붙은 오류는 지운다. **고칠 수가 없는데 저장만 막으면 그 섹션이 영영 저장 불능이다.**
+  // 잠긴 값끼리 모순이 나는 일은 서버의 `sanitize()`·`apply()` 가 막고 있으니, 여기서 잡을 것도 없다.
+  Object.keys(errors).forEach((key) => { if (isLocked(key)) delete errors[key]; });
   if (!sectionBox) return errors;
   sectionBox.querySelectorAll('[data-field]').forEach((node) => {
     const message = errors[node.dataset.field];
@@ -705,12 +833,16 @@ function tipOf(text, fallback) {
 
 /** 모든 필드의 공통 껍데기 — 라벨 · ⓘ · 변경 배지 · 항목별 되돌리기 · 설명 · 오류 슬롯. */
 function fieldShell(key, label, desc, control, extra) {
-  return h('div', { class: 'fld', 'data-field': key },
+  const locked = isLocked(key);
+  const node = h('div', { class: 'fld' + (locked ? ' fld--locked' : ''), 'data-field': key },
     h('div', { class: 'fld__head' },
       h('span', { class: 'fld__label' }, label),
       desc ? h('span', {
         class: 'fld__info', 'aria-hidden': 'true', 'data-tip': tipOf(desc),
       }, 'ⓘ') : null,
+      locked ? h('span', {
+        class: 'fld__lock', 'data-tip': tipOf(lockReason()),
+      }, '🔒 봇 주인이 잠갔어요') : null,
       h('span', { class: 'fld__badge' }, '바꿨어요'),
       h('button', {
         class: 'fld__undo', type: 'button', 'data-tip': '이 항목만 저장 전 값으로 되돌려요',
@@ -722,6 +854,52 @@ function fieldShell(key, label, desc, control, extra) {
     desc ? h('p', { class: 'fld__desc' }, desc) : null,
     h('p', { class: 'fld__err', hidden: true }),
     extra || null,
+  );
+  if (locked) sealField(node, key);
+  return node;
+}
+
+/**
+ * 잠긴 항목을 막는다 — **숨기지 않는다.**
+ * 없어진 줄 알면 "그 설정이 사라졌다" 가 되어 더 헷갈리고, 서버에는 그대로 살아 있는 값이라
+ * 화면과 실제가 갈라진다. 그래서 `portal.js` 의 `setLock()` 과 같은 어법을 쓴다:
+ * **보이되 비활성 + 왜 안 되는지 + 지금 어떤 값인지.**
+ *
+ * `disabled` 를 입력 요소마다 직접 거는 이유: 겉을 덮는 방식(`pointer-events:none`)은
+ * 키보드 탭으로 들어가면 그대로 조작되고, 그 값은 저장 payload 에 안 실려서
+ * "바꿨는데 아무 일도 안 일어나는" 제일 나쁜 실패가 된다.
+ */
+function sealField(node, key) {
+  node.querySelectorAll('.fld__ctl input, .fld__ctl select, .fld__ctl textarea, .fld__ctl button')
+    .forEach((el) => {
+      el.disabled = true;
+      el.setAttribute('disabled', '');
+      el.setAttribute('aria-disabled', 'true');
+    });
+  // 되돌릴 것이 없다 — 바꿀 수가 없으니 `↺` 는 언제 눌러도 아무 일도 안 한다.
+  const undo = node.querySelector('.fld__undo');
+  if (undo) undo.remove();
+  // 비활성 컨트롤에는 포인터 이벤트가 안 가서 툴팁이 안 뜬다. 이유는 **글자로** 남긴다.
+  node.append(h('p', { class: 'lockmsg' },
+    h('strong', { class: 'lockmsg__val' }, `🔒 잠긴 값 · ${overrideValueText(key, lockedValue(key))}`),
+    h('span', { class: 'lockmsg__why' }, lockReason()),
+  ));
+}
+
+/**
+ * 섹션 맨 위에 잠긴 항목을 한 번 모아 알린다.
+ * 항목별 자물쇠만 두면 **접혀 있는 항목**(붐따를 꺼 두면 기준 칸이 아예 안 그려진다)은
+ * 잠긴 줄도 모른 채 지나간다. 여기서는 접혀 있어도 이름과 값이 보인다.
+ */
+function lockBanner(keys) {
+  return h('div', { class: 'lockbar' },
+    h('span', { class: 'lockbar__ico', 'aria-hidden': 'true' }, '🔒'),
+    h('div', { class: 'lockbar__body' },
+      h('strong', { class: 'lockbar__title' }, `이 섹션의 ${keys.length}개 항목은 봇 주인이 잠가 뒀어요`),
+      h('ul', { class: 'lockbar__list' },
+        keys.map((key) => h('li', null, `${lockLabel(key)} · ${overrideValueText(key, lockedValue(key))}`))),
+      h('p', { class: 'lockbar__why' }, lockReason()),
+    ),
   );
 }
 
@@ -3653,6 +3831,409 @@ function paintDiag(box) {
   }
 }
 
+/* ═══════════════════════════ 섹션 9 · 전역 강제값 (봇 주인 전용) ═══════════════════════════
+ *
+ * `GET /music/api/owner/overrides` → `{ overrides, unlimitedKeys }`
+ * `PUT /music/api/owner/overrides` → **부분 갱신**. 값을 보내면 고정, `null` 을 보내면 해제,
+ * 안 보낸 키는 그대로 둔다. 그래서 저장할 때 **바뀐 키만** 싣는다 — 전부 실어 보내면
+ * 다른 사람이 그 사이에 걸어 둔 항목까지 내 화면의 옛 상태로 덮어 버린다.
+ *
+ * ── 이 화면이 반드시 갈라 놓아야 하는 것 ──
+ * **"강제 안 함" 과 "강제로 false" 는 다른 상태다.** 스위치 하나로 그리면 둘이 같은 모양이 되고,
+ * 그러면 "채팅을 전역으로 껐다" 와 "채팅은 서버가 알아서 한다" 를 화면만 보고는 구분할 수 없다.
+ * 그래서 줄마다 **두 층**으로 그린다.
+ *   1층 — 서버가 정해요 / 전역으로 고정   (강제 여부)
+ *   2층 — 고정했을 때 어떤 값인지         (켜기 / 끄기, 숫자)
+ * 1층이 "서버가 정해요" 면 2층은 값 대신 "서버마다 알아서 정해요" 라고 말한다.
+ */
+
+/** 서버 응답 → 화면이 쓰는 `{ 키: 강제값 | null }` 맵. `null` 이 "강제 안 함" 이다. */
+function ownerMapFrom(overrides) {
+  const map = {};
+  (overrides.lockableKeys || []).forEach((key) => { map[key] = null; });
+  const values = overrides.values || {};
+  (overrides.lockedKeys || []).forEach((key) => {
+    // 값 없이 잠긴 키는 서버가 만들지 않는다. 그래도 오면 "강제 안 함" 으로 둔다 —
+    // 모르는 값을 화면이 지어내면 그 값이 그대로 저장돼서 모든 서버에 나간다.
+    if (values[key] !== undefined) map[key] = clone(values[key]);
+  });
+  return map;
+}
+
+/** 전역 강제값에서 저장 안 한 항목들. */
+function ownerDirtyKeys() {
+  if (!S.owner.saved || !S.owner.draft) return [];
+  return Object.keys(S.owner.saved).filter((key) => !same(S.owner.draft[key], S.owner.saved[key]));
+}
+
+async function loadOwnerOverrides() {
+  if (S.owner.loading) return;
+  S.owner.loading = true;
+  try {
+    const data = await api('/music/api/owner/overrides');
+    const overrides = (data && data.overrides) || {};
+    S.owner.data = overrides;
+    S.owner.unlimitedKeys = Array.isArray(data && data.unlimitedKeys) ? data.unlimitedKeys : [];
+    S.owner.saved = ownerMapFrom(overrides);
+    S.owner.draft = clone(S.owner.saved);
+    S.owner.error = null;
+  } catch (error) {
+    S.owner.error = error.message;
+  } finally {
+    S.owner.loading = false;
+  }
+}
+
+/**
+ * 이 항목에 무엇을 넣을 수 있나 — `num` 아니면 `bool`.
+ * 콘솔이 이미 들고 있는 숫자표(`NUM_SPECS`)가 첫 기준이다. 서버에 숫자 항목이 새로 생겨서
+ * 표에 없더라도 지금 값이 숫자면 숫자로 본다 — 숫자 칸을 스위치로 그리는 것보다 낫다.
+ */
+function ownerKind(key) {
+  if (NUM_SPECS[key]) return 'num';
+  const draft = S.owner.draft ? S.owner.draft[key] : null;
+  const saved = S.owner.saved ? S.owner.saved[key] : null;
+  if (typeof draft === 'number' || typeof saved === 'number') return 'num';
+  return 'bool';
+}
+
+/**
+ * "전역으로 고정" 을 처음 켤 때 채워 넣을 값.
+ * **지금 이 서버의 유효값을 그대로 쓴다.** 아무 값이나(0 이나 최솟값) 넣으면 켜는 순간
+ * 모든 서버가 그 값으로 끌려간다 — 켜기만 했는데 사고가 나는 자리다.
+ */
+function ownerSeedValue(key) {
+  const current = S.saved ? S.saved[key] : undefined;
+  if (ownerKind(key) === 'bool') return typeof current === 'boolean' ? current : false;
+  if (typeof current === 'number' && Number.isFinite(current)) return Math.round(current);
+  const spec = NUM_SPECS[key];
+  return spec ? spec.min : 0;
+}
+
+/** 두 칸짜리 고르개. `.seg` 를 그대로 쓴다 — 콘솔 안에서 같은 뜻은 같은 모양이어야 한다. */
+function ownerSeg(label, options) {
+  const box = h('div', { class: 'seg ovr__seg', role: 'radiogroup', 'aria-label': label });
+  options.forEach((option) => {
+    box.append(h('button', {
+      class: 'seg__btn' + (option.on ? ' is-on' : ''),
+      type: 'button', role: 'radio',
+      'aria-checked': option.on ? 'true' : 'false',
+      tabindex: option.on ? '0' : '-1',
+      'data-tip': option.tip,
+      onclick: option.onPick,
+    }, option.label));
+  });
+  return box;
+}
+
+/** 고정할 숫자 값 칸. `0 = 무제한` 항목은 `∞` 버튼과 문구를 같이 준다 (§23.1). */
+function ownerNumber(key) {
+  const spec = NUM_SPECS[key] || { min: 0, max: 1000000, step: 1, unit: '' };
+  const unlimited = isUnlimitedKey(key);
+  const value = Number(S.owner.draft[key]) || 0;
+  const note = h('span', { class: 'ovr__note' });
+
+  const paint = (next) => {
+    const isZero = unlimited && next === 0;
+    note.classList.toggle('is-inf', isZero);
+    note.textContent = isZero
+      ? (spec.zeroLabel || '무제한 · 아무도 안 막아요')
+      : (spec.pretty ? spec.pretty(next) : '');
+  };
+
+  const input = h('input', {
+    class: 'field ovr__num', type: 'number',
+    // 음수를 받는 칸에 `inputmode="numeric"` 을 주면 iOS 키패드에 `-` 가 없다(numberField 와 같은 이유).
+    inputmode: spec.min < 0 ? undefined : 'numeric',
+    min: String(unlimited ? 0 : spec.min), max: String(spec.max), step: String(spec.step),
+    value: String(value),
+    'aria-label': `${lockLabel(key)} 고정값`,
+    'data-tip': unlimited ? '0을 넣으면 모든 서버가 무제한이 돼요' : `${spec.min}~${spec.max}${spec.unit} 사이로 넣어요`,
+  });
+
+  const apply = (raw, sync) => {
+    let next = Number(raw);
+    if (raw === '' || !Number.isFinite(next)) next = unlimited ? 0 : spec.min;
+    next = Math.round(next);
+    // 0(무제한)만 범위 밖으로 나갈 수 있다. 나머지는 서버가 clamp 하기 전에 화면에서 맞춰 둔다 —
+    // 서버가 조용히 깎으면 화면 값과 실제 값이 갈라진다.
+    if (!(unlimited && next === 0)) next = Math.min(spec.max, Math.max(spec.min, next));
+    if (sync) input.value = String(next);
+    S.owner.draft[key] = next;
+    paint(next);
+    // 타이핑 중에 줄을 다시 그리면 포커스와 커서 위치를 잃는다. 표시만 갱신한다.
+    refreshOwnerDirty();
+  };
+  input.addEventListener('input', (event) => apply(event.target.value, false));
+  input.addEventListener('blur', (event) => apply(event.target.value, true));
+  paint(value);
+
+  return h('div', { class: 'ovr__numbox' },
+    input,
+    spec.unit ? h('span', { class: 'ovr__unit' }, spec.unit) : null,
+    unlimited ? h('button', {
+      class: 'btn btn--sm', type: 'button',
+      'data-tip': '모든 서버를 무제한으로 고정해요',
+      'aria-label': `${lockLabel(key)} 무제한으로 고정`,
+      onclick: () => apply(0, true),
+    }, '∞') : null,
+    h('span', { class: 'ovr__range' },
+      unlimited ? `${spec.min}~${spec.max}${spec.unit} · 0은 무제한이에요` : `${spec.min}~${spec.max}${spec.unit}`),
+    note,
+  );
+}
+
+/** 항목 한 줄. */
+function ownerRow(key) {
+  const value = S.owner.draft[key];
+  const forced = value !== null && value !== undefined;
+  const changed = !same(value, S.owner.saved[key]);
+  const kind = ownerKind(key);
+  const label = lockLabel(key);
+
+  const setForced = (on) => {
+    if (on === forced) return;
+    S.owner.draft[key] = on ? ownerSeedValue(key) : null;
+    repaintOwner();
+  };
+
+  const state = ownerSeg(`${label} 고정 여부`, [
+    { label: '서버가 정해요', on: !forced, tip: '이 항목은 서버마다 알아서 정해요', onPick: () => setForced(false) },
+    { label: '전역으로 고정', on: forced, tip: '모든 서버를 같은 값으로 맞추고 서버에서는 못 바꾸게 해요', onPick: () => setForced(true) },
+  ]);
+
+  // 2층. 고정했을 때만 값이 있고, 아니면 "서버가 알아서" 라고 말한다.
+  let valueBox;
+  if (!forced) {
+    const mine = S.saved ? S.saved[key] : undefined;
+    valueBox = h('p', { class: 'ovr__free' },
+      '서버마다 알아서 정해요.'
+      + (mine === undefined ? '' : ` 지금 이 서버는 ${overrideValueText(key, mine)} 예요.`));
+  } else if (kind === 'bool') {
+    // **여기가 핵심이다.** "끄기로 고정" 은 위쪽 "서버가 정해요" 와 전혀 다른 상태다.
+    // 두 층을 나눠 두면 "끔" 이 *고른 값* 이라는 게 눈으로 읽힌다.
+    valueBox = ownerSeg(`${label} 고정값`, [
+      { label: '켜기로 고정', on: value === true, tip: '모든 서버에서 켜진 상태로 둬요', onPick: () => { S.owner.draft[key] = true; repaintOwner(); } },
+      { label: '끄기로 고정', on: value === false, tip: '모든 서버에서 꺼진 상태로 둬요 — "서버가 정해요" 와는 다른 상태예요', onPick: () => { S.owner.draft[key] = false; repaintOwner(); } },
+    ]);
+  } else {
+    valueBox = ownerNumber(key);
+  }
+
+  return h('div', {
+    class: 'ovr__row' + (forced ? ' is-forced' : '') + (changed ? ' is-changed' : ''),
+    'data-ovr': key,
+  },
+    h('div', { class: 'ovr__head' },
+      h('span', { class: 'ovr__name' }, label),
+      h('code', { class: 'ovr__key' }, key),
+      h('span', { class: 'ovr__chip' + (forced ? ' is-forced' : '') },
+        forced ? `🔒 고정 · ${overrideValueText(key, value)}` : '자유'),
+      h('span', { class: 'ovr__badge' }, '바꿨어요'),
+    ),
+    h('div', { class: 'ovr__ctl' }, state, valueBox),
+  );
+}
+
+/** 저장 바. `.sec__foot` 을 **안 쓴다** — `refreshDirty()` 가 그 클래스를 길드 설정 기준으로 덮어쓴다. */
+function ownerFoot() {
+  const count = ownerDirtyKeys().length;
+  return h('footer', { class: 'ovrfoot' + (count ? ' is-active' : '') },
+    h('span', { class: 'ovrfoot__note' }, count
+      ? `바꾼 항목 ${count}개예요 — 저장하면 모든 서버에 바로 적용돼요`
+      : '아직 바꾼 항목이 없어요'),
+    h('button', {
+      class: 'btn', type: 'button', disabled: !count || S.owner.saving,
+      'data-tip': count ? `바꾼 ${count}개를 저장 전 값으로 돌려요` : '되돌릴 변경이 없어요',
+      onclick: () => revertOwner(),
+    }, '되돌리기'),
+    h('button', {
+      class: 'btn btn--primary', type: 'button', disabled: !count || S.owner.saving,
+      'data-testid': 'owner-overrides-save',
+      'data-tip': S.owner.saving ? '지금 저장하는 중이에요'
+        : count ? `바꾼 ${count}개를 모든 서버에 적용해요` : '아직 바꾼 항목이 없어서 보낼 게 없어요',
+      onclick: () => saveOwnerOverrides(),
+    }, '모든 서버에 적용'),
+  );
+}
+
+function paintOwner(box) {
+  box.replaceChildren();
+
+  if (S.owner.error) {
+    box.append(h('div', { class: 'empty' },
+      h('div', { class: 'empty__icon' }, '⚠'),
+      h('div', { class: 'empty__title' }, '전역 강제값을 불러오지 못했어요'),
+      h('div', { class: 'empty__desc' }, S.owner.error),
+      h('button', {
+        class: 'btn btn--primary', type: 'button',
+        'data-tip': '다시 불러와요',
+        onclick: () => { S.owner.error = null; paintOwner(box); loadOwnerOverrides().then(() => repaintOwner()); },
+      }, '다시 시도할게요'),
+    ));
+    return;
+  }
+  if (!S.owner.saved) {
+    box.append(h('div', { class: 'skel', style: 'height:240px' }));
+    return;
+  }
+
+  const keys = (S.owner.data && S.owner.data.lockableKeys) || [];
+  if (!keys.length) {
+    box.append(h('p', { class: 'hint' }, '강제할 수 있는 항목이 없어요.'));
+    return;
+  }
+  const forcedNow = keys.filter((key) => S.owner.draft[key] !== null && S.owner.draft[key] !== undefined);
+  box.append(h('p', { class: 'ovr__sum' },
+    `강제할 수 있는 항목 ${keys.length}개 중 지금 ${forcedNow.length}개를 고정해 뒀어요.`
+    + (forcedNow.length ? ' 고정한 항목은 서버 관리 콘솔에서 자물쇠로 보여요.' : '')));
+
+  const rows = h('div', { class: 'ovr__rows' });
+  keys.forEach((key) => rows.append(ownerRow(key)));
+  box.append(rows, ownerFoot());
+}
+
+/** 줄을 다시 그린다 — 고정 여부나 켜기/끄기가 바뀌어 2층 모양 자체가 달라질 때. */
+function repaintOwner() {
+  if (!ownerBox || !ownerBox.isConnected) return;
+  paintOwner(ownerBox);
+  tooltip(ownerBox);
+  refreshDirty();
+}
+
+/** 숫자를 타이핑하는 중 — 표시만 갱신한다. 다시 그리면 커서를 잃는다. */
+function refreshOwnerDirty() {
+  if (!ownerBox || !ownerBox.isConnected) return;
+  const dirty = new Set(ownerDirtyKeys());
+  ownerBox.querySelectorAll('[data-ovr]').forEach((node) => {
+    node.classList.toggle('is-changed', dirty.has(node.dataset.ovr));
+  });
+  const foot = ownerBox.querySelector('.ovrfoot');
+  if (foot) foot.replaceWith(ownerFoot());
+  refreshDirty();
+}
+
+async function revertOwner() {
+  const count = ownerDirtyKeys().length;
+  if (!count || S.owner.saving) return;
+  const ok = await confirmSheet({
+    title: '바꾼 값을 되돌릴까요',
+    desc: `${count}개 항목이 저장 전 값으로 돌아가요. 아직 아무 서버에도 나가지 않은 변경이에요.`,
+    confirmText: `${count}개 되돌리기`,
+    cancelText: '그냥 둘게요',
+    danger: true,
+  });
+  if (!ok) return;
+  S.owner.draft = clone(S.owner.saved);
+  repaintOwner();
+  toast('저장 전 값으로 되돌렸어요.');
+}
+
+/** 무엇이 어떻게 바뀌는지 한 줄씩. 저장 전 확인창에 그대로 들어간다. */
+function ownerDiffLines(keys) {
+  return keys.map((key) => {
+    const before = S.owner.saved[key];
+    const after = S.owner.draft[key];
+    const name = lockLabel(key);
+    if (after === null || after === undefined) {
+      return `${name} — 고정을 풀어요. 각 서버가 저장해 둔 값으로 돌아가요 (지금은 ${overrideValueText(key, before)}).`;
+    }
+    if (before === null || before === undefined) {
+      return `${name} — 새로 고정해요 · ${overrideValueText(key, after)}`;
+    }
+    return `${name} — ${overrideValueText(key, before)} → ${overrideValueText(key, after)}`;
+  });
+}
+
+async function saveOwnerOverrides() {
+  const keys = ownerDirtyKeys();
+  if (!keys.length || S.owner.saving) return;
+
+  // **저장 전에 반드시 한 번 막는다.** 이 버튼 하나가 봇이 들어가 있는 모든 서버를 바꾼다.
+  // 되돌리는 방법은 여기 다시 와서 푸는 것뿐이고, 그 사이 서버들은 이미 바뀐 채로 돌아간다.
+  const ok = await sheet({
+    title: '모든 서버에 바로 적용돼요',
+    desc: `${keys.length}개 항목을 바꿔요. 고정한 항목은 봇이 들어가 있는 모든 서버에서 같은 값이 되고, `
+      + '서버 관리 콘솔에서는 자물쇠가 걸려 관리자가 못 바꿔요. 고정을 풀면 각 서버가 원래 쓰던 값이 되살아나요.',
+    body: h('ul', { class: 'ovrdiff' }, ownerDiffLines(keys).map((line) => h('li', null, line))),
+    danger: true,
+    dismissValue: false,
+    actions: [
+      { label: '그냥 둘게요', kind: 'ghost', value: false },
+      { label: `${keys.length}개 적용할게요`, kind: 'danger', value: true, autofocus: true },
+    ],
+  }).result;
+  if (!ok) return;
+
+  S.owner.saving = true;
+  repaintOwner();
+
+  // 부분 갱신 — **바뀐 키만** 싣는다. `null` 이 해제고, 안 실은 키는 서버가 그대로 둔다.
+  const payload = {};
+  keys.forEach((key) => { payload[key] = S.owner.draft[key] === undefined ? null : S.owner.draft[key]; });
+
+  try {
+    const result = await api('/music/api/owner/overrides', { method: 'PUT', body: payload });
+    const next = result && result.overrides;
+    if (next) {
+      S.owner.data = next;
+      S.owner.saved = ownerMapFrom(next);
+      S.owner.draft = clone(S.owner.saved);
+      // 관리 콘솔 쪽 자물쇠도 같은 응답으로 바로 맞춘다 — 새로고침해야 보이면 방금 한 일이 안 보인다.
+      if (S.saved) S.saved.ownerOverrides = clone(next);
+      if (S.draft) S.draft.ownerOverrides = clone(next);
+    }
+    toast(`전역 강제값을 저장했어요 · ${keys.length}개 항목`, 'ok');
+
+    // 강제값이 바뀌면 **이 서버의 유효값**도 바뀐다. 편집 중인 게 없을 때만 새로 받는다 —
+    // 남의 편집분을 서버 값으로 덮으면 그 사람이 방금 만진 걸 잃는다.
+    if (!anyDirty()) {
+      try {
+        const fresh = await api('/admin/settings');
+        S.saved = normalizeSettings(fresh.settings || fresh, true);
+        S.draft = clone(S.saved);
+      } catch { /* 다음 새로고침이나 WS `settings` 이벤트가 맞춰 준다 */ }
+    }
+  } catch (error) {
+    toast(`저장하지 못했어요 — ${error.message}`, 'danger');
+  } finally {
+    S.owner.saving = false;
+    repaintOwner();
+  }
+}
+
+function sectionOwner() {
+  const body = h('div', { class: 'sec__body' });
+  if (!IS_OWNER) {
+    // 네비에 아예 안 넣지만, 주소창에 `#owner` 를 직접 쳐 넣는 길이 있어서 한 번 더 막는다.
+    body.append(h('p', { class: 'hint' }, '봇 주인만 볼 수 있는 화면이에요.'));
+    return body;
+  }
+
+  ownerBox = h('div', { class: 'ovr' });
+  body.append(
+    h('div', { class: 'ovrwarn' },
+      h('span', { class: 'ovrwarn__ico', 'aria-hidden': 'true' }, '🌐'),
+      h('div', { class: 'ovrwarn__body' },
+        h('strong', null, '여기서 바꾼 값은 모든 서버에 적용돼요'),
+        h('p', null,
+          '이 화면은 서버 하나가 아니라 봇이 들어가 있는 모든 서버를 한꺼번에 바꿔요. '
+          + '고정한 항목은 서버 관리자가 못 바꾸게 되고, 고정을 풀면 각 서버가 원래 쓰던 값이 되살아나요.'),
+        h('p', null,
+          '리소스 상한·안전·기능 on/off 처럼 봇 전체가 걸린 항목만 여기 있어요. '
+          + '정렬 방식이나 권한 규칙처럼 서버마다 달라야 하는 값은 일부러 넣지 않았어요.'),
+      ),
+    ),
+    ownerBox,
+  );
+
+  paintOwner(ownerBox);
+  if (!S.owner.saved && !S.owner.loading && !S.owner.error) {
+    loadOwnerOverrides().then(() => repaintOwner());
+  }
+  return body;
+}
+
 /* ═══════════════════════════ 섹션 셸 · 저장 ═══════════════════════════ */
 
 const SECTION_RENDER = {
@@ -3664,6 +4245,7 @@ const SECTION_RENDER = {
   blocked: sectionBlocked,
   audit: sectionAudit,
   diag: sectionDiag,
+  owner: sectionOwner,
 };
 
 function renderSection(id) {
@@ -3674,6 +4256,10 @@ function renderSection(id) {
 
   const body = SECTION_RENDER[spec.id]();
   const editable = Boolean(SECTION_KEYS[spec.id]);
+
+  // 잠긴 항목이 있으면 섹션 맨 위에서 한 번 알린다. 한 곳에서만 붙이므로 섹션이 늘어도 빠질 자리가 없다.
+  const sealed = (SECTION_KEYS[spec.id] || []).filter(isLocked);
+  if (sealed.length) body.prepend(lockBanner(sealed));
 
   const next = h('section', { class: 'sec', 'data-section': spec.id },
     h('header', { class: 'sec__head' },
@@ -3749,7 +4335,13 @@ async function saveSection(id) {
   S.saving = true;
   refreshDirty();
   const payload = {};
-  (SECTION_KEYS[id] || []).forEach((key) => { payload[key] = S.draft[key]; });
+  (SECTION_KEYS[id] || []).forEach((key) => {
+    // **잠긴 항목은 아예 안 보낸다.** 서버는 "보여 준 값을 그대로 되보내는 것" 은 봐 주지만,
+    // 화면 쪽에서 값이 한 톨이라도 어긋나면(기본값 채우기·클램프·정규화) 403 이 떨어지고
+    // 그 순간 잠긴 항목 하나 때문에 **그 섹션이 통째로 저장 불능**이 된다. 보낼 이유도 없다.
+    if (isLocked(key)) return;
+    payload[key] = S.draft[key];
+  });
 
   try {
     const result = await api(`/admin/settings/${id}`, { method: 'PUT', body: payload });
@@ -3775,7 +4367,8 @@ async function saveSection(id) {
 /** 저장 안 한 변경이 있으면 확인부터. true 면 이동해도 된다. */
 async function guardLeave() {
   if (!anyDirty()) return true;
-  const count = Object.keys(SECTION_KEYS).reduce((sum, id) => sum + dirtyKeys(id).length, 0);
+  const count = Object.keys(SECTION_KEYS).reduce((sum, id) => sum + dirtyKeys(id).length, 0)
+    + ownerDirtyKeys().length;
   return confirmSheet({
     title: '저장하지 않은 변경이 있어요',
     desc: `${count}개 항목을 바꿔 두고 아직 저장하지 않으셨어요. 이대로 나가면 변경은 사라져요.`,
@@ -3787,17 +4380,18 @@ async function guardLeave() {
 
 async function goSection(id) {
   if (id === S.activeSection) return true;
-  const dirty = dirtyKeys(S.activeSection);
-  if (dirty.length) {
+  const leaving = S.activeSection;
+  const count = sectionDirtyCount(leaving);
+  if (count) {
     const ok = await confirmSheet({
-      title: `"${(SECTIONS.find((item) => item.id === S.activeSection) || {}).label}" 섹션에 저장 안 한 변경이 있어요`,
-      desc: `${dirty.length}개 항목이 저장 전이에요. 지금 이동하면 이 섹션의 변경은 사라져요.`,
+      title: `"${(SECTIONS.find((item) => item.id === leaving) || {}).label}" 섹션에 저장 안 한 변경이 있어요`,
+      desc: `${count}개 항목이 저장 전이에요. 지금 이동하면 이 섹션의 변경은 사라져요.`,
       confirmText: '변경 버리고 갈게요',
       cancelText: '남아서 저장할게요',
       danger: true,
     });
     if (!ok) return false;
-    revertSectionSilently(S.activeSection);
+    revertSectionSilently(leaving);
   }
   renderSection(id);
   history.replaceState(null, '', `#${id}`);
@@ -3846,12 +4440,17 @@ async function jumpTo(spot) {
 
 /** 상단 "저장 안 함" 배지 → 저장 안 한 변경이 있는 첫 섹션. */
 function jumpToFirstDirty() {
-  const found = SECTIONS.find((spec) => dirtyKeys(spec.id).length > 0);
+  const found = SECTIONS.find((spec) => sectionDirtyCount(spec.id) > 0);
   if (!found) return;
   jumpTo({ section: found.id });
 }
 
 function revertSectionSilently(id) {
+  // 전역 강제값은 길드 설정 draft 가 아니라 자기 맵을 들고 있다.
+  if (id === 'owner') {
+    if (S.owner.saved) S.owner.draft = clone(S.owner.saved);
+    return;
+  }
   (SECTION_KEYS[id] || []).forEach((key) => { S.draft[key] = clone(S.saved[key]); });
 }
 
