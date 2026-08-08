@@ -1090,6 +1090,41 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
   }
 }
 
+/* ── 손가락으로 쓰는 화면 ──
+ *
+ * 관리 콘솔은 밀도를 높이려고 컨트롤을 작게 잡아 뒀다. 마우스로는 문제가 없지만
+ * 손가락으로는 22px 짜리 되돌리기 버튼이나 20px 짜리 스위치를 정확히 못 누른다.
+ * 실제로 폭 기준 반응형(@media max-width)은 잘 갖춰져 있는데 **입력 수단** 기준 대응이
+ * 통째로 빠져 있었다 — portal.css 에는 `pointer: coarse` 가 있는데 여기에는 없었다.
+ *
+ * **보이는 크기는 그대로 두고 눌리는 영역만 넓힌다.** 크기를 키우면 촘촘하게 맞춰 둔
+ * 줄맞춤이 전부 어긋나고, 한 화면에 들어가던 설정이 스크롤 밖으로 밀린다.
+ * 그래서 투명한 가짜 영역(`::after`)을 얹어 히트박스만 키운다.
+ */
+@media (pointer: coarse) {
+  .fld__undo,
+  .sw--sm,
+  .chipbtn,
+  .prevtabs__btn,
+  .kindchip { position: relative; }
+
+  .fld__undo::after,
+  .sw--sm::after,
+  .chipbtn::after,
+  .prevtabs__btn::after,
+  .kindchip::after {
+    content: '';
+    position: absolute;
+    /* 22px 버튼에 위아래 11px 씩 붙으면 44px — 손가락 최소 크기 권고치다. */
+    inset: -11px;
+  }
+
+  /* 되돌리기는 변경된 항목에만 나타나는데, 나타났을 때 옆 항목과 히트박스가 겹치면
+   * 엉뚱한 걸 되돌린다. 이건 눌리는 영역 대신 실제 크기를 키운다. */
+  .fld__undo { width: 32px; height: 32px; }
+  .fld__undo::after { inset: -6px; }
+}
+
 /* 420px 이하 — 세그먼트가 넘치면 가로 스크롤로 흘린다. 잘라내지 않는다. */
 @media (max-width: 420px) {
   .seg { width: 100%; }

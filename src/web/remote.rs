@@ -724,6 +724,16 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/api/guilds/{guild_id}/autoplay/seeds/reorder",
             post(api_autoplay_seeds_reorder),
         )
+        // 바구니에서 **한 줄만** 빼기 (V3 §8.7). `reset` 은 칸 통째로 비우는 것뿐이라
+        // "이 곡 하나만 참고에서 빼고 싶다"를 할 방법이 없었다.
+        .route(
+            "/music/api/guilds/{guild_id}/autoplay/recent/remove",
+            post(api_autoplay_recent_remove),
+        )
+        .route(
+            "/music/api/guilds/{guild_id}/autoplay/blocked/remove",
+            post(api_autoplay_blocked_remove),
+        )
         // `📻 이 곡 말고` (V3 §8.5-3 · §14.3) — 잡혀 있는 다음 추천곡을 7일간 막고 다시 뽑는다.
         .route(
             "/music/api/guilds/{guild_id}/autoplay/reroll",
@@ -6592,6 +6602,9 @@ fn autoplay_basket(
         .iter()
         .map(|item| {
             json!({
+                // 한 줄만 지우려면 화면이 그 줄을 지목할 수 있어야 한다. 같은 곡을 여러 번
+                // 틀면 `cacheKey` 가 겹치므로 행 id 가 유일한 식별자다.
+                "id": item.id,
                 "title": item.track.title.clone().unwrap_or_else(|| "제목 없음".into()),
                 "artist": item.track.artist,
                 "playedUtc": item.played_utc,
@@ -6952,6 +6965,86 @@ async fn api_autoplay_seed_remove(
             json_ok(json!({ "ok": true }))
         }
         Ok(false) => json_error(StatusCode::NOT_FOUND, "그 기준 곡을 찾지 못했어요."),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+/// 최근 재생은 **행 id** 로 지운다. 같은 곡을 여러 번 틀면 같은 `cacheKey` 가 여러 줄
+/// 쌓이는데, 키로 지우면 "이 한 번"을 빼려던 게 그 곡 이력을 통째로 날린다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoplayRecentRemoveRequest {
+    id: i64,
+}
+
+async fn api_autoplay_recent_remove(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<AutoplayRecentRemoveRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = autoplay_gate(&ctx) {
+        return response;
+    }
+    match state.app.remote.remove_recent(guild_id, request.id) {
+        Ok(true) => {
+            audit_ok(
+                &state,
+                guild_id,
+                &ctx.session,
+                "autoplay.recent.remove",
+                Some(&request.id.to_string()),
+                Some("removed"),
+            );
+            broadcast_autoplay(&state, guild_id);
+            json_ok(json!({ "ok": true }))
+        }
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "그 기록을 찾지 못했어요."),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+/// 빼 둔 곡은 `cacheKey` 로 푼다 — 곡 하나당 한 줄이라 키가 곧 그 줄이다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoplayBlockedRemoveRequest {
+    cache_key: String,
+}
+
+async fn api_autoplay_blocked_remove(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<AutoplayBlockedRemoveRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = autoplay_gate(&ctx) {
+        return response;
+    }
+    let key = request.cache_key.trim();
+    match state.app.remote.unblock_autoplay_candidate(guild_id, key) {
+        Ok(true) => {
+            audit_ok(
+                &state,
+                guild_id,
+                &ctx.session,
+                "autoplay.blocked.remove",
+                Some(key),
+                Some("unblocked"),
+            );
+            broadcast_autoplay(&state, guild_id);
+            json_ok(json!({ "ok": true }))
+        }
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "그 곡은 빼 둔 목록에 없어요."),
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }

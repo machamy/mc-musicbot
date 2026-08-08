@@ -3222,9 +3222,11 @@ function apSeedSection() {
 }
 
 /* ── 최근 튼 곡 ──
- * 서버에는 한 곡씩 빼는 경로가 없다(`/autoplay/reset` 은 칸 단위 scope 하나뿐).
- * 그래서 "몇 곡까지 참고하는지"를 목록 위에 붙여 두고, 그 범위를 벗어난 줄은 흐리게 만든다 —
- * 지울 수 없다면 최소한 **무엇이 지금 영향을 주고 있는지**는 눈에 보여야 한다.
+ * 한 줄만 빼는 것과 칸을 통째로 비우는 것을 둘 다 둔다. 20곡을 하나씩 지우게 하면 안 되고,
+ * 반대로 한 곡이 거슬려서 이력 전체를 날리게 해서도 안 된다.
+ *
+ * 여기에 더해 "몇 곡까지 참고하는지"를 목록 위에 붙이고 범위 밖 줄은 흐리게 만든다 —
+ * 지우지 않고도 **무엇이 지금 영향을 주고 있는지**가 눈에 보여야 한다.
  */
 function apRecentSection() {
   const basket = autoplayState?.basket;
@@ -3253,8 +3255,15 @@ function apRecentSection() {
         tip: '📻 이 곡을 기준 곡으로 담아요', 'aria-label': '기준 곡으로 담기',
       }, '📻'), () => addSeed(track)), !editable, reason)
       : null;
+    // 한 줄만 빼기. 서버가 준 행 id 가 있어야 지목할 수 있다 — 없는 옛 응답이면 버튼을 안 단다.
+    const drop = Number.isFinite(Number(item.id))
+      ? setLock(bindAct(h('button', {
+        class: 'iconbtn', type: 'button',
+        tip: '이 기록만 참고에서 빼요', 'aria-label': '이 기록만 빼기',
+      }, '✕'), () => removeRecent(Number(item.id))), !editable, reason)
+      : null;
     const sub = [fmtAgo(item.playedUtc), item.artist || track.artist].filter(Boolean).join(' · ');
-    return apRow(track, sub, [toSeed], idle, `최근 ${limit}곡만 참고해서 이 곡은 지금 영향이 없어요`);
+    return apRow(track, sub, [toSeed, drop], idle, `최근 ${limit}곡만 참고해서 이 곡은 지금 영향이 없어요`);
   });
 
   return apSection({
@@ -3263,7 +3272,7 @@ function apRecentSection() {
     count: `${recent.length}곡`,
     action: apWipe('recent', '최근 재생 기록', recent.length,
       '최근 재생 기록을 비울까요?\n추천만 초기화되고 통계와 차트는 그대로예요.'),
-    desc: '자동 재생이 이 목록에서 골라요. 한 곡씩 지우는 건 아직 서버가 못 해서, 대신 참고 범위를 조절해요.',
+    desc: '자동 재생이 이 목록에서 골라요. 한 줄씩 뺄 수도 있고, 참고 범위를 줄여도 돼요.',
     children: [
       h('div', { class: 'autoplay__row' },
         h('div', { class: 'hint', tip: '0을 넣으면 최근에 튼 곡 전부를 참고해요' }, '최근 몇 곡을 참고할까요'),
@@ -3311,13 +3320,23 @@ function apBlockedSection() {
   const basket = autoplayState?.basket;
   if (!basket) return null;
   const blocked = Array.isArray(basket.blocked) ? basket.blocked : [];
+  const editable = autoplayEditable();
+  const reason = lockReason('autoplay');
   const rows = blocked.slice(0, 12).map((item) => {
     const track = item.track || item;
     const title = item.title || track.title || item.cacheKey || '알 수 없는 곡';
+    // 한 곡만 풀기. 전부 풀기는 옆에 그대로 두되, 하나만 되돌리고 싶을 때가 더 흔하다.
+    const free = item.cacheKey
+      ? setLock(bindAct(h('button', {
+        class: 'iconbtn', type: 'button',
+        tip: '이 곡만 다시 추천에 나오게 해요', 'aria-label': '이 곡만 풀기',
+      }, '↩'), () => unblockCandidate(String(item.cacheKey))), !editable, reason)
+      : null;
     return h('div', { class: 'aprow aprow--flat' },
       h('div', { class: 'aprow__main' },
         h('div', { class: 'aprow__title aprow__title--off' }, title),
-        h('div', { class: 'row__sub' }, item.reason || '자동 재생에서 빠져 있어요')));
+        h('div', { class: 'row__sub' }, item.reason || '자동 재생에서 빠져 있어요')),
+      free ? h('div', { class: 'aprow__acts' }, free) : null);
   });
 
   return apSection({
@@ -3419,6 +3438,19 @@ async function addSeed(track) {
 
 async function removeSeed(cacheKey) {
   const result = await call(() => api('/autoplay/seeds/remove', { body: { cacheKey } }), '기준 곡에서 뺐어요.');
+  if (result) loadSeeds();
+}
+
+/** 최근 재생 한 줄만 빼기. **행 id 로 보낸다** — 같은 곡을 여러 번 틀면 cacheKey 가 겹쳐서,
+ *  키로 지우면 "이 한 번"이 아니라 그 곡 이력이 통째로 날아간다. */
+async function removeRecent(id) {
+  const result = await call(() => api('/autoplay/recent/remove', { body: { id } }), '최근 기록에서 뺐어요.');
+  if (result) loadSeeds();
+}
+
+/** 빼 둔 곡 하나만 풀기. 곡 하나당 한 줄이라 키가 곧 그 줄이다. */
+async function unblockCandidate(cacheKey) {
+  const result = await call(() => api('/autoplay/blocked/remove', { body: { cacheKey } }), '다시 추천에 나올 수 있어요.');
   if (result) loadSeeds();
 }
 

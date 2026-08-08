@@ -2638,6 +2638,21 @@ impl RemoteStore {
     /// **통계와 우리 차트는 건드리지 않는다.** 그쪽은 별도 DB(`musicbot-stats.sqlite`)라
     /// 여기서 지워도 개인 통계와 재생 횟수 차트는 그대로 남는다. 추천이 참고하는
     /// 이력만 리셋된다 — 사람들이 원하는 건 "추천을 새로 시작" 이지 "기록을 지움" 이 아니다.
+    /// 최근 재생 목록에서 **한 줄만** 지운다 (§8.7).
+    ///
+    /// `cache_key` 가 아니라 행 `id` 로 지운다. 같은 곡을 여러 번 틀면 같은 `cache_key` 가
+    /// 여러 줄 쌓이는데, 키로 지우면 "이 한 번"을 지우려다 그 곡 이력이 통째로 날아간다.
+    ///
+    /// 길드를 조건에 같이 넣는다 — id 만 믿으면 남의 서버 이력을 지울 수 있다.
+    pub fn remove_recent(&self, guild_id: u64, id: i64) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM remote_recent_tracks WHERE guild_id = ?1 AND id = ?2",
+            params![guild_id as i64, id],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn clear_recent(&self, guild_id: u64) -> usize {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -4872,6 +4887,44 @@ mod tests {
     }
 
     /// 이력 감쇠·아티스트 쿨다운이 쓸 입력을 한 번의 조회로 만든다 (§8.5-1·2).
+    #[test]
+    /// 최근 재생은 **한 줄씩** 지워야 한다 (§8.7).
+    ///
+    /// 같은 곡을 여러 번 틀면 같은 `cache_key` 로 여러 줄이 쌓인다. 키로 지우면
+    /// "이 한 번"을 빼려던 게 그 곡 이력을 통째로 날린다. 그래서 행 id 로 지운다.
+    /// 남의 길드 이력을 id 만으로 지울 수 없어야 한다는 것도 같이 못 박는다.
+    #[test]
+    fn recent_rows_are_removed_one_at_a_time_and_stay_inside_the_guild() {
+        let (store, path) = temp_store("recent-remove");
+        let track = test_track("같은곡");
+        let mut first = QueueItem::new_user(track.clone(), "민수".into(), Some(10));
+        first.id = "first".into();
+        let mut second = QueueItem::new_user(track.clone(), "민수".into(), Some(10));
+        second.id = "second".into();
+        store.record_recent(1, &first, "completed").unwrap();
+        store.record_recent(1, &second, "completed").unwrap();
+        // 다른 길드에도 같은 곡이 한 줄 있다.
+        let mut other = QueueItem::new_user(track.clone(), "지훈".into(), Some(11));
+        other.id = "other".into();
+        store.record_recent(2, &other, "completed").unwrap();
+
+        let rows = store.list_recent(1, 10);
+        assert_eq!(rows.len(), 2, "같은 곡이라도 튼 횟수만큼 쌓인다");
+
+        // 한 줄만 지운다 — 나머지 한 줄은 남아야 한다.
+        assert!(store.remove_recent(1, rows[0].id).unwrap());
+        let left = store.list_recent(1, 10);
+        assert_eq!(left.len(), 1, "키가 같아도 한 줄만 지워진다");
+
+        // 길드가 다르면 id 가 맞아도 안 지워진다.
+        let outsider = store.list_recent(2, 10);
+        assert_eq!(outsider.len(), 1);
+        assert!(!store.remove_recent(1, outsider[0].id).unwrap());
+        assert_eq!(store.list_recent(2, 10).len(), 1, "남의 서버 이력은 못 지운다");
+
+        cleanup(store, path);
+    }
+
     #[test]
     fn recent_history_gives_ages_and_artists_for_the_policy() {
         let (store, path) = temp_store("recent-history");
