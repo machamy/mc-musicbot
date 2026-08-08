@@ -73,6 +73,9 @@ Write-Host '[deploy] 해시 일치 — 여기서부터가 멈춤 구간이에요
 
 # 3~4. 신호 → 교체 → 기동. 한 번의 원격 왕복으로 끝낸다.
 $swap = Invoke-Remote @"
+# 원격 블록에서도 오류를 터뜨린다. 안 그러면 교체가 실패했는데도 아래 Start-ScheduledTask 가
+# 그대로 돌아 **옛 빌드가 살아난 채로 배포가 성공한 것처럼** 보인다. 실제로 그랬다.
+`$ErrorActionPreference = 'Stop'
 `$root = '$Root'
 `$exe  = Join-Path `$root 'bot-mk2\mc-musicbot.exe'
 `$next = "`$exe.next"
@@ -89,7 +92,20 @@ while ((Get-Date) -lt `$deadline -and (Get-Process mc-musicbot -ErrorAction Sile
 `$left = Get-Process mc-musicbot -ErrorAction SilentlyContinue
 if (`$left) { `$left | Stop-Process -Force; Start-Sleep -Milliseconds 400 }
 
-Move-Item -Path `$next -Destination `$exe -Force
+# **`Move-Item -Force` 만으로는 부족하다.** 방금 죽인 프로세스가 exe 핸들을 잠깐 더 쥐고 있어
+# `파일이 이미 있으므로 만들 수 없습니다` 로 실패한다(실측). 먼저 지우고, 몇 번 기다려 준다.
+`$moved = `$false
+foreach (`$try in 1..10) {
+    try {
+        if (Test-Path `$exe) { Remove-Item `$exe -Force }
+        Move-Item -Path `$next -Destination `$exe -Force
+        `$moved = `$true
+        break
+    } catch {
+        Start-Sleep -Milliseconds 300
+    }
+}
+if (-not `$moved) { throw '새 exe 로 교체하지 못했어요. 옛 빌드가 그대로예요.' }
 [IO.File]::WriteAllText((Join-Path `$root 'BUILD_ID.txt'), '$BuildId', (New-Object Text.UTF8Encoding(`$false)))
 Start-ScheduledTask -TaskName '$TaskName'
 
