@@ -6403,6 +6403,9 @@ function renderMarkdown(text) {
 
     const heading = line.match(/^(#{1,4})\s+(.*)$/);
     if (heading) { closeList(); out.push(`<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`); continue; }
+    // 수평선. **목록보다 먼저 본다** — `* * *` 는 목록 규칙에도 걸리기 때문이다.
+    // 이게 없으면 `---` 가 어느 분기에도 안 걸려 맨 아래 `<p>` 로 떨어지고, 화면에 글자로 나온다.
+    if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { closeList(); out.push('<hr>'); continue; }
     if (/^\s*[-*]\s+/.test(line)) {
       if (!listOpen) { out.push('<ul>'); listOpen = true; }
       out.push(`<li>${inline(line.replace(/^\s*[-*]\s+/, ''))}</li>`);

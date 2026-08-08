@@ -984,6 +984,8 @@ body[data-dragging="tab"] { user-select: none; }
 .md code { padding: 1px 4px; border-radius: var(--r-xs); background: var(--surface-2); font-size: 0.92em; }
 .md pre { margin: var(--sp-2) 0; padding: var(--sp-2); border-radius: var(--r-sm); background: var(--surface-2); overflow-x: auto; }
 .md pre code { padding: 0; background: none; }
+/* 패치노트의 `---`. 버전 사이를 가르는 선이라 여백이 선 자체보다 중요하다. */
+.md hr { margin: var(--sp-4) 0; border: 0; border-top: 1px solid var(--line-1); }
 /* 표는 줄마다 따로 그린다(파서가 좁아서). 칸 사이만 벌려 주면 읽힌다. */
 .md__t { width: 100%; border-collapse: collapse; }
 .md__t td { padding: 2px var(--sp-2); border-bottom: 1px solid var(--line-1); vertical-align: top; }
@@ -1697,6 +1699,11 @@ body[data-dragging="tab"] { user-select: none; }
 .dk-body > .lyrics { display: flex; flex-direction: column; }
 .dk-body > .lyrics .lyrics__view { max-height: none; flex: 1; }
 .dk-body > .now { overflow-y: auto; }
+/* **채팅은 자기 안에서 스크롤한다.** 위의 `.dk-body > *` 규칙(`flex: 1 0 auto`)을 그대로 두면
+ * 로그가 내용 높이만큼 늘어나 `.chat__log` 에 오버플로가 생기지 않는다. 그 상태에서도
+ * `.chat__log` 는 `overflow-y: auto` + `overscroll-behavior: contain` 이라 휠을 자기가 삼키고
+ * 부모(`.dk-body`)로 넘기지도 않는다 — 패널 배치에서만 휠 스크롤이 죽던 이유가 이것이다. */
+.dk-body > .chat { flex: 1 1 0; min-height: 0; }
 
 /* 드롭 하이라이트 — 어디에 붙을지 끌기 중에 반드시 보여야 한다 */
 .dk-drop {
