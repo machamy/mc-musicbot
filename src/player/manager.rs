@@ -102,6 +102,27 @@ impl PlayerManager {
         }
     }
 
+    /// 담은 곡을 통계에 남긴다. 사람이 신청한 것만 센다 —
+    /// 자동 재생이 채운 곡은 누구의 신청도 아니라서 남의 기록에 얹히면 안 된다.
+    fn record_queued(&self, guild_id: u64, item: &QueueItem, bulk: bool) {
+        if item.request_kind != PlaybackRequestKind::User {
+            return;
+        }
+        let Some(user_id) = item.requested_by_user_id else {
+            return;
+        };
+        if let Some(stats) = self.stats() {
+            let (cache_key, track_json) = crate::stats::track_parts(&item.track);
+            stats.record(StatEvent::Queued {
+                guild_id,
+                user_id,
+                cache_key,
+                track_json,
+                bulk,
+            });
+        }
+    }
+
     /// 붐따(§10.3)로 대기열에서 내려간 곡을 통계에 남긴다.
     /// 붐따 실행 자체는 웹이 하므로, 웹은 곡을 내린 **뒤에** 이걸 한 번 부른다.
     pub fn record_boomtta(&self, guild_id: u64, item: &QueueItem) {
@@ -191,15 +212,41 @@ impl PlayerManager {
 
     // ───────── 큐 조작 ─────────
 
+    /// 곡 하나를 대기열에 넣는다. 한 곡씩 담은 것으로 통계에 남는다.
     pub async fn enqueue(
         &self,
         guild_id: u64,
         item: QueueItem,
         priority: bool,
     ) -> GuildPlayerState {
+        self.enqueue_inner(guild_id, item, priority, false).await
+    }
+
+    /// `한 번에 담기`로 들어온 곡. 곡 수는 같이 세지만 `queued_bulk` 로 갈라 남는다 (§22.3).
+    pub async fn enqueue_bulk(
+        &self,
+        guild_id: u64,
+        item: QueueItem,
+        priority: bool,
+    ) -> GuildPlayerState {
+        self.enqueue_inner(guild_id, item, priority, true).await
+    }
+
+    async fn enqueue_inner(
+        &self,
+        guild_id: u64,
+        item: QueueItem,
+        priority: bool,
+        bulk: bool,
+    ) -> GuildPlayerState {
         if item.request_kind == PlaybackRequestKind::User {
             self.clear_preview(guild_id);
         }
+        // **통계는 여기서 남긴다** (§22.3). 예전에는 웹 라우트에서만 불러서, 디스코드
+        // 슬래시 명령으로 신청한 곡이 `담은 곡`·`가장 많이 신청한 곡`·마참 점수에
+        // 하나도 안 잡혔다(웹을 안 쓰는 사람은 영원히 0곡). 큐에 넣는 길이 이 함수
+        // 하나뿐이므로 여기 두면 어느 경로로 들어와도 빠지지 않는다.
+        self.record_queued(guild_id, &item, bulk);
         let title = item.track.display_title().to_string();
         self.mutate(
             guild_id,
@@ -1333,6 +1380,38 @@ mod tests {
         let seen = wait_for_user(&stats, guild_id, user, |s| s.played + s.skipped >= 2).await;
         assert_eq!(seen.played, 1, "끝까지 재생된 곡");
         assert_eq!(seen.skipped, 1, "바로재생으로 잘린 곡도 스킵으로 남는다");
+        cleanup(player, remote, root);
+    }
+
+    /// 담은 곡은 **큐에 넣는 그 자리에서** 세야 한다 (§22.3).
+    ///
+    /// 예전에는 웹 라우트에서만 세서, 디스코드 슬래시 명령으로 신청한 곡이 하나도 안 잡혔다.
+    /// 웹을 안 쓰는 사람은 `담은 곡` 이 영원히 0곡이었다. 자동 재생이 채운 곡은 누구의
+    /// 신청도 아니므로 세면 안 되고, 한 번에 담기는 따로 갈려야 한다.
+    #[tokio::test]
+    async fn queueing_counts_no_matter_which_door_it_came_through() {
+        let (player, remote, root) = temp_player("queuestats");
+        let log = Arc::new(LogService::new(root.join("logs")));
+        let stats = Stats::open(&root.join("musicbot-stats.sqlite"), log).expect("통계 DB 열기");
+        player.attach_stats(stats.clone());
+        let (guild_id, user) = (1u64, 7u64);
+
+        // 디스코드 명령이든 웹이든 결국 이 함수 하나를 지난다.
+        player.enqueue(guild_id, user_item("한곡씩", user), false).await;
+        player.enqueue_bulk(guild_id, user_item("한번에1", user), false).await;
+        player.enqueue_bulk(guild_id, user_item("한번에2", user), false).await;
+        // 자동 재생이 채운 곡은 남의 기록에 얹히면 안 된다.
+        let mut auto = user_item("자동", user);
+        auto.request_kind = PlaybackRequestKind::Autoplay;
+        auto.requested_by_user_id = None;
+        player.enqueue(guild_id, auto, false).await;
+
+        let seen = wait_for_user(&stats, guild_id, user, |s| {
+            s.queued_single + s.queued_bulk >= 3
+        })
+        .await;
+        assert_eq!(seen.queued_single, 1, "한 곡씩 담은 것");
+        assert_eq!(seen.queued_bulk, 2, "한 번에 담은 것");
         cleanup(player, remote, root);
     }
 

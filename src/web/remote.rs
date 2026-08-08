@@ -585,23 +585,6 @@ fn record_stat(state: &WebState, event: crate::stats::StatEvent) {
     }
 }
 
-/// 곡을 담았다 (§22.3). `bulk` 면 한 번에 담기로 들어온 것.
-///
-/// 이걸 안 부르면 `담은 곡`·`가장 많이 신청한 곡`·마참 점수가 **구조적으로 영원히 0** 이다.
-fn record_queued(state: &WebState, guild_id: u64, user_id: u64, track: &TrackRef, bulk: bool) {
-    let (cache_key, track_json) = crate::stats::track_parts(track);
-    record_stat(
-        state,
-        crate::stats::StatEvent::Queued {
-            guild_id,
-            user_id,
-            cache_key,
-            track_json,
-            bulk,
-        },
-    );
-}
-
 /// payload 없이 "재조회해라"만 알리는 토픽 (`settings`/`library`/`audit` 등).
 fn emit_bare(state: &WebState, guild_id: u64, topic: &str) {
     emit(state, guild_id, topic, json!({}));
@@ -4598,8 +4581,8 @@ async fn api_enqueue(
         Some(&title),
         Some("queued"),
     );
-    // §22.3 `queued_single` — 여기서 안 던지면 `📊 내 기록` 의 `담은 곡` 이 영원히 0이다.
-    record_queued(&state, guild_id, session.user_id, &request.track, false);
+    // §22.3 `queued_single` 은 `PlayerManager::enqueue` 가 남긴다 — 큐에 넣는 길이 거기 하나뿐이라
+    // 디스코드 명령으로 들어온 곡도 같이 잡힌다. 여기서 또 던지면 웹 신청만 두 번 세진다.
     broadcast_queue(&state, guild_id).await;
     let queue_position = queued
         .upcoming
@@ -5374,7 +5357,9 @@ async fn bulk_enqueue(
         state
             .app
             .player
-            .enqueue(
+            // §22.3 `queued_bulk` — 곡 하나하나가 "담은 곡"이되 한 번에 담은 것으로 갈라 남는다.
+            // 통계는 `enqueue_bulk` 안에서 남는다.
+            .enqueue_bulk(
                 guild_id,
                 QueueItem::new_user(
                     track.clone(),
@@ -5384,8 +5369,6 @@ async fn bulk_enqueue(
                 false,
             )
             .await;
-        // §22.3 `queued_bulk` — 곡 하나하나가 "담은 곡"이다.
-        record_queued(state, guild_id, session.user_id, track, true);
         outcome.added += 1;
     }
     // §22.3 `bulk_times` — 곡 수와 별개로 "한 번에 담기를 쓴 횟수"를 센다.
@@ -9878,26 +9861,30 @@ async fn admin_blacklist_get(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    // 전체 차단 규칙은 **봇 주인만 본다** (§19.2). 서버 관리자에게는 목록에서 아예 뺀다.
-    // 여러 서버가 같은 봇을 쓰는 지금, 전체 규칙은 남의 서버 운영 방침이기도 하다.
+    // 전체 차단 규칙은 **이 화면에 아예 안 나온다** (§19.2). 봇 주인이어도 마찬가지다.
+    //
+    // 예전에는 주인에게만 섞어서 보여 줬는데, 그러면 같은 화면이 보는 사람에 따라 다른 목록을
+    // 내놓는다. 주인이 "이 서버가 막아 둔 것"을 확인하려고 열었는데 남의 서버 방침까지 섞여
+    // 나오고, 지우려 해도 여기서는 자기 길드 항목만 만질 수 있어서 손도 못 댄다.
+    // 전체 규칙은 운영 패널에서 다룬다 — 화면 하나가 한 가지 범위만 책임지게 둔다.
     let owner = ctx.session.is_developer || is_owner_user(&state, ctx.session.user_id);
     let all = state.app.db.list_blacklist(guild_id);
-    let hidden = all
-        .iter()
-        .filter(|entry| entry.guild_id == 0)
-        .count();
+    let hidden = all.iter().filter(|entry| entry.guild_id == 0).count();
     let items: Vec<Value> = all
         .iter()
-        .filter(|entry| owner || entry.guild_id != 0)
+        .filter(|entry| entry.guild_id != 0)
         .map(|entry| blacklist_json(entry, guild_id))
         .collect();
     json_ok(json!({
         "items": items,
         // 내용은 숨기되 **있다는 사실은 숨기지 않는다.** 안 그러면 규칙에 걸렸을 때
         // 서버 관리자가 자기 목록만 보고 "여긴 아무것도 없는데 왜 막히지" 로 헤맨다.
-        "hasGlobal": hidden > 0 && !owner,
-        "globalNote": (hidden > 0 && !owner)
-            .then_some("봇 전체에 적용되는 차단 규칙이 따로 있어요. 내용은 봇 주인만 볼 수 있어요."),
+        "hasGlobal": hidden > 0,
+        "globalNote": (hidden > 0).then_some(if owner {
+            "봇 전체에 적용되는 차단 규칙이 따로 있어요. 운영 패널에서 보고 고칠 수 있어요."
+        } else {
+            "봇 전체에 적용되는 차단 규칙이 따로 있어요. 내용은 봇 주인만 볼 수 있어요."
+        }),
     }))
 }
 
