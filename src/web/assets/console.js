@@ -374,6 +374,54 @@ const PRESENCE_LABEL = {
 /** 자동 재생 기준 곡 상한. 서버가 `max` 를 주면 그 값이 이긴다 (v3 §8.1). */
 const SEED_MAX_FALLBACK = 10;
 
+/**
+ * 설정 검색용 이름표 — 숫자(`NUM_SPECS`)도 권한(`PERM_FIELDS`)도 아닌 항목의 라벨이다.
+ * 이 셋을 합치면 "저장되는 모든 설정"이 이름을 갖는다. 콘솔에 설정이 80개가 넘어서
+ * 어디 있는지 몰라 못 찾는 게 제일 흔한 불편이라, 이름으로 찾아 그 자리까지 데려다준다.
+ * 여기 라벨은 실제 화면 라벨과 같아야 한다 — 찾아갔더니 다른 이름이면 찾은 게 아니다.
+ */
+const FIELD_LABELS = {
+  sortMode: '대기열 정렬 방식',
+  autoBgmEnabled: '자동 재생 사용',
+  repeatMode: '반복',
+  requireVoiceForPlayback: '봇이 음성 채널에 있어야만 조작',
+  publicNowPlaying: '로그인 없이 지금 곡 보기',
+  boomttaEnabled: '붐따 사용',
+  boomttaAction: '붐따 — 내릴 때 어떻게 할까요',
+  voteSkipEnabled: '투표로 넘기기',
+  voteSkipBasis: '투표 스킵 — 누구를 세나요',
+  autoplayMode: '자동 재생 — 무엇을 기준으로 고를까요',
+  autoplayGenres: '자동 재생 — 어떤 장르를 쓸까요',
+  autoplayPolicy: '자동 재생 — 얼마나 비슷하게 고를까요',
+  ruleRoleIds: '권한별 지정 역할',
+  managerRoleIds: '관리자로 대우할 역할',
+  chatEnabled: '채팅 사용',
+  suggestionEnabled: '제안 게시판 사용',
+};
+
+/**
+ * 설정이 아닌 "자리" — 저장 버튼을 거치지 않는 목록·도구들이다.
+ * 이것들도 콘솔 안에 있는데 `SECTION_KEYS` 에는 안 잡혀서, 색인에 따로 넣지 않으면
+ * "차트 어디서 켜요" 같은 질문에 검색이 아무 답도 못 한다.
+ * `anchor` 는 그 섹션을 그린 뒤 스크롤해 갈 요소의 선택자다.
+ */
+const SEARCH_SPOTS = [
+  { section: 'order',   anchor: '.clearq',   label: '대기열 비우기',   desc: '줄 서 있는 곡을 한 번에 전부 지워요' },
+  { section: 'order',   anchor: '.charts',   label: '차트 관리',       desc: '리모컨 차트 탭에 무엇을 보여줄지 켜고 끄고 순서를 바꿔요' },
+  { section: 'order',   anchor: '.seeds',    label: '자동 재생 기준 곡', desc: '자동 재생이 참고할 곡 목록이에요' },
+  { section: 'order',   anchor: '.smpl',     label: '샘플 대기열 비교', desc: '예시 곡으로 정렬 방식 세 가지를 나란히 봐요' },
+  { section: 'perms',   anchor: '.roleview__pick', label: '특정 역할로 보기', desc: '고른 역할만 가진 사람에게 무엇이 열리는지 봐요' },
+  { section: 'users',   anchor: '.suslist',  label: '지금 정지 중',    desc: '정지된 사람 목록과 풀어 주기' },
+  { section: 'users',   anchor: '.userlist', label: '참여자 목록',      desc: '리모컨을 써 본 사람과 접속 상태, 정지' },
+  { section: 'chat',    anchor: null,        label: '신고된 메시지',    desc: '멤버가 신고한 채팅을 지우거나 넘겨요' },
+  { section: 'chat',    anchor: null,        label: '제안 게시판 글',   desc: '올라온 제안의 상태를 바꿔요' },
+  { section: 'blocked', anchor: '.testbox',  label: '막히는지 시험해 보기', desc: '곡 제목을 넣어 지금 규칙에 걸리는지 확인해요' },
+  { section: 'blocked', anchor: '.blocklist', label: '차단 규칙 목록',  desc: '이 서버에서 막아 둔 곡 규칙이에요' },
+  { section: 'audit',   anchor: null,        label: '활동 기록 검색',   desc: '누가 언제 무엇을 바꿨는지 찾아봐요' },
+  { section: 'diag',    anchor: '.diag',     label: '봇 · 서버 상태',   desc: '봇 연결·음성 참가·지연·빌드 ID' },
+  { section: 'diag',    anchor: '.srvstats', label: '이번 달 서버 기록', desc: '최근 30일 많이 나간 곡과 사랑받은 곡' },
+];
+
 /* ═══════════════════════════ 상태 ═══════════════════════════ */
 
 const S = {
@@ -425,6 +473,8 @@ const S = {
 let sectionBox = null;
 let navBox = null;
 let dirtyBadge = null;
+/** 상단 배지 안의 숫자만 따로 들고 있는다 — 좁은 화면에서 뒤 글자를 감추기 때문이다. */
+let dirtyCountNode = null;
 
 /* ═══════════════════════════ 유틸 ═══════════════════════════ */
 
@@ -554,11 +604,27 @@ function refreshDirty() {
     const label = foot.querySelector('.sec__footnote');
     if (label) label.textContent = count ? `바꾼 항목 ${count}개예요` : '아직 바꾼 항목이 없어요';
     foot.querySelectorAll('button').forEach((button) => { button.disabled = !count || S.saving; });
+    // 회색 버튼은 그것만으로 "고장" 처럼 읽힌다. 왜 못 누르는지 버튼 자신이 말하게 한다 (§23.3).
+    // 값이 서로 맞지 않아 막힌 경우는 validate() 가 이 문구를 다시 덮어쓴다.
+    const save = foot.querySelector('[data-testid="settings-save"]');
+    if (save) {
+      save.dataset.tip = S.saving ? '지금 저장하는 중이에요'
+        : count ? `이 섹션에서 바꾼 ${count}개 항목만 서버에 보내요`
+        : '아직 바꾼 항목이 없어서 보낼 게 없어요';
+    }
+    const undo = foot.querySelector('[data-foot-revert]');
+    if (undo) {
+      undo.dataset.tip = count
+        ? `이 섹션에서 바꾼 ${count}개를 전부 저장 전 값으로 돌려요`
+        : '되돌릴 변경이 없어요';
+    }
   }
   if (dirtyBadge) {
     const total = Object.keys(SECTION_KEYS).reduce((sum, id) => sum + dirtyKeys(id).length, 0);
     dirtyBadge.hidden = total === 0;
-    dirtyBadge.textContent = `저장 안 한 변경 ${total}개`;
+    if (dirtyCountNode) dirtyCountNode.textContent = String(total);
+    // 좁은 화면에서는 숫자만 남으므로 읽어 주는 이름은 늘 온전한 문장으로 둔다.
+    dirtyBadge.setAttribute('aria-label', `저장 안 한 변경 ${total}개 — 그 섹션으로 가요`);
   }
   // 네비에도 섹션별 변경 점을 찍는다.
   if (navBox) {
@@ -616,7 +682,11 @@ function validate() {
   if (foot) {
     const blocked = (SECTION_KEYS[S.activeSection] || []).some((key) => errors[key]);
     const save = foot.querySelector('[data-testid="settings-save"]');
-    if (save && blocked) save.disabled = true;
+    if (save && blocked) {
+      save.disabled = true;
+      // 막힌 이유를 그대로 말한다. "저장이 안 눌려요" 로 끝나면 빨간 설명을 못 찾는다.
+      save.dataset.tip = '값이 서로 맞지 않아요. 빨간 설명을 먼저 고치면 저장할 수 있어요';
+    }
   }
   return errors;
 }
@@ -737,7 +807,12 @@ function numberField(key, bounds) {
   const readout = h('span', { class: 'num__pretty' });
   const hintNode = h('span', { class: 'num__hint' });
   const number = h('input', {
-    class: 'field num__input', type: 'number', inputmode: 'numeric',
+    class: 'field num__input', type: 'number',
+    // 음수를 받는 칸(투표 점수 −10~10, 싱크 보정 −5000~5000)에 `inputmode="numeric"` 을 주면
+    // iOS 키패드에 `-` 가 없어서 **휴대폰에서는 음수를 아예 못 넣는다.**
+    // 슬라이더로도 안 되는 건 아니지만 1점 단위를 손가락으로 맞추라는 건 무리다.
+    // 그래서 음수가 가능한 칸만 type=number 의 기본 키보드(부호 포함)를 그대로 쓴다.
+    inputmode: min < 0 ? undefined : 'numeric',
     min: String(unlimited ? 0 : min), max: String(max), step: String(spec.step),
     value: String(value),
     'aria-label': spec.label,
@@ -1491,31 +1566,49 @@ async function openChartSheet(item) {
   const editing = Boolean(item);
   let category = editing ? item.category : 'popular';
   let provider = editing ? item.provider : 'YouTubeMusic';
-  const nameInput = h('input', { class: 'field', placeholder: '차트 이름 (예: 한국 인기곡)', value: editing ? item.name : '' });
-  const urlInput = h('input', { class: 'field', placeholder: '재생목록 주소 (https://…)', value: editing ? (item.url || '') : '' });
+  // 라벨이 `<label for>` 로 안 묶여 있어서 낭독기에는 이름 없는 칸으로 읽혔다. 이름을 직접 붙인다.
+  const nameInput = h('input', {
+    class: 'field', placeholder: '차트 이름 (예: 한국 인기곡)',
+    'aria-label': '차트 이름', value: editing ? item.name : '',
+  });
+  const urlInput = h('input', {
+    class: 'field', placeholder: '재생목록 주소 (https://…)',
+    'aria-label': '차트 주소', value: editing ? (item.url || '') : '',
+  });
 
-  const categoryBox = h('div', { class: 'seg' });
+  // 시트 안의 세그먼트도 "지금 뭐가 골라져 있는지" 를 보조기술에 알려야 한다.
+  // 색만으로 고른 걸 표시하면 화면을 못 보는 사람에게는 아무 표시도 없는 것과 같다.
+  const pickOne = (node, event) => {
+    node.querySelectorAll('.seg__btn').forEach((entry) => {
+      entry.classList.remove('is-on');
+      entry.setAttribute('aria-pressed', 'false');
+    });
+    event.currentTarget.classList.add('is-on');
+    event.currentTarget.setAttribute('aria-pressed', 'true');
+  };
+
+  const categoryBox = h('div', { class: 'seg', role: 'group', 'aria-label': '차트 분류' });
   CHART_CATEGORIES.filter((entry) => entry.key !== 'ours').forEach((entry) => {
     categoryBox.append(h('button', {
       class: 'seg__btn' + (entry.key === category ? ' is-on' : ''), type: 'button',
+      'aria-pressed': entry.key === category ? 'true' : 'false',
       'data-tip': entry.desc,
       onclick: (event) => {
         category = entry.key;
-        categoryBox.querySelectorAll('.seg__btn').forEach((node) => node.classList.remove('is-on'));
-        event.currentTarget.classList.add('is-on');
+        pickOne(categoryBox, event);
       },
     }, entry.label));
   });
 
-  const providerBox = h('div', { class: 'seg' });
+  const providerBox = h('div', { class: 'seg', role: 'group', 'aria-label': '차트 공급자' });
   ['YouTubeMusic', 'YouTube', 'SoundCloud'].forEach((value) => {
     providerBox.append(h('button', {
       class: 'seg__btn' + (value === provider ? ' is-on' : ''), type: 'button',
+      'aria-pressed': value === provider ? 'true' : 'false',
       'data-tip': `${value} 주소로 다뤄요`,
       onclick: (event) => {
         provider = value;
-        providerBox.querySelectorAll('.seg__btn').forEach((node) => node.classList.remove('is-on'));
-        event.currentTarget.classList.add('is-on');
+        pickOne(providerBox, event);
       },
     }, value));
   });
@@ -1819,8 +1912,13 @@ function previewTabs(liveBox, sampleBox) {
     { id: 'sample', label: '샘플 대기열', box: sampleBox, tip: '예시 곡 6개로 세 방식이 어떻게 갈리는지 나란히 봐요' },
   ];
   panes.forEach((pane) => {
+    // 탭과 내용을 id 로 묶어 준다. 안 묶으면 화면 낭독기가 탭을 눌러도 무엇이 바뀌었는지 못 읽는다.
+    pane.box.id = `cs-preview-${pane.id}`;
+    pane.box.setAttribute('role', 'tabpanel');
+    pane.box.setAttribute('aria-labelledby', `cs-previewtab-${pane.id}`);
     bar.append(h('button', {
       class: 'prevtabs__btn', type: 'button', role: 'tab',
+      id: `cs-previewtab-${pane.id}`, 'aria-controls': pane.box.id,
       'data-tab': pane.id, 'data-tip': pane.tip,
       onclick: () => showPreviewTab(pane.id, bar, panes),
     }, pane.label));
@@ -2225,7 +2323,9 @@ function roleViewBox() {
       const rows = (data.permissions || []).map((row) => h('div', {
         class: 'roleview__row' + (row.allowed ? ' is-on' : ''),
       },
-        h('span', null, row.allowed ? '✅' : '🚫'),
+        h('span', { 'aria-hidden': 'true' }, row.allowed ? '✅' : '🚫'),
+        // 화면 낭독기에는 이모지가 "흰색 물음표" 로 읽히기도 한다. 판정은 글자로도 남긴다.
+        h('span', { class: 'sr-only' }, row.allowed ? '쓸 수 있어요' : '못 써요'),
         h('span', { class: 'roleview__key' }, PERM_LABEL[row.key] || row.key),
         h('span', { class: 'roleview__rule' }, row.ruleLabel)));
       out.replaceChildren(
@@ -2234,6 +2334,7 @@ function roleViewBox() {
             ? `${(data.roleNames || []).map((n) => '@' + n).join(' · ')} 역할만 가진 사람이 보는 화면이에요.`
             : '역할이 하나도 없는 사람이 보는 화면이에요.'),
         h('div', { class: 'roleview__grid' }, ...rows));
+      tooltip(out);
     } catch (error) {
       out.replaceChildren(h('p', { class: 'hint' }, `못 불러왔어요 — ${error.message}`));
     }
@@ -2242,6 +2343,9 @@ function roleViewBox() {
   const chips = (S.roles || []).map((role) => {
     const chip = h('button', {
       class: 'chipbtn', type: 'button', 'aria-pressed': 'false',
+      // 아이콘만 있는 버튼이 아니어도, 이 칩은 "고르면 무슨 일이 일어나는지" 가 안 보인다.
+      // 멤버 수까지 같이 붙여서 이 역할이 몇 명짜리인지도 여기서 알 수 있게 한다 (§20).
+      'data-tip': `이 역할만 가진 사람으로 보기 · 멤버 ${role.memberCount != null ? role.memberCount : '?'}명`,
       onClick: () => {
         const id = String(role.id);
         if (picked.has(id)) picked.delete(id); else picked.add(id);
@@ -2255,7 +2359,8 @@ function roleViewBox() {
   const voiceToggle = h('button', {
     class: 'chipbtn', type: 'button', 'aria-pressed': 'false',
     // 같은 음성 채널 규칙은 역할과 무관하게 결과를 바꾼다. 같이 켜 봐야 진짜가 보인다.
-    title: '봇과 같은 음성 채널에 있다고 치고 봐요',
+    // 네이티브 `title=` 은 지연이 길고 휴대폰에서는 아예 안 뜬다. 콘솔 전체 규약대로 `data-tip` 을 쓴다 (§20).
+    'data-tip': '봇과 같은 음성 채널에 있다고 치고 봐요',
     onClick: () => {
       sameVoice = !sameVoice;
       voiceToggle.setAttribute('aria-pressed', String(sameVoice));
@@ -2264,13 +2369,17 @@ function roleViewBox() {
   }, '🔊 같은 음성 채널에 있음');
 
   refresh();
-  return h('div', { class: 'grp' },
+  const group = h('div', { class: 'grp' },
     h('h3', { class: 'grp__title' }, '👁 특정 역할로 보기'),
     h('p', { class: 'grp__desc' },
       '고른 역할만 가진 사람에게 무엇이 열리는지 그대로 보여줘요. ' +
-      '관리자는 모든 규칙을 우회하기 때문에 자기 화면만 봐서는 확인이 안 돼요.'),
-    h('div', { class: 'roleview__pick' }, ...chips, voiceToggle),
+      '관리자는 모든 규칙을 우회하기 때문에 자기 화면만 봐서는 확인이 안 돼요. ' +
+      '아무것도 안 고르면 역할이 하나도 없는 사람 기준이에요.'),
+    h('div', { class: 'roleview__pick', role: 'group', 'aria-label': '어떤 역할로 볼지 고르기' },
+      ...chips, voiceToggle),
     out);
+  tooltip(group);
+  return group;
 }
 
 /** 권한 키 → 사람이 읽는 이름. 미리보기 표에서 쓴다. */
@@ -2492,6 +2601,7 @@ function sectionBlocked() {
   const testInput = h('input', {
     class: 'field', type: 'search',
     placeholder: '곡 제목이나 주소를 넣어 보세요',
+    'aria-label': '차단되는지 시험할 곡 제목이나 주소',
     'data-tip': '지금 규칙으로 막히는지 바로 확인해요',
   });
   let testTimer = null;
@@ -2510,23 +2620,34 @@ function sectionBlocked() {
   ));
 
   // 추가 폼 — 모달까지 갈 일이 아니라 인라인이다.
-  const kindBox = h('div', { class: 'seg' });
+  const kindBox = h('div', { class: 'seg', role: 'group', 'aria-label': '차단 규칙 종류' });
   BLACKLIST_KINDS.forEach((kind) => {
     kindBox.append(h('button', {
       class: 'seg__btn' + (kind.value === S.blocked.kind ? ' is-on' : ''), type: 'button',
+      'aria-pressed': kind.value === S.blocked.kind ? 'true' : 'false',
       'data-tip': kind.desc,
       onclick: (event) => {
         S.blocked.kind = kind.value;
-        kindBox.querySelectorAll('.seg__btn').forEach((node) => node.classList.remove('is-on'));
+        kindBox.querySelectorAll('.seg__btn').forEach((node) => {
+          node.classList.remove('is-on');
+          node.setAttribute('aria-pressed', 'false');
+        });
         event.currentTarget.classList.add('is-on');
+        event.currentTarget.setAttribute('aria-pressed', 'true');
         const note = body.querySelector('[data-kind-note]');
         if (note) note.textContent = kind.desc;
         repaintBlocked();
       },
     }, kind.label));
   });
-  const patternInput = h('input', { class: 'field', placeholder: '막을 제목이나 주소', maxlength: '200' });
-  const noteInput = h('input', { class: 'field', placeholder: '메모 (왜 막았는지 · 선택)', maxlength: '120' });
+  const patternInput = h('input', {
+    class: 'field', placeholder: '막을 제목이나 주소', maxlength: '200',
+    'aria-label': '막을 제목이나 주소',
+  });
+  const noteInput = h('input', {
+    class: 'field', placeholder: '메모 (왜 막았는지 · 선택)', maxlength: '120',
+    'aria-label': '차단 메모 (선택)',
+  });
 
   const listBox = h('div', { class: 'card blocklist' });
   body.append(h('div', { class: 'grp' },
@@ -2617,15 +2738,34 @@ function paintBlocked(box) {
     ? h('p', { class: 'hint', style: 'padding:8px 12px' }, `🔒 ${S.blocked.globalNote}`)
     : null;
   const items = S.blocked.items.filter((item) => item.kind === S.blocked.kind);
+
+  // 이 목록은 **고른 종류만** 보여준다. 다른 종류에 규칙이 있는데 아무 말도 안 하면
+  // "차단이 하나도 없네" 로 읽히고, 그 상태에서 왜 곡이 막히는지 영영 못 찾는다.
+  const others = BLACKLIST_KINDS
+    .filter((kind) => kind.value !== S.blocked.kind)
+    .map((kind) => ({ kind, count: S.blocked.items.filter((item) => item.kind === kind.value).length }))
+    .filter((entry) => entry.count > 0);
+  const otherHint = others.length
+    ? h('p', { class: 'hint', style: 'padding:8px 12px' },
+      `다른 종류에도 규칙이 있어요 — ${others.map((entry) => `${entry.kind.label} ${entry.count}개`).join(' · ')}. ` +
+      '위에서 종류를 바꾸면 보여드려요.')
+    : null;
+
+  // replaceChildren 은 null 을 받으면 문자열 "null" 을 그대로 넣는다.
+  // 전체 규칙 안내가 없을 때 목록 위에 `null` 이라는 글자가 떠 있던 이유가 이것이다.
+  const put = (...nodes) => box.replaceChildren(...nodes.filter(Boolean));
+
   if (!items.length) {
-    box.replaceChildren(
+    put(
       globalHint,
+      otherHint,
       h('div', { class: 'empty' },
         h('div', { class: 'empty__icon' }, '🕊'),
         h('div', { class: 'empty__title' }, '이 종류로 막아 둔 게 없어요'),
         h('div', { class: 'empty__desc' },
           '리모컨의 대기열이나 검색 결과에서 곡의 ⋯ 메뉴를 열면 "차단 목록에 넣기"로 바로 넣을 수도 있어요.'),
       ));
+    tooltip(box);
     return;
   }
   const rows = h('ul', { class: 'rows' });
@@ -2654,7 +2794,7 @@ function paintBlocked(box) {
       }, global ? '못 지워요' : '지우기'),
     ));
   });
-  box.replaceChildren(globalHint, rows);
+  put(globalHint, otherHint, rows);
   tooltip(box);
 }
 
@@ -2708,6 +2848,7 @@ function sectionUsers() {
   const listBox = h('div', { class: 'card userlist' });
   const filter = h('input', {
     class: 'field', type: 'search', placeholder: '이름으로 찾아요',
+    'aria-label': '참여자를 이름으로 찾기',
     'data-tip': '적은 글자가 들어간 사람만 남겨요',
     oninput: (event) => paintParticipants(listBox, event.target.value),
   });
@@ -2798,7 +2939,11 @@ function paintParticipants(box, query) {
     return;
   }
   const rows = h('ul', { class: 'rows' });
-  box.replaceChildren(rows);
+  // 걸러 놓고 몇 명이 남았는지 안 알려 주면 "이게 전부인가" 를 알 수 없다.
+  const count = needle
+    ? h('p', { class: 'hint', style: 'padding:8px 12px' }, `${S.participants.length}명 중 ${items.length}명이 맞아요.`)
+    : null;
+  box.replaceChildren(...[count, rows].filter(Boolean));
   renderList(rows, items, (person) => String(person.userId), (person) => userRow(person));
   tooltip(box);
 }
@@ -2850,36 +2995,47 @@ async function openSuspendSheet(person) {
   let minutes = 30;
   let reason = '';
 
+  // 고른 값을 클래스뿐 아니라 aria-pressed 로도 남긴다 — 색만으로는 안 보이는 사람이 있다.
+  const pickOne = (node, event) => {
+    node.querySelectorAll('.seg__btn').forEach((entry) => {
+      entry.classList.remove('is-on');
+      entry.setAttribute('aria-pressed', 'false');
+    });
+    event.currentTarget.classList.add('is-on');
+    event.currentTarget.setAttribute('aria-pressed', 'true');
+  };
+
   const scopeNote = h('p', { class: 'hint' }, SUSPEND_SCOPES[0].desc);
-  const scopeBox = h('div', { class: 'seg' });
+  const scopeBox = h('div', { class: 'seg', role: 'group', 'aria-label': '무엇을 막을지' });
   SUSPEND_SCOPES.forEach((item) => {
     scopeBox.append(h('button', {
       class: 'seg__btn' + (item.value === scope ? ' is-on' : ''), type: 'button',
+      'aria-pressed': item.value === scope ? 'true' : 'false',
       'data-tip': tipOf(item.desc),
       onclick: (event) => {
         scope = item.value;
         scopeNote.textContent = item.desc;
-        scopeBox.querySelectorAll('.seg__btn').forEach((node) => node.classList.remove('is-on'));
-        event.currentTarget.classList.add('is-on');
+        pickOne(scopeBox, event);
       },
     }, item.label));
   });
 
-  const durationBox = h('div', { class: 'seg' });
+  const durationBox = h('div', { class: 'seg', role: 'group', 'aria-label': '얼마나 막을지' });
   SUSPEND_DURATIONS.forEach((item) => {
     durationBox.append(h('button', {
       class: 'seg__btn' + (item.minutes === minutes ? ' is-on' : ''), type: 'button',
+      'aria-pressed': item.minutes === minutes ? 'true' : 'false',
       'data-tip': item.minutes === null ? '직접 풀 때까지 계속 막아요' : `${item.label} 동안 막아요`,
       onclick: (event) => {
         minutes = item.minutes;
-        durationBox.querySelectorAll('.seg__btn').forEach((node) => node.classList.remove('is-on'));
-        event.currentTarget.classList.add('is-on');
+        pickOne(durationBox, event);
       },
     }, item.label));
   });
 
   const reasonInput = h('input', {
     class: 'field', placeholder: '사유 (본인에게 보여요)', maxlength: '120',
+    'aria-label': '정지 사유',
     oninput: (event) => { reason = event.target.value; },
   });
 
@@ -2964,16 +3120,17 @@ function sectionChat() {
     reportsBox,
   ));
 
+  // 제안 목록은 예전에 그룹 **밖에** 떠 있었다. 신고 목록은 자기 그룹 안에 있는데 이것만
+  // 제목 없는 카드로 혼자 떨어져 있어서, 무슨 목록인지 위로 한참 올라가야 알 수 있었다.
+  const suggestBox = h('div', { class: 'card' });
   body.append(h('div', { class: 'grp' },
     h('h3', { class: 'grp__title' }, '제안 게시판'),
     h('p', { class: 'grp__desc' }, '멤버가 앱 개선 제안을 올리고 공감을 눌러요. 상태는 관리자가 정해요.'),
     fieldShell('suggestionEnabled', '제안 게시판 사용',
       '끄면 새 제안을 받지 않아요. 이미 올라온 제안은 계속 보여요.',
       toggleControl('suggestionEnabled', '멤버가 제안을 올릴 수 있어요', '제안 접수를 닫았어요')),
+    suggestBox,
   ));
-
-  const suggestBox = h('div', { class: 'card' });
-  body.append(suggestBox);
 
   paintReports(reportsBox);
   paintSuggestions(suggestBox);
@@ -3040,6 +3197,15 @@ async function resolveReport(report, action) {
       title: '메시지 삭제',
       desc: '이 채팅을 지워요. 되돌릴 수 없어요.',
       confirmText: '삭제', cancelText: '그냥 둘게요', danger: true,
+    });
+    if (!ok) return;
+  } else {
+    // "문제 없어요" 도 되돌릴 수 없다 — 신고가 목록에서 사라지고 다시 열 방법이 없다.
+    // 삭제만큼 위험하진 않으니 danger 는 안 붙이고 확인만 받는다.
+    const ok = await confirmSheet({
+      title: '신고를 닫을까요',
+      desc: '메시지는 그대로 두고 신고만 닫아요. 닫은 신고는 목록에서 사라지고 다시 열 수 없어요.',
+      confirmText: '닫을게요', cancelText: '더 볼게요',
     });
     if (!ok) return;
   }
@@ -3126,6 +3292,7 @@ function sectionAudit() {
     class: 'field', type: 'search', 'data-testid': 'audit-filter',
     placeholder: '사람 · 동작 · 곡 제목으로 찾아요',
     value: S.audit.query,
+    'aria-label': '활동 기록을 사람·동작·곡 제목으로 찾기',
     'data-tip': '적은 글자가 들어간 기록만 남겨요',
   });
   let timer = null;
@@ -3518,6 +3685,7 @@ function renderSection(id) {
       h('span', { class: 'sec__footnote' }, '아직 바꾼 항목이 없어요'),
       h('button', {
         class: 'btn', type: 'button', disabled: true,
+        'data-foot-revert': '1',
         onclick: () => revertSection(spec.id),
         'data-tip': '이 섹션에서 바꾼 걸 전부 저장 전 값으로 돌려요',
       }, '되돌리기'),
@@ -3547,7 +3715,22 @@ function renderSection(id) {
   tooltip(sectionBox);
 }
 
-function revertSection(id) {
+/**
+ * 섹션 전체 되돌리기.
+ * 저장 버튼 바로 옆이라 잘못 누르기 쉽고, 한 번 누르면 그 섹션에서 만진 걸 전부 잃는다.
+ * 되살릴 방법이 없는 조작에는 예외 없이 확인을 붙인다 — 항목 하나짜리 `↺` 와는 무게가 다르다.
+ */
+async function revertSection(id) {
+  const count = dirtyKeys(id).length;
+  if (!count) return;
+  const ok = await confirmSheet({
+    title: '바꾼 값을 되돌릴까요',
+    desc: `이 섹션에서 바꾼 ${count}개 항목이 저장 전 값으로 돌아가요. 되돌린 값은 다시 살릴 수 없어요.`,
+    confirmText: `${count}개 되돌리기`,
+    cancelText: '그냥 둘게요',
+    danger: true,
+  });
+  if (!ok) return;
   (SECTION_KEYS[id] || []).forEach((key) => { S.draft[key] = clone(S.saved[key]); });
   renderSection(id);
   toast('저장 전 값으로 되돌렸어요.');
@@ -3603,7 +3786,7 @@ async function guardLeave() {
 }
 
 async function goSection(id) {
-  if (id === S.activeSection) return;
+  if (id === S.activeSection) return true;
   const dirty = dirtyKeys(S.activeSection);
   if (dirty.length) {
     const ok = await confirmSheet({
@@ -3613,15 +3796,173 @@ async function goSection(id) {
       cancelText: '남아서 저장할게요',
       danger: true,
     });
-    if (!ok) return;
+    if (!ok) return false;
     revertSectionSilently(S.activeSection);
   }
   renderSection(id);
   history.replaceState(null, '', `#${id}`);
+  // 섹션을 바꾸면 맨 위부터 보여준다. 안 그러면 "순서와 재생" 을 한참 내려 보다가 "진단" 을 눌렀을 때
+  // 새 섹션의 한가운데에 떨어진다 — 짧은 섹션은 아예 아무것도 안 보이는 자리에 서기도 한다.
+  // renderSection 은 저장·WS 이벤트에서도 불리니까 스크롤은 **사람이 옮길 때만** 한다.
+  scrollToTop();
+  return true;
+}
+
+/** 스크롤 위치 되돌리기. 움직임을 줄이라는 설정은 존중한다. */
+function scrollToTop() {
+  const smooth = !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  window.scrollTo({ top: 0, behavior: smooth ? 'smooth' : 'auto' });
+}
+
+/**
+ * 섹션 안의 한 자리로 데려간다 — 설정 검색과 "저장 안 함" 배지가 같이 쓴다.
+ * 접혀 있는 그룹(붐따를 꺼 두면 기준 칸이 아예 안 그려진다) 때문에 못 찾을 수 있는데,
+ * 그때 조용히 아무 일도 안 하면 검색이 고장 난 것처럼 보인다. 왜 없는지 말해 준다 (§23.3).
+ */
+function focusSpot({ field, anchor, label }) {
+  if (!sectionBox) return;
+  const target = field
+    ? sectionBox.querySelector(`[data-field="${field}"]`)
+    : (anchor ? sectionBox.querySelector(anchor) : null);
+  if (!target) {
+    if (label) {
+      toast(`"${label}"은(는) 지금 화면에 없어요. 그 기능을 켜면 바로 나타나요.`, 'info');
+    }
+    return;
+  }
+  target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  // 스크롤만 하면 어느 줄로 온 건지 모른다. 잠깐 테두리를 밝혀 두는 게 화살표보다 확실하다.
+  target.classList.add('is-found');
+  setTimeout(() => target.classList.remove('is-found'), 2200);
+}
+
+/** 검색 결과·배지에서 한 번에 이동한다. 섹션 이동 가드는 그대로 태운다. */
+async function jumpTo(spot) {
+  const moved = await goSection(spot.section);
+  if (!moved) return;
+  // 섹션을 막 그렸으니 다음 프레임에 자리를 찾는다.
+  requestAnimationFrame(() => focusSpot(spot));
+}
+
+/** 상단 "저장 안 함" 배지 → 저장 안 한 변경이 있는 첫 섹션. */
+function jumpToFirstDirty() {
+  const found = SECTIONS.find((spec) => dirtyKeys(spec.id).length > 0);
+  if (!found) return;
+  jumpTo({ section: found.id });
 }
 
 function revertSectionSilently(id) {
   (SECTION_KEYS[id] || []).forEach((key) => { S.draft[key] = clone(S.saved[key]); });
+}
+
+/* ═══════════════════════════ 설정 찾기 ═══════════════════════════
+ *
+ * 콘솔에 저장되는 설정만 80개가 넘고, 목록·도구까지 세면 100개에 가깝다.
+ * 섹션 8개로 묶어 뒀지만 "곡 길이 제한이 제한값인가 순서와 재생인가" 는 여전히 헷갈린다.
+ * 그래서 이름으로 찾아 **그 자리까지 데려다주는** 길을 하나 만든다.
+ *
+ * 새 서버 API 는 쓰지 않는다 — 색인은 이미 화면을 그리는 데 쓰는 상수표에서 만든다.
+ * 시트로 띄우는 이유: 어느 폭에서도 같은 모양이고, 좁은 화면에서 레이아웃을 밀지 않는다.
+ */
+
+/** 검색 색인. 저장되는 설정 + 저장 버튼을 안 거치는 자리들. */
+function buildSearchIndex() {
+  const rows = [];
+  const seen = new Set();
+  Object.entries(SECTION_KEYS).forEach(([section, keys]) => {
+    keys.forEach((key) => {
+      if (seen.has(key)) return;
+      seen.add(key);
+      const spec = NUM_SPECS[key];
+      const perm = PERM_FIELDS.find((entry) => entry.key === key);
+      const label = spec ? spec.label : (perm ? perm.label : FIELD_LABELS[key]);
+      if (!label) return;   // 이름을 모르는 키는 넣지 않는다. 빈 줄을 보여주는 건 도움이 아니다.
+      rows.push({
+        section,
+        field: key,
+        label,
+        desc: spec ? spec.desc : (perm ? perm.desc : ''),
+        unit: spec ? spec.unit : '',
+      });
+    });
+  });
+  SEARCH_SPOTS.forEach((spot) => rows.push(Object.assign({ field: null }, spot)));
+  return rows;
+}
+
+let searchIndex = null;
+/** 시트가 두 장 겹치면 뒤엣것이 안 닫힌다. 한 번에 하나만 연다. */
+let searchOpen = false;
+
+function sectionLabel(id) {
+  const found = SECTIONS.find((spec) => spec.id === id);
+  return found ? `${found.icon} ${found.label}` : id;
+}
+
+async function openSearch() {
+  if (searchOpen) return;
+  searchOpen = true;
+  if (!searchIndex) searchIndex = buildSearchIndex();
+
+  const input = h('input', {
+    class: 'field', type: 'search', autocomplete: 'off',
+    placeholder: '설정 이름으로 찾아요 (예: 볼륨, 붐따, 보관, 차트)',
+    'aria-label': '설정 이름으로 찾기',
+  });
+  const out = h('div', { class: 'srch', role: 'listbox', 'aria-label': '검색 결과' });
+  let handle = null;
+
+  const paint = () => {
+    const needle = String(input.value || '').trim().toLowerCase();
+    // 아무것도 안 적었을 때 빈 화면을 주면 무엇을 적어야 할지 모른다. 섹션 목록을 대신 보여준다.
+    const rows = needle
+      ? searchIndex.filter((row) =>
+        `${row.label} ${row.desc} ${sectionLabel(row.section)}`.toLowerCase().includes(needle))
+      : SECTIONS.map((spec) => ({ section: spec.id, field: null, label: spec.label, desc: spec.desc }));
+
+    if (!rows.length) {
+      out.replaceChildren(h('p', { class: 'hint' },
+        `"${input.value.trim()}" 에 맞는 설정이 없어요. 짧게 줄여서 다시 적어 보세요 — ` +
+        '예를 들어 "최대 볼륨" 대신 "볼륨" 이요.'));
+      return;
+    }
+    out.replaceChildren(...rows.slice(0, 40).map((row) => h('button', {
+      class: 'srch__row', type: 'button', role: 'option',
+      onclick: () => {
+        if (handle) handle.close(false);
+        jumpTo(row);
+      },
+    },
+      h('span', { class: 'srch__label' }, row.label),
+      h('span', { class: 'srch__where' }, sectionLabel(row.section)),
+      row.desc ? h('span', { class: 'srch__desc' }, tipOf(row.desc)) : null,
+    )));
+    if (rows.length > 40) {
+      out.append(h('p', { class: 'hint' }, `${rows.length - 40}개가 더 맞아요. 조금 더 적으면 줄어들어요.`));
+    }
+  };
+
+  input.addEventListener('input', paint);
+  // 엔터는 첫 결과로 간다 — 손이 키보드에 있는 사람이 마우스로 옮겨 가지 않아도 되게.
+  input.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    const first = out.querySelector('.srch__row');
+    if (first) { event.preventDefault(); first.click(); }
+  });
+  paint();
+
+  handle = sheet({
+    title: '설정 찾기',
+    desc: '이름으로 찾으면 그 설정이 있는 섹션으로 가서 자리까지 표시해 드려요.',
+    body: h('div', { class: 'sheetform' }, input, out),
+    dismissValue: false,
+    actions: [{ label: '닫기', kind: 'ghost', value: false }],
+  });
+  try {
+    await handle.result;
+  } finally {
+    searchOpen = false;
+  }
 }
 
 /* ═══════════════════════════ 셸 ═══════════════════════════ */
@@ -3630,20 +3971,35 @@ function renderShell() {
   const root = document.getElementById('app') || document.body;
   root.replaceChildren();
 
-  dirtyBadge = h('span', {
-    class: 'head__dirty', hidden: true,
-    'data-tip': '아직 저장하지 않은 항목이 있어요',
-  });
+  /* 상단 바는 좁은 화면에서 **가로로 밀리던** 자리다.
+   * 되돌아가기(긴 글자) + 제목 + 저장 배지 + 등급 배지 + 테마 버튼이 전부 `flex: none` · nowrap 이라
+   * 360px 에서 합이 400px 을 넘었고, 그러면 페이지 전체가 옆으로 밀려 아래 내용까지 잘렸다.
+   * 그래서 **글자를 짧게 접을 수 있는 조각으로 나눠 둔다** — 아무것도 없애지 않고,
+   * 좁아지면 긴 글자만 CSS 로 감추고 아이콘·숫자와 툴팁으로 뜻을 남긴다. */
+
+  dirtyCountNode = h('span', { class: 'head__dirty-n' }, '0');
+  dirtyBadge = h('button', {
+    class: 'head__dirty', type: 'button', hidden: true,
+    'data-tip': '아직 저장하지 않은 항목이 있어요. 눌러서 그 섹션으로 가요',
+    onclick: () => jumpToFirstDirty(),
+  },
+    dirtyCountNode,
+    h('span', { class: 'head__dirty-t' }, '개 저장 안 함'),
+  );
 
   const back = h('a', {
     class: 'btn btn--ghost head__back',
     href: `/music/guilds/${GUILD_ID}`,
     'data-tip': '유저용 리모컨 화면으로 가요',
+    'aria-label': '리모컨으로 돌아가기',
     onclick: async (event) => {
       event.preventDefault();
       if (await guardLeave()) location.href = `/music/guilds/${GUILD_ID}`;
     },
-  }, '← 리모컨으로 돌아가기');
+  },
+    h('span', { class: 'head__back-ico', 'aria-hidden': 'true' }, '←'),
+    h('span', { class: 'head__back-txt' }, '리모컨으로 돌아가기'),
+  );
 
   const head = h('header', { class: 'cs__head' },
     back,
@@ -3653,10 +4009,19 @@ function renderShell() {
     ),
     dirtyBadge,
     h('div', { class: 'head__spacer' }),
+    h('button', {
+      class: 'btn btn--icon btn--ghost', type: 'button',
+      'data-tip': '설정을 이름으로 찾아요 · Ctrl+K',
+      'aria-label': '설정 찾기',
+      onclick: () => openSearch(),
+    }, '🔎'),
     h('span', {
       class: `tier tier--${M.tier}`,
       'data-tip': IS_OWNER ? '봇을 돌리는 사람이라 모든 서버를 볼 수 있어요' : '이 서버의 관리자라 여기 설정을 바꿀 수 있어요',
-    }, IS_OWNER ? '🛡 봇 주인' : '🛡 서버 관리자'),
+    },
+      h('span', { class: 'tier__ico', 'aria-hidden': 'true' }, '🛡'),
+      h('span', { class: 'tier__txt' }, IS_OWNER ? '봇 주인' : '서버 관리자'),
+    ),
     h('button', {
       class: 'btn btn--icon btn--ghost', type: 'button',
       'data-tip': '밝게 / 어둡게 바꿔요',
@@ -3698,7 +4063,13 @@ function renderDenied() {
     h('div', { class: 'panel denied' },
       h('div', { class: 'denied__icon' }, '🔒'),
       h('h1', null, '서버 관리 콘솔은 관리자만 들어올 수 있어요'),
-      h('p', { class: 'hint' }, '이 서버에서는 관리 권한이 없으세요. 서버 관리자에게 "관리자 지정 역할"을 받으시면 들어올 수 있어요.'),
+      // "권한 없음" 으로 끝내지 않는다. 조건을 그대로 적고, 통과하는 대상을 덧붙인다 (§23.3).
+      h('p', { class: 'hint' },
+        '여기는 세 부류만 들어올 수 있어요 — Discord 의 "관리자" 또는 "서버 관리" 권한을 가진 사람, ' +
+        '이 서버가 "관리자 지정 역할"로 지정해 둔 역할을 가진 사람, 그리고 봇 주인이에요.'),
+      h('p', { class: 'hint' },
+        '지금 계정은 셋 중 어디에도 들어가지 않아요. 서버 관리자에게 관리자 지정 역할을 받으시면 ' +
+        '새로고침만 해도 바로 들어올 수 있어요.'),
       h('a', {
         class: 'btn btn--primary', href: `/music/guilds/${GUILD_ID}`,
         'data-tip': '유저용 리모컨 화면으로 가요',
@@ -3747,6 +4118,15 @@ async function boot() {
     if (!anyDirty()) return;
     event.preventDefault();
     event.returnValue = '';
+  });
+
+  // 설정 찾기 — 손이 키보드에 있을 때 상단 🔎 까지 가지 않아도 되게 한다.
+  // 시트 안에서 또 눌러도 새로 열리지 않는다(openSearch 가 막는다).
+  window.addEventListener('keydown', (event) => {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+    if (String(event.key).toLowerCase() !== 'k') return;
+    event.preventDefault();
+    openSearch();
   });
 
   // 뒤로가기도 같은 가드를 태운다.
