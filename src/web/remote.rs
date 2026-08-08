@@ -10654,19 +10654,47 @@ mod tests {
     fn permission_defaults_match_remote_contract() {
         let settings = RemoteGuildSettings::default();
         let member = MemberContext::default();
-        assert!(!permission_allowed("playback", settings.playback_rule, &settings, &member));
-        assert!(permission_allowed("seek", settings.seek_rule, &settings, &member));
-        assert!(!permission_allowed("volume", settings.volume_rule, &settings, &member));
+        // 음성에 없는 사람: 소리를 흔드는 것은 전부 막힌다.
+        for (key, rule) in [
+            ("playback", settings.playback_rule),
+            ("seek", settings.seek_rule),
+            ("volume", settings.volume_rule),
+            ("skip", settings.skip_rule),
+            ("bulkEnqueue", settings.bulk_enqueue_rule),
+        ] {
+            assert!(
+                !permission_allowed(key, rule, &settings, &member),
+                "{key} 는 음성 밖에서 막혀야 한다"
+            );
+        }
+        // 반대로 신청·좋아요·채팅·자동 재생은 음성에 없어도 된다.
+        for (key, rule) in [
+            ("search", settings.search_rule),
+            ("vote", settings.vote_rule),
+            ("chat", settings.chat_rule),
+            ("autoplay", settings.autoplay_rule),
+        ] {
+            assert!(
+                permission_allowed(key, rule, &settings, &member),
+                "{key} 는 음성 밖에서도 돼야 한다"
+            );
+        }
         let same_voice = MemberContext {
             same_voice_channel: true,
             ..Default::default()
         };
-        assert!(permission_allowed(
-            "playback",
-            settings.playback_rule,
-            &settings,
-            &same_voice
-        ));
+        // 음성에 들어오면 막혔던 것들이 전부 열린다.
+        for (key, rule) in [
+            ("playback", settings.playback_rule),
+            ("seek", settings.seek_rule),
+            ("skip", settings.skip_rule),
+            ("bulkEnqueue", settings.bulk_enqueue_rule),
+        ] {
+            assert!(
+                permission_allowed(key, rule, &settings, &same_voice),
+                "{key} 는 같은 음성 채널이면 열려야 한다"
+            );
+        }
     }
 
     /// 관리자 우회로 통과한 항목은 "← 관리자라 통과"로 표시돼야 한다.

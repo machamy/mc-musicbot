@@ -1788,8 +1788,8 @@ pub struct RemoteGuildSettings {
     pub volume_rule: PermissionRule,
     pub queue_edit_rule: PermissionRule,
     /// 곡 넘기기 권한 (§10.5). 재생/일시정지와 성격이 달라 `playback_rule`에서 갈라냈다.
-    /// **기본이 `GuildMember`** — 리모컨만 보는 사람도 곡을 넘길 수 있어야 한다.
-    #[serde(default = "default_open_rule")]
+    /// **기본이 `SameVoiceChannel`** — 듣지 않는 사람이 남의 재생을 넘기면 안 된다.
+    #[serde(default = "default_voice_rule")]
     pub skip_rule: PermissionRule,
     /// 자동 재생 권한 (§8.3). 추천 방식 전환·기준 곡 등록/삭제/정렬·최근 N곡 수·장르 선택·
     /// `📻 이 곡 말고`·자동 재생 On/Off 를 전부 관장한다. **기본이 `GuildMember`** 다.
@@ -1797,7 +1797,8 @@ pub struct RemoteGuildSettings {
     #[serde(default = "default_open_rule", alias = "autoplaySeedRule")]
     pub autoplay_rule: PermissionRule,
     /// 한 번에 담기 권한 (§15.4). 재생목록 전체 담기 + 차트 전체 담기를 함께 관장한다.
-    #[serde(default = "default_open_rule")]
+    /// **기본이 `SameVoiceChannel`** — 한 번에 수십 곡이 들어가면 듣던 사람의 대기열이 통째로 밀린다.
+    #[serde(default = "default_voice_rule")]
     pub bulk_enqueue_rule: PermissionRule,
     /// 레거시 통짜 지정 역할. **직접 읽지 말고** `roles_for`/`manager_roles`를 쓴다.
     /// 새 값이 없을 때만 폴백으로 쓰이고, 저장 시점에 분리된 값으로 대체된다.
@@ -1989,9 +1990,19 @@ fn default_chat_retention_days() -> u32 {
     30
 }
 
-/// 새 권한들의 기본값. 사용자가 "일반사용자도 할수있고"라고 명시했다(§8.3·§10.5·§15.4).
+/// 듣지 않는 사람에게도 열어 두는 것들의 기본값 (§8.3).
+/// 신청·좋아요·채팅·자동 재생 On/Off 는 음성에 없어도 할 수 있어야 한다 —
+/// 자동 재생은 저장되는 설정이라 특히 그렇다.
 fn default_open_rule() -> PermissionRule {
     PermissionRule::GuildMember
+}
+
+/// **지금 나오는 소리를 흔드는 조작의 기본값** (§10.5·§15.4).
+/// 넘기기·위치 이동·한 번에 담기는 같이 듣고 있는 사람들의 재생을 바꾼다.
+/// 음성에 없는 사람이 이걸 하면 정작 듣는 쪽은 영문을 모르므로 기본으로 막는다.
+/// (서버가 원하면 관리 콘솔에서 `모든 멤버` 로 열 수 있다.)
+fn default_voice_rule() -> PermissionRule {
+    PermissionRule::SameVoiceChannel
 }
 
 fn default_boomtta_threshold() -> u32 {
@@ -2232,12 +2243,12 @@ impl Default for RemoteGuildSettings {
             vote_rule: PermissionRule::GuildMember,
             chat_rule: PermissionRule::GuildMember,
             playback_rule: PermissionRule::SameVoiceChannel,
-            seek_rule: PermissionRule::GuildMember,
+            seek_rule: default_voice_rule(),
             volume_rule: PermissionRule::SameVoiceChannel,
             queue_edit_rule: PermissionRule::SameVoiceChannel,
-            skip_rule: default_open_rule(),
+            skip_rule: default_voice_rule(),
             autoplay_rule: default_open_rule(),
-            bulk_enqueue_rule: default_open_rule(),
+            bulk_enqueue_rule: default_voice_rule(),
             configured_role_ids: Vec::new(),
             rule_role_ids: BTreeMap::new(),
             manager_role_ids: Vec::new(),
@@ -2309,10 +2320,36 @@ mod tests {
         }
         // 관리자 지정 역할도 같은 방식으로 폴백한다.
         assert_eq!(settings.manager_roles(), &[123, 456]);
-        // v3 의 새 권한 3종은 기본이 "모든 사람"이다.
-        assert_eq!(settings.skip_rule, PermissionRule::GuildMember);
+        // 소리를 흔드는 조작은 기본이 "봇과 같은 음성 채널", 나머지는 "모든 멤버"다.
+        assert_eq!(settings.skip_rule, PermissionRule::SameVoiceChannel);
+        assert_eq!(settings.bulk_enqueue_rule, PermissionRule::SameVoiceChannel);
         assert_eq!(settings.autoplay_rule, PermissionRule::GuildMember);
-        assert_eq!(settings.bulk_enqueue_rule, PermissionRule::GuildMember);
+    }
+
+    /// 음성에 없는 사람이 무엇을 할 수 있고 무엇을 못 하는지 — 기본값 계약.
+    /// 채팅·좋아요·신청·자동 재생 On/Off 는 되고, 넘기기·위치 이동·한 번에 담기는 안 된다.
+    #[test]
+    fn listeners_only_control_what_changes_the_sound() {
+        let s = RemoteGuildSettings::default();
+        for (label, rule) in [
+            ("검색·신청", s.search_rule),
+            ("좋아요", s.vote_rule),
+            ("채팅", s.chat_rule),
+            ("자동 재생", s.autoplay_rule),
+        ] {
+            assert_eq!(rule, PermissionRule::GuildMember, "{label} 은 음성 없이도 돼야 한다");
+        }
+        for (label, rule) in [
+            ("넘기기", s.skip_rule),
+            ("위치 이동", s.seek_rule),
+            ("한 번에 담기", s.bulk_enqueue_rule),
+        ] {
+            assert_eq!(
+                rule,
+                PermissionRule::SameVoiceChannel,
+                "{label} 은 같은 음성 채널을 요구해야 한다"
+            );
+        }
     }
 
     /// v2 를 쓰던 서버의 `autoplaySeedRule` 과 그 지정 역할이 개명 때문에 사라지면 안 된다.
