@@ -324,6 +324,35 @@ pub fn public_now(guild_id: u64, build_id: &str) -> String {
     )
 }
 
+/// API 가이드 본문. 마크업이 길어서 별도 파일로 뺐다.
+///
+/// **에셋 테이블(`assets.rs` 의 `lookup`)에는 일부러 넣지 않았다.** 거기 넣으면
+/// `/music/assets/apidoc.html` 이 인증 없이 열리고, 아래 페이지에 걸어 둔 세션 검사가
+/// 우회된다. 여기서 `include_str!` 로 읽어 셸 안에서만 내보낸다.
+const APIDOC_BODY: &str = include_str!("assets/apidoc.html");
+
+/// `GET /music/apidoc` — API 가이드 문서.
+///
+/// `plain()` 을 쓰지 않는다. 그쪽은 `portal.css` 를 박아 두는데, 문서 화면은 자기 CSS 를
+/// 써야 하고 셸 규칙상 토큰 다음에 오는 화면별 CSS 는 **하나뿐**이기 때문이다.
+///
+/// 스크립트가 없다. 읽기만 하는 화면이라 붙일 것이 없고, 없으면 새어 나갈 것도 없다.
+/// (테마 깜빡임 방지 스크립트만 예외 — 스타일시트보다 먼저 돌아야 한다.)
+pub fn apidoc() -> String {
+    let build = super::assets::version();
+    format!(
+        r#"<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>API 가이드 · 마참뮤직</title>
+{THEME_BOOT}
+<link rel="icon" href="/music/assets/favicon.svg?v={build}">
+<link rel="stylesheet" href="/music/assets/tokens.css?v={build}">
+<link rel="stylesheet" href="/music/assets/apidoc.css?v={build}">
+</head><body>{APIDOC_BODY}</body></html>"#
+    )
+}
+
 /// 관리 콘솔 진입 거부 화면. 서버가 403을 주지만 사람이 읽을 수 있어야 한다.
 pub fn denied(message: &str, guild_id: u64) -> String {
     plain(
@@ -339,4 +368,65 @@ pub fn denied(message: &str, guild_id: u64) -> String {
             message = html_escape(message),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 셸 규칙: 토큰 다음에 오는 화면별 CSS 는 하나여야 한다.
+    /// `portal.css` 가 같이 실리면 문서 화면이 리모컨 레이아웃을 뒤집어쓴다.
+    #[test]
+    fn apidoc_links_tokens_then_only_its_own_stylesheet() {
+        let html = apidoc();
+        let tokens = html.find("tokens.css").expect("tokens.css 링크가 없다");
+        let own = html.find("apidoc.css").expect("apidoc.css 링크가 없다");
+        assert!(tokens < own, "tokens.css 가 화면 CSS 보다 먼저 와야 한다");
+        assert!(!html.contains("portal.css"));
+        assert!(!html.contains("console.css"));
+    }
+
+    /// 문서가 **코드에 없는 주소를 적지 못하게** 막는다.
+    ///
+    /// 이 문서의 값어치는 "지금 서버가 실제로 여는 경로" 라는 데 있다. 라우트를 지웠는데
+    /// 문서만 남으면 그때부터는 도움이 아니라 함정이다. 그래서 본문의 `<code>` 안에 적힌
+    /// 경로를 전부 긁어서 `remote.rs` 원문에 있는지 본다.
+    ///
+    /// 표에서는 길드 접두사를 빼고 뒷부분만 적으므로(`/state/hot`), `/music` 으로 시작하지
+    /// 않는 값에는 접두사를 붙여서 찾는다.
+    #[test]
+    fn every_path_in_the_apidoc_exists_in_the_router() {
+        // 테스트에서만 원문을 읽는다. 배포 바이너리에 소스가 딸려 들어가면 안 된다.
+        let router_source = include_str!("remote.rs");
+
+        // 이 라우터에 없는 것이 정상인 주소. 늘리기 전에 정말 그런지 확인할 것.
+        const SKIP: &[&str] = &["/healthz"]; // mod.rs 의 라우터에 있다
+
+        let mut checked = 0;
+        for chunk in APIDOC_BODY.split("<code>").skip(1) {
+            let Some(text) = chunk.split("</code>").next() else {
+                continue;
+            };
+            // 하나의 주소가 아니라 "이 아래 전부" 를 가리키는 조각은 건너뛴다
+            // (`/music/*` · `/music/api/guilds/{guild_id}/…` · 접두사를 뜻하는 `/music/`).
+            let is_prefix_form = text.ends_with('*') || text.ends_with('…') || text.ends_with('/');
+            // `//evil.example` 같은 프로토콜 상대 주소는 우리 라우트가 아니라 반례다.
+            let is_external = text.starts_with("//");
+            if !text.starts_with('/') || is_prefix_form || is_external || SKIP.contains(&text) {
+                continue;
+            }
+            let needle = if text.starts_with("/music") {
+                text.to_string()
+            } else {
+                format!("/music/api/guilds/{{guild_id}}{text}")
+            };
+            assert!(
+                router_source.contains(&needle),
+                "문서에 적힌 {needle} 이 remote.rs 에 없다"
+            );
+            checked += 1;
+        }
+        // 스킵 목록이 잘못 커져서 사실상 아무것도 안 보는 상태가 되는 걸 막는다.
+        assert!(checked > 50, "검사한 경로가 {checked}개뿐이다");
+    }
 }

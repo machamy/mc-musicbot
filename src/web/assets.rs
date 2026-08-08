@@ -19,6 +19,12 @@ use std::sync::OnceLock;
 const TOKENS_CSS: &str = include_str!("assets/tokens.css");
 const PORTAL_CSS: &str = include_str!("assets/portal.css");
 const CONSOLE_CSS: &str = include_str!("assets/console.css");
+/// API 가이드 문서(`/music/apidoc`) 전용. 문서 화면은 토큰 다음에 이 파일 하나만 링크한다.
+///
+/// 본문 마크업(`assets/apidoc.html`)은 **여기 없다.** `remote_page.rs` 가 직접 읽어 셸에 넣는다.
+/// 에셋으로 등록하면 `/music/assets/apidoc.html` 이 로그인 게이트 밖에서 열려서,
+/// 문서 페이지에 걸어 둔 세션 검사가 무의미해진다.
+const APIDOC_CSS: &str = include_str!("assets/apidoc.css");
 
 // ── JS ──
 const CORE_JS: &str = include_str!("assets/core.js");
@@ -51,6 +57,7 @@ pub fn version() -> &'static str {
             TOKENS_CSS,
             PORTAL_CSS,
             CONSOLE_CSS,
+            APIDOC_CSS,
             CORE_JS,
             PORTAL_JS,
             CONSOLE_JS,
@@ -78,6 +85,7 @@ fn lookup(name: &str) -> Option<Asset> {
         "tokens.css" => Asset::Text(TOKENS_CSS, "text/css; charset=utf-8"),
         "portal.css" => Asset::Text(PORTAL_CSS, "text/css; charset=utf-8"),
         "console.css" => Asset::Text(CONSOLE_CSS, "text/css; charset=utf-8"),
+        "apidoc.css" => Asset::Text(APIDOC_CSS, "text/css; charset=utf-8"),
 
         "core.js" => Asset::Text(CORE_JS, "text/javascript; charset=utf-8"),
         "portal.js" => Asset::Text(PORTAL_JS, "text/javascript; charset=utf-8"),
@@ -207,6 +215,7 @@ mod tests {
             "tokens.css",
             "portal.css",
             "console.css",
+            "apidoc.css",
             "core.js",
             "portal.js",
             "console.js",
@@ -233,6 +242,7 @@ mod tests {
         assert!(!PORTAL_JS.trim().is_empty());
         assert!(!PORTAL_CSS.trim().is_empty());
         assert!(!CONSOLE_JS.trim().is_empty());
+        assert!(!APIDOC_CSS.trim().is_empty());
         assert!(ICON_192.starts_with(b"\x89PNG"));
         assert!(ICON_512.starts_with(b"\x89PNG"));
     }

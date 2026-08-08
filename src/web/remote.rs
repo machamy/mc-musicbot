@@ -742,6 +742,10 @@ pub fn router() -> Router<Arc<WebState>> {
         .route("/music/guilds/{guild_id}/now", get(public_now_page))
         // 패치노트 (§30). 로그인 여부와 무관하다 — 무엇이 바뀌었는지는 비밀이 아니다.
         .route("/music/api/changelog", get(api_changelog))
+        // API 가이드 문서. 링크를 아는 사람만 들어온다 — 어디에서도 이 주소로 링크하지 않는다.
+        // 주소가 `/music` 아래인 것은 취향이 아니다. 리모컨 도메인에서는 `/music/*` 밖이
+        // 전부 404 라(`mod.rs` 의 `host_scope_guard`) 다른 자리에 두면 열리지 않는다.
+        .route("/music/apidoc", get(apidoc_page))
         // 서버 승인 (§26) — **봇 주인 전용**. 길드 인가를 안 태운다:
         // 아직 승인 안 된 서버가 대상이라 길드 게이트를 통과할 수 없기 때문이다.
         .route("/music/api/owner/guilds", get(api_owner_guilds))
@@ -9385,6 +9389,27 @@ async fn api_changelog(headers: HeaderMap) -> Response {
         json!({ "markdown": text, "latest": latest }),
         headers.get(header::IF_NONE_MATCH),
     )
+}
+
+/// `GET /music/apidoc` — API 가이드 문서. 링크로만 들어온다(진입 버튼을 만들지 않았다).
+///
+/// **로그인을 요구한다.** 리모컨에서 세션 없이 열리는 페이지는 `/music/login` 계열과,
+/// 서버가 직접 켜야 보이는 `/music/guilds/{id}/now` 뿐이다. 나머지 페이지(`/music`,
+/// `/music/guilds/{id}`)는 전부 세션부터 본다. 이 문서는 관리자·봇 주인 전용 경로까지
+/// 한자리에 늘어놓아서, "무엇이 바뀌었나" 만 알려 주는 패치노트와는 성격이 다르다.
+/// 비밀은 아니지만 공격 표면 목록을 로그인 없이 뿌릴 이유도 없다.
+///
+/// 반대로 **길드 인가는 태우지 않는다.** 문서에 길드 데이터가 한 줄도 없어서 특정 서버의
+/// 멤버여야 할 이유가 없다. 개인 설정(`/music/api/prefs`)과 같은 수준 — 세션만 본다.
+///
+/// 401 을 JSON 으로 주지 않고 로그인 화면으로 보낸다. 사람이 브라우저로 여는 주소라
+/// `{"error":…}` 를 그대로 띄우면 막다른 길이 된다. `next` 를 달아 로그인 뒤 돌아오게 한다.
+async fn apidoc_page(State(state): State<Arc<WebState>>, cookies: Cookies) -> Response {
+    if current_session(&state, &cookies).is_none() {
+        let next = percent_encode("/music/apidoc");
+        return Redirect::to(&format!("/music/login?next={next}")).into_response();
+    }
+    html_page(remote_page::apidoc())
 }
 
 /// `GET /music/guilds/{id}/now` — 로그인 없이 보는 화면 (§29).

@@ -1,0 +1,279 @@
+/* 마참뮤직 API 가이드 문서 화면.
+ *
+ * tokens.css 다음에 **이 파일 하나만** 링크된다(remote_page.rs 의 셸 규칙).
+ * 그래서 portal.css / console.css 의 클래스는 여기서 쓸 수 없고, 필요한 것은 전부
+ * 여기에 다시 있어야 한다. 대신 색은 한 줄도 새로 만들지 않는다 —
+ * 토큰만 쓰면 테마 7종이 늘어나도 이 파일은 손댈 일이 없다.
+ */
+
+body {
+  /* tokens.css 의 body 는 height:100% 라서 문서처럼 길게 흐르는 화면에서는
+     스크롤이 바깥으로 새어 나간다. 문서 화면만 자연 높이로 되돌린다. */
+  height: auto;
+  min-height: 100%;
+  overscroll-behavior: auto;
+}
+
+/* ───────────────────────── 머리말 ───────────────────────── */
+
+.doc-top {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-header);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-5);
+  /* 반투명 위에 블러. 표가 밑으로 지나갈 때 글씨가 겹쳐 보이지 않는다. */
+  background: color-mix(in srgb, var(--surface-1) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line-1);
+}
+.doc-top__mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--fs-lg);
+  flex: none;
+}
+.doc-top__title { font-size: var(--fs-lg); font-weight: var(--fw-semi); color: var(--text-1); }
+.doc-top__sub { color: var(--text-3); font-size: var(--fs-sm); }
+.doc-top__spacer { flex: 1 1 auto; }
+
+/* ───────────────────────── 레이아웃 ───────────────────────── */
+
+.doc {
+  display: grid;
+  grid-template-columns: 224px minmax(0, 1fr);
+  gap: var(--sp-8);
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: var(--sp-6) var(--sp-5) var(--sp-12);
+  align-items: start;
+}
+
+/* 목차. 데스크톱에서는 따라다니고, 좁아지면 본문 위 카드로 접힌다. */
+.doc-nav {
+  position: sticky;
+  top: calc(var(--header-h) + var(--sp-3));
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  /* minmax(0,1fr) 이 아닌 고정 열이라 긴 항목이 넘치면 자기 안에서 스크롤한다. */
+  max-height: calc(100vh - var(--header-h) - var(--sp-8));
+  overflow-y: auto;
+}
+.doc-nav__label {
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  color: var(--text-4);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semi);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.doc-nav a {
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  font-size: var(--fs-md);
+  text-decoration: none;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.doc-nav a:hover { background: var(--surface-2); color: var(--text-1); text-decoration: none; }
+
+.doc-main { min-width: 0; }
+
+/* ───────────────────────── 본문 ───────────────────────── */
+
+.doc-sec {
+  padding: var(--sp-6) 0 var(--sp-2);
+  /* 앵커로 뛰었을 때 sticky 헤더 밑에 제목이 숨지 않게 한다. */
+  scroll-margin-top: calc(var(--header-h) + var(--sp-4));
+  border-top: 1px solid var(--line-1);
+}
+.doc-sec:first-child { border-top: none; padding-top: 0; }
+
+.doc-sec > h2 {
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-2xl);
+  letter-spacing: -0.01em;
+}
+.doc-sec > h3 {
+  margin: var(--sp-6) 0 var(--sp-2);
+  font-size: var(--fs-lg);
+  color: var(--text-1);
+}
+.doc-sec h4 {
+  margin: var(--sp-5) 0 var(--sp-2);
+  color: var(--text-2);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semi);
+}
+.doc-sec p { margin: var(--sp-3) 0; color: var(--text-2); }
+.doc-sec ul { margin: var(--sp-3) 0; padding-left: var(--sp-5); list-style: disc; }
+.doc-sec li { margin: var(--sp-1) 0; color: var(--text-2); }
+.doc-sec li::marker { color: var(--text-4); }
+.doc-lead { color: var(--text-3); font-size: var(--fs-lg); line-height: var(--lh-base); }
+
+code, .code {
+  padding: 1px 5px;
+  border-radius: var(--r-xs);
+  background: var(--surface-3);
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  /* 긴 경로가 좁은 화면에서 줄바꿈 없이 튀어나가는 걸 막는다.
+     `anywhere` 가 아니라 `break-word` 다 — 자리가 있는데도 단어를 쪼개면
+     `window.MACHAM.csrf` 같은 짧은 것까지 두 줄로 끊긴다. */
+  overflow-wrap: break-word;
+}
+
+pre {
+  margin: var(--sp-4) 0;
+  padding: var(--sp-4);
+  background: var(--surface-inset);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-md);
+  overflow-x: auto;
+}
+pre code {
+  padding: 0;
+  background: none;
+  color: var(--text-2);
+  font-size: var(--fs-md);
+  line-height: 1.6;
+  overflow-wrap: normal;
+  white-space: pre;
+}
+
+/* 짚고 넘어갈 것. 색은 의미색 토큰만 쓴다. */
+.note {
+  display: flex;
+  gap: var(--sp-3);
+  margin: var(--sp-4) 0;
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--line-2);
+  border-left: 3px solid var(--info);
+  border-radius: var(--r-sm);
+  background: var(--info-soft);
+  color: var(--text-2);
+  font-size: var(--fs-md);
+}
+.note--warn { border-left-color: var(--warn); background: var(--warn-soft); }
+.note--danger { border-left-color: var(--danger); background: var(--danger-soft); }
+.note__icon { flex: none; }
+.note strong { color: var(--text-1); }
+
+/* ───────────────────────── 표 ─────────────────────────
+ * 모바일에서 표가 페이지를 넓히지 않도록 **반드시** 이 래퍼 안에 둔다.
+ * 래퍼가 가로 스크롤을 먹고, 페이지 본문은 절대 옆으로 밀리지 않는다.
+ */
+.tbl {
+  margin: var(--sp-4) 0;
+  overflow-x: auto;
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-md);
+  -webkit-overflow-scrolling: touch;
+}
+.tbl table {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+  font-size: var(--fs-md);
+}
+.tbl th {
+  /* 헤더를 sticky 로 붙이지 않는다. `overflow-x: auto` 를 준 순간 `.tbl` 이 세로로도
+     스크롤 컨테이너가 돼서, sticky 의 기준이 페이지가 아니라 표 자신이 된다.
+     그 상태로 top 을 주면 헤더가 표 안에서 아래로 밀려 첫 줄을 덮는다. */
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semi);
+  text-align: left;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--line-2);
+  white-space: nowrap;
+}
+.tbl td {
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--line-1);
+  color: var(--text-2);
+  vertical-align: top;
+}
+.tbl tr:nth-child(even) td { background: color-mix(in srgb, var(--surface-2) 45%, transparent); }
+.tbl td:first-child { white-space: nowrap; }
+.tbl td code { background: none; padding: 0; color: var(--text-1); }
+
+/* 메서드 배지. GET=정보, POST=성공, PUT=주의 — 의미색을 그대로 빌린다. */
+.m {
+  display: inline-block;
+  min-width: 44px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-xs);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-bold);
+  text-align: center;
+  background: var(--surface-3);
+  color: var(--text-3);
+}
+.m--get { background: var(--info-soft); color: var(--info); }
+.m--post { background: var(--ok-soft); color: var(--ok); }
+.m--put { background: var(--warn-soft); color: var(--warn); }
+.m--ws { background: var(--accent-soft); color: var(--accent); }
+
+/* 필요 권한 칸. tokens.css 의 .tier 색을 그대로 쓴다. */
+.lv { font-weight: var(--fw-semi); white-space: nowrap; }
+.lv--public { color: var(--ok); }
+.lv--session { color: var(--tier-member); }
+.lv--member { color: var(--tier-member); }
+.lv--manager { color: var(--tier-manager); }
+.lv--owner { color: var(--tier-owner); }
+.lv--rule { color: var(--text-3); }
+
+.doc-foot {
+  margin-top: var(--sp-10);
+  padding-top: var(--sp-5);
+  border-top: 1px solid var(--line-1);
+  color: var(--text-4);
+  font-size: var(--fs-sm);
+}
+
+/* ───────────────────────── 좁은 화면 ─────────────────────────
+ * 목차를 위로 올리고 가로로 흐르게 한다. 세로로 쌓으면 첫 화면이 목차로 다 찬다.
+ */
+@media (max-width: 900px) {
+  .doc {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--sp-4);
+    padding: var(--sp-4) var(--sp-4) var(--sp-10);
+  }
+  .doc-nav {
+    position: static;
+    flex-direction: row;
+    max-height: none;
+    overflow-x: auto;
+    gap: var(--sp-2);
+    padding-bottom: var(--sp-2);
+  }
+  .doc-nav__label { display: none; }
+  .doc-nav a {
+    flex: none;
+    background: var(--surface-2);
+    border: 1px solid var(--line-1);
+    white-space: nowrap;
+    font-size: var(--fs-sm);
+  }
+  .doc-sec > h2 { font-size: var(--fs-xl); }
+  .doc-lead { font-size: var(--fs-base); }
+  .doc-top { padding: var(--sp-3) var(--sp-4); }
+  .doc-top__sub { display: none; }
+}
