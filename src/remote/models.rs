@@ -1072,6 +1072,15 @@ impl AuditKind {
 /// 사람 피드의 기본 필터에 안 잡히므로 조용히 새어 나가지 않는다.
 pub fn audit_kind_for(action: &str) -> AuditKind {
     match action {
+        // 디스코드 명령어 (§32). 뒤에 붙은 명령 이름으로 분류를 정한다 —
+        // `discord.` 를 통째로 Admin 으로 몰면 재생 필터에서 안 보인다.
+        _ if action.starts_with("discord.") => {
+            match action.trim_start_matches("discord.") {
+                "play" | "playnow" | "clear" | "remove" => AuditKind::Song,
+                "playlist" => AuditKind::Playlist,
+                _ => AuditKind::Playback,
+            }
+        }
         _ if action.starts_with("queue.") => AuditKind::Song,
         "playlist.enqueue" | "chart.enqueue" => AuditKind::Song,
         _ if action.starts_with("vote.") => AuditKind::Vote,
@@ -1353,6 +1362,17 @@ pub fn audit_text(
     after: Option<&str>,
     count: u32,
 ) -> String {
+    // 디스코드에서 온 것은 **어디서 했는지를 문장에 박는다** (§32).
+    // 같은 "곡을 넘겼어요" 라도 리모컨인지 채널인지 알아야 상황이 읽힌다.
+    // `target` 에 사람이 읽는 동사구가 그대로 들어온다.
+    if let Some(verb) = action.strip_prefix("discord.") {
+        let _ = verb;
+        return match target {
+            Some(text) => format!("{actor}님이 디스코드에서 {text}"),
+            None => format!("{actor}님이 디스코드에서 명령어를 썼어요"),
+        };
+    }
+
     let item = target.map(truncate_title);
     let item = item.as_deref();
     let many = count > 1;

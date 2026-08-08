@@ -801,6 +801,10 @@ pub async fn handle_command(app: Arc<App>, ctx: Context, cmd: CommandInteraction
     }
 
     let result = dispatch(&app, &ctx, &cmd, canonical, guild_id).await;
+    // 디스코드에서 한 일도 사람 피드에 남긴다 (§32). 전에는 리모컨에서 한 것만 보여서
+    // 채널에서 `/스킵` 을 눌러 곡이 넘어가도 웹에서는 **아무 이유 없이 바뀐 것처럼** 보였다.
+    // 어디서 했는지도 같이 적는다 — 같은 동작이라도 출처를 알아야 상황이 읽힌다.
+    log_discord_command(&app, guild_id, &cmd, canonical, result.is_ok());
     if let Err(msg) = result {
         respond_text(&ctx, &cmd, &format!("⚠️ {msg}"), true).await;
     }
@@ -808,6 +812,66 @@ pub async fn handle_command(app: Arc<App>, ctx: Context, cmd: CommandInteraction
         "Command",
         &format!("Completed '{canonical}' for interaction {}.", cmd.id),
     );
+}
+
+/// 디스코드 명령어를 사람 피드에 한 줄로 남긴다 (§32).
+///
+/// **조회만 하는 명령은 뺀다.** `/도움말` 같은 걸 남기면 피드가 남의 조회 기록으로 덮인다.
+/// 남기는 것은 다른 사람 눈에 결과가 보이는 것들뿐이다.
+fn log_discord_command(
+    app: &Arc<App>,
+    guild_id: u64,
+    cmd: &CommandInteraction,
+    canonical: &str,
+    ok: bool,
+) {
+    let Some(verb) = discord_log_verb(canonical) else {
+        return;
+    };
+    let who = cmd
+        .member
+        .as_ref()
+        .and_then(|m| m.nick.clone())
+        .unwrap_or_else(|| cmd.user.name.clone());
+    // 분류와 문장은 `audit_kind_for` · `audit_text` 가 만든다 — 리모컨 기록과 같은 길을 탄다.
+    let _ = app.remote.add_audit(
+        guild_id,
+        cmd.user.id.get(),
+        &who,
+        &format!("discord.{canonical}"),
+        Some(verb),
+        None,
+        None,
+        ok,
+        (!ok).then_some("명령이 실패했어요"),
+    );
+}
+
+/// 명령어 → 사람이 읽는 동사구. `None` 이면 피드에 안 남긴다.
+///
+/// **조회형은 뺀다.** `/도움말`·`/현재곡` 까지 남기면 피드가 남의 조회 기록으로 덮여
+/// 정작 무슨 일이 있었는지가 묻힌다. 남기는 것은 남 눈에 결과가 보이는 것들뿐이다.
+fn discord_log_verb(canonical: &str) -> Option<&'static str> {
+    Some(match canonical {
+        "play" => "곡을 신청했어요",
+        "playnow" => "곡을 바로 틀었어요",
+        "skip" => "곡을 넘겼어요",
+        "stop" => "재생을 멈췄어요",
+        "pause" => "일시정지했어요",
+        "resume" => "다시 재생했어요",
+        "replay" => "처음부터 다시 틀었어요",
+        "previous" => "이전 곡으로 돌아갔어요",
+        "volume" => "볼륨을 바꿨어요",
+        "shuffle" => "대기열을 섞었어요",
+        "repeat" => "반복 설정을 바꿨어요",
+        "autoplay" => "자동 재생을 바꿨어요",
+        "clear" => "대기열을 비웠어요",
+        "remove" => "대기열에서 곡을 뺐어요",
+        "join" => "봇을 음성 채널로 불렀어요",
+        "leave" => "봇을 음성 채널에서 내보냈어요",
+        "playlist" => "재생목록을 건드렸어요",
+        _ => return None,
+    })
 }
 
 async fn dispatch(

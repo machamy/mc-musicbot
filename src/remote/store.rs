@@ -4505,6 +4505,16 @@ mod tests {
 
         // 역할을 판정하는 데 실제로 목록이 필요한 규칙만 true 여야 한다.
         // 여기가 틀리면 조회 실패 때 멀쩡한 거절까지 "잠시 뒤 다시" 로 바뀐다.
+        // 디스코드 명령어 기록은 **어디서 했는지가 문장에 있어야** 한다 (§32).
+        // 그리고 재생 계열은 Playback 으로 분류돼야 로그 필터에서 보인다.
+        use crate::remote::{AuditKind as K, audit_kind_for, audit_text};
+        assert_eq!(audit_kind_for("discord.skip"), K::Playback);
+        assert_eq!(audit_kind_for("discord.play"), K::Song);
+        assert_eq!(audit_kind_for("discord.playlist"), K::Playlist);
+        let line = audit_text("discord.skip", "마참", Some("곡을 넘겼어요"), None, None, 1);
+        assert_eq!(line, "마참님이 디스코드에서 곡을 넘겼어요");
+        assert!(line.contains("디스코드"), "출처가 빠지면 리모컨 기록과 구분이 안 된다");
+
         use crate::remote::PermissionRule as Rule;
         assert!(Rule::ConfiguredRole.needs_roles());
         assert!(Rule::Administrator.needs_roles());

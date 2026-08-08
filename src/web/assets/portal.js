@@ -3966,9 +3966,11 @@ function buildStage() {
   // 자동 재생 켜고 끄기 — 관리자 전용이 아니라 autoplay 권한을 본다 (§24.3)
   el.autoplayBtn = bindAct(h('button', {
     class: 'pbtn', type: 'button', tip: '자동 재생 켜기/끄기', 'aria-label': '자동 재생',
-  }, '📻'), () => {
-    const on = !!store.get().player?.autoplayEnabled;
-    control('autoplay', on ? 0 : 1);
+  }, '📻'), async () => {
+    const on = autoplayIsOn(store.get().player);
+    // **서버 응답을 기다렸다 알린다.** 먼저 띄우면 권한이 없어 거절당해도
+    // "켰어요" 가 뜨고 버튼은 그대로라, 눌렀는데 아무 일도 안 난 것처럼 보인다.
+    await control('autoplay', on ? 0 : 1);
     toast(on ? '자동 재생을 껐어요. 대기열이 비면 조용해져요.' : '자동 재생을 켰어요. 대기열이 비면 알아서 골라 와요.', 'ok');
   });
 
@@ -4674,6 +4676,16 @@ function syncWebUi() {
   if (!webOn) setWebNote(webBlocked || '');
 }
 
+/** 자동 재생이 켜져 있는가.
+ *
+ * **판정이 한 군데여야 한다.** 예전엔 그리는 쪽은 `!== false`(모르면 켜짐), 누르는 쪽은
+ * `!!`(모르면 꺼짐)를 써서 서로 반대였다. 값이 아직 안 온 상태에서 누르면 켜져 보이는
+ * 버튼이 "켰어요" 토스트를 띄우고 아무것도 안 바뀌는, 딱 어색한 동작이 나왔다.
+ */
+function autoplayIsOn(player) {
+  return (player || {}).autoplayEnabled !== false;
+}
+
 /* ── 진행바 드래그 ── */
 
 let seeking = false;
@@ -4812,8 +4824,10 @@ function renderNow(state) {
   }
 
   // 자동 재생 토글 (§24.3)
-  const autoplayOn = player.autoplayEnabled !== false;
+  const autoplayOn = autoplayIsOn(player);
   el.autoplayBtn.setAttribute('aria-pressed', String(autoplayOn));
+  // 색만으로 구분하면 흑백·고대비 화면에서 켜짐/꺼짐이 같아 보인다. 아이콘도 바꾼다.
+  el.autoplayBtn.textContent = autoplayOn ? '📻' : '🚫';
 
   const offline = !online || !connected;
   const offlineReason = !online ? '봇이 꺼져 있어요' : '봇이 음성 채널에 없어요';
