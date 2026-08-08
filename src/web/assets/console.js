@@ -386,6 +386,12 @@ const S = {
   clearingQueue: false,
   /** 섹션별 지연 로드 데이터 */
   queuePreview: { mode: null, data: null, loading: false },
+  /**
+   * 정렬 미리보기에서 지금 보고 있는 탭 — `live`(지금 대기열) · `sample`(샘플 대기열).
+   * 섹션을 다시 그려도 보던 탭이 유지돼야 한다. 정렬 모드를 누르면 renderSection 이 통째로
+   * 다시 그리는데, 그때마다 "지금 대기열"로 튕기면 샘플로 세 방식을 비교하던 흐름이 끊긴다.
+   */
+  previewTab: 'live',
   permPreview: {},  // 설정 키 → { passCount, memberCount, ... }
   seeds: { items: null, max: SEED_MAX_FALLBACK, canEdit: false, error: null, loading: false },
   participants: null,
@@ -802,12 +808,13 @@ function sectionOrder() {
   const modeSpec = SORT_MODES.find((item) => item.value === mode) || SORT_MODES[0];
 
   const previewBox = h('div', { class: 'prev' });
+  const sampleBox = h('div', { class: 'smpl' });
   const modeField = fieldShell('sortMode', '대기열 정렬 방식',
     null,
     segmentControl('sortMode', SORT_MODES, () => loadQueuePreview()),
     h('div', { class: 'sortnote' },
       h('p', { class: 'sortnote__body' }, modeSpec.desc),
-      previewBox,
+      previewTabs(previewBox, sampleBox),
     ),
   );
 
@@ -825,6 +832,7 @@ function sectionOrder() {
   );
 
   renderQueuePreview(previewBox);
+  renderSampleQueue(sampleBox);
   loadQueuePreview();
   return body;
 }
@@ -963,8 +971,9 @@ function votePointsGroup(previewBox) {
   paint();
 
   // 점수를 바꾸면 계산식도, 아래 대기열 미리보기도 같이 따라간다.
-  group.addEventListener('input', () => { paint(); scheduleQueuePreview(); });
-  group.addEventListener('click', () => { paint(); });
+  // 샘플은 서버를 안 거치니 지연 없이 즉시 다시 계산한다 — 슬라이더를 끄는 동안 순서가 실시간으로 갈린다.
+  group.addEventListener('input', () => { paint(); repaintSampleQueue(); scheduleQueuePreview(); });
+  group.addEventListener('click', () => { paint(); repaintSampleQueue(); });
   if (S.draft.sortMode === 'fifo') {
     group.append(h('div', { class: 'warnbox warnbox--info' },
       h('span', null, 'ℹ'),
@@ -1667,11 +1676,19 @@ function renderQueuePreview(box) {
   }
   const items = preview.data.items || [];
   if (!items.length) {
+    // 빈 화면만 보여 주고 끝내면 정렬 방식을 고르는 사람이 아무 판단도 못 한다.
+    // 곡이 없을 때야말로 샘플이 필요한 순간이라 그쪽으로 넘어가는 길을 같이 준다.
     box.append(h('div', { class: 'empty' },
       h('div', { class: 'empty__icon' }, '🎵'),
       h('div', { class: 'empty__title' }, '대기열이 비어 있어요'),
       h('div', { class: 'empty__desc' }, '곡이 쌓이면 여기서 순서가 어떻게 바뀌는지 미리 보실 수 있어요.'),
+      h('button', {
+        class: 'btn btn--sm', type: 'button',
+        'data-tip': '예시 곡으로 세 방식의 차이를 대신 보여드려요',
+        onclick: () => openSampleTab(),
+      }, '샘플 대기열로 비교해 볼게요'),
     ));
+    tooltip(box);
     return;
   }
 
@@ -1692,6 +1709,218 @@ function renderQueuePreview(box) {
   if (items.length > 10) {
     box.append(h('p', { class: 'hint' }, `아래로 ${items.length - 10}곡 더 있어요.`));
   }
+}
+
+/* ── 샘플 대기열 미리보기 ──
+ *
+ * 왜 있나: 위쪽 "지금 대기열" 미리보기는 **이 서버의 실제 대기열**을 쓴다. 그런데 설정을 만지는
+ * 시점은 보통 아무도 안 듣고 있을 때다. 대기열이 비었거나 한두 곡이면 세 방식이 전부 같은 순서를
+ * 내놓기 때문에, 정작 "이 방식으로 바꾸면 뭐가 달라지나"를 볼 수가 없다.
+ * 그래서 **고정된 가짜 대기열**을 하나 두고, 세 방식의 결과를 나란히 보여 준다.
+ *
+ * 서버를 새로 파지 않는 이유: 이 데이터는 고정이고 정렬 규칙도 순수 함수라 클라에서 계산하면 끝이다.
+ * 미리보기 하나 보자고 엔드포인트를 늘리면 유휴 상태 쿼리 0회 기준(§23.2)만 갉아먹는다.
+ *
+ * 대신 **정렬 규칙은 반드시 서버와 같아야 한다**. 아래 비교 함수들은 `src/remote/ranking.rs` 의
+ * `compare_score` / `compare_fifo` / `compare_fair` 를 그대로 옮긴 것이고, 점수는 화면에서
+ * 편집 중인 점수표(`draftVotePoints`)를 쓴다 — 서버의 `QueueScore::total_score` 와 같은 식이다.
+ * 샘플에는 수동 우선순위(핀·붐따)가 없어서 `compare_manual` 단계만 빠져 있다.
+ */
+
+/**
+ * 샘플 곡 6개 — 신청자 3명. **세 방식이 서로 다른 1위를 내도록** 일부러 이렇게 짰다.
+ *   · 여름밤 드라이브 : 제일 먼저 신청 + 오래 기다림 → 시간제 1위
+ *   · 떼창 유발 록    : 제일 늦게 신청했지만 좋아요 폭격 → 점수제 1위
+ *   · 노래방 18번     : 싫어요를 받아 점수는 꼴찌지만 아직 한 곡도 못 튼 사람 곡 → 공평제 1위
+ * 민수가 3곡을 몰아 넣은 것도 의도다. 공평제에서 그 3곡이 라운드별로 흩어지는 게 눈에 보여야 한다.
+ * `order` 는 신청 순서(서버의 `original_order`), `wait` 는 기다린 곡 수(`wait_score`)다.
+ */
+const SAMPLE_QUEUE = [
+  { id: 'smpl-1', order: 0, who: '민수', title: '여름밤 드라이브',  like: 0, superLike: 0, dislike: 0, wait: 3 },
+  { id: 'smpl-2', order: 1, who: '지훈', title: '출근길 시티팝',    like: 5, superLike: 0, dislike: 0, wait: 2 },
+  { id: 'smpl-3', order: 2, who: '민수', title: '새벽 감성 발라드',  like: 1, superLike: 1, dislike: 0, wait: 1 },
+  { id: 'smpl-4', order: 3, who: '수연', title: '노래방 18번',      like: 0, superLike: 0, dislike: 2, wait: 1 },
+  { id: 'smpl-5', order: 4, who: '민수', title: '떼창 유발 록',      like: 8, superLike: 1, dislike: 0, wait: 0 },
+  { id: 'smpl-6', order: 5, who: '지훈', title: '카페 재즈',        like: 2, superLike: 0, dislike: 0, wait: 0 },
+];
+
+/**
+ * 신청자별 마지막 재생 시각 — 공평제의 2순위 기준(`last_played_utc`).
+ * 빈 문자열은 "아직 한 곡도 못 틀었다"는 뜻이고, 서버와 똑같이 **제일 앞에 온다**.
+ * 수연이 그 자리라서 같은 1라운드 안에서도 수연 곡이 먼저 나간다.
+ */
+const SAMPLE_LAST_PLAYED = { 민수: '2025-05-01T21:40:00Z', 지훈: '2025-05-01T21:10:00Z', 수연: '' };
+
+/** 서버 `QueueScore::total_score` 와 같은 식. 배수를 여기서 다시 곱하지 않는다 (§10.1). */
+function sampleScore(row, points) {
+  return row.wait * points.wait
+    + row.like * points.like
+    + row.superLike * points.superLike
+    + row.dislike * points.dislike;
+}
+
+/** 서버 `ranking::request_rounds` — 사람별로 신청 순서대로 줄 세운 0-based 라운드. */
+function sampleRounds() {
+  const ordered = SAMPLE_QUEUE.slice().sort(sampleTail);
+  const next = new Map();
+  const rounds = new Map();
+  ordered.forEach((row) => {
+    const slot = next.get(row.who) || 0;
+    rounds.set(row.id, slot);
+    next.set(row.who, slot + 1);
+  });
+  return rounds;
+}
+
+/** 모든 모드가 공유하는 마지막 결정자: 신청 순서 → id (서버 `compare_tail`). */
+function sampleTail(a, b) {
+  return (a.order - b.order) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+/** 샘플 대기열을 이 방식·이 점수표로 정렬한 결과. 원본 배열은 건드리지 않는다. */
+function sampleSorted(mode, points, rounds) {
+  const rows = SAMPLE_QUEUE.slice();
+  if (mode === 'score') {
+    // 총점 내림차순 → 신청 순서. 서버 `compare_score` 와 같다.
+    rows.sort((a, b) => (sampleScore(b, points) - sampleScore(a, points)) || sampleTail(a, b));
+  } else if (mode === 'fair') {
+    // 라운드 오름차순 → 마지막 재생 시각 오름차순(못 튼 사람이 먼저) → 신청 순서.
+    rows.sort((a, b) => {
+      const byRound = (rounds.get(a.id) || 0) - (rounds.get(b.id) || 0);
+      if (byRound) return byRound;
+      const left = SAMPLE_LAST_PLAYED[a.who] || '';
+      const right = SAMPLE_LAST_PLAYED[b.who] || '';
+      if (left !== right) return left < right ? -1 : 1;
+      return sampleTail(a, b);
+    });
+  } else {
+    // 시간제는 점수를 아예 안 본다.
+    rows.sort(sampleTail);
+  }
+  return rows;
+}
+
+/** 그 방식에서 이 곡이 왜 그 자리인지 한 조각으로 말한다. 근거 없는 순위는 설득이 안 된다. */
+function sampleReason(mode, row, points, rounds) {
+  if (mode === 'score') return `${sampleScore(row, points)}점`;
+  if (mode === 'fair') return `${(rounds.get(row.id) || 0) + 1}번째 곡`;
+  return `${row.order + 1}번째 신청`;
+}
+
+/**
+ * 미리보기 두 장을 탭으로 묶는다.
+ * 나란히 놓지 않고 탭으로 둔 이유: 정렬 방식 설명 바로 아래라 세로 공간이 이미 빡빡하고,
+ * 샘플 쪽은 표가 3열이라 옆에 붙이면 좁은 화면에서 둘 다 못 읽는 폭이 된다.
+ */
+function previewTabs(liveBox, sampleBox) {
+  const bar = h('div', { class: 'prevtabs', role: 'tablist', 'aria-label': '미리보기 종류' });
+  const panes = [
+    { id: 'live',   label: '지금 대기열', box: liveBox,   tip: '이 서버에 실제로 줄 서 있는 곡에 이 방식을 적용해 봐요' },
+    { id: 'sample', label: '샘플 대기열', box: sampleBox, tip: '예시 곡 6개로 세 방식이 어떻게 갈리는지 나란히 봐요' },
+  ];
+  panes.forEach((pane) => {
+    bar.append(h('button', {
+      class: 'prevtabs__btn', type: 'button', role: 'tab',
+      'data-tab': pane.id, 'data-tip': pane.tip,
+      onclick: () => showPreviewTab(pane.id, bar, panes),
+    }, pane.label));
+  });
+  const wrap = h('div', { class: 'prevwrap' }, bar, liveBox, sampleBox);
+  showPreviewTab(S.previewTab, bar, panes);
+  tooltip(bar);
+  return wrap;
+}
+
+function showPreviewTab(id, bar, panes) {
+  S.previewTab = panes.some((pane) => pane.id === id) ? id : 'live';
+  bar.querySelectorAll('.prevtabs__btn').forEach((btn) => {
+    const on = btn.dataset.tab === S.previewTab;
+    btn.classList.toggle('is-on', on);
+    btn.setAttribute('aria-selected', on ? 'true' : 'false');
+    btn.tabIndex = on ? 0 : -1;
+  });
+  panes.forEach((pane) => { pane.box.hidden = pane.id !== S.previewTab; });
+}
+
+/** "대기열이 비어 있어요" 자리에서 샘플로 건너뛴다 — 빈 화면만 보여 주고 끝내지 않는다. */
+function openSampleTab() {
+  const btn = sectionBox && sectionBox.querySelector('.prevtabs__btn[data-tab="sample"]');
+  if (btn) btn.click();
+}
+
+/** 점수 슬라이더를 끌 때 샘플만 다시 그린다 (서버 왕복 없음). */
+function repaintSampleQueue() {
+  const box = sectionBox && sectionBox.querySelector('.smpl');
+  if (box) renderSampleQueue(box);
+}
+
+function renderSampleQueue(box) {
+  const points = draftVotePoints();
+  const rounds = sampleRounds();
+  const current = S.draft.sortMode;
+  const orders = new Map(SORT_MODES.map((spec) => [spec.value, sampleSorted(spec.value, points, rounds)]));
+
+  box.replaceChildren();
+  box.append(h('div', { class: 'smpl__head' },
+    h('strong', null, '예시 곡으로 세 방식을 비교하면'),
+    h('span', { class: 'smpl__tag' }, '샘플'),
+  ));
+  box.append(h('p', { class: 'hint' },
+    '이 서버의 진짜 대기열이 아니에요. 신청자 3명·6곡을 지금 화면의 점수 그대로 세 방식에 넣어 본 결과라, ' +
+    '대기열이 비어 있어도 차이를 보실 수 있어요.'));
+
+  // 3열 표는 좁은 화면에서 접히면 뜻이 사라진다(세로로 쌓으면 "나란히 비교"가 아니게 된다).
+  // 그래서 폭을 지키고 가로로만 스크롤시킨다.
+  const grid = h('div', { class: 'smpl__grid' });
+  SORT_MODES.forEach((spec) => {
+    const on = spec.value === current;
+    const col = h('div', { class: `smpl__col${on ? ' is-on' : ''}` });
+    col.append(h('div', { class: 'smpl__colhead' },
+      h('span', { class: 'smpl__colname' }, spec.label),
+      on ? h('span', { class: 'smpl__now' }, '지금 고른 방식') : null,
+    ));
+    const rows = h('ol', { class: 'smpl__rows' });
+    (orders.get(spec.value) || []).forEach((row, index) => {
+      rows.append(h('li', { class: 'smpl__row' },
+        h('span', { class: 'smpl__rank' }, String(index + 1)),
+        h('span', { class: 'smpl__main' },
+          h('span', { class: 'smpl__title' }, row.title),
+          h('span', { class: 'smpl__meta' }, `${row.who} · ${sampleReason(spec.value, row, points, rounds)}`),
+        ),
+      ));
+    });
+    col.append(rows);
+    grid.append(col);
+  });
+  box.append(h('div', { class: 'smpl__scroll' }, grid));
+
+  // 한 줄 요약 — 표를 다 안 읽어도 "뭐가 먼저 나가는지"는 바로 보이게 한다.
+  const sum = h('p', { class: 'smpl__sum' }, h('span', { class: 'smpl__sumlabel' }, '맨 앞에 나갈 곡'));
+  SORT_MODES.forEach((spec) => {
+    const first = (orders.get(spec.value) || [])[0];
+    if (!first) return;
+    sum.append(h('span', { class: 'smpl__sumitem' },
+      h('span', { class: 'smpl__sumname' }, spec.label),
+      h('strong', null, first.title)));
+  });
+  box.append(sum);
+
+  // 점수를 0으로 다 내리면 점수제가 시간제와 같아진다. 그때 "세 방식이 다르다"고 우기면 거짓말이 된다.
+  const same = [];
+  for (let i = 0; i < SORT_MODES.length; i += 1) {
+    for (let j = i + 1; j < SORT_MODES.length; j += 1) {
+      const left = (orders.get(SORT_MODES[i].value) || []).map((row) => row.id).join();
+      const right = (orders.get(SORT_MODES[j].value) || []).map((row) => row.id).join();
+      if (left === right) same.push(`${SORT_MODES[i].label}·${SORT_MODES[j].label}`);
+    }
+  }
+  if (same.length) {
+    box.append(h('div', { class: 'warnbox warnbox--info' },
+      h('span', null, 'ℹ'),
+      h('span', null, `지금 점수 설정에서는 ${same.join(', ')} 결과가 같아요. 위쪽 투표 점수를 올리면 갈라져요.`),
+    ));
+  }
+  tooltip(box);
 }
 
 /* ── 자동 재생 기준 곡 (v3 §8.5) ── 저장 버튼을 거치지 않고 바로 서버에 반영한다. */

@@ -375,6 +375,122 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
 .prev__delta.is-down { color: var(--warn); }
 .prev__delta.is-flat { color: var(--text-4); }
 
+/* ── 미리보기 탭 (지금 대기열 · 샘플 대기열) ──
+ * 탭 버튼은 여기서 직접 정의한다. 셸은 tokens.css 다음에 화면별 CSS를 **하나만** 링크하니
+ * portal.css 의 칩 스타일을 빌려 오면 콘솔에서는 아무 스타일도 안 먹는다. */
+.prevwrap { display: flex; flex-direction: column; gap: var(--sp-2); }
+.prevtabs { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.prevtabs__btn {
+  height: 28px;
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-full);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.prevtabs__btn:hover { color: var(--text-1); border-color: var(--line-3); }
+.prevtabs__btn.is-on {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent);
+  font-weight: var(--fw-semi);
+}
+
+/* ── 샘플 대기열 ──
+ * 실제 대기열(.prev)과 같은 상자를 쓰되 점선 테두리로 "이건 진짜가 아니다"를 먼저 알린다. */
+.smpl {
+  padding: var(--sp-3);
+  background: var(--surface-inset);
+  border: 1px dashed var(--line-3);
+  border-radius: var(--r-md);
+}
+.smpl__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-1);
+  color: var(--text-1);
+  font-size: var(--fs-md);
+}
+.smpl__tag {
+  padding: 1px var(--sp-2);
+  border: 1px solid var(--warn);
+  border-radius: var(--r-full);
+  background: var(--warn-soft);
+  color: var(--text-1);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semi);
+  white-space: nowrap;
+}
+
+/* 3열 비교표는 좁아지면 뜻이 사라진다 — 세로로 접지 않고 가로로만 스크롤시킨다 */
+.smpl__scroll { margin-top: var(--sp-3); overflow-x: auto; }
+.smpl__grid {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(190px, 1fr);
+  gap: var(--sp-2);
+  min-width: min-content;
+}
+.smpl__col {
+  padding: var(--sp-2);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
+}
+.smpl__col.is-on { border-color: var(--accent-line); background: var(--accent-soft); }
+.smpl__colhead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+  padding-bottom: var(--sp-1);
+  border-bottom: 1px solid var(--line-1);
+}
+.smpl__colname { color: var(--text-1); font-size: var(--fs-md); font-weight: var(--fw-semi); }
+.smpl__now { color: var(--accent); font-size: var(--fs-xs); white-space: nowrap; }
+
+.smpl__rows { display: flex; flex-direction: column; gap: 2px; }
+.smpl__row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: 3px var(--sp-1);
+  border-radius: var(--r-xs);
+}
+.smpl__rank {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  text-align: right;
+}
+.smpl__main { display: flex; flex-direction: column; min-width: 0; }
+.smpl__title {
+  color: var(--text-1);
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.smpl__meta { color: var(--text-3); font-size: var(--fs-xs); }
+
+.smpl__sum {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-3);
+  margin-top: var(--sp-3);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+}
+.smpl__sumlabel { color: var(--text-3); font-size: var(--fs-xs); }
+.smpl__sumitem { display: inline-flex; align-items: baseline; gap: var(--sp-1); }
+.smpl__sumname { color: var(--text-3); font-size: var(--fs-xs); }
+
 /* ═══════════════════════════ 자동 재생 기준 곡 (v3 §8.5) ═══════════════════════════ */
 
 .seeds { overflow: hidden; }
@@ -922,6 +1038,11 @@ body.is-offline .cs__head { filter: grayscale(0.6); }
 
   .grp { padding: var(--sp-4) var(--sp-3); }
   .fld { padding: var(--sp-3); }
+
+  /* 샘플 비교표는 한 손 폭에서도 3열을 유지한다. 접으면 "나란히 비교"라는 목적 자체가 사라져서
+   * 열을 조금 좁히고 가로 스크롤에 맡긴다. 두 번째 열이 살짝 보여야 스크롤이 있다는 게 읽힌다. */
+  .smpl { padding: var(--sp-2); }
+  .smpl__grid { grid-auto-columns: minmax(158px, 1fr); }
 
   .num { grid-template-columns: minmax(0, 1fr); grid-template-areas: "range" "side" "meta"; }
   .num__side { justify-content: flex-end; }
