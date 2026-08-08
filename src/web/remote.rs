@@ -1261,6 +1261,75 @@ fn guild_from_session(session: &RemoteSession, guild_id: u64) -> Option<OAuthGui
         .cloned()
 }
 
+/// 세션의 서버 목록을 Discord 에서 다시 받아 온다 (§35).
+///
+/// **이게 없으면 "멤버인데 멤버가 아니라고" 나온다.** 목록은 로그인할 때 한 번만 받는데
+/// 세션은 30일을 산다. 그 사이에 서버에 새로 들어가거나 봇이 새 서버에 초대되면,
+/// 그 사람은 다시 로그인하기 전까지 영영 비멤버 취급이다. 실제로 그렇게 막혔다.
+///
+/// 목록에 없을 때만 부른다. 매 요청마다 부르면 Discord 가 429 를 주기 시작한다.
+async fn refresh_session_guilds(
+    state: &Arc<WebState>,
+    cookies: &Cookies,
+    session: &mut RemoteSession,
+) -> bool {
+    if session.is_developer || session.access_token.is_empty() {
+        return false;
+    }
+    // 같은 사람이 없는 서버를 계속 두드려도 조회는 이 간격으로만 나간다.
+    {
+        let mut seen = state.guild_refresh_at.lock().unwrap();
+        if let Some(at) = seen.get(&session.user_id)
+            && at.elapsed() < GUILD_REFRESH_INTERVAL
+        {
+            return false;
+        }
+        seen.insert(session.user_id, Instant::now());
+    }
+    let client = http_client(state);
+    let Ok(rows) =
+        discord_get::<Vec<DiscordGuildResponse>>(&client, &session.access_token, "/users/@me/guilds")
+            .await
+    else {
+        return false;
+    };
+    let guilds = to_oauth_guilds(rows);
+    // 빈 목록은 조회가 잘못됐다는 뜻으로 본다. 그대로 덮으면 멀쩡한 사람이
+    // 모든 서버에서 비멤버가 된다 — 조회 실패가 권한 박탈로 번지면 안 된다.
+    if guilds.is_empty() {
+        return false;
+    }
+    session.guilds = guilds;
+    if let Some(cookie_token) = session_cookie_token(cookies) {
+        state
+            .remote_sessions
+            .lock()
+            .unwrap()
+            .insert(cookie_token.clone(), session.clone());
+        persist_session(state, &cookie_token, session);
+    }
+    true
+}
+
+/// 서버 목록을 다시 받아 오는 최소 간격. Discord 는 이 조회에도 한도를 건다.
+const GUILD_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Discord 응답 → 세션에 담는 모양. 로그인 때와 갱신 때가 **같은 변환**을 써야
+/// 새로 받은 목록만 권한 비트가 달라지는 일이 안 생긴다.
+fn to_oauth_guilds(rows: Vec<DiscordGuildResponse>) -> Vec<OAuthGuild> {
+    rows.into_iter()
+        .filter_map(|guild| {
+            Some(OAuthGuild {
+                id: guild.id.parse().ok()?,
+                name: guild.name,
+                icon: guild.icon,
+                owner: guild.owner,
+                permissions: guild.permissions.parse().unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
 fn bot_in_guild(state: &WebState, guild_id: u64) -> bool {
     state
         .app
@@ -1553,9 +1622,25 @@ async fn authorize(
     }
     refresh_access_token(state, cookies, &mut session).await;
 
-    // 2. 세션의 길드 목록에 없음 → 403
-    let guild = guild_from_session(&session, guild_id)
-        .ok_or_else(|| json_error(StatusCode::FORBIDDEN, "이 서버의 멤버가 아니에요."))?;
+    // 2. 세션의 길드 목록에 없음 → **바로 거절하지 않고 목록을 다시 받아 본다** (§35).
+    //    목록은 로그인 때 한 번만 받는데 세션은 30일을 산다. 그 사이에 서버에 새로
+    //    들어간 사람은 다시 로그인하기 전까지 계속 "멤버가 아니에요" 를 봤다.
+    let guild = match guild_from_session(&session, guild_id) {
+        Some(guild) => guild,
+        None => {
+            if refresh_session_guilds(state, cookies, &mut session).await {
+                guild_from_session(&session, guild_id)
+            } else {
+                None
+            }
+            .ok_or_else(|| {
+                json_error(
+                    StatusCode::FORBIDDEN,
+                    "이 서버의 멤버가 아니에요. 방금 들어오셨다면 잠시 뒤에 새로고침해 주세요.",
+                )
+            })?
+        }
+    };
 
     // 3. 봇이 그 길드에 없음 → 403
     if !session.is_developer && !bot_in_guild(state, guild_id) {
@@ -2923,18 +3008,7 @@ async fn oauth_callback(
     let avatar_url = user.avatar.as_ref().map(|avatar| {
         format!("https://cdn.discordapp.com/avatars/{user_id}/{avatar}.png?size=128")
     });
-    let guilds = guild_rows
-        .into_iter()
-        .filter_map(|guild| {
-            Some(OAuthGuild {
-                id: guild.id.parse().ok()?,
-                name: guild.name,
-                icon: guild.icon,
-                owner: guild.owner,
-                permissions: guild.permissions.parse().unwrap_or(0),
-            })
-        })
-        .collect();
+    let guilds = to_oauth_guilds(guild_rows);
     begin_remote_session(
         &state,
         &cookies,

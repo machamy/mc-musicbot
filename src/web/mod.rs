@@ -105,6 +105,9 @@ pub struct WebState {
     pub remote_chat_rate: Mutex<HashMap<(u64, u64), Instant>>,
     /// Discord 멤버 역할 조회 캐시. 읽기 화면의 2초 동기화가 Discord API를 과호출하지 않게 한다.
     pub remote_member_roles: Mutex<HashMap<(u64, u64), (Instant, Vec<u64>)>>,
+    /// 사람별 마지막 **서버 목록 재조회** 시각 (§35). 없는 서버를 계속 두드려도
+    /// Discord 조회는 이 간격으로만 나간다.
+    pub guild_refresh_at: Mutex<HashMap<u64, Instant>>,
     /// 주요 사용자 동작의 마지막 요청 시각. 연타와 자동화 오용을 완화한다.
     pub remote_action_rate: Mutex<HashMap<(u64, u64, &'static str), Instant>>,
     /// 접속 레지스트리 — `(guild_id, user_id)` → 열려 있는 WebSocket 수. **DB를 쓰지 않는다.**
@@ -195,6 +198,7 @@ pub async fn serve(app: Arc<App>) {
         remote_auth: RwLock::new(remote_auth),
         remote_chat_rate: Mutex::new(HashMap::new()),
         remote_member_roles: Mutex::new(HashMap::new()),
+        guild_refresh_at: Mutex::new(HashMap::new()),
         remote_action_rate: Mutex::new(HashMap::new()),
         presence: Mutex::new(HashMap::new()),
         presence_gate: Mutex::new(HashMap::new()),

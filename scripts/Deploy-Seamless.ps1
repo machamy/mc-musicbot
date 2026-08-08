@@ -18,13 +18,31 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$LocalExe,
+    # **버전은 반드시 준다.** 규칙이다 — 모든 빌드·배포에는 버전 번호와 패치노트가 있어야 한다.
+    # 날짜 자동값을 쓰면 "무엇이 바뀐 배포인지"가 아무 데도 안 남는다.
+    [Parameter(Mandatory = $true)][string]$Version,
     [string]$Remote  = 'bot-host',
     [string]$Root    = '<portable-root>',
-    [string]$BuildId = (Get-Date -Format 'yyyyMMdd-HHmm'),
-    [string]$TaskName = 'MusicBot Portable'
+    [string]$TaskName = 'MusicBot Portable',
+    [string]$ChangelogPath = "$PSScriptRoot\..\docs\CHANGELOG.md"
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ── 규칙 검사: 이 버전의 패치노트가 있어야 배포한다 ────────────────────────
+# 패치노트 없이 나간 빌드는 몇 주 뒤에 "이게 언제 뭐가 바뀐 거지"가 되고,
+# 인앱 패치노트(§30)도 이 파일을 그대로 읽으므로 화면에서도 빈칸이 된다.
+if (-not (Test-Path $ChangelogPath)) { throw "패치노트 파일이 없어요: $ChangelogPath" }
+$changelog = [IO.File]::ReadAllText((Resolve-Path $ChangelogPath), [Text.Encoding]::UTF8)
+if ($changelog -notmatch [Regex]::Escape("## $Version")) {
+    throw @"
+패치노트에 '## $Version' 항목이 없어요.
+docs/CHANGELOG.md 맨 위에 이 버전 항목을 먼저 쓰고 다시 실행하세요.
+(모든 빌드·배포에는 버전 번호와 패치노트가 있어야 한다 — 프로젝트 규칙)
+"@
+}
+$BuildId = $Version
+Write-Host "[deploy] 버전 $Version · 패치노트 확인됨"
 
 function Invoke-Remote([string]$Script) {
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Script))
