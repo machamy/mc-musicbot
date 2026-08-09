@@ -1564,7 +1564,17 @@ pub fn permission_allowed(
 /// 그래서 **봇이 음성에 없고 서버가 그 요구를 껐을 때만** 통과시킨다. 요구가 켜져 있으면
 /// 예전 그대로다(봇이 없으면 조작도 없다).
 fn same_voice_satisfied(settings: &RemoteGuildSettings, member: &MemberContext) -> bool {
-    member.same_voice_channel || (!settings.require_voice_for_playback && !member.bot_in_voice)
+    if member.same_voice_channel {
+        return true;
+    }
+    // 봇이 음성에 **있는데** 내가 다른 채널이면 그대로 막는다. 그때는 방해받을 사람이 실제로 있다.
+    if member.bot_in_voice {
+        return false;
+    }
+    // 봇이 아예 없을 때만 두 가지 사정으로 열린다.
+    //   1. 서버가 "봇이 있어야 조작" 을 껐다 — 막을 청취자가 없다는 판단을 서버가 내린 것.
+    //   2. 웹 재생기 모드 — 봇 없이 리모컨으로 같이 듣는 중이라 조작할 대상이 실제로 있다.
+    !settings.require_voice_for_playback || settings.web_player_mode
 }
 
 /// 이 조작이 "봇이 음성 채널에 있어야 한다"는 제한(`require_voice_for_playback`)을 받는지.
@@ -2185,8 +2195,20 @@ fn ensure_guild_watcher(state: &Arc<WebState>, guild_id: u64) {
             // 봇만 음성에서 빠졌을 때 아무 프레임도 안 나가고, 화면은 계속 재생 중으로 남는다.
             // 다음 추천곡도 마찬가지다 — 대기열 ID 는 그대로라 `next` 만 바뀐 경우를 놓친다.
             let voice_connected = bot_voice_status(&state, guild_id).in_voice();
+            // **시각표 자체를 서명에 넣는다.** 한 곡 반복에서는 `current_item.id` 도 그대로고
+            // 세션 유무도 그대로인데 `started_utc` 만 새로 발급된다. 그걸 안 보면 프레임이
+            // 안 나가서 웹 재생이 같은 곡을 다시 시작하지 못한다 — 교차검증이 잡아 준 것이다.
+            // 가상↔물리 전환도 이 값이 바뀌므로 같이 잡힌다.
+            let started_sig = state
+                .app
+                .coordinator
+                .schedule(guild_id)
+                .await
+                .map(|s| s.started_utc.timestamp_millis().to_string())
+                .unwrap_or_default();
             let signature = format!(
-                "{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}",
+                started_sig,
                 player
                     .current_item
                     .as_ref()
@@ -4754,8 +4776,13 @@ async fn api_control(
     // **자동 재생은 재생 명령이 아니라 저장되는 설정이다.** 봇이 음성에 없을 때야말로
     // "다음에 들어오면 알아서 틀어" 를 켜 두려는 순간이라, 여기에 음성 연결을 요구하면
     // 정작 켜야 할 때 못 켠다. 나머지 조작만 캐시 기준으로 막는다.
+    // **게이트가 둘이다.** 위 권한 검사만 열면 여기서 409 로 막힌다 — 실제로 그렇게 설계했다가
+    // 교차검증에서 잡혔다. 웹 재생기 모드에서는 봇이 없어도 조작할 시각표가 있으므로 통과시킨다.
+    let virtual_playing = ctx.settings.web_player_mode
+        && !bot_voice_status_of(&state.app, guild_id).in_voice();
     if action_requires_voice(&request.action)
         && ctx.settings.require_voice_for_playback
+        && !virtual_playing
         && !bot_voice_status(&state, guild_id).in_voice()
     {
         return json_error(
@@ -11088,6 +11115,52 @@ mod tests {
             &settings,
             &admin
         ));
+    }
+
+    /// 웹 재생기 모드는 **봇이 아예 없을 때만** 권한을 연다.
+    ///
+    /// 봇이 다른 채널에서 틀고 있으면 그대로 막아야 한다 — 그때는 방해받을 사람이 실제로 있다.
+    /// 그리고 모드가 꺼져 있으면 이 기능 도입 전과 **완전히 같아야** 한다(R1).
+    #[test]
+    fn web_player_mode_only_opens_when_the_bot_is_absent() {
+        let outsider = MemberContext {
+            same_voice_channel: false,
+            bot_in_voice: false,
+            ..Default::default()
+        };
+        let bot_elsewhere = MemberContext {
+            same_voice_channel: false,
+            bot_in_voice: true,
+            ..Default::default()
+        };
+
+        // 모드 Off — 도입 전과 같다.
+        let off = RemoteGuildSettings::default();
+        assert!(off.require_voice_for_playback);
+        assert!(!off.web_player_mode);
+        assert!(!same_voice_satisfied(&off, &outsider), "모드 Off 면 예전 그대로 막힌다");
+        assert!(!same_voice_satisfied(&off, &bot_elsewhere));
+
+        // 모드 On — 봇이 없을 때만 열린다.
+        let mut on = RemoteGuildSettings::default();
+        on.web_player_mode = true;
+        assert!(
+            same_voice_satisfied(&on, &outsider),
+            "웹 재생기 모드면 봇이 없어도 조작할 시각표가 있다"
+        );
+        assert!(
+            !same_voice_satisfied(&on, &bot_elsewhere),
+            "봇이 남의 채널에서 틀고 있으면 밖에서 흔들면 안 된다"
+        );
+
+        // 같은 채널이면 어느 설정에서도 열린다 — 기존 계약.
+        let together = MemberContext {
+            same_voice_channel: true,
+            bot_in_voice: true,
+            ..Default::default()
+        };
+        assert!(same_voice_satisfied(&off, &together));
+        assert!(same_voice_satisfied(&on, &together));
     }
 
     /// `봇이 음성 채널에 있어야만 조작` 을 끄면 **실제로 조작이 풀려야 한다.**
