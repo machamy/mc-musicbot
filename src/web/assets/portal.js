@@ -159,9 +159,9 @@ const LAYOUTS = {
   three: {
     label: '3단',
     desc: '검색·대기열을 늘 왼쪽에 띄워요.',
-    extra: '처음이라면 이게 가장 무난해요.',
+    extra: '어느 화면에서나 무난하게 잘 맞아요.',
     when: '뭘 고를지 모르겠으면 이걸 고르세요.',
-    hint: '가장 무난해요',
+    hint: '무난해요',
     cells: [false, true, false],
     drawerUnder: 1280,
   },
@@ -200,8 +200,8 @@ const LAYOUTS = {
   panel: {
     label: '패널',
     desc: '창을 원하는 대로 붙이고 나눠요.',
-    extra: '탭을 끌어다 붙이면 내 마음대로 배치돼요. 넓은 화면에서 진가가 나와요.',
-    when: '내 맘대로 짜고 싶을 때 좋아요.',
+    extra: '처음엔 재생·대기열·채팅이 한눈에 놓여요. 탭을 끌어다 옮기면 내 배치가 돼요.',
+    when: '넓은 화면이라면 이게 제일 좋아요.',
     cells: [true, false, false, false],
     drawerUnder: 0,
   },
@@ -399,6 +399,24 @@ if (window.matchMedia) {
  * CSS는 <html data-layout="...">만 본다.
  */
 
+/* 아직 안 고른 사람에게 무엇을 권하는가.
+ * 패널형이 할 수 있는 게 가장 많아서 기본으로 권하지만, 680px 이하에서는 패널형이
+ * 아예 안 돌아가고 3단으로 내려간다(effectiveLayout). 못 쓸 걸 권할 수는 없으니
+ * 좁은 화면에는 3단을 권한다. 창 크기가 바뀌면 답도 바뀌므로 붙잡아 두지 않는다. */
+function recommendedLayout() {
+  return narrowScreen() ? 'three' : 'panel';
+}
+
+/** 카드에 붙는 배지. 지금 권하는 배치면 '추천'이 이기고, 아니면 배치가 가진 문구를 쓴다. */
+function layoutHint(id) {
+  if (id === recommendedLayout()) return '추천';
+  return LAYOUTS[id]?.hint || null;
+}
+
+/* 아직 안 고른 사람의 첫 화면은 계속 3단이다. 권하는 게 패널형이어도 여기서 패널형을
+ * 넣으면 안 된다 — 도킹 판은 applyLayout()의 mountDock()으로만 붙는데, 첫 페인트는
+ * 그 전에 일어난다. data-layout만 panel이 되고 판은 없는 빈 화면이 된다.
+ * 패널형으로는 시트에서 고를 때(setLayout) 제대로 된 경로로 들어간다. */
 let layoutChosen = !!LAYOUTS[prefGet('layout')];
 let activeLayout = layoutChosen ? prefGet('layout') : 'three';
 document.documentElement.dataset.layout = effectiveLayout();
@@ -1300,7 +1318,7 @@ function layoutOption(id, def, role) {
   },
     h('span', { class: `lay__glyph lay__glyph--${id}`, 'aria-hidden': 'true' },
       ...def.cells.map((main) => h('i', { class: main ? 'is-main' : null }))),
-    h('strong', null, def.label, def.hint ? h('span', { class: 'chip chip--accent' }, def.hint) : null),
+    h('strong', null, def.label, layoutHint(id) ? h('span', { class: 'chip chip--accent' }, layoutHint(id)) : null),
     h('small', null, def.desc));
 }
 
@@ -1391,14 +1409,18 @@ function openLayoutSheet() {
   layoutSheetOpen = true;
   let handle = null;
 
-  const cards = Object.entries(LAYOUTS).map(([id, def]) => h('button', {
+  // 권하는 배치를 맨 앞에 둔다. 나머지 순서는 원래대로.
+  const rec = recommendedLayout();
+  const entries = Object.entries(LAYOUTS).sort((a, b) => (b[0] === rec) - (a[0] === rec));
+
+  const cards = entries.map(([id, def]) => h('button', {
     class: 'pick__card', type: 'button', dataset: { layout: id },
     tip: def.when,
     onClick: () => { setLayout(id, true); handle?.close(id); },
   },
     h('span', { class: `lay__glyph lay__glyph--${id}`, 'aria-hidden': 'true' },
       ...def.cells.map((main) => h('i', { class: main ? 'is-main' : null }))),
-    h('strong', null, def.label, def.hint ? h('span', { class: 'chip chip--accent' }, def.hint) : null),
+    h('strong', null, def.label, layoutHint(id) ? h('span', { class: 'chip chip--accent' }, layoutHint(id)) : null),
     h('p', null, def.desc),
     h('small', null, def.extra)));
 
@@ -1416,8 +1438,9 @@ function openLayoutSheet() {
 
   handle.result.then((value) => {
     layoutSheetOpen = false;
-    // ✕나 Esc로 닫아도 지금 배치를 고른 것으로 쳐서 다시 묻지 않는다
-    if (!value) setLayout(activeLayout, true);
+    // ✕나 Esc로 닫아도 고른 것으로 쳐서 다시 묻지 않는다. 아무 말이 없으면 권하는 배치로.
+    // setLayout을 거치므로 패널형이어도 도킹 판이 제대로 붙는다.
+    if (!value) setLayout(recommendedLayout(), true);
     toast(`${LAYOUTS[activeLayout].label} 배치로 시작할게요.`, 'ok');
   });
 }
