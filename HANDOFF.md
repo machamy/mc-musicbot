@@ -67,18 +67,41 @@ Discord 개발자 포털의 Redirect URI 도 `https://music.example.com/music/oa
 ## 현재 배포 기준
 
 - Cargo package: `mc-musicbot 0.7.0`
-- 봇 호스트 빌드 ID: `20260807-remote-ui-v3`
-- `mc-musicbot.exe` SHA256: `8DAA51057DB8DFE9F0DE6F755796648908F073A93731CB6051985271F6E2C63B`
-  (32,197,120 bytes)
+- 봇 호스트 빌드 ID: `v4.10`
+- `mc-musicbot.exe` SHA256: `5E6260674507C6F34ED3AB95EB0E093DB6F68749BEE0B8C7E22B698B4AE1B59A`
 - 설치 경로: 봇 호스트의 포터블 루트 (`$PORTABLE_ROOT`)
 - 기동: 예약 작업 `MusicBot Portable` → 루트 `START-MK2.cmd` (로그온 트리거)
-- `cargo test`: **199 passed / 0 failed**
+- `cargo test`: **240 passed / 0 failed**
 
-2026-08-07 배포 검증:
-- `music.example.com` 의 `/login` `/botsettings` `/logs` → **404** (도메인 분리 동작)
-- `music.example.com/music` → `/music/login` 303, 에셋 4종 200
-- `musicbot.example.com` → Access 302 유지
-- OAuth `redirect_uri` = `https://music.example.com/music/oauth/callback`
+### 배포 명령
+
+`scripts\Deploy-Seamless.ps1` 이 전부 한다. **PowerShell 로 돌려야 한다** — Git Bash 의
+ssh 는 다른 에이전트를 봐서 `Permission denied (publickey)` 가 난다.
+
+```powershell
+scripts\Deploy-Seamless.ps1 -LocalExe target\release\mc-musicbot.exe -Version v4.10
+```
+
+대상 호스트와 설치 경로는 저장소에 없다. 봇 호스트 PC 에서 한 번만 박아 둔다.
+
+```powershell
+setx MUSICBOT_DEPLOY_REMOTE "<ssh 별칭>"
+setx MUSICBOT_DEPLOY_ROOT   "<포터블 루트>"
+```
+
+안 박아 두면 기본값 `bot-host` 로 붙으려다 이름을 못 찾고 멈춘다. **멈추는 게 정상이다** —
+복사 전에 죽으므로 돌던 봇은 그대로다.
+
+2026-08-10 배포 검증 (v4.10):
+- 멈춤 14.5초, `/healthz` 200
+- 리모컨 도메인의 `/logs` `/botsettings` → **404** (도메인 분리 동작)
+- 받아 간 `portal.js` 344KB 에 `artNode` · `recommendedLayout` · `layoutHint` 들어 있음,
+  옛 `src: artUrl` 0곳
+- 본 DB `user_version` 20 (`track_json`), 통계 DB 2 (`plays_virtual`, 571행 보존)
+
+**통계 DB 를 파일 바이트로 확인하면 안 된다.** WAL 을 쓰기 때문에 방금 끝난 마이그레이션이
+아직 `.sqlite` 본체에 없다. 바이트만 보면 "마이그레이션이 안 됐다" 는 오진이 나온다(실제로 그랬다).
+`-wal` `-shm` 까지 같이 복사해서 sqlite 로 열어야 제대로 보인다.
 
 ---
 
