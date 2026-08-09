@@ -8398,7 +8398,13 @@ async function boot() {
   if (activeRailTab === 'charts') loadCharts();
   if (activeSideTab === 'audit') loadAudit();
 
-  // 한 번도 배치를 고른 적이 없으면 여기서 물어본다. 두 번째 진입부터는 안 뜬다.
+  /* 한 번도 배치를 고른 적이 없으면 여기서 물어본다.
+   *
+   * **여기서 다시 판정한다.** `layoutChosen` 은 모듈이 로드될 때 localStorage 거울만 보고
+   * 정해지는데, 서버에 저장된 개인 설정은 그보다 늦게(`loadCold`) 도착한다. 다시 안 보면
+   * 데스크톱에서 배치를 골라 둔 사람이 **휴대폰으로 처음 들어올 때** 배치는 제대로 적용되는데
+   * 선택 창이 또 뜬다 — 고른 적 없다고 판단하기 때문이다. */
+  if (LAYOUTS[prefGet('layout')]) layoutChosen = true;
   if (!layoutChosen) openLayoutSheet();
 
   connect(ctx.guildId, {
