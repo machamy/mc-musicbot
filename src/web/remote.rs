@@ -672,6 +672,13 @@ pub fn router() -> Router<Arc<WebState>> {
             post(api_queue_action),
         )
         .route("/music/api/guilds/{guild_id}/control", post(api_control))
+        // 브라우저가 **실제로 소리를 내기 시작/중단한 순간** 알려 준다 (웹 재생기 모드).
+        // 이게 없으면 서버는 "듣고 있는 사람" 을 알 방법이 없다 — 자세한 이유는
+        // `WebState::web_listeners` 주석에 적어 뒀다.
+        .route(
+            "/music/api/guilds/{guild_id}/web-listening",
+            post(api_web_listening),
+        )
         .route("/music/api/guilds/{guild_id}/vote", post(api_vote))
         .route("/music/api/guilds/{guild_id}/library", post(api_library))
         .route(
@@ -1862,13 +1869,31 @@ fn presence_add(state: &Arc<WebState>, guild_id: u64, user_id: u64) {
 }
 
 fn presence_remove(state: &Arc<WebState>, guild_id: u64, user_id: u64) {
+    let mut gone = false;
     {
         let mut registry = state.presence.lock().unwrap();
         if let Some(count) = registry.get_mut(&(guild_id, user_id)) {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 registry.remove(&(guild_id, user_id));
+                gone = true;
             }
+        }
+    }
+    // **마지막 소켓이 닫힐 때만** 웹 리스너에서도 뺀다. 탭을 여러 개 열어 두는 게 흔하고,
+    // 하나 닫았다고 듣기가 끝난 것은 아니다. 알림 없이 사라지는 경우(탭 강제 종료·크래시)가
+    // 흔하므로 소켓 종료를 진실로 삼는다 — `web-listening` 보고만 믿으면 유령 리스너가 남는다.
+    if gone {
+        let removed = state
+            .web_listeners
+            .lock()
+            .unwrap()
+            .remove(&(guild_id, user_id));
+        if removed {
+            let state2 = state.clone();
+            tokio::spawn(async move {
+                on_web_listeners_changed(&state2, guild_id).await;
+            });
         }
     }
     schedule_presence(state, guild_id);
@@ -4704,6 +4729,62 @@ struct ControlRequest {
     expected_item_id: Option<String>,
     /// `{action:"repeat", mode:"off|track|queue"}`
     mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebListeningRequest {
+    /// 지금 이 브라우저에서 소리가 나고 있는가.
+    on: bool,
+}
+
+/// 웹 재생 시작·중단 보고.
+///
+/// **소켓이 끊기면 자동으로 빠진다** — `presence_remove` 가 같이 지운다. 탭을 그냥 닫거나
+/// 크래시해도 리스너로 남지 않는다. 알림 없이 사라지는 쪽이 흔하기 때문에 이쪽이 진실이다.
+async fn api_web_listening(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<WebListeningRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let key = (guild_id, ctx.session.user_id);
+    let changed = {
+        let mut listeners = state.web_listeners.lock().unwrap();
+        if request.on {
+            listeners.insert(key)
+        } else {
+            listeners.remove(&key)
+        }
+    };
+    // 비었다↔찼다 경계에서만 구동기를 건드린다. 매 보고마다 흔들면 안 된다.
+    if changed {
+        on_web_listeners_changed(&state, guild_id).await;
+    }
+    json_ok(json!({ "ok": true }))
+}
+
+/// 이 길드에서 실제로 웹으로 듣고 있는 사람 수.
+pub(crate) fn web_listener_count(state: &WebState, guild_id: u64) -> usize {
+    state
+        .web_listeners
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(gid, _)| *gid == guild_id)
+        .count()
+}
+
+/// 리스너가 생기거나 사라졌을 때. 지금은 재동기화만 하고, 가상 세션 생성은 `sync_guild` 가 판단한다.
+async fn on_web_listeners_changed(state: &Arc<WebState>, guild_id: u64) {
+    let app = state.app.clone();
+    let coordinator = app.coordinator.clone();
+    coordinator.sync_guild(&app, guild_id).await;
 }
 
 async fn api_control(

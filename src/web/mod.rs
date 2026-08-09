@@ -152,6 +152,16 @@ pub struct WebState {
     pub remote_action_rate: Mutex<HashMap<(u64, u64, &'static str), Instant>>,
     /// 접속 레지스트리 — `(guild_id, user_id)` → 열려 있는 WebSocket 수. **DB를 쓰지 않는다.**
     pub presence: Mutex<HashMap<(u64, u64), usize>>,
+    /// **지금 실제로 웹에서 듣고 있는 사람** — `(guild_id, user_id)`.
+    ///
+    /// `presence` 로는 알 수 없다. 그건 리모컨 화면을 열어 둔 사람이고, 그중 상당수는
+    /// `웹에서 듣기` 를 꺼 둔 채 보기만 한다. 그 사람들까지 세면 아무도 안 듣는데
+    /// 대기열이 계속 도는 상태가 된다.
+    ///
+    /// 개인 설정(`webPlayback`)으로도 알 수 없다. 그건 "켜 두겠다는 뜻" 이 영속화된 값이고,
+    /// 새로고침하면 브라우저의 실제 재생 상태(`webOn`)는 항상 false 로 시작해 사용자가
+    /// 다시 눌러야 한다. 그래서 **브라우저가 실제로 소리를 내기 시작한 순간** 알려 준다.
+    pub web_listeners: Mutex<HashSet<(u64, u64)>>,
     /// 길드별 presence 브로드캐스트 게이트 — `(마지막 송신, 예약됨)`. 최대 초당 1회로 코얼레싱한다.
     pub presence_gate: Mutex<HashMap<u64, (Instant, bool)>>,
     /// 재생 변화를 감시 중인 길드. 보는 사람이 있을 때만 길드당 하나가 돈다.
@@ -241,6 +251,7 @@ pub async fn serve(app: Arc<App>) {
         guild_refresh_at: Mutex::new(HashMap::new()),
         remote_action_rate: Mutex::new(HashMap::new()),
         presence: Mutex::new(HashMap::new()),
+        web_listeners: Mutex::new(HashSet::new()),
         presence_gate: Mutex::new(HashMap::new()),
         guild_watchers: Mutex::new(HashSet::new()),
         http_client: OnceLock::new(),

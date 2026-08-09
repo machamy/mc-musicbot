@@ -4706,11 +4706,21 @@ function mountSoundCloud(sourceUrl, startSeconds, paused) {
   });
 }
 
+/** 서버에 "지금 이 브라우저에서 소리가 난다/안 난다" 를 알린다.
+ *
+ *  **서버는 이걸 모르면 듣는 사람을 셀 수 없다.** 화면을 열어 둔 것(`presence`)과 실제로
+ *  듣는 것은 다르고, 개인 설정(`webPlayback`)은 "켜 두겠다는 뜻" 이라 새로고침 뒤에도 1 인 채
+ *  소리는 안 나는 상태가 된다. 실패해도 조용히 넘어간다 — 알림이 실패했다고 재생을 막을 이유는 없다. */
+function reportWebListening(on) {
+  api('/web-listening', { body: { on: !!on } }).catch(() => { /* 조용히 */ });
+}
+
 async function toggleWebPlayback() {
   if (webBlocked) { toast(webBlocked, 'warn'); return; }
   if (webOn) {
     webOn = false;
     prefSet('webPlayback', '0');
+    reportWebListening(false);
     stopWebPlayback();
     syncWebUi();
     toast('웹에서 듣기를 껐어요. Discord 쪽은 그대로 재생 중이에요.', 'ok');
@@ -4720,6 +4730,7 @@ async function toggleWebPlayback() {
   // 토글을 누르는 행위 자체가 사용자 제스처다. 자동재생 정책을 통과하는 유일한 타이밍이라 여기서 다 한다.
   webOn = true;
   prefSet('webPlayback', '1');
+  reportWebListening(true);
   syncWebUi();
   setWebNote('플레이어를 준비하고 있어요…');
 
