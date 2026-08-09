@@ -327,7 +327,7 @@ const SECTION_KEYS = {
   order: [
     'sortMode', 'autoBgmEnabled', 'repeatMode', 'defaultVolume',
     'likePoints', 'dislikePoints', 'superLikePoints', 'waitPoints',
-    'boomttaEnabled', 'boomttaThreshold', 'boomttaAction',
+    'dislikeEnabled', 'boomttaEnabled', 'boomttaThreshold', 'boomttaAction',
     'voteSkipEnabled', 'voteSkipBasis', 'voteSkipRatio', 'voteSkipMin',
     'superLikeCooldownSec', 'superLikeDailyLimit',
     'autoplayMode', 'autoplayRecentCount', 'autoplayGenres',
@@ -336,7 +336,7 @@ const SECTION_KEYS = {
     // 재생 동작 (§31 · §36)
     'requireVoiceForPlayback', 'webPlayerMode', 'publicNowPlaying', 'webSyncOffsetMs', 'skipLeadMs', 'seekLockoutMs',
   ],
-  perms:  PERM_FIELDS.map((field) => field.key).concat(['ruleRoleIds', 'managerRoleIds']),
+  perms:  PERM_FIELDS.map((field) => field.key).concat(['ruleRoleIds', 'managerRoleIds', 'disabledCommandGroups']),
   limits: ['minVolume', 'maxVolume', 'maxQueuePerUser', 'maxQueuePerGuild', 'maxTrackSeconds', 'bulkEnqueueLimit', 'auditRetentionDays', 'chatRetentionDays'],
   chat:   ['chatEnabled', 'suggestionEnabled'],
 };
@@ -344,12 +344,15 @@ const SECTION_KEYS = {
 /** 설정에 값이 없을 때 콘솔이 가정하는 기본값 — 서버가 아직 v2 응답을 줘도 화면이 비지 않게 한다. */
 const SETTING_DEFAULTS = {
   likePoints: 1, dislikePoints: -1, superLikePoints: 2, waitPoints: 1,
-  boomttaEnabled: false, boomttaThreshold: 3, boomttaAction: 'bottom',
+  dislikeEnabled: true, boomttaEnabled: false, boomttaThreshold: 3, boomttaAction: 'bottom',
   voteSkipEnabled: false, voteSkipBasis: 'listeners', voteSkipRatio: 50, voteSkipMin: 2,
   superLikeCooldownSec: 0, superLikeDailyLimit: 0,
   autoplayMode: 'recent', autoplayRecentCount: 5, autoplayGenres: [],
   autoplayPolicy: 'balanced', autoplayArtistCooldown: 3, autoplayRecentDecayHours: 24,
   autoplaySeedMax: 10, chartSuperWeight: 2, chartLimit: 50, bulkEnqueueLimit: 200,
+  // 빈 배열이 "전부 켜져 있다" 이다. 설정을 안 만진 서버는 늘 이 상태고,
+  // 그때 봇은 이 기능이 생기기 전과 똑같이 동작한다.
+  disabledCommandGroups: [],
 };
 
 /** 정지 범위 · 기간 (사양서 결정 #14). */
@@ -401,6 +404,7 @@ const FIELD_LABELS = {
   requireVoiceForPlayback: '봇이 음성 채널에 있어야만 조작',
   webPlayerMode: '웹 재생기 모드',
   publicNowPlaying: '로그인 없이 지금 곡 보기',
+  dislikeEnabled: '싫어요 사용',
   boomttaEnabled: '붐따 사용',
   boomttaAction: '붐따 — 내릴 때 어떻게 할까요',
   voteSkipEnabled: '투표로 넘기기',
@@ -410,6 +414,7 @@ const FIELD_LABELS = {
   autoplayPolicy: '자동 재생 — 얼마나 비슷하게 고를까요',
   ruleRoleIds: '권한별 지정 역할',
   managerRoleIds: '관리자로 대우할 역할',
+  disabledCommandGroups: '꺼 둔 디스코드 명령',
   chatEnabled: '채팅 사용',
   suggestionEnabled: '제안 게시판 사용',
 };
@@ -1224,7 +1229,8 @@ function votePointsGroup(previewBox) {
       '리모컨 화면에 뜨는 계산식도 이 값을 그대로 쓰니까 화면이 거짓말하지 않아요.'),
     numberField('likePoints'),
     numberField('superLikePoints'),
-    numberField('dislikePoints'),
+    // 싫어요 점수는 아래 '👎 싫어요' 그룹에 있다. 싫어요를 안 쓰는 서버에는
+    // 있어 봐야 아무 데도 안 쓰이는 값이라, 쓰기로 한 다음에 보이는 게 맞다.
     numberField('waitPoints'),
     formula,
   );
@@ -1265,30 +1271,86 @@ function paintFormula(box) {
   );
 }
 
-/* ── 붐따 (v3 §10.3) ── */
+/* ── 싫어요 · 붐따 (v3 §10.3) ──
+ *
+ * **둘은 한 기능이다.** 붐따는 "싫어요가 이만큼 모이면" 이라 싫어요 없이는 성립하지 않는데,
+ * 예전에는 스위치가 따로 있어서 싫어요를 안 쓰고 싶은 사람이 갈 곳이 없었다.
+ * 그래서 한 줄로 합치고 셋 중 하나로 고르게 한다.
+ *
+ * 저장은 계속 `dislikeEnabled` · `boomttaEnabled` 두 값이다. 합친 건 화면뿐이라
+ * 예전 설정이 그대로 살아나고, 서버 로직도 손댈 곳이 없다.
+ */
+const DISLIKE_MODES = [
+  { value: 'off',    label: '안 써요',       desc: '싫어요 버튼이 사라져요. 좋아요·슈퍼 좋아요만 남아요.' },
+  { value: 'points', label: '점수만',        desc: '싫어요가 점수를 깎아 순서가 뒤로 밀려요. 곡이 사라지지는 않아요.' },
+  { value: 'skip',   label: '모이면 내려요', desc: '점수도 깎고, 일정 수 이상 모이면 대기열에서 내려요 (붐따).' },
+];
+
+function dislikeMode() {
+  if (S.draft.dislikeEnabled === false) return 'off';
+  return S.draft.boomttaEnabled ? 'skip' : 'points';
+}
+
+function setDislikeMode(mode) {
+  setValue('dislikeEnabled', mode !== 'off');
+  // 안 쓰기로 하면 붐따도 같이 내린다. 남겨 두면 다시 켰을 때 예고 없이 곡이 내려간다.
+  setValue('boomttaEnabled', mode === 'skip');
+  renderSection(S.activeSection);
+}
 
 function boomttaGroup() {
-  const on = Boolean(S.draft.boomttaEnabled);
+  const mode = dislikeMode();
   const action = BOOMTTA_ACTIONS.find((item) => item.value === S.draft.boomttaAction) || BOOMTTA_ACTIONS[0];
+  const current = DISLIKE_MODES.find((item) => item.value === mode) || DISLIKE_MODES[1];
+
+  // 저장 필드가 하나가 아니라 `segmentControl` 을 그대로는 못 쓴다. 겉모습과 키보드 조작은
+  // 똑같이 맞춘다 — 여기만 화살표가 안 먹으면 그게 더 이상하다.
+  const seg = h('div', { class: 'seg', role: 'radiogroup', 'aria-label': '싫어요를 어떻게 쓸까요' },
+    ...DISLIKE_MODES.map((item, index) => h('button', {
+      class: 'seg__btn' + (item.value === mode ? ' is-on' : ''),
+      type: 'button', role: 'radio', 'aria-checked': item.value === mode ? 'true' : 'false',
+      tabindex: item.value === mode ? '0' : '-1',
+      'data-value': item.value,
+      'data-tip': tipOf(item.desc, `${item.label}(으)로 바꿔요`),
+      onclick: () => setDislikeMode(item.value),
+      onkeydown: (event) => {
+        const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+        if (!step) return;
+        event.preventDefault();
+        setDislikeMode(DISLIKE_MODES[(index + step + DISLIKE_MODES.length) % DISLIKE_MODES.length].value);
+      },
+    }, item.label)));
 
   const group = h('div', { class: 'grp' },
-    h('h3', { class: 'grp__title' }, '💥 붐따 — 싫어요가 모이면 내리기'),
+    h('h3', { class: 'grp__title' }, '👎 싫어요'),
     h('p', { class: 'grp__desc' },
-      '싫어요가 일정 수 이상 모인 곡을 대기열에서 내려요. 꺼 두면 싫어요는 점수에만 영향을 주고 곡이 사라지지 않아요. ' +
-      '지금 재생 중인 곡에는 적용하지 않아요.'),
-    fieldShell('boomttaEnabled', '붐따 사용',
-      '켜면 기준을 넘는 순간 바로 실행되고, 신청한 분에게 알려 드려요. 조용히 사라지지 않아요.',
-      toggleControl('boomttaEnabled', '기준을 넘으면 대기열에서 내려요', '싫어요는 점수에만 반영해요')),
+      '싫어요를 어떻게 쓸지 한 줄로 정해요. 예전에는 "싫어요 점수"와 "붐따"가 따로 있었는데 ' +
+      '사실 같은 기능의 단계라 하나로 합쳤어요.'),
+    fieldShell('dislikeEnabled', '싫어요를 어떻게 쓸까요', current.desc, seg),
   );
-  if (!on) return group;
+
+  if (mode === 'off') {
+    group.append(h('p', { class: 'hint' },
+      '리모컨에서 싫어요 버튼이 안 보여요. 이미 눌러 둔 표는 뗄 수 있게 남겨 둬요 — ' +
+      '못 떼면 그 표가 영영 점수에 남거든요.'));
+    return group;
+  }
+
+  group.append(numberField('dislikePoints'));
+
+  if (mode !== 'skip') {
+    group.append(h('p', { class: 'hint' }, '점수만 깎아요. 지금 재생 중인 곡에도, 대기열에도 곡이 사라지는 일은 없어요.'));
+    return group;
+  }
 
   group.append(
     numberField('boomttaThreshold'),
     fieldShell('boomttaAction', '내릴 때 어떻게 할까요', action.desc,
       segmentControl('boomttaAction', BOOMTTA_ACTIONS)),
     h('p', { class: 'hint' }, Number(S.draft.boomttaThreshold) === 0
-      ? '기준을 무제한으로 두셔서 싫어요가 아무리 모여도 곡이 내려가지 않아요. 사실상 꺼 둔 것과 같아요.'
-      : `지금 설정이면 싫어요 ${S.draft.boomttaThreshold}개가 모이는 순간 그 곡을 ${action.label} 처리해요.`),
+      ? '기준을 무제한으로 두셔서 싫어요가 아무리 모여도 곡이 내려가지 않아요. 사실상 "점수만"과 같아요.'
+      : `지금 설정이면 싫어요 ${S.draft.boomttaThreshold}개가 모이는 순간 그 곡을 ${action.label} 처리해요. ` +
+        '내려갈 때는 신청한 분에게 알려 드려요 — 조용히 사라지지 않아요. 지금 나오는 곡에는 적용하지 않아요.'),
   );
   return group;
 }
@@ -2480,7 +2542,96 @@ function sectionPerms() {
     ),
   ));
 
+  body.append(commandGroupsCard());
+
   return body;
+}
+
+/* ── 디스코드 명령 그룹 on/off ──
+ *
+ * 그룹 표는 **서버가 준다**(`settings.commandGroups`). 여기서 목록을 하드코딩하면
+ * 명령이 하나 늘 때마다 두 곳을 고쳐야 하고, 한쪽만 고치면 화면에 없는 스위치가
+ * 서버에서만 살아 있게 된다.
+ *
+ * 저장은 **꺼 둔 그룹의 전체 목록**을 통째로 보낸다. 화면이 늘 전체 상태를 알고 있어서
+ * 부분 갱신보다 어긋날 자리가 없다.
+ */
+function commandGroupsCard() {
+  const groups = Array.isArray(S.saved && S.saved.commandGroups) ? S.saved.commandGroups : [];
+  const off = new Set((S.draft.disabledCommandGroups || []).map(String));
+
+  const card = h('div', { class: 'grp' },
+    h('h3', { class: 'grp__title' }, '💬 디스코드 명령'),
+    h('p', { class: 'grp__desc' },
+      '리모컨이 있으니 디스코드로는 적게 하고 싶을 때 꺼요. 그룹 단위로만 끄고 켜요 — ' +
+      '하고 싶은 말은 보통 "대기열은 웹에서만 만지게 해라" 쪽이지 "/제거 하나만 막아라"가 아니거든요.'),
+  );
+
+  if (!groups.length) {
+    card.append(h('p', { class: 'hint' },
+      '명령 목록을 아직 못 받았어요. 새로고침해도 안 나오면 봇이 옛 버전이에요.'));
+    return card;
+  }
+
+  card.append(h('div', { class: 'warnbox warnbox--info' },
+    h('span', null, 'ℹ'),
+    h('span', null,
+      '꺼도 명령이 목록에서 사라지지는 않아요. 디스코드에 명령은 한 번만 등록되는데 ' +
+      '이 설정은 서버마다 다르거든요. 대신 누르면 "이 서버에서는 꺼 뒀어요"라고 대답해요 — ' +
+      '조용히 아무 일도 안 일어나는 것보다 낫잖아요.'),
+  ));
+
+  groups.forEach((group) => {
+    const key = String(group.key || '');
+    const on = !off.has(key);
+    const names = (group.commands || [])
+      .map((cmd) => `/${cmd.korean || cmd.name}`)
+      .join(' · ');
+
+    const sw = h('button', {
+      class: 'sw' + (on ? ' is-on' : ''), type: 'button', role: 'switch',
+      'aria-checked': on ? 'true' : 'false',
+      'aria-label': `${group.label} 명령`,
+      'data-tip': on ? '눌러서 꺼요' : '눌러서 켜요',
+      onclick: () => {
+        const next = new Set((S.draft.disabledCommandGroups || []).map(String));
+        if (next.has(key)) next.delete(key); else next.add(key);
+        // 서버가 준 순서대로 담는다. 순서가 매번 달라지면 "안 바꿨는데 바꿈"으로 보인다.
+        setValue('disabledCommandGroups',
+          groups.map((entry) => String(entry.key)).filter((entry) => next.has(entry)));
+        renderSection(S.activeSection);
+      },
+    }, h('span', { class: 'sw__knob' }));
+
+    card.append(h('div', { class: 'fld', 'data-field': `commandGroup:${key}` },
+      h('div', { class: 'fld__head' },
+        h('span', { class: 'fld__label' }, group.label),
+        h('span', { class: 'fld__badge' }, '바꿨어요'),
+      ),
+      h('div', { class: 'fld__ctl' },
+        h('div', { class: 'sw__row' }, sw,
+          h('span', { class: 'sw__text' }, on ? '디스코드에서 쓸 수 있어요' : '이 서버에서는 꺼 뒀어요'))),
+      h('p', { class: 'fld__desc' }, group.description),
+      h('p', { class: 'hint' }, names),
+    ));
+  });
+
+  // `/리모컨` 이 조회 그룹에 있다. 그걸 끄면 리모컨 주소를 물어볼 곳이 없어진다.
+  if (off.has('info')) {
+    card.append(h('div', { class: 'warnbox warnbox--warn' },
+      h('span', null, '⚠'),
+      h('span', null,
+        '조회를 꺼서 디스코드에서는 봇이 아무 말도 안 해요. 리모컨 주소를 알려 주는 ' +
+        '/리모컨 도 같이 막혔으니, 주소를 채널 공지에 박아 두세요.'),
+    ));
+  }
+
+  const count = off.size;
+  card.append(h('p', { class: 'hint' }, count === 0
+    ? `${groups.length}개 그룹이 모두 켜져 있어요. 지금은 이 기능이 없던 때와 똑같이 동작해요.`
+    : `${groups.length}개 중 ${count}개를 꺼 뒀어요.`));
+
+  return card;
 }
 
 /** 권한 한 줄 — 규칙 드롭다운 + 그 항목만의 역할 선택기 + 통과 인원 미리보기. */

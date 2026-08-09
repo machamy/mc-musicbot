@@ -3611,7 +3611,8 @@ async fn api_state_cold(
             // 빈 채널 규칙 (§27). **잠금 여부까지 같이 보낸다** — 값만 보내면
             // 화면이 바꿀 수 있는 것처럼 그려 놓고 저장에서 거절당한다.
             "emptyVoice": empty_voice_json(&state, guild_id),
-            // 붐따 (V3 §10.3) — 꺼져 있으면 싫어요는 점수에만 영향을 준다.
+            // 싫어요·붐따 (V3 §10.3). 화면은 이 둘을 합쳐 세 모드로 보여 준다.
+            "dislikeEnabled": settings.dislike_enabled,
             "boomttaEnabled": settings.boomtta_enabled,
             "boomttaThreshold": settings.boomtta_threshold,
             "boomttaAction": settings.boomtta_action.as_str(),
@@ -3822,6 +3823,9 @@ fn permissions_json(state: &WebState, ctx: &AuthContext) -> Value {
         "key": "ops",
         "label": "운영 패널",
         "description": "봇 전체를 관리하는 화면이에요.",
+        // **주소를 같이 준다.** 운영 패널은 리모컨과 다른 도메인이라 화면이 혼자서는
+        // 만들 수 없다. 예전에는 `/` 로 박혀 있어서 누르면 제자리로 돌아왔다.
+        "url": crate::web::ops_panel_url(),
         "allowed": ops,
         "rule": "owner",
         "ruleLabel": "봇 주인 전용",
@@ -5296,6 +5300,15 @@ async fn api_vote(
             }
         },
     };
+
+    // 싫어요를 안 쓰는 서버 (§10.3). **취소는 막지 않는다** — 껐을 때 이미 눌러 둔
+    // 표를 못 떼면 그 표가 영영 점수에 남는다.
+    if kind == Some(QueueVoteKind::Dislike) && !ctx.settings.dislike_enabled {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "이 서버는 싫어요를 쓰지 않아요.",
+        );
+    }
 
     let points = ctx.settings.vote_points();
     let previous = state.app.remote.user_vote(&item.id, ctx.user_id());
@@ -7696,7 +7709,8 @@ async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value 
         "dislikePoints": settings.dislike_points,
         "superLikePoints": settings.super_like_points,
         "waitPoints": settings.wait_points,
-        // ── V3 §10.3 붐따 ──
+        // ── V3 §10.3 싫어요 · 붐따 ──
+        "dislikeEnabled": settings.dislike_enabled,
         "boomttaEnabled": settings.boomtta_enabled,
         "boomttaThreshold": settings.boomtta_threshold,
         "boomttaAction": settings.boomtta_action.as_str(),
@@ -7926,7 +7940,10 @@ async fn admin_settings_put(
                     *slot = value;
                 }
             }
-            // ── 붐따 (V3 §10.3) ──
+            // ── 싫어요 · 붐따 (V3 §10.3) ──
+            if let Some(value) = json_bool(&body, "dislikeEnabled") {
+                settings.dislike_enabled = value;
+            }
             if let Some(value) = json_bool(&body, "boomttaEnabled") {
                 settings.boomtta_enabled = value;
             }

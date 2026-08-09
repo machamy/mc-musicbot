@@ -64,6 +64,24 @@ fn remote_host() -> Option<&'static str> {
         .as_deref()
 }
 
+/// 운영 패널로 가는 주소. **리모컨 화면이 이걸 모르면 링크를 만들 수가 없다.**
+///
+/// 운영 패널은 리모컨과 **다른 도메인**이라 `/` 같은 상대경로로는 절대 닿지 않는다.
+/// 예전에는 링크가 `/` 로 박혀 있었고, 리모컨 도메인의 `/` 는 `host_scope_guard` 가
+/// `/music` 으로 되돌리므로 **누르면 방금 보던 화면으로 돌아왔다.**
+///
+/// 호스트 분리를 안 켠 로컬 개발에서는 같은 서버의 `/` 가 진짜 운영 패널이라 그대로 둔다.
+pub(crate) fn ops_panel_url() -> String {
+    build_ops_url(admin_host())
+}
+
+fn build_ops_url(admin: Option<&str>) -> String {
+    match admin {
+        Some(host) => format!("https://{host}/"),
+        None => "/".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSurface {
     Admin,
@@ -426,6 +444,18 @@ mod host_scope_tests {
 
     const ADMIN: Option<&str> = Some("musicbot.example.com");
     const REMOTE: Option<&str> = Some("music.example.com");
+
+    /// 운영 패널 링크는 **다른 도메인**을 가리켜야 한다.
+    ///
+    /// 예전에는 화면에 `/` 가 박혀 있었는데, 리모컨 도메인의 `/` 는 위 `host_scope_guard`
+    /// 가 `/music` 으로 되돌린다. 그래서 운영 패널을 누르면 **방금 보던 화면으로 돌아왔다.**
+    /// 상대경로로는 절대 닿을 수 없는 자리라 못 박아 둔다.
+    #[test]
+    fn ops_link_points_at_the_admin_domain_not_at_ourselves() {
+        assert_eq!(build_ops_url(ADMIN), "https://musicbot.example.com/");
+        // 호스트 분리를 안 켠 로컬 개발에서는 같은 서버의 `/` 가 진짜 운영 패널이다.
+        assert_eq!(build_ops_url(None), "/");
+    }
 
     #[test]
     fn separates_admin_remote_and_internal_hosts() {

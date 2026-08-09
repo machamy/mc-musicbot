@@ -1116,7 +1116,9 @@ function buildProfileMenu() {
     href: `/music/guilds/${ctx.guildId}/admin`,
   }, h('span', null, '⚙'), h('span', null, '서버 관리 콘솔'));
 
-  el.opsLink = h('a', { class: 'dd__item', role: 'menuitem', href: '/', target: '_blank', rel: 'noreferrer' },
+  // href 는 여기서 정하지 않는다 — 운영 패널은 **다른 도메인**이라 서버가 알려 줘야 한다.
+  // `renderMe` 가 권한 응답의 `ops.url` 로 채운다. 그때까지는 눌러도 아무 데도 안 간다.
+  el.opsLink = h('a', { class: 'dd__item', role: 'menuitem', target: '_blank', rel: 'noreferrer' },
     h('span', null, '🛠'), h('span', null, '운영 패널'));
 
   // 서버 승인 (§26.2) — 봇 주인만. 대기 중인 서버가 있으면 개수를 배지로 붙인다.
@@ -3696,6 +3698,12 @@ function updateQueueItem(node, item, index, rounds) {
     ? `싫어요 · ${points.dislike}점이에요${boomttaNote(dislike)}`
     : p.dislike.getAttribute('data-tip'));
 
+  /* 싫어요를 안 쓰는 서버에서는 버튼을 아예 안 보여준다 (§10.3).
+   * 여기서만 회색으로 두면 "왜 안 눌리지" 가 되는데, 이건 권한이 없는 게 아니라
+   * 그 기능 자체를 안 쓰기로 한 것이라 설명할 말이 없다. 없는 게 정확하다.
+   * **내가 이미 눌러 둔 표는 예외** — 그건 뗄 수 있어야 한다. 서버도 취소는 받아 준다. */
+  p.dislike.hidden = !dislikeAllowed() && item.myVote !== 'dislike';
+
   // 이미 내가 슈퍼를 눌러 둔 곡이면 **취소는 언제나 열어 둔다.** 서버도 취소는 제한 검사 없이
   // 허용하고 횟수까지 환불한다(§10.6 — "실수로 누른 걸 하루 종일 못 쓰게 하면 가혹해요").
   // 여기서 잠그면 하루 1회 설정에서 잘못 누른 슈퍼를 되돌릴 방법이 사라진다.
@@ -3724,10 +3732,18 @@ function updateQueueItem(node, item, index, rounds) {
   setLock(p.remove, !canRemove, item.isMine ? lockReason('search') : lockReason('queueEdit'));
 }
 
+/** 이 서버가 싫어요를 쓰는가 (§10.3).
+ *
+ * 값이 아직 안 왔으면 **쓴다고 본다.** 여기서 없는 값을 "끔"으로 읽으면 설정을 받기 전
+ * 한 프레임 동안 버튼이 사라졌다 나타나고, 옛 서버에 붙었을 때는 영영 안 보인다. */
+function dislikeAllowed() {
+  return (store.get().settings || {}).dislikeEnabled !== false;
+}
+
 /** 붐따가 켜져 있으면 몇 개 더 모이면 내려가는지 알려 준다 (§10.3). */
 function boomttaNote(dislike) {
   const settings = store.get().settings || {};
-  if (!settings.boomttaEnabled) return '';
+  if (!settings.boomttaEnabled || !dislikeAllowed()) return '';
   const threshold = Number(settings.boomttaThreshold) || 0;
   if (threshold <= 0) return '';
   const left = Math.max(0, threshold - (dislike || 0));
@@ -3911,10 +3927,13 @@ function nowVoteButtons(current) {
       : '오늘 슈퍼 좋아요를 다 썼어요 (UTC 자정에 초기화돼요)');
   }
 
+  // 싫어요를 안 쓰는 서버면 여기서도 뺀다. 이미 눌러 둔 표는 뗄 수 있게 남긴다.
+  const showDislike = dislikeAllowed() || current.myVote === 'dislike';
+
   return h('div', { class: 'nowvote', role: 'group', 'aria-label': '지금 곡에 투표' },
     make('like', `👍 ${points.like}`, `좋아요 · ${points.like}점 올라가요`),
     superButton,
-    make('dislike', `👎 ${points.dislike}`, `싫어요 · ${points.dislike}점이에요`));
+    showDislike ? make('dislike', `👎 ${points.dislike}`, `싫어요 · ${points.dislike}점이에요`) : null);
 }
 
 async function vote(itemId, kind) {
@@ -4761,6 +4780,36 @@ function mountSoundCloud(sourceUrl, startSeconds, paused) {
  *  소리는 안 나는 상태가 된다. 실패해도 조용히 넘어간다 — 알림이 실패했다고 재생을 막을 이유는 없다. */
 function reportWebListening(on) {
   api('/web-listening', { body: { on: !!on } }).catch(() => { /* 조용히 */ });
+}
+
+/* 지난번에 켜 두었으면 **아무 데나 처음 누를 때** 알아서 되살린다.
+ *
+ * 브라우저는 사용자가 한 번 건드리기 전에는 소리를 못 내게 막는다. 그래서 예전에는
+ * "🔊 웹에서 듣기를 한 번 눌러 주세요" 라고 안내만 했는데, 이미 켜 두겠다고 한 사람에게
+ * 매번 같은 버튼을 찾아 누르게 하는 건 기억하고 있다는 말과 어긋난다.
+ *
+ * **자동재생 정책을 어기는 게 아니다.** 어디를 누르든 그 클릭이 곧 사용자 제스처라
+ * 브라우저가 허락하는 순간이 된다. 다만 그 순간을 우리가 고르지 않을 뿐이다.
+ *
+ * 첫 제스처가 웹 버튼 자체이면 손대지 않는다 — 그쪽 핸들러가 이미 켤 것이고,
+ * 여기서 같이 켜면 켰다 껐다 하며 서로 취소한다. */
+function armWebResume() {
+  setWebNote('지난번에 켜 두셔서, 화면을 한 번 누르면 바로 이어서 들려드려요.');
+
+  const go = (event) => {
+    if (event && event.target && event.target.closest && event.target.closest('.webbtn')) return;
+    off();
+    // 그 사이에 직접 켰거나 막힌 상태가 됐으면 아무것도 하지 않는다.
+    if (webOn || webBlocked) return;
+    toggleWebPlayback();
+  };
+  const off = () => {
+    document.removeEventListener('pointerdown', go, true);
+    document.removeEventListener('keydown', go, true);
+  };
+  // capture 로 듣는다. 다른 핸들러가 stopPropagation 을 해도 제스처는 놓치지 않는다.
+  document.addEventListener('pointerdown', go, true);
+  document.addEventListener('keydown', go, true);
 }
 
 async function toggleWebPlayback() {
@@ -6814,7 +6863,11 @@ function renderProfile() {
       h('span', { class: `tier tier--${state.tier}` }, `${tier.icon} ${tier.label}`)));
 
   setLock(el.consoleBtn, !can('console'), lockReason('console'));
-  el.opsLink.hidden = !can('ops');
+  // 주소가 아직 안 왔으면 링크를 아예 안 보여준다. 갈 데를 모르는 링크를 눌러
+  // 제자리로 돌아오는 것보다, 잠깐 안 보이는 쪽이 덜 헷갈린다.
+  const opsUrl = (state.permissions?.entries || []).find((row) => row.key === 'ops')?.url;
+  if (opsUrl) el.opsLink.href = opsUrl;
+  el.opsLink.hidden = !can('ops') || !opsUrl;
   renderNotifyBox();
   syncLayoutOptions();
 
@@ -8404,7 +8457,7 @@ async function boot() {
   el.lyricsToggle.setAttribute('aria-expanded', String(lyricsOpen));
   el.lyricsToggle.classList.toggle('btn--primary', lyricsOpen);
   syncWebUi();
-  if (webWanted) setWebNote('지난번에 웹에서 듣기를 켜 두셨어요. 🔊 웹에서 듣기를 한 번 눌러 주세요.');
+  if (webWanted) armWebResume();
 
   clock.onTick(renderProgress);
   scheduleViz();

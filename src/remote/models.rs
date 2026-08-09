@@ -285,8 +285,12 @@ impl QueueScore {
     }
 
     /// 붐따 기준을 넘겼는지 (§10.3). 꺼져 있거나 기준이 `0`(무제한)이면 절대 안 걸린다.
+    ///
+    /// 싫어요를 안 쓰는 서버에서는 애초에 표가 안 쌓이지만, 껐을 때 남아 있던 표까지
+    /// 세어 곡을 내리면 안 되므로 여기서도 한 번 더 본다.
     pub fn boomtta_triggered(&self, settings: &RemoteGuildSettings) -> bool {
-        settings.boomtta_enabled
+        settings.dislike_enabled
+            && settings.boomtta_enabled
             && as_limit_u32(settings.boomtta_threshold)
                 .is_some_and(|threshold| self.dislike_count >= threshold as i32)
     }
@@ -1865,7 +1869,15 @@ pub struct RemoteGuildSettings {
     #[serde(default = "default_wait_points")]
     pub wait_points: i32,
 
-    // ───────── 붐따 (§10.3) ─────────
+    // ───────── 싫어요 · 붐따 (§10.3) ─────────
+    /// 싫어요를 아예 안 쓰는가. **끄면 버튼이 사라지고 서버도 표를 안 받는다.**
+    ///
+    /// 붐따와 싫어요는 사실 한 기능의 두 단계다 — 싫어요를 안 받으면 붐따도 있을 수 없다.
+    /// 그래서 화면에서는 셋 중 하나(안 씀 / 점수만 / 쌓이면 내리기)로 고르게 하고,
+    /// 저장은 이 값과 `boomtta_enabled` 두 개로 나눠 둔다. 나눠 두면 예전 설정이
+    /// 그대로 살아난다 — 이 값이 없던 서버는 `true` 라서 지금까지와 똑같이 동작한다.
+    #[serde(default = "default_true")]
+    pub dislike_enabled: bool,
     /// 꺼져 있으면(기본) 싫어요는 점수에만 영향을 준다. 곡이 사라지지 않는다.
     #[serde(default)]
     pub boomtta_enabled: bool,
@@ -2328,6 +2340,7 @@ impl Default for RemoteGuildSettings {
             dislike_points: default_dislike_points(),
             super_like_points: default_super_like_points(),
             wait_points: default_wait_points(),
+            dislike_enabled: true,
             boomtta_enabled: false,
             boomtta_threshold: default_boomtta_threshold(),
             boomtta_action: BoomttaAction::Bottom,
@@ -2802,6 +2815,35 @@ mod tests {
 
         settings.boomtta_threshold = 0;
         assert!(!score.boomtta_triggered(&settings), "0은 무제한이라 안 걸린다");
+    }
+
+    /// **싫어요를 안 쓰기로 하면 쌓여 있던 표로도 곡이 안 내려간다.**
+    ///
+    /// 끄기 전에 모인 표는 그대로 남아 있다. 그걸 계속 세면 "안 쓴다고 했는데 곡이 사라지는"
+    /// 제일 이해 안 되는 상황이 된다.
+    #[test]
+    fn turning_dislikes_off_also_stops_boomtta() {
+        let mut settings = RemoteGuildSettings::default();
+        settings.boomtta_enabled = true;
+        settings.boomtta_threshold = 2;
+        let score = score_of(0, 0, 0, 3);
+        assert!(score.boomtta_triggered(&settings), "켜 뒀으면 걸린다");
+
+        settings.dislike_enabled = false;
+        assert!(!score.boomtta_triggered(&settings));
+    }
+
+    /// 이 기능이 생기기 전에 저장된 설정은 **지금까지와 똑같이 동작해야 한다.**
+    ///
+    /// `dislikeEnabled` 가 없는 JSON 이 `false` 로 읽히면 그 순간 모든 옛 서버에서
+    /// 싫어요 버튼이 사라진다. 기본값 하나가 조용히 전부를 바꾸는 자리라 못 박아 둔다.
+    #[test]
+    fn settings_without_dislike_field_keep_dislikes_on() {
+        let old = serde_json::json!({ "guildId": 1, "boomttaEnabled": true });
+        let settings: RemoteGuildSettings =
+            serde_json::from_value(old).expect("옛 설정을 읽을 수 있어야 해요");
+        assert!(settings.dislike_enabled, "없으면 켜 둔 것으로 읽는다");
+        assert!(settings.boomtta_enabled, "옛 붐따 설정도 그대로 살아난다");
     }
 
     /// 모수가 1명이면 그 사람 혼자 눌러도 넘어간다 — 혼자 듣는데 투표를 시키면 괴롭힘이다.
