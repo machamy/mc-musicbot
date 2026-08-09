@@ -262,6 +262,140 @@ impl Coordinator {
         self.virtual_sessions.lock().await.remove(&guild_id);
     }
 
+    /// 봇이 음성에 없을 때 가상 재생을 맞춘다. **돌봐 줬으면 `true`** 를 준다.
+    ///
+    /// `false` 면 아래의 기존 경로가 그대로 돈다 — 모드가 꺼져 있거나 들을 사람이 없는
+    /// 평소 상태에서는 **도입 전과 완전히 같게** 동작한다는 뜻이다.
+    async fn reconcile_virtual(
+        self: &Arc<Self>,
+        app: &Arc<App>,
+        guild_id: u64,
+        state: &GuildPlayerState,
+    ) -> bool {
+        let settings = app.remote.load_guild_settings(guild_id);
+        let listeners = app
+            .web_listener_count
+            .get()
+            .map(|counter| counter(guild_id))
+            .unwrap_or(0);
+
+        // 켤 이유가 없으면 도는 것을 정리하고 손을 뗀다.
+        if !settings.web_player_mode || listeners == 0 || state.current_item.is_none() {
+            let had = self.virtual_sessions.lock().await.remove(&guild_id).is_some();
+            if had {
+                app.log.info(
+                    "Playback",
+                    &format!("웹 재생기 시각표를 멈췄어요 (guild {guild_id})."),
+                );
+            }
+            return false;
+        }
+        let current = state.current_item.clone().expect("바로 위에서 확인함");
+
+        // **길이를 모르면 시작하지 않는다.** 0 으로 두면 곡이 즉시 끝난 것으로 처리돼
+        // 대기열이 순식간에 비워진다. 대기열은 손대지 않고 그 자리에 멈춘 채 둔다.
+        let Some(duration) = current.track.duration.map(|d| Duration::from_secs_f64(d.as_secs_f64())) else {
+            app.log.warn(
+                "Playback",
+                &format!(
+                    "'{}' 은 길이를 알 수 없어 웹 재생을 시작하지 못했어요 (guild {guild_id}).",
+                    current.track.display_title()
+                ),
+            );
+            self.virtual_sessions.lock().await.remove(&guild_id);
+            return true;
+        };
+
+        // 같은 곡이 이미 돌고 있으면 그대로 둔다. 매 호출마다 새로 잡으면 위치가 0 으로 돌아간다.
+        {
+            let virtuals = self.virtual_sessions.lock().await;
+            if let Some(v) = virtuals.get(&guild_id) {
+                if v.item_id == current.id {
+                    return true;
+                }
+            }
+        }
+
+        let generation = self.gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let start_offset = Duration::from_secs_f64(current.start_offset.as_secs_f64());
+        let started_utc = chrono::Utc::now()
+            - chrono::Duration::from_std(start_offset).unwrap_or_default();
+        {
+            let mut virtuals = self.virtual_sessions.lock().await;
+            virtuals.insert(
+                guild_id,
+                VirtualSession {
+                    item_id: current.id.clone(),
+                    started_utc,
+                    paused_at: if state.is_paused {
+                        Some(start_offset)
+                    } else {
+                        None
+                    },
+                    generation,
+                },
+            );
+        }
+        app.log.info(
+            "Playback",
+            &format!(
+                "웹 재생기 시각표 시작: '{}' (guild {guild_id}, 듣는 사람 {listeners}명).",
+                current.track.display_title()
+            ),
+        );
+
+        // 물리 재생과 **같은 시작 훅**을 태운다. 안 부르면 다음 곡 프리페치·자동추천
+        // preview·재생 카드가 하나도 안 돈다.
+        crate::player::side_effects::on_track_started(
+            app.clone(),
+            self.clone(),
+            guild_id,
+            current.clone(),
+        );
+
+        self.clone()
+            .spawn_virtual_timer(app.clone(), guild_id, generation, duration, start_offset);
+        true
+    }
+
+    /// 곡이 끝날 시각에 깨어나 다음 곡으로 넘긴다.
+    ///
+    /// **남은 시간만 기다린다** — 이어재생·seek 로 중간부터 시작했으면 그만큼 빼야 한다.
+    /// 깨어나서는 자기 세대가 아직 살아 있는지 먼저 본다. 그 사이 스킵·정지·봇 합류가
+    /// 있었으면 세대가 바뀌어 있고, 그때는 아무것도 하지 않는다.
+    fn spawn_virtual_timer(
+        self: Arc<Self>,
+        app: Arc<App>,
+        guild_id: u64,
+        generation: u64,
+        duration: Duration,
+        start_offset: Duration,
+    ) {
+        let remaining = duration.saturating_sub(start_offset);
+        tokio::spawn(async move {
+            tokio::time::sleep(remaining).await;
+            {
+                let virtuals = self.virtual_sessions.lock().await;
+                match virtuals.get(&guild_id) {
+                    Some(v) if v.generation == generation => {}
+                    // 세대가 다르거나 사라졌으면 내 차례가 아니다.
+                    _ => return,
+                }
+            }
+            // **물리 자연 종료와 같은 순서를 그대로 탄다.** 이걸 재사용하지 않으면
+            // 자동재생 보충과 다음 세션 생성이 끊긴다.
+            app.player.advance(guild_id).await;
+            crate::player::side_effects::ensure_autoplay(
+                app.clone(),
+                self.clone(),
+                guild_id,
+                true,
+            )
+            .await;
+            self.sync_guild(&app, guild_id).await;
+        });
+    }
+
     pub async fn leave_voice(&self, app: &Arc<App>, guild_id: u64) {
         self.cancel_current(guild_id).await;
         if let Some(manager) = app.songbird.get() {
@@ -279,6 +413,19 @@ impl Coordinator {
     pub async fn sync_guild(self: &Arc<Self>, app: &Arc<App>, guild_id: u64) {
         loop {
             let state = app.player.get_state(guild_id).await;
+
+            // **봇이 실제로 음성에 없으면** 가상 재생을 살펴본다 (웹 재생기 모드).
+            //
+            // 저장된 `voice_channel_id` 가 아니라 Discord 캐시를 본다 — 저장값은 "다음에
+            // 어디로 들어갈까" 라서 강제 퇴장 뒤에도 남는다(§16 B1).
+            //
+            // 모드가 꺼져 있거나 듣는 사람이 없으면 `reconcile_virtual` 이 아무것도 안 만들고,
+            // 그러면 아래 기존 경로가 그대로 돈다 — **도입 전과 완전히 같다.**
+            if !crate::web::remote::bot_voice_status_of(app, guild_id).in_voice() {
+                if self.reconcile_virtual(app, guild_id, &state).await {
+                    return;
+                }
+            }
 
             // 음성 채널 미바인딩 → 송출 중지.
             let Some(channel_id) = state.voice_channel_id else {

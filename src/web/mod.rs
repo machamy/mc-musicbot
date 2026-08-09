@@ -278,6 +278,14 @@ pub async fn serve(app: Arc<App>) {
         }));
     }
 
+    // 코디네이터가 "지금 듣는 사람이 있나" 를 물어볼 수 있게 해 준다 (웹 재생기 모드).
+    {
+        let hook_state = state.clone();
+        let _ = app.web_listener_count.set(Box::new(move |guild_id| {
+            remote::web_listener_count(&hook_state, guild_id)
+        }));
+    }
+
     // 한가할 때 차트를 미리 받아 둔다 (§15.3).
     {
         let hook_state = state.clone();

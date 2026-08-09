@@ -4525,7 +4525,17 @@ function offsetLabel(value) {
  * 개인(`webOffset`)이 사람마다 남는 차이를 다듬는다.
  */
 function syncOffsetSeconds() {
-  const server = (store.get().schedule?.webSyncOffsetMs || 0) / 1000;
+  const state = store.get();
+  const server = (state.schedule?.webSyncOffsetMs || 0) / 1000;
+  /* **가상 재생 중에는 개인 보정을 안 쓴다.**
+   *
+   * 이 값의 목적은 "봇에서 나오는 소리와 내 브라우저 소리를 맞추는 것" 이다. 그런데 봇이
+   * 음성에 없는 웹 재생기 모드에는 맞출 봇 소리가 자체가 없다 — 기준이 없는 보정값이다.
+   *
+   * 그대로 두면 더 나쁘다. 보정은 사람마다 최대 ±10초라, 각자 **다른 목표**를 따라가게 되어
+   * "모두가 같은 곡 같은 위치" 가 깨진다. 기존 2초 보정은 나와 내 목표 사이만 맞출 뿐
+   * 사람 사이 오차를 좁혀 주지 않는다. */
+  if (state.player?.voiceConnected === false && state.settings?.webPlayerMode) return server;
   return webOffset + server;
 }
 

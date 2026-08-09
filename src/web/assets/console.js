@@ -334,7 +334,7 @@ const SECTION_KEYS = {
     'autoplayPolicy', 'autoplayArtistCooldown', 'autoplayRecentDecayHours', 'autoplaySeedMax',
     'chartSuperWeight', 'chartLimit',
     // 재생 동작 (§31 · §36)
-    'requireVoiceForPlayback', 'publicNowPlaying', 'webSyncOffsetMs', 'skipLeadMs', 'seekLockoutMs',
+    'requireVoiceForPlayback', 'webPlayerMode', 'publicNowPlaying', 'webSyncOffsetMs', 'skipLeadMs', 'seekLockoutMs',
   ],
   perms:  PERM_FIELDS.map((field) => field.key).concat(['ruleRoleIds', 'managerRoleIds']),
   limits: ['minVolume', 'maxVolume', 'maxQueuePerUser', 'maxQueuePerGuild', 'maxTrackSeconds', 'bulkEnqueueLimit', 'auditRetentionDays', 'chatRetentionDays'],
@@ -399,6 +399,7 @@ const FIELD_LABELS = {
   autoBgmEnabled: '자동 재생 사용',
   repeatMode: '반복',
   requireVoiceForPlayback: '봇이 음성 채널에 있어야만 조작',
+  webPlayerMode: '웹 재생기 모드',
   publicNowPlaying: '로그인 없이 지금 곡 보기',
   boomttaEnabled: '붐따 사용',
   boomttaAction: '붐따 — 내릴 때 어떻게 할까요',
@@ -1181,6 +1182,12 @@ function playbackGroup() {
       '켜 두면 봇이 음성에 없을 때 재생·스킵이 거절돼요. 눌러도 아무 일이 안 나는 상태를 막아요. ' +
       '끄면 조작을 미리 받아 두고 봇이 들어오는 순간부터 이어 가요.',
       toggleControl('requireVoiceForPlayback', '없으면 거절해요', '미리 받아 둬요')),
+    // 봇 없이 리모컨만으로 같이 듣기.
+    fieldShell('webPlayerMode', '웹 재생기 모드',
+      '봇이 음성 채널에 없어도 리모컨에서 같이 들을 수 있어요. 서버가 재생 시각표를 돌리고 ' +
+      '브라우저들이 그걸 따라가서, 듣는 사람 모두가 같은 곡을 같은 지점에서 들어요. ' +
+      '실제로 듣는 사람이 아무도 없으면 저절로 멈춰요. 봇이 음성에 들어오면 봇이 이어받아요.',
+      toggleControl('webPlayerMode', '봇 없이도 같이 들어요', '봇이 있어야 들어요')),
     // 로그인 없이 지금 곡 보기 (§29).
     fieldShell('publicNowPlaying', '로그인 없이 지금 곡 보기',
       '켜면 로그인하지 않은 사람도 지금 무슨 곡인지 볼 수 있어요. ' +

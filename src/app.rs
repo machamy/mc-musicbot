@@ -146,6 +146,12 @@ pub struct App {
     /// 유휴 시간 차트 프리페치 훅 (§15.3). `web::serve` 가 채운다 —
     /// 차트를 펼치는 코드가 웹 계층에 있어서 여기서 직접 부를 수 없다.
     pub on_chart_prefetch: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// 이 길드에서 **실제로 웹으로 듣고 있는 사람 수**를 세어 주는 훅.
+    ///
+    /// 코디네이터가 가상 재생을 돌릴지 판단할 때 쓴다. 세는 곳은 `WebState::web_listeners`
+    /// 인데 코디네이터는 거기 못 닿는다 — `on_restarting` 과 같은 방향으로 웹이 채워 준다.
+    /// 훅이 없으면 0 으로 본다(웹이 아직 안 뜬 기동 직후 등).
+    pub web_listener_count: OnceLock<Box<dyn Fn(u64) -> usize + Send + Sync>>,
     /// 마지막 재정렬 tick 시각(길드 무관). 웹이 nextSortAt 을 계산해 카운트다운을 그린다.
     /// 순서가 바뀌었는지와 무관하게 매 tick 갱신된다 — 카운트다운은 "다음 검사 시각"이지
     /// "다음에 순서가 바뀌는 시각"이 아니다. 아직 한 번도 안 돌았으면 `None`.
@@ -246,6 +252,7 @@ impl App {
             on_queue_sorted: OnceLock::new(),
             on_restarting: OnceLock::new(),
             on_chart_prefetch: OnceLock::new(),
+            web_listener_count: OnceLock::new(),
             last_queue_sort: RwLock::new(None),
             queue_sort_last: Mutex::new(HashMap::new()),
             announce_channels: Mutex::new(HashMap::new()),

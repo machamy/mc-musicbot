@@ -2547,6 +2547,30 @@ mod tests {
         assert_eq!(settings.autoplay_rule, PermissionRule::GuildMember);
     }
 
+    /// 웹 재생기 모드는 **기본이 꺼짐**이고, 저장본에 없던 서버도 꺼짐으로 읽혀야 한다.
+    ///
+    /// 이 값이 조용히 켜지면 봇이 잠깐 음성에서 빠졌을 때 서버가 혼자 대기열을 돌리기
+    /// 시작한다. 도입 전 저장본과의 호환이 곧 R1(기존 동작 보존)이다.
+    #[test]
+    fn web_player_mode_is_off_unless_someone_turns_it_on() {
+        assert!(!RemoteGuildSettings::default().web_player_mode);
+
+        // 이 필드를 모르던 시절의 저장본.
+        let legacy = r#"{"searchRule":"guildMember","requireVoiceForPlayback":true}"#;
+        let parsed: RemoteGuildSettings = serde_json::from_str(legacy).unwrap();
+        assert!(
+            !parsed.web_player_mode,
+            "옛 저장본은 꺼짐으로 읽혀야 한다 — 안 그러면 도입만으로 동작이 바뀐다"
+        );
+
+        // 켜 두면 그대로 살아남는다(직렬화 왕복).
+        let mut on = RemoteGuildSettings::default();
+        on.web_player_mode = true;
+        let round: RemoteGuildSettings =
+            serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(round.web_player_mode);
+    }
+
     /// 음성에 없는 사람이 무엇을 할 수 있고 무엇을 못 하는지 — 기본값 계약.
     /// 채팅·좋아요·신청·자동 재생 On/Off 는 되고, 넘기기·위치 이동·한 번에 담기는 안 된다.
     #[test]

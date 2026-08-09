@@ -3585,6 +3585,8 @@ async fn api_state_cold(
             // 이 설정을 꺼도 리모컨은 여전히 "봇이 음성에 없음"만 보고 버튼을 잠갔다.
             // 설정은 있는데 아무 효과가 없는 상태였다.
             "requireVoiceForPlayback": settings.require_voice_for_playback,
+            // 화면이 이 값을 알아야 잠금 판정과 개인 오프셋 처리가 맞는다.
+            "webPlayerMode": settings.web_player_mode,
             "minVolume": settings.min_volume,
             "maxVolume": settings.max_volume,
             "sortMode": settings.sort_mode.as_str(),
@@ -7717,6 +7719,7 @@ async fn admin_settings_snapshot(state: &Arc<WebState>, guild_id: u64) -> Value 
         // **읽어올 수 있어야 켜고 끌 수 있다.** 저장 핸들러만 만들어 두고 스냅샷에 안 실어서
         // 화면에서는 존재하지도 않는 설정이 됐던 자리다.
         "requireVoiceForPlayback": settings.require_voice_for_playback,
+        "webPlayerMode": settings.web_player_mode,
         "publicNowPlaying": settings.public_now_playing,
         "skipLeadMs": settings.skip_lead_ms,
         "seekLockoutMs": settings.seek_lockout_ms,
@@ -8123,6 +8126,9 @@ async fn admin_settings_put(
             }
             if let Some(value) = body.get("requireVoiceForPlayback").and_then(|v| v.as_bool()) {
                 settings.require_voice_for_playback = value;
+            }
+            if let Some(value) = body.get("webPlayerMode").and_then(|v| v.as_bool()) {
+                settings.web_player_mode = value;
             }
             if let Some(value) = body.get("publicNowPlaying").and_then(|v| v.as_bool()) {
                 settings.public_now_playing = value;
