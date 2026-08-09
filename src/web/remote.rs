@@ -7873,6 +7873,7 @@ async fn admin_settings_put(
     let mut settings = ctx.settings.clone();
     let before = serde_json::to_string(&settings).unwrap_or_default();
     let mut sort_mode_changed = false;
+    let mut web_player_mode_changed = false;
 
     match section.as_str() {
         "order" => {
@@ -8128,7 +8129,14 @@ async fn admin_settings_put(
                 settings.require_voice_for_playback = value;
             }
             if let Some(value) = body.get("webPlayerMode").and_then(|v| v.as_bool()) {
+                // **켜고 끄는 즉시 반영한다.** 리스너 콜백은 접속 수 경계에서만 울리므로,
+                // 이미 사람들이 붙어 있는 상태에서 설정만 바꾸면 아무 일도 안 일어난다.
+                // 끌 때도 마찬가지다 — 도는 시각표를 그대로 두면 안 된다.
+                let changed = settings.web_player_mode != value;
                 settings.web_player_mode = value;
+                if changed {
+                    web_player_mode_changed = true;
+                }
             }
             if let Some(value) = body.get("publicNowPlaying").and_then(|v| v.as_bool()) {
                 settings.public_now_playing = value;
@@ -8305,6 +8313,15 @@ async fn admin_settings_put(
         let app = state.app.clone();
         tokio::spawn(async move {
             crate::player::side_effects::refresh_preview(app, guild_id).await;
+        });
+    }
+    // 웹 재생기 모드를 켜거나 끈 직후에는 시각표를 다시 맞춘다. 켜면 이미 듣고 있던
+    // 사람들로 바로 시작하고, 끄면 도는 것이 즉시 멈춘다.
+    if web_player_mode_changed {
+        let app = state.app.clone();
+        let coordinator = app.coordinator.clone();
+        tokio::spawn(async move {
+            coordinator.sync_guild(&app, guild_id).await;
         });
     }
     // 아래 `refresh_scored_order` 가 캐시에서 정렬 모드와 투표 점수를 읽으므로 **그 전에** 버린다.

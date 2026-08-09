@@ -110,6 +110,12 @@ impl EventHandler for Handler {
         self.app.db.delete_guild_metadata(gid);
         self.app.announce_channels.lock().unwrap().remove(&gid);
         self.app.last_np_message.lock().unwrap().remove(&gid);
+        // **도는 시각표도 멈춘다.** 안 그러면 봇이 쫓겨난 서버에서 가상 재생이 계속
+        // 돌면서 "봇이 초대된 서버에서만" 이라는 경계를 넘는다.
+        let app = self.app.clone();
+        tokio::spawn(async move {
+            app.coordinator.cancel_current(gid).await;
+        });
     }
 
     async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {

@@ -174,6 +174,7 @@ impl PlayerManager {
                 .load_guild_state(guild_id, eff.effective_volume, eff.autoplay_default);
         self.prepare_scored_queue(&mut state);
         self.attach_preview(&mut state);
+        self.attach_virtual_flag(&mut state);
         state
     }
 
@@ -199,6 +200,7 @@ impl PlayerManager {
         self.db.save_guild_state(&state);
         self.log.info(category, log_msg);
         self.attach_preview(&mut state);
+        self.attach_virtual_flag(&mut state);
         state
     }
 
@@ -796,6 +798,15 @@ impl PlayerManager {
         self.previews.lock().unwrap().contains_key(&guild_id)
     }
 
+    /// 저장되지 않는 런타임 사실을 상태에 붙인다. `attach_preview` 와 같은 자리에서 돈다.
+    fn attach_virtual_flag(&self, state: &mut GuildPlayerState) {
+        state.virtual_playback = self
+            .virtual_guilds
+            .lock()
+            .map(|set| set.contains(&state.guild_id))
+            .unwrap_or(false);
+    }
+
     fn attach_preview(&self, state: &mut GuildPlayerState) {
         let previews = self.previews.lock().unwrap();
         if let Some(p) = previews.get(&state.guild_id) {
@@ -893,6 +904,7 @@ impl PlayerManager {
         self.prepare_scored_queue(&mut state);
         self.db.save_guild_state(&state);
         self.attach_preview(&mut state);
+        self.attach_virtual_flag(&mut state);
         state
     }
 

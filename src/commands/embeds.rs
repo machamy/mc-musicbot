@@ -114,6 +114,11 @@ pub fn now_playing_embed(
     if state.is_paused {
         footer.push_str(" | Paused");
     }
+    // **웹에서만 도는 중이면 그렇게 말한다.** 디스코드만 보는 사람에게 카드가 평소와
+    // 똑같이 뜨면 "봇이 트는 줄" 알고 음성 채널에 들어와 무음을 듣게 된다.
+    if state.virtual_playback {
+        footer.push_str(" | 웹에서만 재생 중 · 음성 채널에서는 안 들려요");
+    }
     let mut embed = CreateEmbed::new()
         .colour(0xF1C40F)
         .title("Now Playing")

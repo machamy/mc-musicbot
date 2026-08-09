@@ -323,6 +323,12 @@ pub struct GuildPlayerState {
     pub recent_tracks: Vec<TrackRef>,
     /// 휘발성 autoplay 미리보기 (SQLite 비저장).
     pub autoplay_preview: Option<QueueItem>,
+    /// **지금 봇 없이 웹에서만 도는 중인가** (웹 재생기 모드).
+    ///
+    /// 저장하지 않는다 — 이 값은 코디네이터가 아는 런타임 사실이고, `PlayerManager` 가
+    /// 상태를 만들 때마다 붙여 준다. DB 에 담으면 재시작 뒤에 거짓이 남는다.
+    /// (이 구조체는 serde 를 안 쓴다. 저장은 `db::save_guild_state` 가 필드를 골라 담는다.)
+    pub virtual_playback: bool,
 }
 
 impl Default for RepeatMode {
