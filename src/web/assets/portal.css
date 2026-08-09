@@ -1174,6 +1174,10 @@ body[data-dragging="tab"] { user-select: none; }
 .vote--now .vote__icon { font-size: 18px; line-height: 1; }
 /* 숫자는 사람 수다. 자릿수가 바뀌어도 버튼이 안 흔들리게 폭을 잡아 둔다. */
 .vote--now .vote__count { min-width: 1.2em; text-align: center; font-variant-numeric: tabular-nums; }
+/* 지금 곡의 점수줄. 대기열 줄과 같은 `.score` 를 쓰되 카드 안이라 위아래로 숨을 준다. */
+.nowscore { margin: var(--sp-2) 0; }
+.nowscore__note { display: block; margin-top: var(--sp-1); }
+
 /* 명단 토글은 투표가 아니라 보기 설정이라 한 칸 떨어뜨리고 조용하게 둔다. */
 .vote--voters { margin-left: auto; font-size: var(--fs-sm); color: var(--text-3); }
 .vote--voters:hover { color: var(--text-1); }

@@ -3996,6 +3996,32 @@ function nowVotersOpen() {
   return prefGet('nowVoters') !== '0';
 }
 
+/* 내 한 표를 화면에 **즉시** 반영한다 (§10.7).
+ *
+ * 서버 응답을 기다렸다 방송을 받아 그리면 아무리 빨라도 한 박자 늦고, 지금 나오는 곡은
+ * 그보다 훨씬 늦게 왔다. 누른 사람 눈에는 "안 눌렸나?" 로 보여서 또 누르게 된다.
+ *
+ * 서버가 진짜 숫자를 보내오면 그게 이긴다 — 여기서 만든 값은 그때까지만 쓰는 임시값이다.
+ * 그래서 총점(`totalScore`)·계산식은 손대지 않는다. 배점을 여기서 다시 계산하면
+ * 서버 공식과 갈라져서, 잠깐이지만 **화면이 틀린 총점을 보여주게 된다.**
+ */
+function bumpScore(score, before, after) {
+  if (!score) return score;
+  const field = { like: 'likeCount', superLike: 'superLikeCount', dislike: 'dislikeCount' };
+  const next = Object.assign({}, score);
+  if (before && field[before]) next[field[before]] = Math.max(0, (next[field[before]] || 0) - 1);
+  if (after && field[after]) next[field[after]] = (next[field[after]] || 0) + 1;
+
+  // 누가 눌렀는지 목록에도 나를 넣고 뺀다. 숫자만 늘고 명단에 내가 없으면 그것도 거짓말이다.
+  const by = { like: 'likeBy', superLike: 'superBy', dislike: 'dislikeBy' };
+  const me = String(store.get().user?.id || '');
+  if (me) {
+    if (before && by[before]) next[by[before]] = (next[by[before]] || []).filter((id) => String(id) !== me);
+    if (after && by[after]) next[by[after]] = [...(next[by[after]] || []), me];
+  }
+  return next;
+}
+
 async function vote(itemId, kind) {
   const state = store.get();
   // 대기열에도, **지금 나오는 곡에도** 투표할 수 있다 (§10.7).
@@ -4010,11 +4036,15 @@ async function vote(itemId, kind) {
   notePersonalVote(itemId, next);
   const patch = {
     queue: store.get().queue.map((row) => (row.id === itemId
-      ? Object.assign({}, row, { myVote: next })
+      ? Object.assign({}, row, { myVote: next, score: bumpScore(row.score, item?.myVote, next) })
       : row)),
   };
   if (store.get().current?.id === itemId) {
-    patch.current = Object.assign({}, store.get().current, { myVote: next });
+    const now = store.get().current;
+    const bumped = bumpScore(scoreForCurrent(now), item?.myVote, next);
+    patch.current = Object.assign({}, now, { myVote: next, score: bumped });
+    // 점수 캐시도 같이 올린다. 여기가 안 바뀌면 다음 렌더가 캐시의 옛 숫자로 되돌린다.
+    if (bumped) queueScoreCache.set(itemId, bumped);
   }
   store.patch(patch);
 
@@ -5252,6 +5282,17 @@ function renderNow(state) {
   const nowScore = scoreForCurrent(current);
   clear(el.nowVoters);
   if (current) el.nowVoters.appendChild(nowVoteButtons(current));
+  /* 지금 곡의 점수도 대기열 줄과 **같은 모양**으로 보여준다.
+   * 대기열에 있을 때는 계산식과 총점이 보이다가 재생이 시작되는 순간 사라졌는데,
+   * 정작 이 곡이 몇 점인지 제일 궁금한 때가 지금이다. 순서를 바꾸지 않는다는 것만
+   * 아래 한 줄로 밝힌다 — 점수만 보이면 이걸로 순서가 바뀌는 줄 안다. */
+  if (nowScore) {
+    const scoreBox = h('div', { class: 'score nowscore' });
+    el.nowVoters.appendChild(scoreBox);
+    renderScore(scoreBox, nowScore, state.queueMode);
+    scoreBox.appendChild(h('span', { class: 'hint nowscore__note' }, '나가고 있는 곡이라 순서는 안 바뀌어요'));
+  }
+
   // 아래 명단은 사람이 고른 대로. 접어 뒀으면 버튼 줄만 남는다.
   if (nowScore && voterList(nowScore).length && nowVotersOpen()) {
     el.nowVoters.appendChild(voterPanel(nowScore));
@@ -8817,6 +8858,19 @@ function selfTest() {
     [countOf('like'), countOf('dislike')], ['3', '2']);
   eq('지금 곡 투표: 버튼이 대기열 줄(32px)보다 크다',
     voteRow.querySelector('[data-vote-kind="like"]')?.classList.contains('vote--now'), true);
+
+  /* §10.7 — 내 한 표는 화면에 즉시 보여야 한다.
+   * 지금 나오는 곡은 대기열 방송에 안 실려서, 이게 없으면 다음 재생 프레임이 나갈 때까지
+   * 숫자가 그대로였다("한참 뒤에 늘어난다"). */
+  eq('투표 즉시 반영: 새 표는 +1', bumpScore({ likeCount: 2 }, null, 'like').likeCount, 3);
+  eq('투표 즉시 반영: 취소는 −1', bumpScore({ likeCount: 2 }, 'like', null).likeCount, 1);
+  const swapped = bumpScore({ likeCount: 2, superLikeCount: 0 }, 'like', 'superLike');
+  eq('투표 즉시 반영: 종류를 바꾸면 옛 쪽이 줄고 새 쪽이 는다',
+    [swapped.likeCount, swapped.superLikeCount], [1, 1]);
+  eq('투표 즉시 반영: 0 아래로는 안 내려간다', bumpScore({ likeCount: 0 }, 'like', null).likeCount, 0);
+  // 총점은 서버 공식이 만든다. 여기서 다시 계산하면 잠깐이라도 틀린 총점을 보여준다.
+  eq('투표 즉시 반영: 총점과 계산식은 안 건드린다',
+    bumpScore({ likeCount: 2, totalScore: 9, formula: '👍2 = 9' }, null, 'like').totalScore, 9);
 
   console.info(fails.length ? `[자가검사] ${fails.length}건 실패` : '[자가검사] 전부 통과', fails);
   return { fail: fails.length, fails };

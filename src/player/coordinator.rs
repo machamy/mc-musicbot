@@ -95,6 +95,63 @@ pub struct Coordinator {
 
 const MAX_CONSECUTIVE_PLAY_FAILS: u32 = 5;
 
+/// 음성 상태가 밖에서 바뀌었을 때 저장된 채널 바인딩을 어떻게 할지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingChange {
+    /// 그대로 둔다.
+    Keep,
+    /// 실제로 있는 채널로 옮겨 적는다.
+    Rebind(u64),
+    /// 지운다 — 다시 부를 때까지 안 들어간다.
+    Clear,
+}
+
+#[cfg(test)]
+mod voice_binding_tests {
+    use super::*;
+
+    /// **강제 퇴장을 당하면 바인딩을 지운다.**
+    ///
+    /// 이게 없으면 바로 뒤의 `sync_guild` 가 저장값으로 `play_track` 을 불러서
+    /// 봇이 쫓겨난 그 순간 다시 들어왔다. 부르지도 않았는데 돌아오는 게 이것이었다.
+    #[test]
+    fn being_removed_from_voice_clears_the_binding() {
+        assert_eq!(
+            Coordinator::handoff_binding(None, Some(42)),
+            BindingChange::Clear
+        );
+    }
+
+    /// 다른 방으로 끌려가면 그 방으로 따라간다. 저장값이 옛 방이면 도로 돌아가 버린다.
+    #[test]
+    fn being_dragged_elsewhere_moves_the_binding() {
+        assert_eq!(
+            Coordinator::handoff_binding(Some(7), Some(42)),
+            BindingChange::Rebind(7)
+        );
+    }
+
+    /// 평소에는 아무것도 안 한다 — 우리가 넣어 둔 자리에 그대로 있는 상태.
+    #[test]
+    fn staying_put_changes_nothing() {
+        assert_eq!(
+            Coordinator::handoff_binding(Some(42), Some(42)),
+            BindingChange::Keep
+        );
+        // 이미 나가 있고 저장값도 없으면 지울 것도 없다 (`/나가기` 뒤).
+        assert_eq!(Coordinator::handoff_binding(None, None), BindingChange::Keep);
+    }
+
+    /// 우리가 부르기 전에 들어와 있는 걸 발견하면 적어 둔다 — 기동 직후 같은 때.
+    #[test]
+    fn finding_ourselves_already_in_voice_records_it() {
+        assert_eq!(
+            Coordinator::handoff_binding(Some(7), None),
+            BindingChange::Rebind(7)
+        );
+    }
+}
+
 #[cfg(test)]
 mod virtual_session_tests {
     use super::*;
@@ -312,8 +369,50 @@ impl Coordinator {
     ///
     /// 강제 퇴장도 여기로 온다. 예전에는 `voice_state_update` 가 세션을 안 건드려서,
     /// Discord 캐시는 미연결인데 물리 세션이 남아 시각표가 계속 나갔다 — 그 자체가 버그였다.
+    /// 음성 상태가 밖에서 바뀌었을 때 저장된 바인딩을 어떻게 할까.
+    /// 판단만 하는 함수라 Discord 없이도 검사할 수 있다.
+    fn handoff_binding(live: Option<u64>, stored: Option<u64>) -> BindingChange {
+        match live {
+            Some(actual) if stored != Some(actual) => BindingChange::Rebind(actual),
+            None if stored.is_some() => BindingChange::Clear,
+            _ => BindingChange::Keep,
+        }
+    }
+
     pub async fn handoff_voice_change(self: &Arc<Self>, app: &Arc<App>, guild_id: u64) {
         self.record_voice_change(app, guild_id).await;
+
+        /* **바인딩을 현실에 맞춘다.** 이게 없으면 봇이 자기 발로 돌아온다.
+         *
+         * 저장된 `voice_channel_id` 는 "다음에 어디로 들어갈까" 라서 강제 퇴장 뒤에도
+         * 남아 있었다. 그런데 바로 아래 `sync_guild` 가 그 값으로 `play_track` 을 부르니,
+         * 누가 봇을 뺀 **그 순간** 다시 들어왔다. 부르지도 않았는데 돌아오는 게 이것이다.
+         *
+         * 그래서 누가 밖에서 우리를 옮기거나 뺐으면 저장값도 따라간다.
+         *   · 다른 방으로 끌려갔다  → 그 방으로 바꾼다. 끌고 간 자리에서 계속 튼다.
+         *   · 아무 데도 없다        → 지운다. 다시 부를 때까지 안 들어간다.
+         *
+         * 웹 재생기 모드는 이 값과 무관하다. `sync_guild` 가 Discord 캐시를 먼저 보고
+         * 가상 재생을 챙긴 뒤에야 여기로 오므로, 봇 없이 듣던 사람은 그대로 이어 듣는다.
+         */
+        let live = crate::web::remote::bot_voice_status_of(app, guild_id);
+        let stored = app.player.get_state(guild_id).await.voice_channel_id;
+        match Self::handoff_binding(live.channel_id, stored) {
+            BindingChange::Rebind(actual) => {
+                app.player.connect_voice(guild_id, actual).await;
+            }
+            BindingChange::Clear => {
+                app.log.info(
+                    "Voice",
+                    &format!(
+                        "길드 {guild_id}: 음성에서 빠져서 채널 연결을 풀었어요. 다시 부르기 전까지는 안 들어가요."
+                    ),
+                );
+                app.player.disconnect_voice(guild_id).await;
+            }
+            BindingChange::Keep => {}
+        }
+
         let position = self.current_position(guild_id).await;
         if let Some(pos) = position {
             // 0초면 굳이 쓰지 않는다 — 아직 시작 전이거나 방금 바뀐 곡이다.

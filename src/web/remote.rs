@@ -5449,6 +5449,41 @@ async fn api_vote(
     }
 
     broadcast_queue(&state, guild_id).await;
+
+    /* **지금 나오는 곡은 대기열 방송에 안 들어간다.**
+     *
+     * `broadcast_queue` 는 `player.upcoming` 만 싣는데 재생 중인 곡은 거기 없다.
+     * 그래서 지금 곡에 투표하면 아무한테도 안 알려졌고, 숫자는 다음 `playback` 프레임이
+     * 나갈 때(다음 곡·일시정지 같은 게 있어야 한다)까지 그대로였다 — "한참 뒤에 늘어난다"
+     * 가 이것이다. 지금 곡이 대상이면 재생 프레임도 같이 민다. */
+    if player
+        .current_item
+        .as_ref()
+        .is_some_and(|current| current.id == item.id)
+    {
+        let player = state.app.player.get_state(guild_id).await;
+        let position = state
+            .app
+            .coordinator
+            .current_position(guild_id)
+            .await
+            .map(|value| value.as_secs_f64())
+            .unwrap_or(0.0);
+        emit(
+            &state,
+            guild_id,
+            "playback",
+            playback_payload(
+                &state,
+                &player,
+                position,
+                &now_utc(),
+                None,
+                state.app.coordinator.schedule(guild_id).await,
+            ),
+        );
+    }
+
     json_ok(json!({
         "ok": true,
         "boomtta": boomtta_fired,
