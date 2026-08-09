@@ -1947,6 +1947,18 @@ pub struct RemoteGuildSettings {
     /// 끄면 조작을 받아 두고 봇이 들어오는 순간부터 그대로 이어 간다.
     #[serde(default = "default_true")]
     pub require_voice_for_playback: bool,
+    /// **웹 재생기 모드** — 봇이 음성 채널에 없어도 리모컨만으로 같이 듣는다.
+    ///
+    /// 켜면 서버가 음성 연결 없이도 재생 시각표(`startedUtc`)를 돌린다. 브라우저들은
+    /// 그 하나의 시각표를 따라가므로 **모두가 같은 곡·같은 위치**가 된다.
+    ///
+    /// **기본이 `false` 다.** 이 값이 없는 기존 저장본은 도입 전과 완전히 같게 동작한다 —
+    /// 봇이 음성에 없으면 시각표가 안 생기고 대기열도 안 넘어간다.
+    ///
+    /// `require_voice_for_playback` 과 자동으로 엮이지 않는다. 봇을 잠깐 뺐다고 리모컨이
+    /// 혼자 돌기 시작하면 "왜 혼자 재생되지" 가 되기 때문에, 켤 사람이 명시적으로 켠다.
+    #[serde(default)]
+    pub web_player_mode: bool,
     /// **디스코드로는 쓰지 않을 명령 그룹** (`commands::catalog::GROUPS` 의 키).
     ///
     /// "이제 리모컨이 있으니까 디스코드로는 좀 적게 하고 싶다" 를 그대로 담은 값이다.
@@ -2267,6 +2279,7 @@ impl Default for RemoteGuildSettings {
             seek_lockout_ms: default_seek_lockout_ms(),
             web_sync_offset_ms: 0,
             require_voice_for_playback: true,
+            web_player_mode: false,
             public_now_playing: true,
             min_volume: 0,
             max_volume: 200,

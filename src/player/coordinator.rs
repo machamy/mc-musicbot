@@ -46,8 +46,41 @@ pub struct TrackSchedule {
     pub started_utc: chrono::DateTime<chrono::Utc>,
 }
 
+/// 봇이 음성에 없을 때 도는 **시각표만 있는 세션** (웹 재생기 모드).
+///
+/// 오디오는 한 바이트도 안 나른다. 시각을 흘려 보내는 것이 전부고, 브라우저들이 그 하나의
+/// 시각표를 따라가므로 모두가 같은 곡·같은 위치가 된다.
+///
+/// **일시정지는 위치를 얼려서 담는다.** `started_utc` 만으로 계산하면 멈춰 있는 동안에도
+/// 위치가 계속 흐른다 — 물리 세션은 songbird 핸들이 멈춰서 저절로 해결되지만 여기는 아니다.
+#[derive(Debug, Clone)]
+pub struct VirtualSession {
+    pub item_id: String,
+    /// 0초 지점의 UTC. **미래일 수 있다** (스킵 직후처럼 앞으로 잡아 둔 경우).
+    pub started_utc: chrono::DateTime<chrono::Utc>,
+    /// 멈춘 위치. `Some` 이면 정지 중이고 그 값이 곧 현재 위치다.
+    pub paused_at: Option<Duration>,
+    /// 이 세션의 세대. 뒤늦게 깨어난 타이머가 자기 세대인지 확인한다.
+    pub generation: u64,
+}
+
+impl VirtualSession {
+    /// 지금 위치. 멈춰 있으면 얼려 둔 값, 아니면 흐른 시간.
+    ///
+    /// `started_utc` 가 미래면 아직 시작 전이라 0 이다 — `Duration` 은 음수를 못 담는다.
+    pub fn position(&self) -> Duration {
+        if let Some(frozen) = self.paused_at {
+            return frozen;
+        }
+        let elapsed = chrono::Utc::now() - self.started_utc;
+        elapsed.to_std().unwrap_or(Duration::ZERO)
+    }
+}
+
 pub struct Coordinator {
     sessions: Mutex<HashMap<u64, Session>>,
+    /// 시각표만 도는 가상 세션. 물리 세션과 **같은 길드에 동시에 있지 않는다.**
+    virtual_sessions: Mutex<HashMap<u64, VirtualSession>>,
     /// 길드별 마지막으로 재생 횟수를 +1 한 item_id. 스톨 워치독/게이트웨이 재접속이
     /// 같은 곡으로 play_track 을 다시 호출해도 중복 카운트하지 않도록 막는 게이트.
     played_counted: Mutex<HashMap<u64, String>>,
@@ -59,10 +92,70 @@ pub struct Coordinator {
 
 const MAX_CONSECUTIVE_PLAY_FAILS: u32 = 5;
 
+#[cfg(test)]
+mod virtual_session_tests {
+    use super::*;
+
+    fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::seconds(secs)
+    }
+
+    fn session(started: chrono::DateTime<chrono::Utc>, paused: Option<Duration>) -> VirtualSession {
+        VirtualSession {
+            item_id: "곡".into(),
+            started_utc: started,
+            paused_at: paused,
+            generation: 1,
+        }
+    }
+
+    /// 흐르는 중에는 시작 시각으로부터 지난 만큼이 위치다.
+    #[test]
+    fn a_running_session_reports_elapsed_time() {
+        let v = session(at(30), None);
+        let pos = v.position().as_secs();
+        assert!((29..=31).contains(&pos), "약 30초여야 하는데 {pos}초");
+    }
+
+    /// **미래 `started_utc` 에서 패닉하거나 뒤집히면 안 된다.**
+    ///
+    /// `schedule_start_in` 은 스킵 직후처럼 시작을 앞으로 잡아 두고, 그때 `started_utc` 가
+    /// 미래가 된다. `Duration` 은 음수를 못 담으므로 그대로 빼면 터진다. 아직 시작 전이니 0 이다.
+    #[test]
+    fn a_future_start_reads_as_zero_not_a_panic() {
+        let v = session(chrono::Utc::now() + chrono::Duration::seconds(5), None);
+        assert_eq!(v.position(), Duration::ZERO);
+    }
+
+    /// **멈춰 있는 동안에는 위치가 안 흐른다.**
+    ///
+    /// 물리 세션은 songbird 핸들이 멈춰서 저절로 해결되지만 가상은 시각 계산이라
+    /// 얼려 두지 않으면 정지 중에도 계속 간다.
+    #[test]
+    fn a_paused_session_freezes_its_position() {
+        let v = session(at(100), Some(Duration::from_secs(42)));
+        assert_eq!(v.position(), Duration::from_secs(42));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(v.position(), Duration::from_secs(42), "정지 중에는 안 흘러야 한다");
+    }
+
+    /// 재개하면 얼려 둔 지점이 0초 기준이 된다 — `apply_pause` 가 하는 계산과 같은 식.
+    #[test]
+    fn resuming_rebases_the_start_to_the_frozen_point() {
+        let frozen = Duration::from_secs(42);
+        let mut v = session(at(100), Some(frozen));
+        v.started_utc = chrono::Utc::now() - chrono::Duration::from_std(frozen).unwrap();
+        v.paused_at = None;
+        let pos = v.position().as_secs();
+        assert!((41..=43).contains(&pos), "재개 직후는 얼린 지점이어야 하는데 {pos}초");
+    }
+}
+
 impl Coordinator {
     pub fn new() -> Coordinator {
         Coordinator {
             sessions: Mutex::new(HashMap::new()),
+            virtual_sessions: Mutex::new(HashMap::new()),
             played_counted: Mutex::new(HashMap::new()),
             gen_counter: AtomicU64::new(1),
             play_fail: Mutex::new(HashMap::new()),
@@ -71,9 +164,19 @@ impl Coordinator {
 
     /// 이 곡의 0초 지점 UTC (§31). 웹이 절대 시각으로 따라가게 하는 값이다.
     pub async fn schedule(&self, guild_id: u64) -> Option<TrackSchedule> {
-        let sessions = self.sessions.lock().await;
-        sessions.get(&guild_id).map(|s| TrackSchedule {
-            started_utc: s.started_utc,
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.get(&guild_id) {
+                return Some(TrackSchedule {
+                    started_utc: s.started_utc,
+                });
+            }
+        }
+        // 물리 세션이 없으면 가상 세션을 본다. **화면은 시각표가 어디서 왔는지 묻지 않는다** —
+        // 이 한 자리 덕분에 진행바·웹 재생·동기화가 전부 그대로 따라온다.
+        let virtuals = self.virtual_sessions.lock().await;
+        virtuals.get(&guild_id).map(|v| TrackSchedule {
+            started_utc: v.started_utc,
         })
     }
 
@@ -93,10 +196,17 @@ impl Coordinator {
 
     /// 현재 곡의 재생 위치 (시작 오프셋 포함). /현재곡 진행바용.
     pub async fn current_position(&self, guild_id: u64) -> Option<Duration> {
-        let sessions = self.sessions.lock().await;
-        let s = sessions.get(&guild_id)?;
-        let info = s.handle.get_info().await.ok()?;
-        Some(s.start_offset + info.position)
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.get(&guild_id) {
+                // **물리 계산은 그대로 둔다.** `started_utc` 를 보지 않고 핸들 위치를 쓴다 —
+                // 둘을 통일하려 들면 기존 진행바가 틀어진다.
+                let info = s.handle.get_info().await.ok()?;
+                return Some(s.start_offset + info.position);
+            }
+        }
+        let virtuals = self.virtual_sessions.lock().await;
+        virtuals.get(&guild_id).map(|v| v.position())
     }
 
     pub async fn apply_volume(&self, guild_id: u64, volume_percent: i32) {
@@ -114,21 +224,42 @@ impl Coordinator {
     }
 
     pub async fn apply_pause(&self, guild_id: u64, paused: bool) {
-        let sessions = self.sessions.lock().await;
-        if let Some(s) = sessions.get(&guild_id) {
-            if paused {
-                let _ = s.handle.pause();
-            } else {
-                let _ = s.handle.play();
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.get(&guild_id) {
+                if paused {
+                    let _ = s.handle.pause();
+                } else {
+                    let _ = s.handle.play();
+                }
+                return;
+            }
+        }
+        // 가상 세션은 멈출 핸들이 없다. **위치를 얼려서 담고**, 풀 때 그 지점을 0초로 삼아
+        // `started_utc` 를 다시 잡는다. 안 그러면 멈춰 있는 동안에도 위치가 계속 흐른다.
+        let mut virtuals = self.virtual_sessions.lock().await;
+        if let Some(v) = virtuals.get_mut(&guild_id) {
+            match (paused, v.paused_at) {
+                (true, None) => v.paused_at = Some(v.position()),
+                (false, Some(frozen)) => {
+                    v.started_utc = chrono::Utc::now()
+                        - chrono::Duration::from_std(frozen).unwrap_or_default();
+                    v.paused_at = None;
+                }
+                _ => {}
             }
         }
     }
 
     pub async fn cancel_current(&self, guild_id: u64) {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(s) = sessions.remove(&guild_id) {
-            let _ = s.handle.stop();
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.remove(&guild_id) {
+                let _ = s.handle.stop();
+            }
         }
+        // 가상 세션도 같이 버린다. 남겨 두면 물리와 시각표가 두 벌이 된다.
+        self.virtual_sessions.lock().await.remove(&guild_id);
     }
 
     pub async fn leave_voice(&self, app: &Arc<App>, guild_id: u64) {
