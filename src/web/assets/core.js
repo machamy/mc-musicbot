@@ -1095,7 +1095,10 @@ function merge(type, data, handlers) {
         startedUtc: data.startedUtc,
         isPaused: data.isPaused,
         // 봇이 음성에 없으면 실제로는 아무것도 안 나온다 (§36).
-        stopped: data.voiceConnected === false || !data.current,
+        // **서버가 판정한 값을 쓴다.** 예전에는 여기서 `voiceConnected` 로 파생했는데,
+        // 그러면 봇이 음성에 없을 때 웹 재생기 모드의 시각표가 돌고 있어도 화면이 멈춘다.
+        // 폴백을 남기는 이유는 옛 서버 + 새 화면 조합에서 §36 이 회귀하면 안 되기 때문이다.
+        stopped: data.stopped ?? (data.voiceConnected === false || !data.current),
         durationSeconds: data.durationSeconds ?? (data.current ? data.current.durationSeconds : undefined),
       });
       break;

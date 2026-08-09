@@ -2677,6 +2677,15 @@ fn playback_payload(
             .channel_id
             .map(|id| id.to_string()),
         "voiceConnected": bot_voice_status(state, player.guild_id).in_voice(),
+        // **"재생이 흐르는가" 는 서버가 판정한다** (§36 의 기준을 고쳐 잡은 것).
+        //
+        // 예전에는 화면이 `voiceConnected` 로 파생했다. 그 판단의 의도는 옳았지만
+        // (봇이 빠졌는데 진행바만 혼자 가던 문제) 기준이 틀렸다 — 물어야 할 것은
+        // *봇이 음성에 있는가* 가 아니라 *시각표가 도는가* 다. 웹 재생기 모드에서는
+        // 봇이 없어도 시각표가 돌고, 그때 화면이 멈춰 버리면 안 된다.
+        //
+        // 지금은 값이 예전과 **정확히 같다** — 물리 세션이 없으면 시각표도 없기 때문이다.
+        "stopped": schedule.is_none() || player.current_item.is_none(),
         "botOnline": bot_in_guild(state, player.guild_id),
         // 곡이 바뀌면 다음 곡도 같이 바뀐다 — 같은 프레임에 실어야 화면이 한 번만 움직인다 (V3 §14).
         "next": next_up_json(player),
@@ -3371,6 +3380,9 @@ async fn api_state_hot(
         .collect();
     let (sorted_at, next_sort_at, sort_period) = sort_clock(&state, guild_id, player.upcoming.len());
     let bot = bot_voice_status(&state, guild_id);
+    // 아래 `player.stopped` 와 `startedUtc` 가 **같은 조회 결과**를 써야 한다.
+    // 따로 부르면 그 사이에 세션이 생기거나 사라져 둘이 어긋난 프레임이 나갈 수 있다.
+    let schedule_now = state.app.coordinator.schedule(guild_id).await;
     let state_ref: &WebState = &state;
     let current_points = points.clone();
     // 한 사람에게만 나가는 응답이라 개인화해도 안전하다(브로드캐스트는 None 이어야 한다).
@@ -3389,6 +3401,9 @@ async fn api_state_hot(
             "botOnline": ctx.session.is_developer || bot_in_guild(&state, guild_id),
             "minVolume": ctx.settings.min_volume,
             "maxVolume": ctx.settings.max_volume,
+            // 진입 로드에도 같이 싣는다. WS 프레임만 고치면 **새로고침 직후**에는
+            // 화면이 여전히 옛 방식으로 파생해서 가상 재생이 멈춘다 (`loadHot` 경로).
+            "stopped": schedule_now.is_none() || player.current_item.is_none(),
         },
         "current": player
             .current_item
@@ -3397,7 +3412,7 @@ async fn api_state_hot(
         "positionSeconds": position,
         "sampledAtUtc": sampled_at,
         // 절대 시각 일정 (§31). 진입·재연결 응답에도 실어야 그 순간부터 정확히 맞는다.
-        "startedUtc": state.app.coordinator.schedule(guild_id).await.map(|s| s.started_utc.to_rfc3339()),
+        "startedUtc": schedule_now.map(|s| s.started_utc.to_rfc3339()),
         "skipLeadMs": ctx.settings.skip_lead_ms,
         "seekLockoutMs": ctx.settings.seek_lockout_ms,
         "webSyncOffsetMs": ctx.settings.web_sync_offset_ms,

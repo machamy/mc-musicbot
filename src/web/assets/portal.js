@@ -8286,7 +8286,8 @@ async function loadHot() {
     isPaused: data.player?.isPaused,
     // **진입 로드에서도 멈춤 여부를 넘긴다** (§36). 이게 없으면 새로고침 직후에는
     // 봇이 음성에 없어도 진행바가 다시 흐르기 시작한다.
-    stopped: data.player?.voiceConnected === false || !data.current,
+    // 진입 로드도 서버 판정을 쓴다. WS 만 고치면 **새로고침 직후**에 다시 멈춘다.
+    stopped: data.player?.stopped ?? (data.player?.voiceConnected === false || !data.current),
     durationSeconds: data.current?.durationSeconds ?? trackSeconds(data.current?.track),
   });
 }
