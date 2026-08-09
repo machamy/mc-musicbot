@@ -235,6 +235,7 @@ const SIDE_DEF_TWO = 390;   // 2단은 채팅이 배치의 절반이라 기본�
 const PREF_DEFAULTS = {
   layout: null, theme: 'dark', layoutSizes: null, panelLayout: null,
   lyricsOpen: '1', webPlayback: '0', webVolume: '60', webOffset: '0',
+  nowVoters: '1',            // 지금 곡에 누가 눌렀는지 아래에 펼쳐 둘까
   auditFilter: null,          // JSON 배열 문자열. 없으면 곡+재생목록
   notify: null,               // {"song":1,"mention":1,"reply":1}
 };
@@ -3897,29 +3898,49 @@ function hideVoterCard() {
  */
 function nowVoteButtons(current) {
   const points = votePoints();
+  const score = scoreForCurrent(current) || {};
   const isMine = current.isMine
     ?? (current.requestedByUserId && String(current.requestedByUserId) === String(store.get().user?.id));
   const canVote = can('vote') && !isMine;
   const mineReason = '내가 신청한 곡에는 투표할 수 없어요';
   const reason = isMine ? mineReason : lockReason('vote');
 
-  const make = (kind, label, tip) => {
+  /* 숫자는 **몇 명이 눌렀나**다. 예전에는 배점(`👍 1`)이 붙어 있었는데, 그 자리에
+   * 숫자가 있으면 사람은 개수로 읽는다 — 아무도 안 눌렀는데 `👍 1` 이 떠 있었다.
+   * 배점은 눌러야 아는 값이 아니라 설명이라, 툴팁으로 내린다. */
+  const make = (kind, count, icon, tip, extraClass) => {
     const button = bindAct(h('button', {
-      class: 'vote', type: 'button',
+      class: `vote vote--primary vote--now${extraClass ? ` ${extraClass}` : ''}`,
+      type: 'button',
       'aria-pressed': String(current.myVote === kind),
+      'aria-label': `${tipLabel(kind)} ${count}명`,
+      dataset: { voteKind: kind },
       tip,
-    }, label), () => vote(current.id, kind));
-    return setLock(button, !canVote, reason);
+    },
+      h('span', { class: 'vote__icon', 'aria-hidden': 'true' }, icon),
+      h('span', { class: 'vote__count' }, String(count)),
+    ), () => vote(current.id, kind));
+    setLock(button, !canVote, reason);
+    // 버튼에 올려도 누가 눌렀는지 뜬다 (§10.4). 점수 막대에만 있으면 정작 누르는
+    // 자리에서는 확인할 수가 없다.
+    button.__score = score;
+    bindVoterCard(button);
+    return button;
   };
+
+  const likeCount = score.likeCount || 0;
+  const superCount = score.superLikeCount || 0;
+  const dislikeCount = score.dislikeCount || 0;
 
   const superInfo = superLikeInfo();
   const superMine = current.myVote === 'superLike';
-  const superLabel = superInfo.coolLeft > 0 && !superMine
-    ? `⭐ ${fmtTime(superInfo.coolLeft)}`
-    : `⭐ ${points.superLike}`;
-  const superButton = make('superLike', superLabel, superMine
+  const superButton = make('superLike', superCount, '⭐', superMine
     ? '슈퍼 좋아요를 취소해요'
-    : `슈퍼 좋아요 · ${points.superLike}점 올라가요`);
+    : `슈퍼 좋아요 · 한 표에 ${points.superLike}점${superInfo.coolLeft > 0 ? ` · ${fmtTime(superInfo.coolLeft)} 뒤에 쓸 수 있어요` : ''}`);
+  // 쿨타임이 돌면 개수 대신 남은 시간을 보여준다 — 회색으로만 두면 고장인 줄 안다 (§10.6).
+  if (superInfo.coolLeft > 0 && !superMine) {
+    superButton.querySelector('.vote__count').textContent = fmtTime(superInfo.coolLeft);
+  }
   // 이미 눌러 둔 슈퍼의 **취소는 언제나 열어 둔다** — 대기열 행과 같은 규칙이다.
   if (!superMine && (superInfo.coolLeft > 0 || superInfo.left === 0)) {
     setLock(superButton, true, superInfo.coolLeft > 0
@@ -3931,9 +3952,48 @@ function nowVoteButtons(current) {
   const showDislike = dislikeAllowed() || current.myVote === 'dislike';
 
   return h('div', { class: 'nowvote', role: 'group', 'aria-label': '지금 곡에 투표' },
-    make('like', `👍 ${points.like}`, `좋아요 · ${points.like}점 올라가요`),
+    make('like', likeCount, '👍', `좋아요 · 한 표에 ${points.like}점${voterHint(score)}`),
     superButton,
-    showDislike ? make('dislike', `👎 ${points.dislike}`, `싫어요 · ${points.dislike}점이에요`) : null);
+    showDislike
+      ? make('dislike', dislikeCount, '👎',
+        `싫어요 · 한 표에 ${points.dislike}점${boomttaNote(dislikeCount)}`, 'vote--down')
+      : null,
+    votersToggle(score));
+}
+
+/** 버튼 aria-label 에 쓸 이름. 이모지는 스크린리더가 못 읽는다. */
+function tipLabel(kind) {
+  return kind === 'like' ? '좋아요' : kind === 'superLike' ? '슈퍼 좋아요' : '싫어요';
+}
+
+/** 아무도 안 눌렀으면 "올려 보라"는 말을 안 붙인다 — 올려도 아무것도 안 뜬다. */
+function voterHint(score) {
+  return voterList(score).length ? ' · 마우스를 올리면 누가 눌렀는지 보여요' : '';
+}
+
+/* 아래 명단을 펼칠지 접을지 (§10.4).
+ *
+ * 늘 펼쳐 두면 좁은 화면에서 재생 카드가 명단에 밀려 진행바까지 내려간다. 그렇다고
+ * 없애면 "누가 눌렀는지" 를 마우스 없는 기기에서는 볼 방법이 사라진다. 그래서 고르게 한다.
+ * 선택은 계정에 저장돼서 기기를 옮겨도 따라간다. */
+function votersToggle(score) {
+  if (!voterList(score).length) return null;
+  const open = nowVotersOpen();
+  return h('button', {
+    class: 'vote vote--primary vote--voters',
+    type: 'button',
+    'aria-expanded': String(open),
+    'aria-label': open ? '누가 눌렀는지 접기' : '누가 눌렀는지 펼치기',
+    tip: open ? '아래 명단을 접어요' : '누가 뭘 눌렀는지 아래에 펼쳐요',
+    onClick: () => {
+      prefSet('nowVoters', open ? '0' : '1');
+      renderNow(store.get());
+    },
+  }, h('span', { 'aria-hidden': 'true' }, open ? '▾ 명단' : '▸ 명단'));
+}
+
+function nowVotersOpen() {
+  return prefGet('nowVoters') !== '0';
 }
 
 async function vote(itemId, kind) {
@@ -5192,7 +5252,8 @@ function renderNow(state) {
   const nowScore = scoreForCurrent(current);
   clear(el.nowVoters);
   if (current) el.nowVoters.appendChild(nowVoteButtons(current));
-  if (nowScore && voterList(nowScore).length) {
+  // 아래 명단은 사람이 고른 대로. 접어 뒀으면 버튼 줄만 남는다.
+  if (nowScore && voterList(nowScore).length && nowVotersOpen()) {
     el.nowVoters.appendChild(voterPanel(nowScore));
   }
   el.nowVoters.hidden = !current;
@@ -8740,6 +8801,22 @@ function selfTest() {
   eq('stats: available:false 를 0으로 꾸미지 않는다',
     normalizeStats({ available: false, message: '꺼져 있어요.' }).available, false);
   eq('stats: 점수를 모르면 null (0이 아니다)', normalizeStats({ available: true }).machamScore, null);
+
+  /* §10.7 — 지금 곡의 투표 버튼에 붙는 숫자는 **사람 수**여야 한다.
+   * 예전에는 배점이 붙어 있어서, 아무도 안 눌렀는데 `👍 1` 이 떠 있었다.
+   * 배점과 사람 수가 우연히 같은 값일 때가 많아 눈으로는 좀처럼 안 잡힌다. */
+  // `myVote: 'dislike'` 로 둔다 — 싫어요를 안 쓰는 서버에서도 **내가 눌러 둔 표**는
+  // 뗄 수 있게 버튼이 남으므로, 서버 설정과 무관하게 세 개가 다 나온다.
+  const voteRow = nowVoteButtons({
+    id: 'selftest', myVote: 'dislike', isMine: false,
+    score: { likeCount: 3, superLikeCount: 0, dislikeCount: 2, likeBy: ['1'], dislikeBy: ['2'] },
+  });
+  const countOf = (kind) =>
+    voteRow.querySelector(`[data-vote-kind="${kind}"] .vote__count`)?.textContent;
+  eq('지금 곡 투표: 숫자는 누른 사람 수다',
+    [countOf('like'), countOf('dislike')], ['3', '2']);
+  eq('지금 곡 투표: 버튼이 대기열 줄(32px)보다 크다',
+    voteRow.querySelector('[data-vote-kind="like"]')?.classList.contains('vote--now'), true);
 
   console.info(fails.length ? `[자가검사] ${fails.length}건 실패` : '[자가검사] 전부 통과', fails);
   return { fail: fails.length, fails };

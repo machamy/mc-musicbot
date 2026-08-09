@@ -1146,12 +1146,42 @@ body[data-dragging="tab"] { user-select: none; }
 
 /* 지금 나오는 곡의 투표 버튼 (§10.7). 대기열 행의 `.vote` 를 그대로 쓰되
  * 카드 안에서는 한 줄로 서고, 눌러 둔 것은 눌린 상태로 보인다. */
-.nowvote { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1); margin-bottom: var(--sp-2); }
+.nowvote { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
 .nowvote .vote[aria-pressed="true"] {
   border-color: var(--accent-line);
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: var(--fw-semi);
+}
+
+/* 지금 나오는 곡의 버튼은 **대기열 줄보다 커야 한다.**
+ * 예전에는 24px 짜리 `.vote` 라서 대기열의 32px 짜리보다 오히려 작았다.
+ * 이 카드에서 제일 자주 누르는 버튼인데 제일 작았던 셈이다. */
+.vote--now {
+  height: 40px;
+  padding: 0 var(--sp-3);
+  gap: var(--sp-2);
+  font-size: var(--fs-md);
+}
+/* **내가 누른 싫어요는 빨강이어야 한다.**
+ * 위 `.nowvote .vote[aria-pressed="true"]` 와 특이도가 같아서, 이 줄이 없으면
+ * 나중에 나온 그쪽이 이겨 싫어요가 좋아요와 똑같은 보라색으로 눌린다(실제로 그랬다). */
+.nowvote .vote--down[aria-pressed="true"] {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.vote--now .vote__icon { font-size: 18px; line-height: 1; }
+/* 숫자는 사람 수다. 자릿수가 바뀌어도 버튼이 안 흔들리게 폭을 잡아 둔다. */
+.vote--now .vote__count { min-width: 1.2em; text-align: center; font-variant-numeric: tabular-nums; }
+/* 명단 토글은 투표가 아니라 보기 설정이라 한 칸 떨어뜨리고 조용하게 둔다. */
+.vote--voters { margin-left: auto; font-size: var(--fs-sm); color: var(--text-3); }
+.vote--voters:hover { color: var(--text-1); }
+
+@media (max-width: 560px) {
+  /* 좁은 화면에서 네 개가 두 줄로 갈리면 카드가 훌쩍 길어진다. 한 줄에 붙인다. */
+  .vote--now { height: 36px; padding: 0 var(--sp-2); }
+  .vote--voters { margin-left: 0; }
 }
 
 /* 추천 바구니 (§8.7). 세 칸을 나란히 두고 각각 비운다. */
