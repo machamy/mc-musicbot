@@ -190,7 +190,19 @@ impl App {
         let remote = Arc::new(
             RemoteStore::open(&config.db_path()).expect("마참뮤직 SQLite 테이블 준비 실패"),
         );
-        let player = Arc::new(PlayerManager::new(db.clone(), remote.clone(), log.clone()));
+        // **가상 재생 중인 길드.** 코디네이터가 쓰고 플레이어가 읽는다.
+        //
+        // `GuildPlayerState` 에 담으면 안 된다 — 그 객체는 매 조작마다 SQLite 에서 새로
+        // 만들어지고 저장 스키마에 그런 칸이 없다. 둘이 같은 손잡이를 나눠 갖는 게
+        // 유일하게 맞는 방법이다(`PlayerManager` 는 `Coordinator` 를 참조하지 않는다).
+        let virtual_guilds: Arc<std::sync::Mutex<std::collections::HashSet<u64>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let player = Arc::new(PlayerManager::new(
+            db.clone(),
+            remote.clone(),
+            log.clone(),
+            virtual_guilds.clone(),
+        ));
 
         let global = db.load_global_settings();
         let ytdlp = YtDlp {
@@ -203,7 +215,7 @@ impl App {
             blacklist: blacklist.clone(),
             log: log.clone(),
         });
-        let coordinator = Arc::new(Coordinator::new());
+        let coordinator = Arc::new(Coordinator::new(virtual_guilds));
 
         let build_id = std::fs::read_to_string(config.portable_root.join("BUILD_ID.txt"))
             .map(|s| s.trim().to_string())

@@ -88,6 +88,9 @@ pub struct Coordinator {
     gen_counter: AtomicU64,
     /// 길드별 연속 재생 실패 횟수. 다운로드/ffmpeg 실패가 반복될 때 무한 스킵을 막는다.
     play_fail: Mutex<HashMap<u64, u32>>,
+    /// 지금 가상 재생 중인 길드. `PlayerManager` 와 같은 손잡이를 나눠 갖는다 —
+    /// 통계가 재생을 `plays_virtual` 로 가를 때 이 값을 읽는다.
+    virtual_guilds: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
 }
 
 const MAX_CONSECUTIVE_PLAY_FAILS: u32 = 5;
@@ -152,8 +155,11 @@ mod virtual_session_tests {
 }
 
 impl Coordinator {
-    pub fn new() -> Coordinator {
+    pub fn new(
+        virtual_guilds: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    ) -> Coordinator {
         Coordinator {
+            virtual_guilds,
             sessions: Mutex::new(HashMap::new()),
             virtual_sessions: Mutex::new(HashMap::new()),
             played_counted: Mutex::new(HashMap::new()),
@@ -260,6 +266,7 @@ impl Coordinator {
         }
         // 가상 세션도 같이 버린다. 남겨 두면 물리와 시각표가 두 벌이 된다.
         self.virtual_sessions.lock().await.remove(&guild_id);
+        self.virtual_guilds.lock().unwrap().remove(&guild_id);
     }
 
     /// 봇이 음성 채널을 들락날락한 것을 활동 기록에 남긴다 (§13.3).
@@ -341,6 +348,7 @@ impl Coordinator {
         // 켤 이유가 없으면 도는 것을 정리하고 손을 뗀다.
         if !settings.web_player_mode || listeners == 0 || state.current_item.is_none() {
             let had = self.virtual_sessions.lock().await.remove(&guild_id).is_some();
+            self.virtual_guilds.lock().unwrap().remove(&guild_id);
             if had {
                 app.log.info(
                     "Playback",
@@ -381,6 +389,7 @@ impl Coordinator {
             - chrono::Duration::from_std(start_offset).unwrap_or_default();
         {
             let mut virtuals = self.virtual_sessions.lock().await;
+            self.virtual_guilds.lock().unwrap().insert(guild_id);
             virtuals.insert(
                 guild_id,
                 VirtualSession {

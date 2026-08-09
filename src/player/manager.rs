@@ -42,6 +42,9 @@ pub struct PlayerManager {
     /// 길드별 셔플 시드. 셔플은 별도 정렬 모드가 아니라 `Fifo` + 무작위 `original_order`이며
     /// (사양서 §3.3), 그 무작위 순서를 시드 하나로 재현한다.
     shuffle_seeds: StdMutex<HashMap<u64, u64>>,
+    /// 지금 **가상 재생**(봇 없이 시각표만) 중인 길드. 코디네이터와 같은 손잡이를 나눠 갖는다.
+    /// `record_play` 가 이걸 읽어 재생을 `plays_virtual` 로 가른다.
+    virtual_guilds: Arc<StdMutex<HashSet<u64>>>,
     /// 길드별 마지막으로 확인된 대기열 길이. 재정렬 주기 결정(v3 §18.2)에 쓰는데,
     /// 그것 때문에 5초마다 길드마다 DB를 읽으면 §18.2 를 고치려다 §23.2 를 깨뜨린다.
     queue_lens: StdMutex<HashMap<u64, usize>>,
@@ -66,7 +69,12 @@ pub enum CancelOutcome {
 }
 
 impl PlayerManager {
-    pub fn new(db: Arc<Db>, remote: Arc<RemoteStore>, log: Arc<LogService>) -> PlayerManager {
+    pub fn new(
+        db: Arc<Db>,
+        remote: Arc<RemoteStore>,
+        log: Arc<LogService>,
+        virtual_guilds: Arc<StdMutex<HashSet<u64>>>,
+    ) -> PlayerManager {
         PlayerManager {
             db,
             remote,
@@ -76,6 +84,7 @@ impl PlayerManager {
             preview_inflight: StdMutex::new(HashSet::new()),
             settings: StdMutex::new(HashMap::new()),
             shuffle_seeds: StdMutex::new(HashMap::new()),
+            virtual_guilds,
             queue_lens: StdMutex::new(HashMap::new()),
             last_sorted: StdMutex::new(HashMap::new()),
             stats: StdMutex::new(None),
@@ -98,7 +107,16 @@ impl PlayerManager {
     /// 통계 쓰기가 재생 경로를 막으면 안 된다(§22.2).
     fn record_play(&self, guild_id: u64, finished: &QueueItem, outcome: PlayOutcome) {
         if let Some(stats) = self.stats() {
-            stats.record(StatEvent::played_from_item(guild_id, finished, outcome));
+            // **종료 시점 기준**으로 가른다. 가상으로 시작해 물리로 인계돼 끝났으면 물리다.
+            // 한 재생이 두 카운터를 동시에 올리지 않는다.
+            let is_virtual = self
+                .virtual_guilds
+                .lock()
+                .map(|set| set.contains(&guild_id))
+                .unwrap_or(false);
+            stats.record(StatEvent::played_from_item(
+                guild_id, finished, outcome, is_virtual,
+            ));
         }
     }
 
@@ -1178,7 +1196,16 @@ mod tests {
         let db = Arc::new(Db::open(&db_path).unwrap());
         let remote = Arc::new(RemoteStore::open(&db_path).unwrap());
         let log = Arc::new(LogService::new(root.join("logs")));
-        (PlayerManager::new(db, remote.clone(), log), remote, root)
+        (
+            PlayerManager::new(
+                db,
+                remote.clone(),
+                log,
+                Arc::new(StdMutex::new(HashSet::new())),
+            ),
+            remote,
+            root,
+        )
     }
 
     fn cleanup(player: PlayerManager, remote: Arc<RemoteStore>, root: std::path::PathBuf) {

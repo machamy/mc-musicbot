@@ -33,7 +33,7 @@ const DAILY_KEEP_DAYS: i64 = 90;
 /// 봇 전체 합계를 담는 가짜 guild_id. 실제 길드 ID는 0이 될 수 없다.
 const ALL_GUILDS: u64 = 0;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// 어떤 투표인지. `remote::QueueVoteKind` 와 별개로 두어 통계 모듈이 remote 에 의존하지 않게 한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +77,9 @@ pub enum StatEvent {
         requester: Option<u64>,
         /// 자동재생이 채운 곡인가. 차트의 `plays_user`/`plays_autoplay` 를 가른다.
         autoplay: bool,
+        /// **봇 없이 웹에서만 돈 재생인가.** 같은 방식으로 `plays_virtual` 을 가른다.
+        /// 집계 행이라 행 단위 boolean 으로는 못 나눈다 — 카운터를 따로 둔다.
+        is_virtual: bool,
         cache_key: String,
         track_json: String,
         outcome: PlayOutcome,
@@ -107,7 +110,12 @@ impl StatEvent {
     /// 자동재생 판정은 `request_kind` 하나로 한다 — 신청자 ID 가 비었다는 이유로
     /// 자동재생 취급하면 안 된다. `/이전곡`으로 되돌아간 곡은 사람이 시킨 곡인데도
     /// 신청자 ID 가 없어서, 그걸 자동재생으로 세면 §15.2b 차트가 틀어진다.
-    pub fn played_from_item(guild_id: u64, item: &QueueItem, outcome: PlayOutcome) -> StatEvent {
+    pub fn played_from_item(
+        guild_id: u64,
+        item: &QueueItem,
+        outcome: PlayOutcome,
+        is_virtual: bool,
+    ) -> StatEvent {
         let autoplay = item.request_kind == PlaybackRequestKind::Autoplay;
         let (cache_key, track_json) = track_parts(&item.track);
         StatEvent::Played {
@@ -119,6 +127,7 @@ impl StatEvent {
                 item.requested_by_user_id
             },
             autoplay,
+            is_virtual,
             cache_key,
             track_json,
             outcome,
@@ -614,6 +623,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                 track_json TEXT NOT NULL,
                 plays_user     INTEGER NOT NULL DEFAULT 0,
                 plays_autoplay INTEGER NOT NULL DEFAULT 0,
+                plays_virtual  INTEGER NOT NULL DEFAULT 0,
                 likes  INTEGER NOT NULL DEFAULT 0,
                 supers INTEGER NOT NULL DEFAULT 0,
                 requesters INTEGER NOT NULL DEFAULT 0,
@@ -637,6 +647,21 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             COMMIT;
             "#,
         )?;
+    }
+    // **기존 DB 에는 CREATE 문을 고쳐도 컬럼이 안 생긴다.** 위 `version >= SCHEMA_VERSION`
+    // 에서 곧장 빠져나가기 때문이다. 그래서 단계를 따로 둔다.
+    // 백필은 필요 없다 — 기본값 0 이 곧 "가상 재생이 없었다" 이고 그게 사실이다.
+    if version < 2 {
+        let has_column = conn
+            .prepare("PRAGMA table_info(stat_track_plays)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .flatten()
+            .any(|name| name == "plays_virtual");
+        if !has_column {
+            conn.execute_batch(
+                "ALTER TABLE stat_track_plays ADD COLUMN plays_virtual INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -765,6 +790,7 @@ fn apply(tx: &rusqlite::Transaction<'_>, event: &StatEvent) -> rusqlite::Result<
             guild_id,
             requester,
             autoplay,
+            is_virtual,
             cache_key,
             track_json,
             outcome,
@@ -792,7 +818,11 @@ fn apply(tx: &rusqlite::Transaction<'_>, event: &StatEvent) -> rusqlite::Result<
 
             // 차트는 자동재생을 따로 센다 (§15.2b). 순위에는 plays_user 만 쓴다.
             // 기준은 `autoplay` 플래그다 — 신청자 유무로 가르면 안 된다(위 주석 참고).
-            let column = if *autoplay {
+            // **가상이 먼저다.** 봇 없이 웹에서만 돈 재생은 자동재생이든 아니든 `plays_virtual`
+            // 이다 — 우리 차트의 `plays_user` 는 "봇으로 실제로 튼 것" 이어야 순위가 뜻을 갖는다.
+            let column = if *is_virtual {
+                "plays_virtual"
+            } else if *autoplay {
                 "plays_autoplay"
             } else {
                 "plays_user"
@@ -806,7 +836,7 @@ fn apply(tx: &rusqlite::Transaction<'_>, event: &StatEvent) -> rusqlite::Result<
                     ),
                     params![scope as i64, cache_key, now],
                 )?;
-                if !*autoplay {
+                if !*autoplay && !*is_virtual {
                     tx.execute(
                         "INSERT INTO stat_track_daily(guild_id, cache_key, day, plays_user)
                          VALUES(?1, ?2, ?3, 1)
@@ -1023,6 +1053,50 @@ mod tests {
         }
     }
 
+    /// **가상 재생은 `plays_virtual` 로만 간다.** 우리 차트의 순위는 `plays_user` 로 내는데,
+    /// 봇 없이 웹에서만 돈 재생이 거기 섞이면 "많이 튼 곡" 이 뜻을 잃는다.
+    ///
+    /// 집계 행이라 행 단위 boolean 으로는 못 나눈다 — `plays_user`/`plays_autoplay` 와
+    /// 같은 방식으로 카운터를 따로 둔 이유다.
+    #[test]
+    fn virtual_plays_go_to_their_own_counter() {
+        let stats = open_temp();
+        let ev = |is_virtual: bool, autoplay: bool| StatEvent::Played {
+            guild_id: 1,
+            requester: if autoplay { None } else { Some(7) },
+            autoplay,
+            is_virtual,
+            cache_key: "곡".into(),
+            track_json: "{\"title\":\"곡\"}".into(),
+            outcome: PlayOutcome::Completed,
+        };
+        apply_now(&stats, &[ev(false, false), ev(true, false), ev(true, true)]);
+        let conn = stats.conn.lock().unwrap();
+
+        let (user, auto, virt): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT plays_user, plays_autoplay, plays_virtual FROM stat_track_plays
+                 WHERE guild_id = 1 AND cache_key = '곡'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(user, 1, "봇으로 튼 것만 plays_user");
+        assert_eq!(auto, 0, "가상은 자동재생이어도 plays_autoplay 로 안 간다");
+        assert_eq!(virt, 2, "가상 재생 두 번");
+
+        // 일별 집계(차트 순위 재료)에도 가상은 안 들어간다.
+        let daily: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(plays_user), 0) FROM stat_track_daily
+                 WHERE guild_id = 1 AND cache_key = '곡'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(daily, 1, "일별 집계에는 봇으로 튼 것만");
+    }
+
     /// 기간 이름은 `parse` ↔ `as_str` 로 왕복한다. 한쪽만 고치면 화면이 고른 기간과
     /// 서버가 계산한 기간이 조용히 갈라진다(§15.2b).
     #[test]
@@ -1111,6 +1185,7 @@ mod tests {
             guild_id: guild,
             requester,
             autoplay: requester.is_none(),
+            is_virtual: false,
             cache_key: key.into(),
             track_json: format!("{{\"title\":\"{key}\"}}"),
             outcome: PlayOutcome::Completed,
@@ -1302,7 +1377,7 @@ mod tests {
         let auto = QueueItem::new_autoplay(track("auto"));
         let StatEvent::Played {
             requester, autoplay, ..
-        } = StatEvent::played_from_item(1, &auto, PlayOutcome::Completed)
+        } = StatEvent::played_from_item(1, &auto, PlayOutcome::Completed, false)
         else {
             panic!("played_from_item 은 Played 를 만들어야 한다");
         };
@@ -1313,7 +1388,7 @@ mod tests {
         let previous = QueueItem::new_user(track("prev"), "(이전 곡)".into(), None);
         let StatEvent::Played {
             requester, autoplay, ..
-        } = StatEvent::played_from_item(1, &previous, PlayOutcome::Completed)
+        } = StatEvent::played_from_item(1, &previous, PlayOutcome::Completed, false)
         else {
             panic!("played_from_item 은 Played 를 만들어야 한다");
         };
@@ -1330,8 +1405,8 @@ mod tests {
         apply_now(
             &stats,
             &[
-                StatEvent::played_from_item(1, &previous, PlayOutcome::Completed),
-                StatEvent::played_from_item(1, &auto, PlayOutcome::Completed),
+                StatEvent::played_from_item(1, &previous, PlayOutcome::Completed, false),
+                StatEvent::played_from_item(1, &auto, PlayOutcome::Completed, false),
             ],
         );
         let chart = stats.chart(1, ChartKind::Plays, ChartWindow::All, 2, 10);
@@ -1348,7 +1423,7 @@ mod tests {
         let item = QueueItem::new_user(track("song"), "민수".into(), Some(10));
         apply_now(
             &stats,
-            &[StatEvent::played_from_item(1, &item, PlayOutcome::Skipped)],
+            &[StatEvent::played_from_item(1, &item, PlayOutcome::Skipped, false)],
         );
         let user = stats.user_stats(1, 10);
         assert_eq!(user.played, 0);
