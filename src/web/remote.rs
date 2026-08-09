@@ -6,6 +6,7 @@
 //! 이 계약대로 이미 작성돼 있으므로 서버가 프런트에 맞춘다.
 
 use super::{WebState, remote_page};
+use crate::app::App;
 use crate::models::{
     CsTimeSpan, PlaylistEntry, PlaylistScope, ProviderKind, QueueItem, RepeatMode, TrackRef,
 };
@@ -1933,8 +1934,13 @@ pub(crate) struct BotVoiceStatus {
     pub(crate) channel_name: Option<String>,
 }
 
+/// 웹 쪽 호출부를 위한 얇은 래퍼. 판정은 `bot_voice_status_of` 하나뿐이다.
+pub(crate) fn bot_voice_status(state: &WebState, guild_id: u64) -> BotVoiceStatus {
+    bot_voice_status_of(&state.app, guild_id)
+}
+
 impl BotVoiceStatus {
-    fn in_voice(&self) -> bool {
+    pub(crate) fn in_voice(&self) -> bool {
         self.channel_id.is_some()
     }
 }
@@ -1948,8 +1954,13 @@ fn authoritative_voice_channel(cache_says: Option<u64>, stored: Option<u64>) -> 
     cache_says
 }
 
-pub(crate) fn bot_voice_status(state: &WebState, guild_id: u64) -> BotVoiceStatus {
-    let Some(cache) = state.app.discord_cache.get() else {
+/// 봇이 지금 이 길드의 어느 음성 채널에 있는지 — **Discord 캐시가 진실이다** (§16 B1).
+///
+/// `App` 만 받는다. 본문이 `discord_cache` 밖에 안 쓰는데 `WebState` 를 요구하면
+/// 코디네이터처럼 웹 바깥에 있는 쪽이 같은 판정을 못 쓴다. 저장된 `voice_channel_id` 로
+/// 대신하면 안 된다 — 그건 "다음에 어디로 들어갈까" 이고 강제 퇴장 뒤에도 남는다.
+pub(crate) fn bot_voice_status_of(app: &Arc<App>, guild_id: u64) -> BotVoiceStatus {
+    let Some(cache) = app.discord_cache.get() else {
         return BotVoiceStatus::default();
     };
     let Some(guild) = cache.guild(GuildId::new(guild_id)) else {
