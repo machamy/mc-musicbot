@@ -114,6 +114,21 @@ impl EventHandler for Handler {
 
     async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
         let Some(guild_id) = new.guild_id else { return };
+        // **봇 자신이 들어오거나 나갔으면 재생을 넘긴다.**
+        //
+        // 예전에는 여기서 빈 채널 정책만 봤다. 그래서 강제 퇴장을 당하면 Discord 캐시는
+        // 미연결인데 코디네이터 세션이 그대로 남아, 시각표가 계속 나가고 화면은 재생 중으로
+        // 보였다. 웹 재생기 모드에서는 반대로 봇이 들어와도 가상 시각표가 안 걷혔다.
+        //
+        // 위치를 잃지 않고 넘기는 것이 `handoff_voice_change` 의 일이다.
+        if new.user_id == ctx.cache.current_user().id {
+            let app = self.app.clone();
+            let coordinator = app.coordinator.clone();
+            let gid = guild_id.get();
+            tokio::spawn(async move {
+                coordinator.handoff_voice_change(&app, gid).await;
+            });
+        }
         evaluate_auto_leave(self.app.clone(), ctx, guild_id).await;
     }
 }

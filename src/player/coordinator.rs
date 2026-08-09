@@ -262,6 +262,33 @@ impl Coordinator {
         self.virtual_sessions.lock().await.remove(&guild_id);
     }
 
+    /// 봇의 음성 상태가 바뀌었다 — 재생 위치를 잃지 않고 넘긴다.
+    ///
+    /// **순서가 전부다.** songbird 시작 위치는 `QueueItem.start_offset` 에서 오고
+    /// `started_utc` 도 그 값으로 다시 만들어진다(`play_track`). 그래서 세션을 먼저 버리면
+    /// 흘러간 위치를 잃고 곡이 **처음부터 다시 시작한다.**
+    ///
+    /// ```text
+    /// 1. 지금 위치를 읽는다        2. start_offset 에 쓴다        3. 그다음에 세션을 버린다
+    /// ```
+    ///
+    /// 강제 퇴장도 여기로 온다. 예전에는 `voice_state_update` 가 세션을 안 건드려서,
+    /// Discord 캐시는 미연결인데 물리 세션이 남아 시각표가 계속 나갔다 — 그 자체가 버그였다.
+    pub async fn handoff_voice_change(self: &Arc<Self>, app: &Arc<App>, guild_id: u64) {
+        let position = self.current_position(guild_id).await;
+        if let Some(pos) = position {
+            // 0초면 굳이 쓰지 않는다 — 아직 시작 전이거나 방금 바뀐 곡이다.
+            if pos > Duration::from_millis(500) {
+                app.player
+                    .set_current_start_offset(guild_id, CsTimeSpan(pos))
+                    .await;
+            }
+        }
+        // 여기서 물리·가상 양쪽을 다 버린다. 위치는 이미 큐 항목에 적어 뒀다.
+        self.cancel_current(guild_id).await;
+        self.sync_guild(app, guild_id).await;
+    }
+
     /// 봇이 음성에 없을 때 가상 재생을 맞춘다. **돌봐 줬으면 `true`** 를 준다.
     ///
     /// `false` 면 아래의 기존 경로가 그대로 돈다 — 모드가 꺼져 있거나 들을 사람이 없는
@@ -346,12 +373,22 @@ impl Coordinator {
 
         // 물리 재생과 **같은 시작 훅**을 태운다. 안 부르면 다음 곡 프리페치·자동추천
         // preview·재생 카드가 하나도 안 돈다.
-        crate::player::side_effects::on_track_started(
-            app.clone(),
-            self.clone(),
-            guild_id,
-            current.clone(),
-        );
+        //
+        // 다만 **인계는 새 시작이 아니다.** 봇이 나가서 가상이 이어받는 경우 같은 곡인데도
+        // 훅을 다시 태우면 프리페치·preview 가 두 번 돌고 디스코드에 카드가 또 올라간다.
+        // `played_counted` 가 이미 "이 곡은 세었다" 를 길드별로 들고 있으므로 그걸 본다.
+        let already_started = {
+            let counted = self.played_counted.lock().await;
+            counted.get(&guild_id).map(|id| id == &current.id).unwrap_or(false)
+        };
+        if !already_started {
+            crate::player::side_effects::on_track_started(
+                app.clone(),
+                self.clone(),
+                guild_id,
+                current.clone(),
+            );
+        }
 
         self.clone()
             .spawn_virtual_timer(app.clone(), guild_id, generation, duration, start_offset);
