@@ -262,6 +262,37 @@ impl Coordinator {
         self.virtual_sessions.lock().await.remove(&guild_id);
     }
 
+    /// 봇이 음성 채널을 들락날락한 것을 활동 기록에 남긴다 (§13.3).
+    ///
+    /// **행위자가 사람이 아닐 수 있다.** 강제 퇴장이나 빈 채널 정리는 아무도 시키지 않은
+    /// 일이라 `봇` 으로 적는다. 사람이 `/참여`·`/나가기` 로 시킨 것은 그 명령 쪽에서 이미
+    /// 남기므로, 여기서는 **상태가 실제로 바뀌었을 때만** 한 줄 남긴다 — 안 그러면 같은
+    /// 일이 두 줄이 된다.
+    async fn record_voice_change(&self, app: &Arc<App>, guild_id: u64) {
+        let now = crate::web::remote::bot_voice_status_of(app, guild_id);
+        let was_in_voice = self.sessions.lock().await.contains_key(&guild_id);
+        let (action, channel) = match (was_in_voice, now.in_voice()) {
+            // 세션이 있었는데 지금 음성에 없다 — 나갔거나 쫓겨났다.
+            (true, false) => ("voice.leave", None),
+            // 세션이 없었는데 지금 있다 — 들어왔다.
+            (false, true) => ("voice.join", now.channel_name.clone()),
+            // 둘 다 있으면 방을 옮긴 것이다. 둘 다 없으면 기록할 게 없다.
+            (true, true) => ("voice.move", now.channel_name.clone()),
+            (false, false) => return,
+        };
+        let _ = app.remote.add_audit(
+            guild_id,
+            0,
+            "봇",
+            action,
+            channel.as_deref(),
+            None,
+            None,
+            true,
+            None,
+        );
+    }
+
     /// 봇의 음성 상태가 바뀌었다 — 재생 위치를 잃지 않고 넘긴다.
     ///
     /// **순서가 전부다.** songbird 시작 위치는 `QueueItem.start_offset` 에서 오고
@@ -275,6 +306,7 @@ impl Coordinator {
     /// 강제 퇴장도 여기로 온다. 예전에는 `voice_state_update` 가 세션을 안 건드려서,
     /// Discord 캐시는 미연결인데 물리 세션이 남아 시각표가 계속 나갔다 — 그 자체가 버그였다.
     pub async fn handoff_voice_change(self: &Arc<Self>, app: &Arc<App>, guild_id: u64) {
+        self.record_voice_change(app, guild_id).await;
         let position = self.current_position(guild_id).await;
         if let Some(pos) = position {
             // 0초면 굳이 쓰지 않는다 — 아직 시작 전이거나 방금 바뀐 곡이다.

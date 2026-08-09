@@ -1089,7 +1089,10 @@ pub fn audit_kind_for(action: &str) -> AuditKind {
         _ if action.starts_with("queue.") => AuditKind::Song,
         "playlist.enqueue" | "chart.enqueue" => AuditKind::Song,
         _ if action.starts_with("vote.") => AuditKind::Vote,
-        _ if action.starts_with("playback.") || action.starts_with("autoplay.toggle") => {
+        _ if action.starts_with("playback.")
+            || action.starts_with("voice.")
+            || action.starts_with("autoplay.toggle") =>
+        {
             AuditKind::Playback
         }
         _ if action.starts_with("playlist.") || action.starts_with("autoplay.") => {
@@ -1427,6 +1430,21 @@ pub fn audit_text(
                 (None, false) => format!("{actor}님이 {what}를 눌렀어요"),
             }
         }
+        // 봇이 음성 채널을 들락날락한 것 (§13.3). **행위자가 사람이 아닐 수 있다** —
+        // 강제 퇴장이나 빈 채널 정리는 아무도 시키지 않은 일이라 `actor` 가 `봇` 이다.
+        // 채널 이름이 있으면 어디인지까지 말한다. 어디로 갔는지 모르면 그냥 사실만 적는다.
+        "voice.join" => match item {
+            Some(name) => format!("{actor}님이 봇을 **{name}** 으로 불렀어요"),
+            None => format!("{actor}님이 봇을 음성 채널로 불렀어요"),
+        },
+        "voice.leave" => match item {
+            Some(name) => format!("봇이 **{name}** 에서 나갔어요"),
+            None => "봇이 음성 채널에서 나갔어요".to_string(),
+        },
+        "voice.move" => match item {
+            Some(name) => format!("봇이 **{name}** 으로 옮겼어요"),
+            None => "봇이 다른 음성 채널로 옮겼어요".to_string(),
+        },
         "playback.pause" => format!("{actor}님이 일시정지했어요"),
         "playback.resume" => format!("{actor}님이 다시 재생했어요"),
         "playback.skip" => format!("{actor}님이 곡을 넘겼어요"),
@@ -2852,6 +2870,10 @@ mod tests {
         assert_eq!(audit_kind_for("chart.enqueue"), AuditKind::Song);
         assert_eq!(audit_kind_for("vote.superlike"), AuditKind::Vote);
         assert_eq!(audit_kind_for("playback.skip"), AuditKind::Playback);
+        // 봇의 음성 이동도 재생 분류다 — 재생 필터에서 같이 보여야 상황이 읽힌다.
+        assert_eq!(audit_kind_for("voice.join"), AuditKind::Playback);
+        assert_eq!(audit_kind_for("voice.leave"), AuditKind::Playback);
+        assert_eq!(audit_kind_for("voice.move"), AuditKind::Playback);
         assert_eq!(audit_kind_for("autoplay.toggle"), AuditKind::Playback);
         assert_eq!(audit_kind_for("autoplay.seed.add"), AuditKind::Playlist);
         assert_eq!(audit_kind_for("playlist.create"), AuditKind::Playlist);
@@ -3134,5 +3156,33 @@ mod tests {
                 "키 {key} 설명 누락"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod voice_audit_tests {
+    use super::*;
+
+    /// 봇이 방을 옮기고 나가고 들어온 것이 **사람이 읽는 문장**으로 나와야 한다.
+    ///
+    /// 이 줄이 없으면 리모컨 활동 기록에서 봇이 갑자기 사라져도 이유를 알 수 없다.
+    /// 강제 퇴장처럼 아무도 시키지 않은 일은 행위자가 `봇` 이다 — 그때 "봇님이" 같은
+    /// 어색한 문장이 나오지 않게 문장 자체를 다르게 쓴다.
+    #[test]
+    fn voice_moves_read_as_sentences() {
+        let join = audit_text("voice.join", "마참", Some("일반"), None, None, 1);
+        assert!(join.contains("마참"), "{join}");
+        assert!(join.contains("일반"), "채널 이름이 있으면 어디인지 말한다: {join}");
+
+        let leave = audit_text("voice.leave", "봇", Some("일반"), None, None, 1);
+        assert!(leave.starts_with("봇이"), "행위자가 봇이면 봇으로 시작한다: {leave}");
+        assert!(!leave.contains("봇님이"), "어색한 존칭이 붙으면 안 된다: {leave}");
+
+        let moved = audit_text("voice.move", "봇", Some("2번방"), None, None, 1);
+        assert!(moved.contains("2번방"), "{moved}");
+
+        // 채널 이름을 모르면 사실만 적는다.
+        let unknown = audit_text("voice.leave", "봇", None, None, None, 1);
+        assert!(unknown.contains("음성 채널에서 나갔어요"), "{unknown}");
     }
 }
