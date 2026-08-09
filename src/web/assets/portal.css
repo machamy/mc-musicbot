@@ -1216,6 +1216,8 @@ body[data-dragging="tab"] { user-select: none; }
   text-align: right;
 }
 .aprow__art { width: 32px; height: 32px; }
+/* 앨범아트를 모르는 줄. 빈 칸이지만 자리는 그대로 잡아 줄이 안 흐트러진다. */
+.row__art--none { background: var(--surface-3); }
 .aprow__main { flex: 1; min-width: 0; }
 .aprow__title {
   color: var(--text-1);

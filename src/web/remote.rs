@@ -6784,6 +6784,10 @@ fn autoplay_basket(
                 "artist": item.track.artist,
                 "playedUtc": item.played_utc,
                 "cacheKey": item.track.cache_key(),
+                // **트랙을 통째로 같이 보낸다.** 제목·가수만 보내면 화면이 앨범아트 주소를
+                // 만들 수 없다(유튜브 썸네일은 `provider` + `contentId` 에서 나온다).
+                // 그래서 `src=""` 인 `<img>` 가 그려지고 브라우저가 깨진 이미지로 표시했다.
+                "track": track_json(&item.track),
             })
         })
         .collect();

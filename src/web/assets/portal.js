@@ -546,6 +546,18 @@ function trackKey(track) {
 }
 
 /** 서버가 artUrl을 주면 그걸 쓰고, 없으면 유튜브 썸네일을 유추한다. */
+/** 앨범아트 칸. **주소가 없으면 `<img>` 를 만들지 않는다.**
+ *
+ *  `src=""` 는 브라우저가 "불러오기 실패" 로 보고 깨진 이미지 아이콘을 그린다. 주소를
+ *  모르는 곡(제공자·ID 를 안 실어 보낸 목록 등)에서 그게 줄마다 떴다. 자리는 CSS 가
+ *  잡으므로 빈 칸으로 대신하면 줄이 흐트러지지 않는다. */
+function artNode(track, cls) {
+  const url = artUrl(track);
+  return url
+    ? h('img', { class: cls, src: url, alt: '', loading: 'lazy' })
+    : h('div', { class: `${cls} row__art--none`, 'aria-hidden': 'true' });
+}
+
 function artUrl(track) {
   if (!track) return '';
   if (track.artUrl) return track.artUrl;
@@ -2460,7 +2472,7 @@ function trackRow(track, source, extra, opts) {
 
   const row = h('div', { class: 'row', dataset: { mqRow: '1' } },
     opts && opts.rank ? h('span', { class: 'row__rank', tip: `이 차트에서 ${opts.rank}위예요` }, String(opts.rank)) : null,
-    h('img', { class: 'row__art', src: artUrl(track) || '', alt: '', loading: 'lazy' }),
+    artNode(track, 'row__art'),
     h('div', { class: 'row__main' },
       mqText(trackTitle(track), 'row__title'),
       h('div', { class: 'row__sub' }, extra || trackSub(track))),
@@ -3093,8 +3105,11 @@ function apRow(track, sub, acts, idle, idleTip) {
   const attrs = { class: `aprow${idle ? ' aprow--idle' : ''}` };
   // 빈 tip 을 달면 툴팁 대상이 되어 아무 글자도 없는 말풍선이 뜬다. 있을 때만 붙인다.
   if (idle && idleTip) attrs.tip = idleTip;
+  /* **주소가 없으면 `<img>` 자체를 안 만든다.**
+   * `src=""` 는 브라우저가 "불러오기 실패" 로 보고 깨진 이미지 아이콘을 그린다.
+   * 자리는 CSS 가 잡아 주므로 빈 칸을 대신 넣으면 줄이 흐트러지지 않는다. */
   return h('div', attrs,
-    h('img', { class: 'row__art aprow__art', src: artUrl(track) || '', alt: '', loading: 'lazy' }),
+    artNode(track, 'row__art aprow__art'),
     h('div', { class: 'aprow__main' },
       h('div', { class: 'aprow__title' }, trackTitle(track)),
       h('div', { class: 'row__sub' }, sub || trackSub(track))),
@@ -7905,7 +7920,7 @@ function recentList(title, rows, sub) {
     ...rows.map((row) => {
       const track = row.track || row;
       const node = h('div', { class: 'row row--tight', dataset: { mqRow: '1' } },
-        h('img', { class: 'row__art', src: artUrl(track) || '', alt: '', loading: 'lazy' }),
+        artNode(track, 'row__art'),
         h('div', { class: 'row__main' }, mqText(trackTitle(track), 'row__title')),
         h('span', { class: 'row__sub' }, sub(row)));
       bindContextTarget(node, () => trackMenu(track, { source: 'person' }));
