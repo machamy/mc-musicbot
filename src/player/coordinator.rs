@@ -95,6 +95,20 @@ pub struct Coordinator {
 
 const MAX_CONSECUTIVE_PLAY_FAILS: u32 = 5;
 
+/// `reconcile_virtual` 이 이번 동기화를 어떻게 처리했는가.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtualOutcome {
+    /// 웹 재생을 돌봤다 — 여기서 끝낸다.
+    Handled,
+    /// 내 일이 아니다 — 아래 기존(물리) 경로가 그대로 돈다.
+    NotMine,
+    /// 대기열을 바꿨다 — **처음부터 다시 맞춰야 한다.**
+    ///
+    /// 이게 없으면 곡을 넘겨 놓고 아무도 그다음을 안 틀어서 조용히 멈춘다
+    /// (`skip` 도 `ensure_autoplay` 도 스스로 동기화를 부르지 않는다).
+    Again,
+}
+
 /// `play_track` 이 실제로 소리를 내보냈는가.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlayOutcome {
@@ -465,7 +479,7 @@ impl Coordinator {
         app: &Arc<App>,
         guild_id: u64,
         state: &GuildPlayerState,
-    ) -> bool {
+    ) -> VirtualOutcome {
         let settings = app.remote.load_guild_settings(guild_id);
         let listeners = app
             .web_listener_count
@@ -483,22 +497,76 @@ impl Coordinator {
                     &format!("웹 재생기 시각표를 멈췄어요 (guild {guild_id})."),
                 );
             }
-            return false;
+            return VirtualOutcome::NotMine;
         }
         let current = state.current_item.clone().expect("바로 위에서 확인함");
 
         // **길이를 모르면 시작하지 않는다.** 0 으로 두면 곡이 즉시 끝난 것으로 처리돼
         // 대기열이 순식간에 비워진다. 대기열은 손대지 않고 그 자리에 멈춘 채 둔다.
-        let Some(duration) = current.track.duration.map(|d| Duration::from_secs_f64(d.as_secs_f64())) else {
-            app.log.warn(
-                "Playback",
-                &format!(
-                    "'{}' 은 길이를 알 수 없어 웹 재생을 시작하지 못했어요 (guild {guild_id}).",
-                    current.track.display_title()
-                ),
-            );
-            self.virtual_sessions.lock().await.remove(&guild_id);
-            return true;
+        /* **길이를 모르면 물어보고, 그래도 모르면 넘긴다.**
+         *
+         * 웹 재생은 곡이 언제 끝나는지 알아야 다음 곡으로 넘어갈 수 있어서 길이가 꼭 필요하다.
+         * 예전에는 여기서 그냥 손을 떼면서 `true`(내가 처리했다)를 돌려줬는데, 그러면
+         * `sync_guild` 가 **아래 실제 재생 경로까지 건너뛰고 그대로 끝난다.** 곡은 영영
+         * 시작하지 않고 대기열도 안 넘어가서, 같은 경고만 몇 분이고 반복됐다 — 실제로 그랬다.
+         *
+         * 길이는 검색 결과(flat playlist)로 담긴 곡에 자주 비어 있다. 그럴 때 한 번
+         * 물어보면 대개 알 수 있다. 그래도 모르면 **멈춰 있는 것보다 넘기는 게 낫다.** */
+        let duration = match current.track.duration {
+            Some(value) => Duration::from_secs_f64(value.as_secs_f64()),
+            None => {
+                let looked_up = app
+                    .ytdlp()
+                    .inspect_track(&current.track.source_url, current.track.provider)
+                    .await
+                    .and_then(|track| track.duration)
+                    .map(|value| Duration::from_secs_f64(value.as_secs_f64()))
+                    .filter(|value| !value.is_zero());
+
+                match looked_up {
+                    Some(found) => {
+                        app.log.info(
+                            "Playback",
+                            &format!(
+                                "'{}' 의 길이를 알아내서 웹 재생을 시작해요 ({}초, guild {guild_id}).",
+                                current.track.display_title(),
+                                found.as_secs()
+                            ),
+                        );
+                        // 알아낸 길이를 큐 항목에 적어 둔다. 안 그러면 다음 호출마다 또 물어본다.
+                        app.player
+                            .set_current_duration(guild_id, CsTimeSpan(found))
+                            .await;
+                        found
+                    }
+                    None => {
+                        app.log.warn(
+                            "Playback",
+                            &format!(
+                                "'{}' 은 길이를 알 수 없어 넘어가요 (guild {guild_id}).",
+                                current.track.display_title()
+                            ),
+                        );
+                        self.record_playback_failure(
+                            app,
+                            guild_id,
+                            "playback.failed",
+                            current.track.display_title(),
+                        );
+                        self.virtual_sessions.lock().await.remove(&guild_id);
+                        // **여기서 멈추면 안 된다.** 대기열을 한 칸 밀고 다시 맞춘다.
+                        app.player.skip(guild_id).await;
+                        crate::player::side_effects::ensure_autoplay(
+                            app.clone(),
+                            self.clone(),
+                            guild_id,
+                            true,
+                        )
+                        .await;
+                        return VirtualOutcome::Again;
+                    }
+                }
+            }
         };
 
         // 같은 곡이 이미 돌고 있으면 그대로 둔다. 매 호출마다 새로 잡으면 위치가 0 으로 돌아간다.
@@ -506,7 +574,7 @@ impl Coordinator {
             let virtuals = self.virtual_sessions.lock().await;
             if let Some(v) = virtuals.get(&guild_id) {
                 if v.item_id == current.id {
-                    return true;
+                    return VirtualOutcome::Handled;
                 }
             }
         }
@@ -561,7 +629,7 @@ impl Coordinator {
 
         self.clone()
             .spawn_virtual_timer(app.clone(), guild_id, generation, duration, start_offset);
-        true
+        VirtualOutcome::Handled
     }
 
     /// 곡이 끝날 시각에 깨어나 다음 곡으로 넘긴다.
@@ -631,8 +699,24 @@ impl Coordinator {
             // 모드가 꺼져 있거나 듣는 사람이 없으면 `reconcile_virtual` 이 아무것도 안 만들고,
             // 그러면 아래 기존 경로가 그대로 돈다 — **도입 전과 완전히 같다.**
             if !crate::web::remote::bot_voice_status_of(app, guild_id).in_voice() {
-                if self.reconcile_virtual(app, guild_id, &state).await {
-                    return;
+                match self.reconcile_virtual(app, guild_id, &state).await {
+                    VirtualOutcome::Handled => return,
+                    // 길이를 모르는 곡을 넘겼다. 넘긴 채로 두면 아무도 그다음을 안 트니
+                    // 여기서 처음부터 다시 맞춘다. 계속 넘어가기만 하면 몇 번에서 끊는다.
+                    VirtualOutcome::Again => {
+                        stale_rounds += 1;
+                        if stale_rounds >= 5 {
+                            app.log.warn(
+                                "Playback",
+                                &format!(
+                                    "길이를 알 수 없는 곡이 이어져서 이번 동기화는 여기서 멈춰요 (guild {guild_id})."
+                                ),
+                            );
+                            return;
+                        }
+                        continue;
+                    }
+                    VirtualOutcome::NotMine => {}
                 }
             }
 

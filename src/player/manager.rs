@@ -735,6 +735,32 @@ impl PlayerManager {
         .await
     }
 
+    /// 뒤늦게 알아낸 곡 길이를 현재 곡에 적어 둔다.
+    ///
+    /// 검색 결과로 담긴 곡은 길이가 비어 있는 경우가 있다. 웹 재생은 길이를 알아야
+    /// 곡이 언제 끝나는지 알 수 있어서, 한 번 알아내면 여기 적어 둔다 —
+    /// 안 적으면 동기화가 돌 때마다 같은 것을 다시 물어본다.
+    pub async fn set_current_duration(
+        &self,
+        guild_id: u64,
+        duration: CsTimeSpan,
+    ) -> GuildPlayerState {
+        self.mutate(
+            guild_id,
+            "Playback",
+            &format!(
+                "Learned track duration {} for guild {guild_id}.",
+                duration.display()
+            ),
+            |s| {
+                if let Some(cur) = s.current_item.as_mut() {
+                    cur.track.duration = Some(duration);
+                }
+            },
+        )
+        .await
+    }
+
     pub async fn apply_configured_settings(&self, guild_id: u64) -> GuildPlayerState {
         let eff = self.effective_settings(guild_id);
         self.mutate(
