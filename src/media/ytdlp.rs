@@ -14,6 +14,130 @@ pub struct YtDlp {
     pub cookie_file: Option<String>,
 }
 
+/* ── JS 런타임 (§EJS) ──────────────────────────────────────────────
+ *
+ * 유튜브는 재생 주소에 서명을 걸어 두고, 그 서명은 유튜브가 내려보내는 자바스크립트를
+ * **실행해야** 풀린다. yt-dlp 는 그 실행기를 밖에서 찾는데(기본은 deno), 못 찾으면
+ * 서명이 필요 없는 옛 경로로 우회하다가 결국 `HTTP Error 403: Forbidden` 을 맞는다.
+ *
+ * 우리 포터블에는 `deno.exe` 가 yt-dlp 바로 옆에 들어 있다. 그런데 그 폴더가 PATH 에
+ * 없어서 yt-dlp 는 없는 것으로 알고 있었다 — **PATH 에 넣어 줘도 안 찾는다**(실측).
+ * 그래서 위치를 인자로 못 박아 준다.
+ *
+ * `--js-runtimes` 는 최근에 생긴 인자라, 옛 yt-dlp 에 붙이면 **모르는 인자라고 전부
+ * 실패한다.** 그래서 기동 때 한 번 물어보고, 받아 주는 판일 때만 붙인다.
+ */
+static JS_RUNTIME_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// yt-dlp 옆에 있는 JS 런타임. 없으면 `None` — 그때는 지금까지와 똑같이 동작한다.
+fn js_runtime_beside(exe: &str) -> Option<(String, String)> {
+    let dir = std::path::Path::new(exe).parent()?;
+    // deno 가 yt-dlp 의 기본값이라 먼저 본다. 나머지는 있으면 쓰는 정도다.
+    for name in ["deno", "node", "bun"] {
+        for file in [format!("{name}.exe"), name.to_string()] {
+            let path = dir.join(&file);
+            if path.is_file() {
+                return Some((name.to_string(), path.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    None
+}
+
+/// 이 yt-dlp 가 `--js-runtimes` 를 아는지 한 번만 물어본다.
+async fn probe_js_runtime_args(exe: &str) -> Vec<String> {
+    let Some((name, path)) = js_runtime_beside(exe) else {
+        return Vec::new();
+    };
+    let ok = Command::new(exe)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains("--js-runtimes"))
+        .unwrap_or(false);
+    if !ok {
+        return Vec::new();
+    }
+    vec!["--js-runtimes".into(), format!("{name}:{path}")]
+}
+
+/// 다시 해 보면 될 것 같은 실패인가 (§10.8).
+///
+/// **판단을 틀리는 쪽의 대가가 다르다.** 잠깐의 문제를 영구 실패로 보면 멀쩡한 곡이
+/// 넘어가고(사람이 바로 알아챈다), 반대로 보면 몇 초 더 기다렸다 똑같이 넘어간다.
+/// 그래서 애매하면 다시 해 보는 쪽으로 기운다 — 다만 "없는 영상" 처럼 결과가 뻔한
+/// 것들만 골라서 즉시 포기한다.
+pub(crate) fn is_transient(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    // 다시 해도 소용없는 것들. 이것들이 먼저다.
+    const HOPELESS: [&str; 7] = [
+        "video unavailable",
+        "private video",
+        "members-only",
+        "removed by the uploader",
+        "account associated with this video has been terminated",
+        "is not a valid url",
+        "unsupported url",
+    ];
+    if HOPELESS.iter().any(|needle| lower.contains(needle)) {
+        return false;
+    }
+    const TRANSIENT: [&str; 10] = [
+        "403",
+        "forbidden",
+        "429",
+        "too many requests",
+        "timed out",
+        "timeout",
+        "temporary failure",
+        "connection",
+        // 시간 초과는 우리가 우리말로 적어 보낸다. 영어 낱말만 보면 이걸 놓친다.
+        "초과해 중단",
+        "실행 실패",
+    ];
+    TRANSIENT.iter().any(|needle| lower.contains(needle))
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::is_transient;
+
+    /// 유튜브가 들쭉날쭉 뱉는 403 은 **다시 해 볼 값어치가 있다.**
+    /// 이걸 영구 실패로 보는 바람에 멀쩡한 곡이 줄줄이 스킵됐다.
+    #[test]
+    fn a_403_is_worth_another_try() {
+        assert!(is_transient("ERROR: unable to download video data: HTTP Error 403: Forbidden"));
+        assert!(is_transient("HTTP Error 429: Too Many Requests"));
+        assert!(is_transient("yt-dlp 다운로드가 10분을 초과해 중단했습니다."));
+    }
+
+    /// 없는 영상은 몇 번을 해도 없다. 기다리게 할 이유가 없다.
+    #[test]
+    fn a_missing_video_is_not_worth_waiting_for() {
+        assert!(!is_transient("ERROR: [youtube] xxxx: Video unavailable"));
+        assert!(!is_transient("ERROR: [youtube] xxxx: Private video. Sign in if you've been granted access"));
+    }
+
+    /// **없는 영상 판정이 403 판정보다 먼저다.** 두 낱말이 한 줄에 같이 나오는 응답이
+    /// 실제로 있어서, 순서가 뒤집히면 죽은 영상을 붙잡고 계속 기다린다.
+    #[test]
+    fn hopeless_wins_over_transient_when_both_appear() {
+        assert!(!is_transient("HTTP Error 403: Forbidden — Video unavailable"));
+    }
+}
+
+/// 기동 때 한 번 불러 둔다. 안 불러도 동작은 같고, 첫 재생이 조금 느려질 뿐이다.
+pub async fn init_js_runtime(exe: &str) -> Option<String> {
+    let args = probe_js_runtime_args(exe).await;
+    let described = args.get(1).cloned();
+    let _ = JS_RUNTIME_ARGS.set(args);
+    described
+}
+
 pub enum AuthMode {
     BrowserProfile,
     CookieFile,
@@ -31,6 +155,12 @@ impl AuthMode {
 }
 
 impl YtDlp {
+    /// 모든 호출 앞에 붙는 공통 인자. 지금은 JS 런타임 위치 하나뿐이다.
+    /// 아직 안 물어봤으면 빈 목록 — 그때는 기능이 생기기 전과 완전히 같다.
+    fn base_args(&self) -> Vec<String> {
+        JS_RUNTIME_ARGS.get().cloned().unwrap_or_default()
+    }
+
     /// C# YtDlpAuthArguments.Build 과 동일: 프로필에 ':' 가 있으면 그대로,
     /// 없으면 edge → chrome 순서로 둘 다 시도. 그 다음 쿠키 파일, 마지막은 공개 접근.
     fn auth_chain(&self) -> Vec<(AuthMode, Vec<String>)> {
@@ -64,8 +194,10 @@ impl YtDlp {
 
     /// 메타 조회 1회 실행. 30초 타임아웃 — 초과 시 future drop 으로 프로세스가 kill 된다.
     async fn run_json_once(&self, args: &[String]) -> Option<Value> {
+        let mut full = self.base_args();
+        full.extend_from_slice(args);
         let fut = Command::new(&self.exe)
-            .args(args)
+            .args(&full)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -230,7 +362,50 @@ impl YtDlp {
     }
 
     /// 곡 다운로드 — 인증 fallback 체인을 따라 시도, 성공 시 실제 파일 경로 반환.
+    /// 곡 하나를 받는다. 잠깐 튕긴 것뿐이면 **몇 번 더 해 본다** (§10.8).
+    ///
+    /// 유튜브는 같은 요청에도 `403 Forbidden` 을 들쭉날쭉 낸다 — 두 번에 한 번 꼴로
+    /// 튕기다가 잠시 뒤엔 멀쩡히 주기도 한다. 예전에는 한 번 튕기면 곧장 실패로 보고
+    /// 곡을 넘겨 버려서, **멀쩡한 곡이 줄줄이 스킵됐다.**
+    ///
+    /// 그래서 잠깐의 문제로 보이는 실패에만 쉬었다가 다시 해 본다. 없는 영상·비공개처럼
+    /// 다시 해도 소용없는 실패는 그대로 넘긴다 — 기다리게 할 이유가 없다.
     pub async fn download(
+        &self,
+        source_url: &str,
+        output_template: &str,
+        remove_segments: bool,
+    ) -> Result<(String, &'static str), String> {
+        // 쉬는 시간을 늘려 가며 시도한다. 바로 다시 하면 같은 이유로 또 튕긴다.
+        const BACKOFF_SECS: [u64; 2] = [3, 8];
+        let mut last = String::new();
+        for (round, wait) in BACKOFF_SECS.iter().enumerate() {
+            match self
+                .download_once(source_url, output_template, remove_segments)
+                .await
+            {
+                Ok(found) => return Ok(found),
+                Err(err) => {
+                    if !is_transient(&err) {
+                        return Err(err);
+                    }
+                    last = err;
+                    let _ = round;
+                    tokio::time::sleep(std::time::Duration::from_secs(*wait)).await;
+                }
+            }
+        }
+        // 마지막 한 번.
+        match self
+            .download_once(source_url, output_template, remove_segments)
+            .await
+        {
+            Ok(found) => Ok(found),
+            Err(err) => Err(if err.trim().is_empty() { last } else { err }),
+        }
+    }
+
+    async fn download_once(
         &self,
         source_url: &str,
         output_template: &str,
@@ -238,7 +413,8 @@ impl YtDlp {
     ) -> Result<(String, &'static str), String> {
         let mut last_err = String::new();
         for (mode, auth_args) in self.auth_chain() {
-            let mut args: Vec<String> = vec![
+            let mut args: Vec<String> = self.base_args();
+            args.extend([
                 "--no-playlist".into(),
                 "-f".into(),
                 "bestaudio".into(),
@@ -250,7 +426,7 @@ impl YtDlp {
                 "--newline".into(),
                 "--print".into(),
                 "after_move:filepath".into(),
-            ];
+            ]);
             // SponsorBlock: 인트로/아웃트로/비음악 구간 컷 (해당 데이터가 있는 영상에만).
             if remove_segments {
                 args.push("--sponsorblock-remove".into());

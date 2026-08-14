@@ -1449,6 +1449,16 @@ pub fn audit_text(
             Some(name) => format!("봇이 **{name}** 으로 옮겼어요"),
             None => "봇이 다른 음성 채널로 옮겼어요".to_string(),
         },
+        // 재생 실패로 넘어간 것 (§10.8). **사람이 넘긴 것과 말을 다르게 한다** —
+        // 로그만 보고 "누가 자꾸 넘기지?" 하고 서로를 의심하는 일이 실제로 있었다.
+        "playback.failed" => match item {
+            Some(name) => format!("**{name}** 을 못 틀어서 다음 곡으로 넘어갔어요"),
+            None => "곡을 못 틀어서 다음 곡으로 넘어갔어요".to_string(),
+        },
+        "playback.failed.stop" => match item {
+            Some(name) => format!("재생이 연달아 실패해서 멈췄어요 (마지막: **{name}**)"),
+            None => "재생이 연달아 실패해서 멈췄어요".to_string(),
+        },
         "playback.pause" => format!("{actor}님이 일시정지했어요"),
         "playback.resume" => format!("{actor}님이 다시 재생했어요"),
         "playback.skip" => format!("{actor}님이 곡을 넘겼어요"),

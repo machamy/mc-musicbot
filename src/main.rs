@@ -157,6 +157,20 @@ async fn main() {
     // 우리가 관리하는 yt-dlp 를 백그라운드로 주기 자동 업데이트 (설정으로 끌 수 있음).
     media::tools::spawn_auto_update(app.clone());
 
+    /* 유튜브 서명을 풀 JS 런타임을 yt-dlp 에게 알려 준다.
+     * 못 찾으면 서명이 필요한 곡마다 `HTTP Error 403: Forbidden` 이 나고, 그러면
+     * 재생 실패로 곡이 줄줄이 넘어간다. 여기서 한 번만 물어보고 결과를 재사용한다. */
+    match media::ytdlp::init_js_runtime(&app.config.yt_dlp_path).await {
+        Some(found) => app
+            .log
+            .info("Tools", &format!("유튜브 서명 해석에 {found} 를 씁니다.")),
+        None => app.log.warn(
+            "Tools",
+            "JS 런타임을 못 찾았습니다. 유튜브 곡이 403 으로 실패할 수 있어요 \
+             — yt-dlp 옆에 deno 를 두면 해결됩니다.",
+        ),
+    }
+
     // songbird 인스턴스를 직접 만들어 보관 — 코디네이터가 게이트웨이 컨텍스트 없이 접근 가능.
     let manager = songbird::Songbird::serenity();
     let _ = app.songbird.set(manager.clone());

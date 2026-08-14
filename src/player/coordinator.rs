@@ -95,6 +95,15 @@ pub struct Coordinator {
 
 const MAX_CONSECUTIVE_PLAY_FAILS: u32 = 5;
 
+/// `play_track` 이 실제로 소리를 내보냈는가.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayOutcome {
+    /// 세션을 걸었다.
+    Started,
+    /// 준비를 끝냈더니 이미 다른 곡이 현재 곡이었다 — 내보내지 않고 손을 뗐다.
+    Stale,
+}
+
 /// 음성 상태가 밖에서 바뀌었을 때 저장된 채널 바인딩을 어떻게 할지.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BindingChange {
@@ -357,6 +366,26 @@ impl Coordinator {
         );
     }
 
+    /* 재생 실패로 곡이 넘어간 것을 **리모컨 활동 기록에도** 남긴다 (§10.8).
+     *
+     * 예전에는 디스코드 채널에만 알렸다. 그래서 리모컨만 보는 사람에게는 곡이 아무 이유
+     * 없이 줄줄이 사라지는 것으로 보였고, 활동 기록에는 아무것도 없으니 원인을 찾을
+     * 실마리가 없었다. 사람이 넘긴 것과 문구를 다르게 해서 서로 의심하지 않게 한다.
+     */
+    fn record_playback_failure(&self, app: &Arc<App>, guild_id: u64, action: &str, title: &str) {
+        let _ = app.remote.add_audit(
+            guild_id,
+            0,
+            "봇",
+            action,
+            Some(title),
+            None,
+            None,
+            true,
+            None,
+        );
+    }
+
     /// 봇의 음성 상태가 바뀌었다 — 재생 위치를 잃지 않고 넘긴다.
     ///
     /// **순서가 전부다.** songbird 시작 위치는 `QueueItem.start_offset` 에서 오고
@@ -588,6 +617,9 @@ impl Coordinator {
     /// 재생 실패(다운로드 403/삭제된 영상/ffmpeg 등) 시 다음 곡으로 넘어가며 재시도한다.
     /// 큐 전체가 재생 불가면 연속 실패 상한에서 멈춰 무한 스킵을 막는다.
     pub async fn sync_guild(self: &Arc<Self>, app: &Arc<App>, guild_id: u64) {
+        // 준비가 끝날 때마다 곡이 또 바뀌어 있는 상황이 이어질 수 있다. 무한히 쫓아가지
+        // 않도록 몇 바퀴만 돈다 — 어차피 다음 `sync_guild` 가 다시 맞춘다.
+        let mut stale_rounds = 0u32;
         loop {
             let state = app.player.get_state(guild_id).await;
 
@@ -641,9 +673,24 @@ impl Coordinator {
                 .play_track(app, guild_id, channel_id, &state, &current)
                 .await
             {
-                Ok(()) => {
+                Ok(PlayOutcome::Started) => {
                     self.play_fail.lock().await.remove(&guild_id);
                     return;
+                }
+                // 준비하는 사이에 곡이 바뀌었다. 실패가 아니므로 실패 수를 세지 않고,
+                // 위로 돌아가 **지금 곡**으로 다시 맞춘다.
+                Ok(PlayOutcome::Stale) => {
+                    stale_rounds += 1;
+                    if stale_rounds >= 5 {
+                        app.log.warn(
+                            "Playback",
+                            &format!(
+                                "곡이 계속 바뀌어서 이번 동기화는 여기서 멈춰요 (guild {guild_id})."
+                            ),
+                        );
+                        return;
+                    }
+                    continue;
                 }
                 Err(e) => {
                     app.log.error(
@@ -660,6 +707,7 @@ impl Coordinator {
                     if fails >= MAX_CONSECUTIVE_PLAY_FAILS {
                         self.play_fail.lock().await.remove(&guild_id);
                         self.cancel_current(guild_id).await;
+                        self.record_playback_failure(app, guild_id, "playback.failed.stop", &title);
                         crate::player::side_effects::announce_text(
                             app,
                             guild_id,
@@ -670,6 +718,7 @@ impl Coordinator {
                         .await;
                         return;
                     }
+                    self.record_playback_failure(app, guild_id, "playback.failed", &title);
                     crate::player::side_effects::announce_text(
                         app,
                         guild_id,
@@ -700,7 +749,7 @@ impl Coordinator {
         channel_id: u64,
         state: &GuildPlayerState,
         item: &QueueItem,
-    ) -> Result<(), String> {
+    ) -> Result<PlayOutcome, String> {
         let manager = app.songbird.get().ok_or("songbird not ready")?.clone();
         let global = app.db.load_global_settings();
 
@@ -796,6 +845,28 @@ impl Coordinator {
         // 다음 곡 다운로드(수 초)가 진행되는 동안 사용자가 누른 일시정지/볼륨이 stale 스냅샷에
         // 묻히지 않도록, 실제 재생 직전에 최신 상태를 다시 읽어 반영한다.
         let live = app.player.get_state(guild_id).await;
+
+        /* **그 사이에 곡이 바뀌었으면 이 소리를 내보내면 안 된다.**
+         *
+         * 여기까지 오는 데 다운로드가 수 초 걸린다. 그동안 스킵이 들어오면 대기열은 이미
+         * 다음 곡으로 넘어가 있는데, 뒤늦게 끝난 이 다운로드가 그대로 세션을 덮어써서
+         * **화면은 새 곡, 귀에는 옛 곡**이 된다. 403 이 연달아 나던 날처럼 곡이 빠르게
+         * 넘어갈 때 특히 잘 벌어진다 — 실패한 곡을 지나치는 동안에도 다운로드는 계속 돈다.
+         *
+         * 위에서 볼륨·일시정지를 다시 읽는 것과 같은 이유인데, 정작 **어떤 곡인지**는
+         * 안 보고 있었다. 여기서 손을 떼고 부른 쪽이 지금 곡으로 다시 맞추게 한다. */
+        if live.current_item.as_ref().map(|c| c.id.as_str()) != Some(item.id.as_str()) {
+            let _ = handle.stop();
+            app.log.info(
+                "Playback",
+                &format!(
+                    "'{}' 준비가 끝나기 전에 곡이 바뀌어서 내보내지 않았어요 (guild {guild_id}).",
+                    item.track.display_title()
+                ),
+            );
+            return Ok(PlayOutcome::Stale);
+        }
+
         let _ = handle.set_volume((live.effective_volume.clamp(0, 200) as f32) / 100.0);
         if live.is_paused {
             let _ = handle.pause();
@@ -860,7 +931,7 @@ impl Coordinator {
             "Playback",
             &format!("First PCM frame path armed for guild {guild_id} (songbird driver)."),
         );
-        Ok(())
+        Ok(PlayOutcome::Started)
     }
 
     /// 일시정지가 아닌데 10초간 position 이 안 움직이면 죽은 것으로 보고 그 위치에서 이어재생.
