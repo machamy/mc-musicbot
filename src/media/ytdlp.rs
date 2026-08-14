@@ -65,6 +65,61 @@ async fn probe_js_runtime_args(exe: &str) -> Vec<String> {
     vec!["--js-runtimes".into(), format!("{name}:{path}")]
 }
 
+/* ── 못 읽는 쿠키 창구는 이번 실행 동안 건너뛴다 ──────────────────
+ *
+ * 인증 체인은 브라우저 쿠키 → 쿠키 파일 → 공개 순서로 시도한다. 그런데 쿠키를 **아예
+ * 못 읽는** 창구(브라우저가 켜져 있어 DB 가 잠겼거나, 윈도우 크롬처럼 요즘 복호화가
+ * 막힌 경우)는 몇 번을 해도 같은 자리에서 같은 이유로 실패한다.
+ *
+ * 그걸 곡마다 두 번씩 다시 해 보고 있었다. 곡 하나 받을 때마다 헛도는 yt-dlp 가 둘씩
+ * 붙는 셈이고, 재시도까지 겹치면 그 수가 배로 는다. 한 번 못 읽은 창구는 이번 실행
+ * 동안 접어 둔다 — 브라우저를 닫고 다시 켜는 것 같은 변화는 봇을 다시 켤 때 반영된다.
+ *
+ * **곡이 안 받아지는 것과는 다른 실패다.** 403 같은 건 여기 해당하지 않는다 —
+ * 그건 창구는 멀쩡한데 그 곡을 못 준 것이라, 접었다가는 멀쩡한 창구를 잃는다.
+ */
+static DEAD_COOKIE_SOURCES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn dead_sources() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    DEAD_COOKIE_SOURCES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// 쿠키를 못 읽어서 난 실패인가. **곡을 못 받은 것과 구분해야 한다.**
+pub(crate) fn is_cookie_source_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    const NEEDLES: [&str; 6] = [
+        "could not copy",
+        "cookie database",
+        "unable to decrypt",
+        "could not find",
+        "unsupported browser",
+        "permission denied",
+    ];
+    NEEDLES.iter().any(|needle| lower.contains(needle))
+}
+
+#[cfg(test)]
+mod cookie_source_tests {
+    use super::{is_cookie_source_failure, is_transient};
+
+    /// 브라우저가 켜져 있으면 크롬 쿠키 DB 를 못 베낀다 — 이번 실행 내내 같다.
+    #[test]
+    fn a_locked_cookie_database_is_a_source_failure() {
+        assert!(is_cookie_source_failure(
+            "ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271"
+        ));
+    }
+
+    /// **403 은 창구 문제가 아니다.** 이걸 창구 실패로 보면 멀쩡한 쿠키 창구를 접어 버린다.
+    #[test]
+    fn a_403_is_not_a_source_failure() {
+        let err = "ERROR: unable to download video data: HTTP Error 403: Forbidden";
+        assert!(!is_cookie_source_failure(err));
+        assert!(is_transient(err), "403 은 다시 해 볼 것으로 남아야 한다");
+    }
+}
+
 /// 다시 해 보면 될 것 같은 실패인가 (§10.8).
 ///
 /// **판단을 틀리는 쪽의 대가가 다르다.** 잠깐의 문제를 영구 실패로 보면 멀쩡한 곡이
@@ -189,6 +244,10 @@ impl YtDlp {
             }
         }
         chain.push((AuthMode::Public, Vec::new()));
+        // 이번 실행에서 쿠키를 못 읽는 것으로 판명된 창구는 뺀다. 공개 접근은 쿠키가
+        // 없으니 걸러질 일이 없다 — 마지막 폴백이 사라지는 일은 생기지 않는다.
+        let dead = dead_sources().lock().unwrap();
+        chain.retain(|(_, args)| args.is_empty() || !dead.contains(&args.join(" ")));
         chain
     }
 
@@ -432,6 +491,7 @@ impl YtDlp {
                 args.push("--sponsorblock-remove".into());
                 args.push("music_offtopic,intro,outro".into());
             }
+            let source_key = auth_args.join(" ");
             args.extend(auth_args);
             args.push("-o".into());
             args.push(output_template.to_string());
@@ -470,6 +530,10 @@ impl YtDlp {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
                 last_err = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+                // 쿠키를 아예 못 읽는 창구면 접어 둔다 (곡을 못 받은 것과는 다르다).
+                if !source_key.is_empty() && is_cookie_source_failure(&last_err) {
+                    dead_sources().lock().unwrap().insert(source_key.clone());
+                }
             }
         }
         Err(last_err)
