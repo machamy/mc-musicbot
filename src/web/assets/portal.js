@@ -137,8 +137,14 @@ const AUDIT_KINDS = {
   playlist: { icon: '📃', label: '재생목록' },
   moderation: { icon: '🛡', label: '관리' },
   admin: { icon: '⚙', label: '설정' },
+  // 봇이 곡을 못 튼 일. 사람이 한 게 아니라 벌어진 일이라 따로 둔다.
+  trouble: { icon: '⚠', label: '문제' },
 };
-const AUDIT_DEFAULT = ['song', 'playlist'];
+/* 기본으로 켜 두는 칩.
+ *
+ * **'문제' 가 여기 있어야 한다.** 재생 실패는 '재생' 으로 묶여 있었는데 그 칩은 기본이
+ * 꺼짐이라, 정작 "곡이 왜 자꾸 사라지지" 를 알아야 할 사람 눈에는 안 보였다. */
+const AUDIT_DEFAULT = ['song', 'playlist', 'trouble'];
 
 /* 차트 분류 카드 (§15.3). 서버가 주는 순서를 우선하고, 이건 아이콘·설명 사전이다. */
 const CHART_CATEGORIES = {

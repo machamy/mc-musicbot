@@ -1014,6 +1014,12 @@ pub enum AuditKind {
     Moderation,
     /// 서버 설정 변경.
     Admin,
+    /// **봇이 곡을 못 튼 일.** 사람이 한 게 아니라 벌어진 일이다.
+    ///
+    /// 재생 조작(`Playback`)에 섞어 두면 안 된다. 그쪽은 기본 필터에서 꺼져 있어서,
+    /// 정작 "곡이 왜 자꾸 사라지지" 를 알아야 할 사람 눈에는 안 보인다. 볼륨 조작은
+    /// 안 봐도 그만이지만 이건 아니다.
+    Trouble,
 }
 
 impl AuditKind {
@@ -1025,6 +1031,7 @@ impl AuditKind {
             Self::Playlist => "playlist",
             Self::Moderation => "moderation",
             Self::Admin => "admin",
+            Self::Trouble => "trouble",
         }
     }
 
@@ -1036,6 +1043,7 @@ impl AuditKind {
             "playlist" => Some(Self::Playlist),
             "moderation" => Some(Self::Moderation),
             "admin" => Some(Self::Admin),
+            "trouble" => Some(Self::Trouble),
             _ => None,
         }
     }
@@ -1049,6 +1057,7 @@ impl AuditKind {
             Self::Playlist => "📃 재생목록",
             Self::Moderation => "🛡 관리",
             Self::Admin => "🛡 관리",
+            Self::Trouble => "⚠ 문제",
         }
     }
 
@@ -1093,6 +1102,9 @@ pub fn audit_kind_for(action: &str) -> AuditKind {
         _ if action.starts_with("queue.") => AuditKind::Song,
         "playlist.enqueue" | "chart.enqueue" => AuditKind::Song,
         _ if action.starts_with("vote.") => AuditKind::Vote,
+        // 못 튼 것은 '재생 조작' 이 아니라 '문제' 다. 아래 `playback.` 접두보다 먼저 본다 —
+        // 순서가 뒤집히면 실패가 재생으로 분류돼 기본 필터에서 사라진다.
+        _ if action.starts_with("playback.failed") => AuditKind::Trouble,
         _ if action.starts_with("playback.")
             || action.starts_with("voice.")
             || action.starts_with("autoplay.toggle") =>
@@ -2912,6 +2924,19 @@ mod tests {
         too_many.sanitize();
         assert_eq!(too_many.autoplay_recent_count, 20);
         assert_eq!(too_many.recent_count_limit(), Some(20));
+    }
+
+    /// **못 튼 것은 '재생' 이 아니라 '문제' 로 분류돼야 한다.**
+    ///
+    /// `playback.` 접두 판정이 먼저 걸리면 실패가 재생으로 묶이고, 재생 칩은 기본이
+    /// 꺼짐이라 리모컨 활동 기록에서 통째로 사라진다 — 곡이 왜 넘어갔는지 알 길이 없어진다.
+    #[test]
+    fn playback_failures_are_trouble_not_playback() {
+        assert_eq!(audit_kind_for("playback.failed"), AuditKind::Trouble);
+        assert_eq!(audit_kind_for("playback.failed.stop"), AuditKind::Trouble);
+        // 사람이 하는 재생 조작은 그대로 '재생' 이다.
+        assert_eq!(audit_kind_for("playback.skip"), AuditKind::Playback);
+        assert_eq!(audit_kind_for("playback.pause"), AuditKind::Playback);
     }
 
     #[test]

@@ -23,9 +23,41 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// C# TempData 상태 배너 흐름의 등가물 — `?msg=...(&err=1)` 로 리다이렉트하면
 /// layout 의 FLASH_JS 가 페이지 상단에 초록/빨강 배너를 그린다.
 fn redirect_flash(path: &str, msg: &str, is_err: bool) -> Response {
-    let sep = if path.contains('?') { '&' } else { '?' };
+    Redirect::to(&flash_url(path, msg, is_err)).into_response()
+}
+
+/// `/settings#cookies` 처럼 **닻이 붙은 경로**에도 안내 문구를 얹는다.
+///
+/// 닻은 언제나 맨 끝이어야 한다. 그냥 뒤에 붙이면 `/settings#cookies?msg=...` 가 되고,
+/// 그러면 `?msg=` 까지 통째로 닻의 일부가 되어 **안내가 영영 안 뜬다.**
+fn flash_url(path: &str, msg: &str, is_err: bool) -> String {
+    let (base, fragment) = match path.split_once('#') {
+        Some((base, frag)) => (base, format!("#{frag}")),
+        None => (path, String::new()),
+    };
+    let sep = if base.contains('?') { '&' } else { '?' };
     let err = if is_err { "&err=1" } else { "" };
-    Redirect::to(&format!("{path}{sep}msg={}{err}", url_encode(msg))).into_response()
+    format!("{base}{sep}msg={}{err}{fragment}", url_encode(msg))
+}
+
+#[cfg(test)]
+mod flash_url_tests {
+    use super::flash_url;
+
+    /// 닻이 없으면 예전 그대로.
+    #[test]
+    fn a_plain_path_gets_the_query_appended() {
+        assert_eq!(flash_url("/settings", "됐어요", false), "/settings?msg=%EB%90%90%EC%96%B4%EC%9A%94");
+    }
+
+    /// **닻은 맨 끝으로.** 순서가 뒤집히면 안내가 닻에 삼켜져 화면에 안 뜬다.
+    #[test]
+    fn an_anchor_stays_at_the_very_end() {
+        let url = flash_url("/settings#cookies", "됐어요", true);
+        assert!(url.starts_with("/settings?msg="), "쿼리가 먼저여야 하는데: {url}");
+        assert!(url.ends_with("#cookies"), "닻이 끝이어야 하는데: {url}");
+        assert!(url.contains("&err=1"));
+    }
 }
 
 /// ISO UTC 타임스탬프 → "MM-dd HH:mm:ss" (C# 로그 뷰어 표기와 동일 모양, UTC 기준).
@@ -500,6 +532,8 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
         return r;
     }
     let s = state.app.db.load_global_settings();
+    // 올려 둔 쿠키의 **요약만** 읽는다 (줄 수·유튜브 개수·로그인 여부). 내용은 안 본다.
+    let cookie_line = cookie_status_line(&state);
     let chk = |b: bool| if b { "checked" } else { "" };
     let pol = |p: EmptyVoiceChannelPolicy, v: EmptyVoiceChannelPolicy| {
         if p == v { "selected" } else { "" }
@@ -530,7 +564,7 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
 <label class="field">로그 보관 일수 (1–3650)</label><input type="number" name="log_retention_days" min="1" max="3650" value="{lr}"/>
 <label class="field">선호 브라우저 프로필 (쿠키 추출)</label><input type="text" name="preferred_browser_profile" value="{bp}"/>
 <label class="field">쿠키 파일 경로 (선택)</label><input type="text" name="cookie_file_path" value="{cf}"/>
-<p class="hint">이 칸은 <b>봇 호스트에 이미 있는 파일의 경로</b>예요. 파일을 새로 올리려면 아래 칸을 쓰세요.</p>
+<p class="hint">이 칸은 <b>봇 호스트에 이미 있는 파일의 경로</b>예요. 파일을 새로 올리려면 <a href='#cookies'>이 페이지 맨 아래 &quot;유튜브 쿠키&quot;</a> 에서 올리세요.</p>
 <label class="checkbox" title="yt-dlp --sponsorblock-remove music_offtopic,intro,outro — SponsorBlock 데이터가 있는 영상의 인트로/아웃트로/비음악 구간을 다운로드 시 잘라냅니다. 이미 캐시된 곡엔 적용 안 되고 새로 받는 곡부터 적용됩니다."><input type="checkbox" name="sponsorblock_remove" {sb}/> 인트로/아웃트로 제거 (SponsorBlock · 새로 받는 곡부터)</label>
 <label class="checkbox" title="봇이 받은(tools 폴더 안의) yt-dlp 를 하루 1회 자동으로 yt-dlp -U 합니다. YouTube 변경으로 다운로드가 깨지는 것을 예방합니다. 시스템/PATH 의 yt-dlp 는 건드리지 않습니다."><input type="checkbox" name="auto_update_tools" {au}/> yt-dlp 자동 업데이트 (하루 1회)</label>
 </div>
@@ -545,7 +579,20 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
 <label class="field">송출 비트레이트 (kbps, 32–128 · 기본 96)</label><input type="number" name="voice_bitrate_kbps" min="32" max="128" value="{br}"/>
 </div>
 <div class="actions"><button class="btn btn-primary" type="submit">재생 설정 저장</button></div>
-</form>"#,
+</form>
+<div class="card" id="cookies"><h2>유튜브 쿠키 {cookie_badge}</h2>
+<p class="sub">유튜브가 <code>403 Forbidden</code> 을 뿌려 곡이 자꾸 넘어갈 때 쓰는 마지막 수단입니다. 로그인한 세션의 쿠키를 주면 대부분 해결됩니다.</p>
+<p class="kv">현재: {cookie_status}</p>
+<form method="post" action="/botsettings/cookies" enctype="multipart/form-data">
+<input type="hidden" name="csrf_token" value="{cookie_csrf}"/>
+<label class="field" for="cookie-file">cookies.txt 올리기 (넷스케이프 형식)</label>
+<input id="cookie-file" type="file" name="cookies" accept=".txt,text/plain"/>
+<p class="kv">브라우저에서 <b>youtube.com 에 로그인한 채로</b> 확장 프로그램(Get cookies.txt LOCALLY 등)으로 내보낸 파일을 그대로 올리면 됩니다. 올리면 위의 경로 칸이 자동으로 채워져서 <b>다음 곡부터</b> 쓰입니다.</p>
+<p class="kv"><strong>⚠ 쿠키는 그 자체가 로그인입니다.</strong> 이 파일을 가진 사람은 그 계정으로 들어갈 수 있어요. 평소 쓰시는 계정 말고 <b>버리는 계정</b>을 권합니다 — 유튜브가 자동 다운로드에 쓰인 계정을 제재하는 경우가 있어요. 내용은 화면·로그 어디에도 안 띄웁니다.</p>
+<div class="actions"><button class="btn btn-primary" type="submit">쿠키 올리기</button>
+<button class="btn btn-secondary" type="submit" name="remove" value="1">저장된 쿠키 지우기</button></div>
+</form>
+</div>"#,
         mv = s.master_volume,
         ne = chk(s.normalize_enabled),
         ad = chk(s.autoplay_default),
@@ -556,6 +603,13 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
         p1 = pol(s.empty_voice_policy, EmptyVoiceChannelPolicy::AutoLeave),
         p2 = pol(s.empty_voice_policy, EmptyVoiceChannelPolicy::StopPlayback),
         p3 = pol(s.empty_voice_policy, EmptyVoiceChannelPolicy::DoNothing),
+        cookie_badge = if cookie_line.is_some() { "· 등록됨" } else { "" },
+        cookie_status = html_escape(
+            cookie_line
+                .as_deref()
+                .unwrap_or("올려 둔 쿠키가 없어요. 지금은 로그인 없이 받고 있어요.")
+        ),
+        cookie_csrf = html_escape(&admin_csrf_token(&state, &cookies).unwrap_or_default()),
         cl = s.cache_limit_gb,
         lr = s.log_retention_days,
         bp = html_escape(&s.preferred_browser_profile),
@@ -684,8 +738,6 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
     } else {
         format!(r#"<p class="kv">알려진 서버: {known}</p>"#)
     };
-    // 올려 둔 쿠키의 **요약만** 읽는다 (줄 수·유튜브 개수·로그인 여부). 내용은 안 본다.
-    let cookie_line = cookie_status_line(&state);
     let body = format!(
         r#"<h1 class="page-title">봇 설정</h1>
 <p class="page-sub">봇 본체가 읽는 botsettings.json입니다. 읽기 전용 — 파일을 수정한 뒤 재시작하면 반영됩니다.</p>
@@ -724,23 +776,6 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
 <div class="actions"><button class="btn btn-primary" type="submit">OAuth 설정 저장</button>
 <a class="btn btn-secondary" href="/music/login" target="_blank" rel="noopener">로그인 화면 열기</a></div>
 </form></div>
-<div class="card"><h2>유튜브 쿠키 {cookie_badge}</h2>
-<p class="sub">유튜브가 <code>403 Forbidden</code> 을 뿌려 곡이 자꾸 넘어갈 때 쓰는 마지막 수단입니다. 로그인한 세션의 쿠키를 주면 대부분 해결됩니다.</p>
-<p class="kv">현재: {cookie_status}</p>
-<form method="post" action="/botsettings/cookies" enctype="multipart/form-data">
-<input type="hidden" name="csrf_token" value="{csrf}"/>
-<label class="field" for="cookie-file">cookies.txt 올리기 (넷스케이프 형식)</label>
-<input id="cookie-file" type="file" name="cookies" accept=".txt,text/plain"/>
-<p class="kv">브라우저에서 <b>youtube.com 에 로그인한 채로</b> 확장 프로그램(Get cookies.txt LOCALLY 등)으로 내보낸 파일을 그대로 올리면 됩니다. 올리면 저장 경로가 자동으로 설정돼서 <b>다음 곡부터</b> 쓰입니다.</p>
-<p class="kv"><strong>⚠ 쿠키는 그 자체가 로그인입니다.</strong> 이 파일을 가진 사람은 그 계정으로 들어갈 수 있어요. 평소 쓰시는 계정 말고 <b>버리는 계정</b>을 권합니다 — 유튜브가 자동 다운로드에 쓰인 계정을 제재하는 경우가 있어요. 내용은 화면·로그 어디에도 안 띄웁니다.</p>
-<div class="actions"><button class="btn btn-primary" type="submit">쿠키 올리기</button></div>
-</form>
-<form method="post" action="/botsettings/cookies" enctype="multipart/form-data" style="margin-top:8px">
-<input type="hidden" name="csrf_token" value="{csrf}"/>
-<input type="hidden" name="remove" value="1"/>
-<div class="actions"><button class="btn btn-secondary" type="submit">저장된 쿠키 지우기</button></div>
-</form>
-</div>
 <div class="card"><h2>전용 override (선택)</h2>
 <p class="sub">비워 두면 공용 설정을 그대로 따릅니다. 현재 적용 값:</p>
 <div class="diag-grid">
@@ -782,12 +817,6 @@ pub async fn botsettings_page(State(state): Ctx, cookies: Cookies) -> Response {
         ),
         youtube_status = youtube_status,
         youtube_referrer = html_escape(&format!("{}/*", auth.public_base_url)),
-        cookie_badge = if cookie_line.is_some() { "· 등록됨" } else { "" },
-        cookie_status = html_escape(
-            cookie_line
-                .as_deref()
-                .unwrap_or("올려 둔 쿠키가 없어요. 지금은 로그인 없이 받고 있어요.")
-        ),
         redirect_uri = html_escape(&auth.redirect_uri()),
         oauth_path = html_escape(
             &crate::web::remote::RemoteAuthConfig::storage_path(&app.config.data_root)
@@ -918,7 +947,7 @@ pub async fn botsettings_oauth_post(
             .app
             .log
             .error("Web", &format!("OAuth 설정 저장 실패: {error}"));
-        return redirect_flash("/botsettings", &error, true);
+        return redirect_flash("/settings#cookies", &error, true);
     }
     let configured = next.configured();
     let public_base_url = next.public_base_url.clone();
@@ -2432,11 +2461,11 @@ pub async fn botsettings_cookies_post(
             .app
             .log
             .info("Tools", "유튜브 쿠키 파일을 지웠습니다.");
-        return redirect_flash("/botsettings", "쿠키 파일을 지웠어요.", false);
+        return redirect_flash("/settings#cookies", "쿠키 파일을 지웠어요.", false);
     }
 
     let Some(text) = body else {
-        return redirect_flash("/botsettings", "올릴 파일을 골라 주세요.", true);
+        return redirect_flash("/settings#cookies", "올릴 파일을 골라 주세요.", true);
     };
 
     // 넷스케이프 형식인지 대충 본다. 엉뚱한 파일을 넣어 두면 yt-dlp 가 매번 실패하는데,
@@ -2444,7 +2473,7 @@ pub async fn botsettings_cookies_post(
     let sum = summarize_cookies(&text);
     if sum.lines == 0 {
         return redirect_flash(
-            "/botsettings",
+            "/settings#cookies",
             "쿠키가 한 줄도 없어요. 브라우저 확장으로 받은 cookies.txt (넷스케이프 형식) 가 맞는지 확인해 주세요.",
             true,
         );
@@ -2483,5 +2512,5 @@ pub async fn botsettings_cookies_post(
     } else {
         "등록은 했는데 로그인 쿠키가 안 보여요. 로그아웃 상태에서 뽑으셨을 수 있어요 — 403 이 계속되면 다시 뽑아 주세요."
     };
-    redirect_flash("/botsettings", note, !sum.logged_in)
+    redirect_flash("/settings#cookies", note, !sum.logged_in)
 }
