@@ -323,6 +323,8 @@ pub async fn serve(app: Arc<App>) {
         )
         .route("/botsettings", get(pages::botsettings_page))
         .route("/botsettings/oauth", post(pages::botsettings_oauth_post))
+        // 쿠키 파일 업로드 (§10.9). 봇 주인 화면이라 파일을 그대로 받는다.
+        .route("/botsettings/cookies", post(pages::botsettings_cookies_post))
         .route("/sharedconfig", get(pages::sharedconfig_page))
         .route("/guilds", get(pages::guilds_page).post(pages::guilds_post))
         .route("/tools", get(pages::tools_page).post(pages::tools_post))
