@@ -515,13 +515,28 @@ impl Coordinator {
         let duration = match current.track.duration {
             Some(value) => Duration::from_secs_f64(value.as_secs_f64()),
             None => {
-                let looked_up = app
-                    .ytdlp()
-                    .inspect_track(&current.track.source_url, current.track.provider)
-                    .await
-                    .and_then(|track| track.duration)
+                /* 싼 것부터 본다.
+                 *
+                 * 1) **받아 둔 파일.** 한 번이라도 튼 곡이면 캐시에 길이가 이미 적혀 있다.
+                 *    네트워크도 안 타고 유튜브를 또 두드리지도 않는다.
+                 * 2) 그래도 없으면 물어본다. */
+                let from_cache = app
+                    .cache
+                    .get(&current.track.cache_key())
+                    .and_then(|entry| entry.duration)
                     .map(|value| Duration::from_secs_f64(value.as_secs_f64()))
                     .filter(|value| !value.is_zero());
+
+                let looked_up = match from_cache {
+                    Some(found) => Some(found),
+                    None => app
+                        .ytdlp()
+                        .inspect_track(&current.track.source_url, current.track.provider)
+                        .await
+                        .and_then(|track| track.duration)
+                        .map(|value| Duration::from_secs_f64(value.as_secs_f64()))
+                        .filter(|value| !value.is_zero()),
+                };
 
                 match looked_up {
                     Some(found) => {

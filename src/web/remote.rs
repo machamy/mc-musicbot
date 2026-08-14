@@ -2565,6 +2565,14 @@ fn track_json(track: &TrackRef) -> Value {
         "contentId": track.content_id,
         "sourceUrl": track.source_url,
         "cacheKey": track.cache_key(),
+        /* **길이를 그대로도 실어 보낸다.**
+         *
+         * 아래 둘은 화면이 읽는 값이다. 그런데 화면이 곡을 담을 때 이 객체를 **그대로
+         * 돌려보내고**, 서버는 그걸 `TrackRef` 로 읽는다. `TrackRef` 가 아는 이름은
+         * `duration` 하나뿐이라 여기 없으면 **담는 순간 길이가 사라졌다.**
+         * 서버는 길이를 알고 있었는데(검색 결과에 157초로 나왔다) 자기가 보낸 이름을
+         * 자기가 못 읽어서 잃어버린 것이다. 그러면 웹 재생이 곡을 시작하지 못한다. */
+        "duration": track.duration,
         "durationSeconds": track.duration.map(|duration| duration.as_secs_f64()),
         "durationLabel": track.duration.map(|duration| duration.display()),
         "artUrl": Value::Null,
@@ -10967,6 +10975,36 @@ async fn seed_dev_guild(state: &WebState, guild_id: u64, user_id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **화면이 곡을 돌려보낼 때 길이가 살아남아야 한다.**
+    ///
+    /// 화면은 검색 결과 객체를 그대로 `/queue` 로 돌려보내고 서버는 그걸 `TrackRef` 로
+    /// 읽는다. 예전에는 `durationSeconds`(화면이 읽는 이름)만 실어 보내서, `TrackRef` 가
+    /// 아는 `duration` 이 없어 **담는 순간 길이가 사라졌다.** 길이가 없으면 웹 재생이
+    /// 곡을 시작하지 못해 그 자리에 멈춘다 — 실제로 그렇게 멈췄다.
+    #[test]
+    fn a_track_survives_the_round_trip_with_its_duration() {
+        let track = TrackRef {
+            provider: ProviderKind::YouTube,
+            content_id: "rTqYRWcA-Yw".into(),
+            source_url: "https://www.youtube.com/watch?v=rTqYRWcA-Yw".into(),
+            title: Some("어떤 곡".into()),
+            artist: Some("어떤 사람".into()),
+            duration: Some(CsTimeSpan::from_secs_f64(157.0)),
+            variant_key: None,
+        };
+
+        // 서버 → 화면 → 서버.
+        let wire = track_json(&track);
+        let back: TrackRef = serde_json::from_value(wire).expect("돌아온 곡을 읽을 수 있어야 해요");
+
+        assert_eq!(
+            back.duration.map(|d| d.as_secs_f64() as i64),
+            Some(157),
+            "길이가 왕복에서 사라지면 안 돼요"
+        );
+        assert_eq!(back.content_id, track.content_id);
+    }
 
     #[test]
     fn safe_next_only_accepts_internal_remote_paths() {
