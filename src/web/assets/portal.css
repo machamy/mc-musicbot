@@ -2787,6 +2787,32 @@ body.gate {
  * 일시정지도 원천적으로 안 생긴다. `controls:0` 만으로는 hover 오버레이가 안 막힌다.
  * 거기서 되감으면 그 사람만 어긋나므로 애초에 못 닿게 하는 편이 맞다. */
 
+/* 영상 위에 얹는 안내막. 영상과 같은 자리로 JS 가 옮긴다.
+ * 클릭은 안 받는다 — 유튜브에 닿지 않게 하는 규칙이 여기서도 같다. */
+.videochrome {
+  position: fixed;
+  z-index: calc(var(--z-video) + 1);
+  pointer-events: none;
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+.videochrome__veil {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semi);
+}
+.videochrome__count {
+  position: absolute; left: var(--sp-2); top: var(--sp-2);
+  padding: 2px var(--sp-2);
+  border-radius: var(--r-full);
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: var(--fs-xs);
+}
+
 /* 영상일 때 카드는 한 칸이 되고 자리는 16:9 가 된다. */
 :root .now[data-video="1"] { grid-template-columns: minmax(0, 1fr); align-content: start; }
 :root .now[data-video="1"] .now__artwrap {

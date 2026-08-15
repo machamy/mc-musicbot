@@ -4771,6 +4771,17 @@ function buildWebPlayback() {
     h('div', { id: 'macham-sc' }));
   document.body.appendChild(el.webHost);
 
+  /* 영상 위에 얹는 안내막 (§39).
+   *
+   * 영상은 `body` 밑 fixed 라 카드 안 요소로는 못 덮는다. 그래서 같은 방식으로 하나 더
+   * 띄우고 `placeVideo` 가 둘을 같이 옮긴다. 멈춘 영상이 아무 설명 없이 얼어 있으면
+   * 고장으로 보이는데, 실제로는 봇이 음성에서 빠졌거나 누가 일시정지한 것이다. */
+  el.videoVeil = h('div', { class: 'videochrome__veil', hidden: true });
+  el.videoCount = h('span', { class: 'videochrome__count' });
+  el.videoChrome = h('div', { class: 'videochrome', hidden: true, 'aria-hidden': 'true' },
+    el.videoVeil, el.videoCount);
+  document.body.appendChild(el.videoChrome);
+
   window.addEventListener('pagehide', stopWebPlayback);
 }
 
@@ -4871,6 +4882,7 @@ function hideVideoBox() {
   if (el.webHost.dataset.video === '1') delete el.webHost.dataset.video;
   el.webHost.style.cssText = '';
   videoBoxKey = '';
+  if (el.videoChrome) { el.videoChrome.hidden = true; el.videoChrome.style.cssText = ''; }
   if (el.nowCard && el.nowCard.dataset.video === '1') delete el.nowCard.dataset.video;
 }
 
@@ -4898,8 +4910,32 @@ function placeVideo() {
   el.webHost.style.width = `${Math.round(full.width)}px`;
   el.webHost.style.height = `${Math.round(full.height)}px`;
   el.webHost.style.clipPath = insetPath(full, clip);
+  // 안내막도 같은 자리로. 영상 위에 정확히 겹쳐야 한다.
+  if (el.videoChrome) {
+    el.videoChrome.hidden = false;
+    el.videoChrome.style.left = el.webHost.style.left;
+    el.videoChrome.style.top = el.webHost.style.top;
+    el.videoChrome.style.width = el.webHost.style.width;
+    el.videoChrome.style.height = el.webHost.style.height;
+    el.videoChrome.style.clipPath = el.webHost.style.clipPath;
+    paintVideoChrome();
+  }
   // 1×1 로 만들어진 플레이어라 iframe 에게도 커졌다고 알려 준다.
   try { ytPlayer?.setSize?.(Math.round(full.width), Math.round(full.height)); } catch { /* 아직 준비 전 */ }
+}
+
+/** 지금 무엇을 알려야 하나. 멈춰 있으면 그 이유를 말한다. */
+function paintVideoChrome() {
+  if (!el.videoVeil) return;
+  const state = store.get();
+  const count = state.watch?.count || 0;
+  el.videoCount.textContent = count > 1 ? `🎬 ${count}명이 같이 보는 중` : '🎬 같이 보는 중';
+
+  let note = '';
+  if (clock.stopped) note = '멈춤 · 봇이 음성 채널에 없어요';
+  else if (state.player?.isPaused) note = '⏸ 일시정지';
+  el.videoVeil.textContent = note;
+  el.videoVeil.hidden = !note;
 }
 
 /* 위치를 rAF 로 따라간다.
@@ -5018,6 +5054,14 @@ async function offerVideo(watch) {
 function syncVideoUi() {
   if (!el.videoBtn) return;
   const state = store.get();
+  /* 보는 중인데 영상이 안 나오는 곡이면 **이유를 말한다.**
+   * 아무 설명 없이 아트로 돌아가면 고장으로 보인다. 판은 그대로 두고 다음 곡에 다시 뜬다. */
+  if (videoJoined && state.current && !videoShowing()) {
+    const source = webSourceOf(state.current.track);
+    setWebNote(source && source.kind === 'sc'
+      ? '이 곡은 사운드클라우드라 영상이 없어요. 다음 유튜브 곡부터 다시 보여드려요.'
+      : '이 곡은 영상으로 보여드릴 수 없어요. 다음 곡부터 다시 따라갈게요.');
+  }
   const phase = watchPhase({
     watch: state.watch, meId: state.user?.id, joined: videoJoined, asked: watchAsked(),
   });
@@ -6553,6 +6597,9 @@ function memberRow(member, status) {
     personAvatar(id, name, member.avatarUrl, 'sm'),
     h('span', { class: `dot dot--${status}`, tip: STATUS_TIP[status] || '접속 상태예요' }),
     h('span', { class: 'member__name' }, personButton(id, name)),
+    // 같이보기 중인 사람에게 표를 붙인다 (§39). 누가 보고 있는지 알아야 합류할 마음이 든다.
+    ((store.get().watch?.watchers) || []).map(String).includes(id)
+      ? h('span', { class: 'chip chip--accent', tip: '지금 영상으로 같이 보고 있어요' }, '🎬') : null,
     member.tier && member.tier !== 'member'
       ? h('span', { class: `tier tier--${member.tier}`, tip: TIERS[member.tier]?.desc || '' }, TIERS[member.tier]?.icon || '') : null);
 
@@ -8859,7 +8906,8 @@ async function boot() {
   store.subscribe(['user', 'tier', 'permissions'], renderProfile);
   store.subscribe(['guild', 'guilds'], renderGuild);
   store.subscribe(['presence'], renderPresenceSummary);
-  store.subscribe(['presence', 'members', 'intentStatus'], renderMembers);
+  // `watch` 도 본다 — 같이보기 표가 붙고 떨어지려면 명단이 바뀔 때 다시 그려야 한다.
+  store.subscribe(['presence', 'members', 'intentStatus', 'watch'], renderMembers);
   store.subscribe(['queue', 'queueMode', 'permissions', 'suspension', 'tier', 'conn', 'hotAt', 'settings', 'superLike'], renderQueue);
   store.subscribe(['current', 'player', 'permissions', 'suspension', 'tier', 'settings', 'conn', 'next', 'skipVote'], renderNow);
   store.subscribe(['chat', 'chatDelta', 'permissions', 'suspension', 'tier', 'conn', 'settings', 'coldAt'], renderChat);
