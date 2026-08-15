@@ -5136,8 +5136,17 @@ const WEB_ERRORS = {
   150: '이 곡은 다른 사이트에서의 재생이 막혀 있어요. Discord로 들어 주세요.',
 };
 
+/* 이 안내는 **한 번도 뜬 적이 없었다.**
+ *
+ * 첫 줄이 `webVideoId = null;` 이었는데 그런 이름은 저장소 어디에도 선언돼 있지 않다.
+ * 이 파일은 `<script type="module">` 로 실려서 늘 strict mode 이고, strict mode 에서
+ * 선언 안 된 이름에 대입하면 `ReferenceError` 다. 그래서 임베드가 막힌 영상을 만나면
+ * 아래 `setWebNote` 까지 오지도 못하고 예외가 났다 — 사람 눈에는 **아무 설명 없이 조용히
+ * 안 나오는 곡**으로 보였다.
+ *
+ * 지울 수 있었던 이유: 그 변수를 읽는 곳이 한 군데도 없다. 지금 곡이 무엇인지는
+ * `webSource` 가 들고 있다. */
 function onWebError(code) {
-  webVideoId = null;
   // 토글은 켜 둔 채로 다음 곡을 기다린다. 곡 하나 때문에 기능을 꺼버리면 더 헷갈린다.
   setWebNote(`${WEB_ERRORS[code] || '이 곡은 웹에서 재생할 수 없어요.'} 다음 곡부터 다시 따라갈게요.`);
 }
@@ -5462,7 +5471,15 @@ function drawViz() {
   const dpr = Math.min(2, window.devicePixelRatio || 1);
   const width = canvas.clientWidth;
   const height = canvas.clientHeight;
-  if (!width || !height) { scheduleViz(); return; }
+  /* 캔버스가 아직(또는 영영) 0×0 이다.
+   *
+   * **여기서 `scheduleViz()` 를 바로 부르면 안 된다.** 수다 배치는 `.viz` 를
+   * `display:none` 으로 감춰서(`portal.css`) 폭이 영원히 0 이다. 그러면 아무것도 그리지
+   * 않는 프레임을 초당 60번 영원히 돈다 — 배터리만 먹고 화면에는 아무 일도 없다.
+   *
+   * 잠깐 뒤에 다시 본다. 배치가 바뀌어 다시 보이게 되면 그때 크기가 잡히고, 계속 숨어
+   * 있으면 4배 느리게 헛돌 뿐이다. 어차피 배치 전환·곡 변경 때 따로 깨워 준다. */
+  if (!width || !height) { setTimeout(scheduleViz, 250); return; }
   if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
     canvas.width = Math.round(width * dpr);
     canvas.height = Math.round(height * dpr);
@@ -8877,6 +8894,20 @@ function selfTest() {
   // 총점은 서버 공식이 만든다. 여기서 다시 계산하면 잠깐이라도 틀린 총점을 보여준다.
   eq('투표 즉시 반영: 총점과 계산식은 안 건드린다',
     bumpScore({ likeCount: 2, totalScore: 9, formula: '👍2 = 9' }, null, 'like').totalScore, 9);
+
+  /* §9 — 임베드가 막힌 곡은 **이유를 말해 줘야 한다.**
+   * 이 함수는 첫 줄의 미선언 대입 때문에 strict mode 에서 통째로 죽어 있었다.
+   * 그래서 안내가 한 번도 뜬 적이 없고, 사람 눈에는 이유 없이 조용히 넘어가는 곡이었다.
+   * 밖에서는 못 부르는 함수라 여기서 실제로 태워 본다. */
+  {
+    const kept = el.webNote ? el.webNote.textContent : null;
+    let blew = null;
+    try { onWebError(150); } catch (error) { blew = String(error && error.message || error); }
+    eq('임베드 불가: onWebError 가 안 터진다', blew, null);
+    eq('임베드 불가: 안내가 실제로 뜬다',
+      !!(el.webNote && !el.webNote.hidden && el.webNote.textContent.includes('막혀 있어요')), true);
+    if (el.webNote) setWebNote(kept || '');   // 검사 흔적을 지운다
+  }
 
   console.info(fails.length ? `[자가검사] ${fails.length}건 실패` : '[자가검사] 전부 통과', fails);
   return { fail: fails.length, fails };

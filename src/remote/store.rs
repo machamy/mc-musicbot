@@ -665,7 +665,13 @@ pub fn is_valid_pref(key: &str, value: &str) -> bool {
     match key {
         "layout" => LAYOUT_VALUES.contains(&value),
         "theme" => THEME_VALUES.contains(&value),
-        "lyricsOpen" | "webPlayback" => matches!(value, "0" | "1"),
+        // `nowVoters` — 지금 곡에 누가 눌렀는지 명단을 펼쳐 둘까 (§10.4).
+        //
+        // **여기 없으면 저장이 통째로 실패한다.** 이 검사는 키 하나만 모르면
+        // `api_prefs_put` 이 배치 전체를 거절하는데, 화면은 300ms 동안 여러 설정을 모아
+        // 한 번에 보낸다. 그래서 명단을 접었다 폈다 하는 동안 같은 배치에 실린
+        // `webVolume`·`webOffset` 저장까지 같이 날아갔다 — 실제로 그랬다.
+        "lyricsOpen" | "webPlayback" | "nowVoters" => matches!(value, "0" | "1"),
         "webVolume" => value
             .parse::<u32>()
             .map(|volume| volume <= 100 && !value.starts_with('+'))
@@ -4639,6 +4645,26 @@ mod tests {
         assert_eq!(store.delete_prefs(10, &["layout"]).unwrap(), 1);
         assert!(!store.load_prefs(10).contains_key("layout"));
         cleanup(store, path);
+    }
+
+    /// **화면이 보내는 키는 여기 전부 있어야 한다.**
+    ///
+    /// 하나라도 빠지면 그 키만 못 쓰는 게 아니다. `api_prefs_put` 이 배치 전체를 거절하고,
+    /// 화면은 여러 설정을 300ms 동안 모아 한 번에 보낸다 — 같이 실린 멀쩡한 값까지 날아간다.
+    /// `nowVoters` 가 실제로 그랬다.
+    #[test]
+    fn every_pref_the_screen_sends_is_accepted() {
+        for (key, value) in [
+            ("layout", "three"),
+            ("theme", "dark"),
+            ("lyricsOpen", "1"),
+            ("webPlayback", "1"),
+            ("webVolume", "60"),
+            ("webOffset", "0"),
+            ("nowVoters", "0"),
+        ] {
+            assert!(is_valid_pref(key, value), "화면이 보내는 '{key}' 를 거절해요");
+        }
     }
 
     #[test]
