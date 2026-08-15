@@ -489,12 +489,32 @@ impl Coordinator {
 
         // 켤 이유가 없으면 도는 것을 정리하고 손을 뗀다.
         if !settings.web_player_mode || listeners == 0 || state.current_item.is_none() {
+            /* **멈추기 전에 듣던 자리를 적어 둔다.**
+             *
+             * 마지막 사람이 `웹에서 듣기` 를 끄면 시각표가 멈추는데, 예전에는 위치를
+             * 안 남기고 버렸다. 그래서 봇을 불러 이어 들으려 하면 **곡이 처음부터**
+             * 다시 시작했다 — 듣던 자리를 잃는 게 진짜 손해다.
+             * 이제 그대로 남아서, 봇이 들어오면 그 지점부터 잇는다. */
+            let resume_at = self
+                .virtual_sessions
+                .lock()
+                .await
+                .get(&guild_id)
+                .map(|session| session.position());
             let had = self.virtual_sessions.lock().await.remove(&guild_id).is_some();
             self.virtual_guilds.lock().unwrap().remove(&guild_id);
             if had {
+                if let Some(position) = resume_at.filter(|p| *p > Duration::from_millis(500)) {
+                    app.player
+                        .set_current_start_offset(guild_id, CsTimeSpan(position))
+                        .await;
+                }
                 app.log.info(
                     "Playback",
-                    &format!("웹 재생기 시각표를 멈췄어요 (guild {guild_id})."),
+                    &format!(
+                        "웹 재생기 시각표를 멈췄어요 — {:.0}초 지점을 남겨 뒀어요 (guild {guild_id}).",
+                        resume_at.unwrap_or_default().as_secs_f64()
+                    ),
                 );
             }
             return VirtualOutcome::NotMine;

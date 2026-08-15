@@ -4837,6 +4837,12 @@ function watchPhase({ watch, meId, joined, asked }) {
   return 'invite';
 }
 
+/** 지금 곡이 라이브인가 (§40). 라이브의 "지금" 은 계산한 위치가 아니라 **맨 끝**이다. */
+function currentIsLive(track) {
+  const t = track || store.get().current?.track;
+  return !!(t && t.isLive);
+}
+
 /** 이 곡을 영상으로 보여 줄 수 있는가. 사운드클라우드에는 보여 줄 영상이 없다. */
 function videoShowing() {
   if (!videoJoined) return false;
@@ -5257,7 +5263,14 @@ async function toggleWebPlayback() {
     reportWebListening(false);
     stopWebPlayback();
     syncWebUi();
-    toast('웹에서 듣기를 껐어요. Discord 쪽은 그대로 재생 중이에요.', 'ok');
+    /* **봇이 없으면 "Discord 쪽은 그대로" 가 거짓말이다.**
+     * 그 말을 믿고 껐다가 소리가 통째로 사라지면 고장으로 보인다. 실제로 무슨 일이
+     * 벌어졌는지, 계속 들으려면 무엇을 하면 되는지 말한다. 듣던 자리는 서버가 남겨 둔다. */
+    const botHere = !!store.get().player?.voiceChannelId;
+    toast(botHere
+      ? '웹에서 듣기를 껐어요. Discord 쪽은 그대로 재생 중이에요.'
+      : '웹에서 듣기를 껐어요. 봇이 음성 채널에 없어서 재생도 멈춰요 — /참여 로 부르면 듣던 자리에서 이어져요.',
+      botHere ? 'ok' : 'warn');
     return;
   }
 
@@ -5353,8 +5366,15 @@ function syncWebNow(force) {
       try {
         // 곡이 방금 시작했으면 **0초부터** 튼다. 절대 시각 기준이라 몇 ms 뒤처져 있어도
         // `startSeconds` 에 그 값을 넣으면 도입부가 잘려서 "끊긴 것처럼" 들린다 (§31).
-        const from = position < WEB_START_SNAP ? 0 : position;
-        ytPlayer.loadVideoById({ videoId: next.key, startSeconds: from });
+        /* **라이브는 시작 지점을 주지 않는다** (§40). 라이브에는 "몇 초 지점" 이 없고
+         * 유튜브가 알아서 맨 끝(지금 방송 중인 자리)에 붙는다. 계산한 위치를 억지로 넣으면
+         * 한참 전 구간으로 되감기거나 아예 안 붙는다. */
+        if (currentIsLive()) {
+          ytPlayer.loadVideoById({ videoId: next.key });
+        } else {
+          const from = position < WEB_START_SNAP ? 0 : position;
+          ytPlayer.loadVideoById({ videoId: next.key, startSeconds: from });
+        }
         ytPlayer.setVolume(webVolume);
         if (paused) setTimeout(() => { try { ytPlayer.pauseVideo(); } catch { /* 무시 */ } }, 500);
         webPreloaded = null;
@@ -5634,7 +5654,9 @@ function renderNow(state) {
       personButton(current.requestedByUserId, current.requestedByDisplay || '알 수 없음'),
       current.requestedByUserId && String(current.requestedByUserId) === String(state.user?.id)
         ? h('span', { class: 'chip chip--accent' }, '내 곡') : null);
-    el.timeEnd.textContent = fmtTime(current.durationSeconds || trackSeconds(current.track));
+    el.timeEnd.textContent = currentIsLive(current.track)
+      ? 'LIVE'
+      : fmtTime(current.durationSeconds || trackSeconds(current.track));
   }
 
   // 지금 재생 중인 곡은 제일 궁금한 곡이라 툴팁이 아니라 카드에 바로 보여준다 (§10.4).
@@ -9295,6 +9317,14 @@ function selfTest() {
   eq('영상 자리: 안 잘리면 클립 없음',
     insetPath({ left: 0, top: 0, right: 100, bottom: 100 }, { left: 0, top: 0, right: 100, bottom: 100 }),
     'none');
+
+  /* §40 — 라이브 판정.
+   *
+   * **이 두 줄이 있는 진짜 이유**: 이 함수를 쓰는 코드만 들어가고 정의가 안 들어간 채로
+   * 배포된 적이 있다. `node --check` 는 문법만 보므로 못 잡았고, 웹에서 듣기 보정이
+   * 매 틱 조용히 터지고 있었다. 여기서 실제로 불러 보면 그때 바로 걸린다. */
+  eq('라이브 판정: 라이브면 참', currentIsLive({ isLive: true }), true);
+  eq('라이브 판정: 평범한 곡이면 거짓', currentIsLive({ isLive: false }), false);
 
   console.info(fails.length ? `[자가검사] ${fails.length}건 실패` : '[자가검사] 전부 통과', fails);
   return { fail: fails.length, fails };
