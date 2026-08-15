@@ -32,6 +32,9 @@ REM Register both the admin and remote hostnames to this PC. The host-local
 REM data\registrar.json is preserved by updates and is never in the manifest.
 if exist "scripts\Register-RemoteHosts.ps1" if exist "data\registrar.json" powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\Register-RemoteHosts.ps1" -ConfigPath "data\registrar.json"
 
+REM Put a staged build in place before starting. Does nothing if none is waiting.
+if exist "scripts\Apply-Staged-Update.cmd" call "scripts\Apply-Staged-Update.cmd"
+
 start "MusicBot" bot-mk2\mc-musicbot.exe
 
 echo.

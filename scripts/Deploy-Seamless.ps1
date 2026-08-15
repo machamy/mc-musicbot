@@ -27,7 +27,13 @@ param(
     [string]$Remote  = $(if ($env:MUSICBOT_DEPLOY_REMOTE) { $env:MUSICBOT_DEPLOY_REMOTE } else { 'bot-host' }),
     [string]$Root    = $(if ($env:MUSICBOT_DEPLOY_ROOT) { $env:MUSICBOT_DEPLOY_ROOT } else { 'C:\musicbot-portable' }),
     [string]$TaskName = 'MusicBot Portable',
-    [string]$ChangelogPath = "$PSScriptRoot\..\docs\CHANGELOG.md"
+    [string]$ChangelogPath = "$PSScriptRoot\..\docs\CHANGELOG.md",
+    # **돌고 있는 봇을 건드리지 않는다.** 새 exe 를 옆자리에 놓아 두기만 하고 끝낸다.
+    # 다음에 봇이 꺼졌다 켜질 때 `Apply-Staged-Update.cmd` 가 알아서 갈아 끼운다.
+    #
+    # 준비된 빌드가 있다는 이유만으로 듣고 있는 사람의 노래를 끊을 이유는 없다.
+    # 급한 고침이 아니면 이쪽이 기본이어야 한다.
+    [switch]$Stage
 )
 
 $ErrorActionPreference = 'Stop'
@@ -73,6 +79,22 @@ $remoteHash = ($verify | Select-Object -Last 1).Trim()
 if ($remoteHash -ne $localHash) {
     throw "복사본 해시가 달라요. 배포를 중단했어요. (원격 $remoteHash)"
 }
+if ($Stage) {
+    # 다음 기동에서 쓸 버전을 적어 둔다. 이걸 안 남기면 갈아 끼운 뒤에도
+    # BUILD_ID.txt 가 옛 번호로 남아 무엇이 도는지 아무도 모른다.
+    $note = Invoke-Remote @"
+`$root = '$Root'
+Set-Content -LiteralPath (Join-Path `$root 'bot-mk2\PENDING_BUILD.txt') -Value '$Version' -Encoding ascii
+'staged'
+"@
+    if (($note | Select-Object -Last 1).Trim() -ne 'staged') {
+        throw '예약 표시를 남기지 못했어요. 옆자리 파일을 지웁니다.'
+    }
+    Write-Host '[deploy] 예약 완료 — 봇은 그대로 돌고 있어요.'
+    Write-Host "[deploy] 다음에 봇을 껐다 켜면 $Version 로 바뀝니다."
+    return
+}
+
 Write-Host '[deploy] 해시 일치 — 여기서부터가 멈춤 구간이에요'
 
 # 3~4. 신호 → 교체 → 기동. 한 번의 원격 왕복으로 끝낸다.
