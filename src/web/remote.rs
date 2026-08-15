@@ -4517,6 +4517,94 @@ struct LrcLibRow {
     synced_lyrics: Option<String>,
 }
 
+/* ── 가사 찾기 (§41) ─────────────────────────────────────────────
+ *
+ * **유튜브 제목은 곡 제목이 아니다.** `아이유 - 밤편지 [Official MV] 4K` 처럼 꾸밈이 잔뜩
+ * 붙고, "가수" 자리에는 채널 이름(`HoYoFair`)이 들어온다. 그걸 그대로 LRCLIB 에
+ * `track_name` + `artist_name` 으로 넘기니 거의 매번 빈손이었다.
+ *
+ * 그래서 두 가지를 한다. **제목을 씻고**, **한 번에 포기하지 않는다.**
+ */
+
+/// 제목에서 곡 이름이 아닌 것들을 떼어낸다.
+///
+/// 대괄호·괄호 안의 홍보 문구(`[Official MV]`, `(Lyrics)`), 화질 표시, 뒤에 붙는 `MV` 따위다.
+/// **괄호 안을 무조건 지우지는 않는다** — `밤편지(Through the Night)` 처럼 부제가 들어 있는
+/// 경우가 많아서, 안에 홍보 낱말이 있을 때만 지운다.
+pub(crate) fn clean_track_title(raw: &str) -> String {
+    const NOISE: [&str; 23] = [
+        "official", "video", "audio", "lyric", "lyrics", "mv", "m/v", "hd", "hq", "4k", "8k",
+        "live", "teaser", "trailer", "visualizer", "color coded", "가사", "자막", "공식",
+        "뮤직비디오", "리릭", "풀버전", "clip",
+    ];
+    let mut out = String::with_capacity(raw.len());
+    let mut depth_round = 0i32;
+    let mut depth_square = 0i32;
+    let mut buffer = String::new();
+    for ch in raw.chars() {
+        match ch {
+            '(' | '[' | '【' | '〔' => {
+                if depth_round + depth_square == 0 {
+                    buffer.clear();
+                }
+                if ch == '(' { depth_round += 1 } else { depth_square += 1 }
+                buffer.push(ch);
+            }
+            ')' | ']' | '】' | '〕' => {
+                if ch == ')' { depth_round -= 1 } else { depth_square -= 1 }
+                buffer.push(ch);
+                if depth_round + depth_square <= 0 {
+                    let inside = buffer.to_lowercase();
+                    // 홍보 낱말이 든 묶음만 버린다. 부제·원제는 검색에 도움이 된다.
+                    if !NOISE.iter().any(|noise| inside.contains(noise)) {
+                        out.push_str(&buffer);
+                    }
+                    buffer.clear();
+                    depth_round = 0;
+                    depth_square = 0;
+                }
+            }
+            _ => {
+                if depth_round + depth_square > 0 {
+                    buffer.push(ch);
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out.push_str(&buffer); // 안 닫힌 괄호는 그냥 살린다
+    // 뒤에 남은 꼬리표(`... MV`, `... 4K`)를 떼어낸다.
+    let mut text = out.trim().trim_matches(|c: char| c == '-' || c == '|' || c == '·').trim().to_string();
+    loop {
+        let lower = text.to_lowercase();
+        let cut = NOISE
+            .iter()
+            .filter_map(|noise| lower.strip_suffix(noise).map(|head| head.trim_end_matches([' ', '-', '|', '·', '/']).len()))
+            .min();
+        match cut {
+            Some(at) if at > 0 && at < text.len() => text.truncate(at),
+            _ => break,
+        }
+    }
+    text.trim().to_string()
+}
+
+/// 채널 이름처럼 가수로 못 쓸 값인가.
+///
+/// `... Topic` 은 유튜브가 자동 생성한 채널이라 실제 가수명이고, 그 외 `VEVO`·`Records`
+/// 같은 것은 회사다. 애매하면 **가수 없이** 검색하는 쪽이 낫다 — 틀린 가수로 좁히면 0건이다.
+fn artist_is_channelish(artist: &str) -> bool {
+    let lower = artist.trim().to_lowercase();
+    /* **욕심내지 않는다.** 가수 이름에도 흔한 낱말(`official`·`music`)까지 걸러 내면
+     * `Official HIGE DANdism` 같은 진짜 밴드를 놓친다. 게다가 틀려도 대가가 작다 —
+     * 가수를 붙인 질문이 빗나가면 아래 단계에서 가수 없이 다시 찾는다.
+     * 그래서 **회사 이름이 분명한 것만** 거른다. */
+    ["vevo", "records", "labels", "entertainment", "- topic"]
+        .iter()
+        .any(|noise| lower.contains(noise))
+}
+
 async fn api_lyrics(
     State(state): State<Arc<WebState>>,
     cookies: Cookies,
@@ -4550,23 +4638,53 @@ async fn api_lyrics(
             .map(|(artist, title)| (artist.to_string(), title.to_string()))
             .unwrap_or_else(|| (String::new(), title.clone())),
     };
-    let mut request = http_client(&state).get("https://lrclib.net/api/search");
-    if artist.is_empty() {
-        request = request.query(&[("q", track_name.as_str())]);
-    } else {
-        request = request.query(&[
-            ("track_name", track_name.as_str()),
-            ("artist_name", artist.as_str()),
-        ]);
+    /* **한 번 물어보고 포기하지 않는다** (§41).
+     *
+     * 좁은 질문(가수+곡)이 제일 정확하지만 유튜브 제목·채널명으로는 거의 안 맞는다.
+     * 그래서 좁은 것부터 넓은 것까지 차례로 물어보고 **처음 잡히는 것**을 쓴다.
+     * 넓은 질문(`q=`)은 LRCLIB 가 알아서 비슷한 것을 찾아 준다. */
+    let clean = clean_track_title(&track_name);
+    let usable_artist = (!artist.trim().is_empty() && !artist_is_channelish(&artist)).then(|| artist.clone());
+
+    let mut attempts: Vec<Vec<(&str, String)>> = Vec::new();
+    if let Some(artist) = &usable_artist {
+        // 씻은 제목을 먼저 — 원본 제목은 꾸밈 때문에 거의 안 맞는다.
+        attempts.push(vec![("track_name", clean.clone()), ("artist_name", artist.clone())]);
+        attempts.push(vec![("q", format!("{artist} {clean}"))]);
     }
-    let row = match request.send().await {
-        Ok(response) if response.status().is_success() => response
-            .json::<Vec<LrcLibRow>>()
-            .await
-            .ok()
-            .and_then(|rows| rows.into_iter().next()),
-        _ => None,
-    };
+    attempts.push(vec![("q", clean.clone())]);
+    // 씻고 나서 달라졌으면 원본으로도 한 번. 씻다가 중요한 말을 지웠을 수 있다.
+    if clean != track_name {
+        attempts.push(vec![("q", track_name.clone())]);
+    }
+
+    let mut row = None;
+    for attempt in attempts {
+        if attempt.iter().any(|(_, value)| value.trim().is_empty()) {
+            continue;
+        }
+        let request = http_client(&state)
+            .get("https://lrclib.net/api/search")
+            .query(&attempt);
+        let found = match request.send().await {
+            Ok(response) if response.status().is_success() => response
+                .json::<Vec<LrcLibRow>>()
+                .await
+                .ok()
+                // 가사가 실제로 들어 있는 줄만 쓴다. 빈 줄을 잡으면 "찾았는데 비어 있음" 이 된다.
+                .and_then(|rows| {
+                    rows.into_iter().find(|row| {
+                        row.plain_lyrics.as_deref().is_some_and(|text| !text.trim().is_empty())
+                            || row.synced_lyrics.as_deref().is_some_and(|text| !text.trim().is_empty())
+                    })
+                }),
+            _ => None,
+        };
+        if found.is_some() {
+            row = found;
+            break;
+        }
+    }
     match row {
         Some(row) => {
             let lyrics = LyricsDocument {
@@ -11226,6 +11344,40 @@ mod tests {
         let second = crate::models::uuid_like();
         assert_ne!(first, second, "판 표가 겹치면 초대가 삼켜져요");
         assert!(!first.is_empty());
+    }
+
+    /* ── 가사 제목 씻기 (§41) ──
+     * 유튜브 제목을 그대로 넘기면 LRCLIB 가 거의 못 찾는다. 다만 **너무 씻어도 안 된다** —
+     * 부제나 원제를 지우면 오히려 못 찾는다. 그 경계를 못 박는다. */
+    #[test]
+    fn a_youtube_title_loses_its_decorations() {
+        assert_eq!(clean_track_title("밤편지 [Official MV]"), "밤편지");
+        assert_eq!(clean_track_title("Ditto (Official Video) 4K"), "Ditto");
+        assert_eq!(clean_track_title("Hype Boy MV"), "Hype Boy");
+        assert_eq!(clean_track_title("어떤 곡 (Lyrics)"), "어떤 곡");
+    }
+
+    /// **부제·원제는 남긴다.** 괄호를 무조건 지우면 `밤편지(Through the Night)` 가
+    /// `밤편지` 가 되는데, LRCLIB 에는 원제로 올라온 경우가 많아 오히려 못 찾는다.
+    #[test]
+    fn a_subtitle_survives_the_cleaning() {
+        assert_eq!(
+            clean_track_title("밤편지 (Through the Night)"),
+            "밤편지 (Through the Night)"
+        );
+        assert_eq!(clean_track_title("응급실(쾌걸춘향OST)"), "응급실(쾌걸춘향OST)");
+    }
+
+    /// 채널 이름을 가수로 쓰면 검색이 0건이 된다. 애매하면 가수 없이 넓게 찾는 편이 낫다.
+    #[test]
+    fn a_channel_name_is_not_an_artist() {
+        assert!(artist_is_channelish("HYBE LABELS"));
+        assert!(artist_is_channelish("Taylor Swift VEVO"));
+        assert!(artist_is_channelish("아이유 - Topic"));
+        assert!(!artist_is_channelish("아이유"));
+        // **진짜 밴드 이름에 회사스러운 낱말이 들어 있을 수 있다.** 이걸 거르면
+        // 제일 정확한 질문을 스스로 버리는 셈이다.
+        assert!(!artist_is_channelish("Official HIGE DANdism"));
     }
 
     #[test]

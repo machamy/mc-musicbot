@@ -1053,7 +1053,17 @@ body[data-dragging="tab"] { user-select: none; }
   display: flex;
   flex-direction: column;
   width: min(560px, calc(100vw - var(--sp-4)));
-  max-height: min(46vh, 420px);
+  height: min(46vh, 420px);
+  /* **진짜 창처럼 모서리를 끌어 크기를 바꾼다.**
+   * `resize` 는 `overflow` 가 `visible` 이 아니어야 먹는다. 안쪽 출력창이 따로 스크롤하므로
+   * 여기서 잘라도 내용이 가려지지 않는다. 너무 작으면 입력줄이 사라지고 너무 크면
+   * 화면을 덮어서, 양쪽에 한계를 둔다. */
+  resize: both;
+  overflow: hidden;
+  min-width: 320px;
+  min-height: 160px;
+  max-width: calc(100vw - var(--sp-4));
+  max-height: 90vh;
   border: 1px solid var(--line-2);
   border-radius: var(--r-md);
   background: var(--surface-1);
@@ -2804,6 +2814,18 @@ body.gate {
   font-size: var(--fs-lg);
   font-weight: var(--fw-semi);
 }
+/* 크기 조절만 클릭을 받는다. 나머지 안내막은 유튜브에 마우스가 안 닿게 그대로 막아 둔다. */
+.videosize {
+  position: absolute; right: var(--sp-2); top: var(--sp-2);
+  display: flex; align-items: center; gap: var(--sp-1);
+  padding: 2px var(--sp-1);
+  border-radius: var(--r-full);
+  background: rgba(0, 0, 0, 0.55);
+  pointer-events: auto;
+}
+.videosize .iconbtn { color: #fff; width: 24px; height: 24px; }
+.videosize__label { color: #fff; font-size: var(--fs-xs); min-width: 3.6em; text-align: center; }
+
 .videochrome__count {
   position: absolute; left: var(--sp-2); top: var(--sp-2);
   padding: 2px var(--sp-2);
@@ -2817,9 +2839,14 @@ body.gate {
 :root .now[data-video="1"] { grid-template-columns: minmax(0, 1fr); align-content: start; }
 :root .now[data-video="1"] .now__artwrap {
   aspect-ratio: 16 / 9;
-  width: min(100%, calc(min(52vh, 460px) * 16 / 9));
+  /* 폭이 개인 설정이다(§40 `--video-w`). 마지막 단계는 카드 여백까지 밀어내
+   * 가장자리를 채운다(`--video-bleed`). 높이는 16:9 를 따르되 화면을 넘지 않게 막는다. */
+  width: min(
+    calc(var(--video-w, 100%) + 2 * var(--video-bleed, 0px)),
+    calc(84vh * 16 / 9)
+  );
+  margin-inline: calc(-1 * var(--video-bleed, 0px));
   max-width: none;
-  margin-inline: auto;
 }
 /* 영상이 뜨기 전 몇 백 ms 를 아트가 받아 준다. 검은 화면이 그대로 보이지 않게. */
 :root .now[data-video="1"] .now__art { filter: blur(18px) brightness(0.5); }

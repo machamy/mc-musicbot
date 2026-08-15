@@ -4780,8 +4780,16 @@ function buildWebPlayback() {
    * 고장으로 보이는데, 실제로는 봇이 음성에서 빠졌거나 누가 일시정지한 것이다. */
   el.videoVeil = h('div', { class: 'videochrome__veil', hidden: true });
   el.videoCount = h('span', { class: 'videochrome__count' });
-  el.videoChrome = h('div', { class: 'videochrome', hidden: true, 'aria-hidden': 'true' },
-    el.videoVeil, el.videoCount);
+  el.videoSizeLabel = h('span', { class: 'videosize__label' });
+  // 크기 조절. 안내막은 클릭을 안 받지만 이 줄만 예외로 받는다.
+  el.videoSizeBox = h('div', { class: 'videosize' },
+    h('button', { class: 'iconbtn', type: 'button', tip: '영상을 작게', 'aria-label': '영상 작게',
+      onClick: () => bumpVideoSize(-1) }, '−'),
+    el.videoSizeLabel,
+    h('button', { class: 'iconbtn', type: 'button', tip: '영상을 크게', 'aria-label': '영상 크게',
+      onClick: () => bumpVideoSize(1) }, '＋'));
+  el.videoChrome = h('div', { class: 'videochrome', hidden: true },
+    el.videoVeil, el.videoCount, el.videoSizeBox);
   document.body.appendChild(el.videoChrome);
 
   window.addEventListener('pagehide', stopWebPlayback);
@@ -4835,6 +4843,43 @@ function watchPhase({ watch, meId, joined, asked }) {
   // 이미 답한 판이면 안 묻는다. 버튼으로는 언제든 합류할 수 있다.
   if (asked && String(asked) === String(watch.id)) return 'rejoin';
   return 'invite';
+}
+
+/* 영상 크기 (§40).
+ *
+ * **폭이 기준이다.** 처음엔 높이 상한(vh)만 조절했는데, 넓은 화면에서는 카드 폭이 먼저
+ * 걸려서 "크게" 를 눌러도 아무 일도 안 일어났다(실측: 458px 그대로). 사람이 보기에
+ * 고장이다. 그래서 카드 폭의 몇 %를 쓸지로 바꿨다.
+ *
+ * 마지막 단계는 카드 좌우 여백까지 밀어내 **가장자리까지** 채운다. 그래야 "제일 크게" 가
+ * 실제로 제일 크다. 높이는 16:9 를 지키되 화면을 넘지 않게 상한을 같이 둔다.
+ */
+const VIDEO_SIZES = [
+  { w: '60%', bleed: false, label: '작게' },
+  { w: '80%', bleed: false, label: '보통' },
+  { w: '100%', bleed: false, label: '크게' },
+  { w: '100%', bleed: true, label: '꽉 차게' },
+];
+
+function videoSizeStep() {
+  const raw = Number(prefGet('videoSize'));
+  return Number.isInteger(raw) && raw >= 1 && raw <= VIDEO_SIZES.length ? raw : 3;
+}
+
+function applyVideoSize() {
+  const size = VIDEO_SIZES[videoSizeStep() - 1];
+  const root = document.documentElement.style;
+  root.setProperty('--video-w', size.w);
+  root.setProperty('--video-bleed', size.bleed ? 'var(--sp-4)' : '0px');
+  if (el.videoSizeLabel) el.videoSizeLabel.textContent = size.label;
+  // 자리 크기가 바뀌었으니 다음 프레임에 오버레이가 따라온다(rAF 가 알아서 다시 잰다).
+}
+
+function bumpVideoSize(step) {
+  const next = Math.min(VIDEO_SIZES.length, Math.max(1, videoSizeStep() + step));
+  if (next === videoSizeStep()) return;
+  prefSet('videoSize', String(next));
+  applyVideoSize();
 }
 
 /** 지금 곡이 라이브인가 (§40). 라이브의 "지금" 은 계산한 위치가 아니라 **맨 끝**이다. */
@@ -8196,6 +8241,8 @@ function buildDevConsole() {
   document.body.appendChild(el.devBox);
   makeDevDraggable(bar);
   restoreDevPos();
+  restoreDevSize();
+  watchDevSize();
 }
 
 /* ── 창처럼 끌어서 옮기기 ──
@@ -8233,7 +8280,11 @@ function makeDevDraggable(handle) {
   // 제목줄을 두 번 누르면 원래 자리로. 화면 밖으로 보냈을 때의 탈출구다.
   handle.addEventListener('dblclick', () => {
     prefSet('devPos', '');
+    prefSet('devSize', '');
     for (const side of ['left', 'top', 'right', 'bottom']) el.devBox.style[side] = '';
+    // 크기도 같이 되돌린다. 자리만 돌아오고 크기가 이상하게 남으면 반쯤 고친 셈이다.
+    el.devBox.style.width = '';
+    el.devBox.style.height = '';
   });
   // 창을 줄이면 콘솔이 화면 밖에 남을 수 있다. 그때마다 다시 가둔다.
   window.addEventListener('resize', () => {
@@ -8254,6 +8305,33 @@ function placeDev(x, y) {
   el.devBox.style.bottom = 'auto';
   el.devBox.style.left = `${Math.min(Math.max(0, x), maxX)}px`;
   el.devBox.style.top = `${Math.min(Math.max(0, y), maxY)}px`;
+}
+
+/* 크기도 창처럼 기억한다.
+ *
+ * 모서리 끌기는 브라우저가 해 주므로(`resize: both`) 우리는 **결과만 적어 둔다.**
+ * 끄는 동안 매번 저장하면 요청이 쏟아지므로 멈춘 뒤에 한 번만 적는다. */
+function watchDevSize() {
+  if (!window.ResizeObserver || !el.devBox) return;
+  let timer = 0;
+  new ResizeObserver(() => {
+    if (!el.devBox.style.width && !el.devBox.style.height) return;   // 아직 손 안 댐
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const rect = el.devBox.getBoundingClientRect();
+      prefSet('devSize', `${Math.round(rect.width)},${Math.round(rect.height)}`);
+    }, 400);
+  }).observe(el.devBox);
+}
+
+function restoreDevSize() {
+  const saved = String(prefGet('devSize') || '').split(',');
+  const w = Number(saved[0]);
+  const h = Number(saved[1]);
+  if (saved.length !== 2 || !Number.isFinite(w) || !Number.isFinite(h)) return;
+  // 저장해 둔 크기가 지금 화면보다 크면 화면에 맞춘다 — 작은 화면으로 옮겨 왔을 때다.
+  el.devBox.style.width = `${Math.min(w, window.innerWidth - 24)}px`;
+  el.devBox.style.height = `${Math.min(h, window.innerHeight - 24)}px`;
 }
 
 function restoreDevPos() {
@@ -8958,6 +9036,7 @@ async function boot() {
   el.lyricsToggle.setAttribute('aria-expanded', String(lyricsOpen));
   el.lyricsToggle.classList.toggle('btn--primary', lyricsOpen);
   syncWebUi();
+  applyVideoSize();
   if (webWanted) armWebResume();
 
   clock.onTick(renderProgress);

@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 22;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -548,7 +548,7 @@ const MIGRATION_V15: &str = r#"
 ///   - `internal:...` — 우리가 튼 기록으로 만드는 차트(§15.2b). 외부 호출이 없다.
 ///
 /// 관리 콘솔에서 주소를 바꿀 수 있다. 여기 값은 **처음 한 번만** 심어진다.
-const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 47] = [
+const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 49] = [
     // 우리가 실제로 튼 것으로 만드는 차트 — 자동재생으로 나간 곡은 세지 않는다.
     (ChartCategory::Ours, "우리 서버 인기곡", "Internal", "internal:guild-plays"),
     (ChartCategory::Ours, "우리 서버 사랑받은 곡", "Internal", "internal:guild-love"),
@@ -594,12 +594,14 @@ const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 47] = [
     (ChartCategory::Genre, "시티팝 최신", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_muPPezCrTrwoL7Ep_9a69YkIaBjsyKTg0"),
     // 노래방 — TJ 는 공식 API 를 직접 긁는다. 검색으로 흉내내지 않는다.
     (ChartCategory::Karaoke, "TJ 인기 100", "TJ", "tj:hot"),
+    (ChartCategory::Karaoke, "TJ 가요 100", "TJ", "tj:top:1"),
     (ChartCategory::Karaoke, "TJ 발라드", "TJ", "tj:top:4"),
     (ChartCategory::Karaoke, "TJ 댄스", "TJ", "tj:top:5"),
     (ChartCategory::Karaoke, "TJ 트로트", "TJ", "tj:top:6"),
     (ChartCategory::Karaoke, "TJ 인디·어쿠스틱", "TJ", "tj:top:7"),
     (ChartCategory::Karaoke, "TJ 팝송", "TJ", "tj:top:2"),
     (ChartCategory::Karaoke, "TJ J-POP", "TJ", "tj:top:3"),
+    (ChartCategory::Karaoke, "TJ OST", "TJ", "tj:top:8"),
     (ChartCategory::Karaoke, "일본 노래방 히트", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kW4l3hmtC_Aq2XCvin1b3h6tziPMH0tsk"),
     // 금영은 공개 API 를 못 찾아서 검색으로 남긴다. 노래방 채널은 개별 곡을 올리므로
     // 인기곡 검색과 달리 모음 영상이 안 잡힌다(2026-08-07 실측: 6/6 개별 반주).
@@ -672,6 +674,23 @@ pub fn is_valid_pref(key: &str, value: &str) -> bool {
         // 한 번에 보낸다. 그래서 명단을 접었다 폈다 하는 동안 같은 배치에 실린
         // `webVolume`·`webOffset` 저장까지 같이 날아갔다 — 실제로 그랬다.
         "lyricsOpen" | "webPlayback" | "nowVoters" => matches!(value, "0" | "1"),
+        // 영상 크기 1~4 (§40). 목록에 없으면 저장이 통째로 실패한다 — `nowVoters` 가 그랬다.
+        "videoSize" => matches!(value, "1" | "2" | "3" | "4"),
+        /* 개발자 콘솔 창의 자리와 크기. `"x,y"` · `"w,h"` 꼴의 정수 두 개다.
+         *
+         * **`devPos` 는 화면이 보내는데 여기 없었다.** 그래서 콘솔을 옮겨 놔도 다음에
+         * 열면 늘 오른쪽 아래로 돌아갔고, 게다가 같은 배치에 실린 다른 설정까지
+         * 같이 거절당했다(`nowVoters` 와 같은 사고). */
+        "devPos" | "devSize" => {
+            let mut parts = value.split(',');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(a), Some(b), None) => {
+                    a.parse::<i32>().is_ok_and(|v| v.abs() <= 20_000)
+                        && b.parse::<i32>().is_ok_and(|v| v.abs() <= 20_000)
+                }
+                _ => false,
+            }
+        }
         "webVolume" => value
             .parse::<u32>()
             .map(|volume| volume <= 100 && !value.starts_with('+'))
@@ -3538,6 +3557,21 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                 // 그대로 코드로 남는다. 같은 길드의 이웃 표에서 찾아 채운다.
                 backfill_blocked_tracks(&tx)?;
             }
+            /* TJ 가요 100 과 OST 100 이 통째로 빠져 있었다.
+             *
+             * TJ 는 분류 번호의 뜻을 공개하지 않아서 곡을 보고 하나씩 채운 표인데,
+             * `1`(가요)과 `8`(OST)은 **번호가 있는지조차 몰라서** 목록에 없었다.
+             * 2026-08-16 에 실제 응답을 훑어 둘 다 100곡짜리 정식 차트임을 확인했다.
+             * 새 차트는 기존 DB 에도 심어야 보인다 — v18 때와 같은 이유다. */
+            20 => seed_builtin_charts(&tx)?,
+            /* "가사 없음" 으로 적어 둔 것을 비운다.
+             *
+             * 찾는 방법을 고쳤는데(§41 — 제목을 씻고 여러 번 물어본다) 예전에 못 찾아서
+             * `found = 0` 으로 박아 둔 곡은 **다시 안 찾아본다.** 고친 보람이 그 곡들에는
+             * 영영 닿지 않는다. 찾은 가사는 그대로 두고 못 찾은 기록만 지운다. */
+            21 => {
+                tx.execute("DELETE FROM remote_lyrics WHERE found = 0", [])?;
+            }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -4664,6 +4698,9 @@ mod tests {
             ("webVolume", "60"),
             ("webOffset", "0"),
             ("nowVoters", "0"),
+            ("videoSize", "3"),
+            ("devPos", "120,80"),
+            ("devSize", "640,420"),
         ] {
             assert!(is_valid_pref(key, value), "화면이 보내는 '{key}' 를 거절해요");
         }
