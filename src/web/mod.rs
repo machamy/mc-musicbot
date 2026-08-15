@@ -140,6 +140,19 @@ async fn host_scope_guard(request: Request<Body>, next: Next) -> Response {
     }
 }
 
+/// 같이보기 한 판 (§39). 휘발성이다 — `WebState::watch_parties` 주석 참고.
+#[derive(Debug, Clone)]
+pub struct WatchParty {
+    /// 판 세대. 비었다가 다시 켜지면 올라간다.
+    ///
+    /// 클라이언트는 이 값으로 **"이미 물어본 판인가"** 를 기억한다. 세대가 없으면
+    /// 거절한 사람에게 판이 새로 열려도 다시 물어볼 방법이 없다.
+    pub id: u64,
+    pub started_by: u64,
+    pub started_by_display: String,
+    pub watchers: HashSet<u64>,
+}
+
 pub struct WebState {
     pub app: Arc<App>,
     /// 웹 비밀번호 SHA-256 해시. None 이면 미설정(최초 설정 필요) 상태.
@@ -180,6 +193,16 @@ pub struct WebState {
     /// 새로고침하면 브라우저의 실제 재생 상태(`webOn`)는 항상 false 로 시작해 사용자가
     /// 다시 눌러야 한다. 그래서 **브라우저가 실제로 소리를 내기 시작한 순간** 알려 준다.
     pub web_listeners: Mutex<HashSet<(u64, u64)>>,
+    /// **지금 이 방에서 도는 같이보기 한 판** (§39).
+    ///
+    /// `web_listeners` 와 같은 이유로 **DB를 쓰지 않는다.** 접속해 있는 동안에만 뜻이 있는
+    /// 값이고, 브라우저를 닫으면 사라지는 게 맞다. 재시작 뒤에 되살아나면 오히려 틀린다 —
+    /// 브라우저의 실제 재생 상태는 새로고침하면 항상 꺼진 채로 시작하기 때문이다.
+    ///
+    /// **판이 켜져 있다 ⟺ `watchers` 가 비어 있지 않다.** 따로 on/off 플래그를 두지 않는다.
+    /// 그러면 "마지막 사람이 나갔을 때" 가 특수 케이스가 아니라 정의가 되고,
+    /// "판을 끄는 사람" 이라는 권한 문제가 아예 생기지 않는다.
+    pub watch_parties: Mutex<HashMap<u64, WatchParty>>,
     /// 길드별 presence 브로드캐스트 게이트 — `(마지막 송신, 예약됨)`. 최대 초당 1회로 코얼레싱한다.
     pub presence_gate: Mutex<HashMap<u64, (Instant, bool)>>,
     /// 재생 변화를 감시 중인 길드. 보는 사람이 있을 때만 길드당 하나가 돈다.
@@ -270,6 +293,7 @@ pub async fn serve(app: Arc<App>) {
         remote_action_rate: Mutex::new(HashMap::new()),
         presence: Mutex::new(HashMap::new()),
         web_listeners: Mutex::new(HashSet::new()),
+        watch_parties: Mutex::new(HashMap::new()),
         presence_gate: Mutex::new(HashMap::new()),
         guild_watchers: Mutex::new(HashSet::new()),
         http_client: OnceLock::new(),

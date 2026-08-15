@@ -5,7 +5,7 @@
 //! (`{"t":토픽,"d":데이터}`)로 밀어 준다. 프런트(`assets/portal.js`, `assets/console.js`)는
 //! 이 계약대로 이미 작성돼 있으므로 서버가 프런트에 맞춘다.
 
-use super::{WebState, remote_page};
+use super::{WatchParty, WebState, remote_page};
 use crate::app::App;
 use crate::models::{
     CsTimeSpan, PlaylistEntry, PlaylistScope, ProviderKind, QueueItem, RepeatMode, TrackRef,
@@ -679,6 +679,9 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/api/guilds/{guild_id}/web-listening",
             post(api_web_listening),
         )
+        // 같이보기 (§39). 켜고 끄는 보고가 전부다 — 판이 켜져 있다는 것은
+        // "보고 있는 사람이 하나라도 있다" 와 같은 말이다.
+        .route("/music/api/guilds/{guild_id}/watch", post(api_watch))
         .route("/music/api/guilds/{guild_id}/vote", post(api_vote))
         .route("/music/api/guilds/{guild_id}/library", post(api_library))
         .route(
@@ -1894,6 +1897,23 @@ fn presence_remove(state: &Arc<WebState>, guild_id: u64, user_id: u64) {
             tokio::spawn(async move {
                 on_web_listeners_changed(&state2, guild_id).await;
             });
+        }
+        // 같이보기도 같은 규칙으로 정리한다 (§39). 탭을 그냥 닫아도 명단에 안 남는다.
+        let left = {
+            let mut parties = state.watch_parties.lock().unwrap();
+            match parties.get_mut(&guild_id) {
+                Some(party) => {
+                    let removed = party.watchers.remove(&user_id);
+                    if party.watchers.is_empty() {
+                        parties.remove(&guild_id);
+                    }
+                    removed
+                }
+                None => false,
+            }
+        };
+        if left {
+            broadcast_watch(state, guild_id);
         }
     }
     schedule_presence(state, guild_id);
@@ -3513,6 +3533,9 @@ async fn api_state_hot(
         // 투표 스킵 현황 (V3 §10.5). 진행 중이 아니면 null 이다.
         "skipVote": skip_vote_json(&state, &ctx, &player),
         "presence": build_presence(&state, guild_id).await,
+        // 같이보기 판 (§39). **여기 실리는 것이 늦게 들어온 사람 안내의 전부다** —
+        // 진입·새로고침·재연결이 전부 이 경로를 지난다.
+        "watch": watch_payload(&state, guild_id),
     }))
 }
 
@@ -4798,6 +4821,139 @@ async fn api_web_listening(
         on_web_listeners_changed(&state, guild_id).await;
     }
     json_ok(json!({ "ok": true }))
+}
+
+/* ── 같이보기 (§39) ───────────────────────────────────────────────
+ *
+ * 한 사람이 켜면 나머지에게 "같이 볼래요?" 가 뜨고, **수락한 사람만** 영상으로 바뀐다.
+ * 그래서 서버가 들고 있어야 하는 것은 스위치가 아니라 **명단**이다.
+ *
+ * 팝업을 이벤트로 쏘지 않고 이 명단에서 파생시킨다. 이벤트로 쏘면 그 순간 접속해 있던
+ * 사람만 받는다 — 늦게 들어온 사람은 판이 도는 줄도 모른다. 상태로 두고 `/state/hot` 에
+ * 실으면 **진입·새로고침·재연결 세 경로가 공짜로 같이 맞는다.**
+ */
+
+/// 판 세대 발급기. 길드별로 연속일 필요가 없어 전역 하나면 된다.
+static WATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchRequest {
+    /// 나는 지금 영상으로 보고 있는가.
+    on: bool,
+}
+
+/// 지금 판의 모양. 아무도 안 보고 있으면 `on: false` 다.
+pub(crate) fn watch_payload(state: &WebState, guild_id: u64) -> Value {
+    let parties = state.watch_parties.lock().unwrap();
+    match parties.get(&guild_id).filter(|party| !party.watchers.is_empty()) {
+        Some(party) => {
+            let mut watchers: Vec<String> =
+                party.watchers.iter().map(|id| id.to_string()).collect();
+            // 순서가 매번 달라지면 화면이 헛되이 다시 그려진다. HashSet 이라 정렬해서 낸다.
+            watchers.sort();
+            json!({
+                "on": true,
+                // 숫자로 보내면 자바스크립트가 큰 값에서 정밀도를 잃는다. 이 저장소는
+                // 모든 스노플레이크를 문자열로 보낸다 — 판 id 도 같은 규칙을 따른다.
+                "id": party.id.to_string(),
+                "startedBy": party.started_by.to_string(),
+                "startedByDisplay": party.started_by_display,
+                "count": watchers.len(),
+                "watchers": watchers,
+            })
+        }
+        None => json!({
+            "on": false,
+            "id": Value::Null,
+            "startedBy": Value::Null,
+            "startedByDisplay": Value::Null,
+            "count": 0,
+            "watchers": [],
+        }),
+    }
+}
+
+fn broadcast_watch(state: &Arc<WebState>, guild_id: u64) {
+    let payload = watch_payload(state, guild_id);
+    emit(state, guild_id, "watch", payload);
+}
+
+/// 같이보기에 들어가고 나간다.
+///
+/// **시작에만 권한을 본다.** 합류에까지 걸면, `playback` 이 관리자 전용인 서버에서
+/// *초대 팝업은 뜨는데 수락하면 403* 이 나는 최악이 된다. 나가기도 검사하지 않는다 —
+/// 나가겠다는 사람을 막을 이유가 없다.
+async fn api_watch(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<WatchRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if rate_limited(
+        &state,
+        guild_id,
+        ctx.user_id(),
+        "watch",
+        Duration::from_millis(500),
+    ) {
+        return json_error(StatusCode::TOO_MANY_REQUESTS, "너무 빨라요. 잠깐만 쉬었다 해요.");
+    }
+
+    // 새 판을 여는 경우에만 권한을 본다. 이미 도는 판에 합류하는 것은 누구나 된다.
+    let starting = {
+        let parties = state.watch_parties.lock().unwrap();
+        request.on
+            && !parties
+                .get(&guild_id)
+                .is_some_and(|party| !party.watchers.is_empty())
+    };
+    if starting {
+        if let Err(response) = ctx.require(
+            "playback",
+            ctx.settings.playback_rule,
+            "같이보기를 시작할 권한이 없어요.",
+        ) {
+            return response;
+        }
+    }
+
+    let user_id = ctx.user_id();
+    let changed = {
+        let mut parties = state.watch_parties.lock().unwrap();
+        if request.on {
+            let party = parties.entry(guild_id).or_insert_with(|| WatchParty {
+                id: WATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                started_by: user_id,
+                started_by_display: ctx.session.display_name.clone(),
+                watchers: HashSet::new(),
+            });
+            party.watchers.insert(user_id)
+        } else {
+            match parties.get_mut(&guild_id) {
+                Some(party) => {
+                    let removed = party.watchers.remove(&user_id);
+                    // 마지막 사람이 나가면 판 자체가 사라진다. 이게 "판이 끝났다" 의 정의다.
+                    if party.watchers.is_empty() {
+                        parties.remove(&guild_id);
+                    }
+                    removed
+                }
+                None => false,
+            }
+        }
+    };
+
+    // 실제로 명단이 바뀐 경우에만 알린다. 같은 보고가 두 번 와도 화면이 흔들리지 않는다.
+    if changed {
+        broadcast_watch(&state, guild_id);
+    }
+    json_ok(json!({ "ok": true, "watch": watch_payload(&state, guild_id) }))
 }
 
 /// 이 길드에서 실제로 웹으로 듣고 있는 사람 수.
@@ -11021,6 +11177,49 @@ mod tests {
             "길이가 왕복에서 사라지면 안 돼요"
         );
         assert_eq!(back.content_id, track.content_id);
+    }
+
+    /* ── 같이보기 명단 (§39) ──
+     * `WebState` 를 통째로 만들지 않고 명단 자료구조만 떼어 검사한다. 판정 규칙이
+     * 여기 다 들어 있고, 이게 틀리면 "마지막 사람이 나가도 판이 안 끝나는" 식으로 샌다. */
+
+    fn party(id: u64, watchers: &[u64]) -> WatchParty {
+        WatchParty {
+            id,
+            started_by: watchers.first().copied().unwrap_or(0),
+            started_by_display: "누군가".into(),
+            watchers: watchers.iter().copied().collect(),
+        }
+    }
+
+    /// **마지막 사람이 나가면 판이 사라진다.** 이게 "판이 끝났다" 의 정의다 —
+    /// 따로 끄는 스위치가 없으므로 이 규칙이 무너지면 유령 판이 영원히 남는다.
+    #[test]
+    fn the_party_ends_when_the_last_watcher_leaves() {
+        let mut parties: HashMap<u64, WatchParty> = HashMap::new();
+        parties.insert(1, party(7, &[100, 200]));
+
+        // 한 명 나감 — 판은 계속 돈다.
+        let p = parties.get_mut(&1).unwrap();
+        p.watchers.remove(&100);
+        assert!(!p.watchers.is_empty(), "아직 한 명 남았다");
+
+        // 마지막 한 명 나감 — 엔트리 자체가 사라진다.
+        let p = parties.get_mut(&1).unwrap();
+        p.watchers.remove(&200);
+        if p.watchers.is_empty() {
+            parties.remove(&1);
+        }
+        assert!(parties.get(&1).is_none(), "마지막 사람이 나가면 판이 없어야 한다");
+    }
+
+    /// 판이 비었다 다시 열리면 **세대가 올라간다.** 안 그러면 한 번 거절한 사람에게
+    /// 새 판이 열려도 다시 물어볼 방법이 없다.
+    #[test]
+    fn a_new_party_gets_a_new_generation() {
+        let first = WATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let second = WATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(second > first, "판 세대가 올라가야 해요 ({first} → {second})");
     }
 
     #[test]
