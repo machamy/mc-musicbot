@@ -3193,6 +3193,14 @@ async fn discord_get<T: for<'de> Deserialize<'de>>(
 struct DevLoginForm {
     #[serde(default)]
     next: Option<String>,
+    /// **로컬에서 여러 사람을 흉내 내는 손잡이.**
+    ///
+    /// 같이보기 초대·투표·접속자 목록처럼 두 사람이 있어야 확인되는 것들이 있는데,
+    /// `MUSICBOT_DEV_USER_ID` 는 프로세스당 하나라 탭을 여러 개 열어도 전부 같은 사람이다.
+    /// 여기에 번호를 주면 그 번호가 그대로 user_id 가 되어 **탭마다 다른 사람**이 된다.
+    /// `dev_login` 이 켜져 있고 루프백에서 온 요청에만 이 폼이 닿는다.
+    #[serde(default, rename = "as")]
+    as_user: Option<u64>,
 }
 
 async fn dev_login(
@@ -3225,10 +3233,16 @@ async fn dev_login(
             permissions: ADMINISTRATOR_PERMISSION,
         });
     }
-    let user_id = std::env::var("MUSICBOT_DEV_USER_ID")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    // 폼이 사람을 지정했으면 그게 이긴다 — 탭마다 다른 사람으로 들어오기 위한 것이다.
+    let user_id = form
+        .as_user
         .filter(|id| *id != 0)
+        .or_else(|| {
+            std::env::var("MUSICBOT_DEV_USER_ID")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|id| *id != 0)
+        })
         .unwrap_or_else(|| state.app.config.bot_owner_user_id.max(1));
     if std::env::var("MUSICBOT_DEV_SEED").ok().as_deref() == Some("1") {
         if let Some(guild) = guilds.first() {
@@ -3241,8 +3255,11 @@ async fn dev_login(
         None,
         RemoteSession {
             user_id,
-            username: "local-tester".into(),
-            display_name: "로컬 검증자".into(),
+            username: format!("local-{user_id}"),
+            display_name: match form.as_user {
+                Some(n) => format!("로컬 {n}번"),
+                None => "로컬 검증자".into(),
+            },
             avatar_url: None,
             guilds,
             access_token: String::new(),

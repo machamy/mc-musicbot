@@ -2210,6 +2210,10 @@ body.gate {
 
 /* 보조 동작(로컬 입장·로그아웃)은 본 동작과 시각적으로 떨어뜨린다 */
 .gate__dev { margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--line-1); }
+/* 로컬 검증용 사람 고르기. 같이보기 초대처럼 두 사람이 있어야 보이는 것들을 위해
+ * 탭마다 다른 사람으로 들어온다. 이 줄은 dev 로그인이 켜진 로컬에서만 그려진다. */
+.gate__devrow { display: flex; gap: var(--sp-2); margin-top: var(--sp-2); }
+.gate__devrow .btn { flex: 1; }
 
 .gate__foot { margin-top: var(--sp-4); color: var(--text-4); font-size: var(--fs-xs); line-height: var(--lh-base); }
 

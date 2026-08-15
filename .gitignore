@@ -25,3 +25,6 @@ registrar.json
 *.log
 Thumbs.db
 .DS_Store
+
+# 로컬 개발 서버의 데이터 폴더 (scripts/Dev-Local.ps1)
+.devrun/

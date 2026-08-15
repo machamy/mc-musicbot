@@ -151,8 +151,17 @@ pub fn login(
         let hidden = next
             .map(|path| format!(r#"<input type="hidden" name="next" value="{}">"#, html_escape(path)))
             .unwrap_or_default();
+        // 여러 사람이 있어야 확인되는 것들(같이보기 초대·투표·접속자 목록)을 로컬에서
+        // 보려면 **탭마다 다른 사람**이어야 한다. 환경변수는 프로세스당 하나뿐이라
+        // 여기서 고르게 한다. 이 폼 자체가 `dev_login` + 루프백에서만 뜬다.
         &format!(
-            r#"<form method="post" action="/music/dev-login" class="gate__dev">{hidden}<button class="btn btn--ghost btn--wide" data-testid="dev-login" type="submit">로컬 검증 계정으로 입장</button></form>"#
+            r#"<form method="post" action="/music/dev-login" class="gate__dev">{hidden}
+<button class="btn btn--ghost btn--wide" data-testid="dev-login" type="submit">로컬 검증 계정으로 입장</button>
+<div class="gate__devrow">
+<button class="btn btn--ghost" data-testid="dev-login-2" type="submit" name="as" value="2">2번 사람으로</button>
+<button class="btn btn--ghost" data-testid="dev-login-3" type="submit" name="as" value="3">3번 사람으로</button>
+</div>
+</form>"#
         )
     } else {
         ""

@@ -73,6 +73,36 @@ Discord 개발자 포털의 Redirect URI 도 `https://music.example.com/music/oa
 - 기동: 예약 작업 `MusicBot Portable` → 루트 `START-MK2.cmd` (로그온 트리거)
 - `cargo test`: **240 passed / 0 failed**
 
+### 로컬 개발 — 실서버를 안 건드리고 전부 확인한다
+
+```powershell
+scripts\Dev-Local.ps1              # 띄우기 (씨앗 데이터 포함)
+scripts\Dev-Local.ps1 -Fresh       # 데이터까지 지우고 새로
+scripts\Dev-Local.ps1 -NoBuild     # 빌드 건너뛰기
+```
+
+`.devrun/` 에 격리된 데이터로 돌고 `http://127.0.0.1:8791/music` 에 뜬다.
+**디스코드 토큰이 없어도 웹은 완전히 뜬다** — 게이트웨이만 401 로 실패한다.
+
+**`MUSICBOT_DEV_SEED=1` 이 핵심이다.** 이게 없으면 재생 중인 곡도 대기열도 없어서
+화면이 텅 빈 채로 뜬다. 나는 이걸 모른 채로 여러 번 띄워 놓고 "왜 아무것도 안 나오지" 를
+반복했다. 스크립트가 대신 세워 주므로 손으로 띄우지 마라. 심어 주는 것은
+`seed_dev_guild`(`remote.rs`) — 재생 중인 곡 1곡 + 대기열 3곡 + 투표 두 개다.
+
+**두 사람이 필요하면** 로그인 화면의 `2번 사람으로` / `3번 사람으로` 를 쓴다.
+`MUSICBOT_DEV_USER_ID` 는 프로세스당 하나라 탭을 여러 개 열어도 전부 같은 사람이었는데,
+폼의 `as` 값이 그걸 이긴다. 같이보기 초대·투표·접속자 목록처럼 **두 사람이 있어야 보이는
+것들**이 이걸로 확인된다.
+
+브라우저 하나로 두 사람을 동시에 하려면 한쪽을 HTTP 로 몬다. 쿠키 항아리를 따로 두고,
+CSRF 는 **페이지 셸**에서 뽑는다(API 응답에는 없다 — `core.js` 가 하는 것과 같은 방식):
+
+```bash
+curl -s -c p2.txt -X POST http://127.0.0.1:8791/music/dev-login --data-urlencode "as=2"
+curl -s -b p2.txt http://127.0.0.1:8791/music/guilds/1 -o g.html
+# g.html 의 window.MACHAM = {...} 에서 csrf 를 꺼내 X-CSRF-Token 헤더로 보낸다
+```
+
 ### 배포 명령
 
 `scripts\Deploy-Seamless.ps1` 이 전부 한다. **PowerShell 로 돌려야 한다** — Git Bash 의
