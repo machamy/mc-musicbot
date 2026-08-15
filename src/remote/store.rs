@@ -3099,6 +3099,7 @@ impl RemoteStore {
             artist: (!artist.is_empty()).then_some(artist),
             duration: duration_ms.map(|ms| crate::models::CsTimeSpan::from_secs_f64(ms as f64 / 1000.0)),
             variant_key: None,
+            is_live: false,
         })
     }
 
@@ -4024,6 +4025,7 @@ mod tests {
             artist: None,
             duration: None,
             variant_key: None,
+            is_live: false,
         }
     }
 

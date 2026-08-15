@@ -608,6 +608,7 @@ mod tests {
                 artist: None,
                 duration: None,
                 variant_key: None,
+                is_live: false,
             },
             "민수".into(),
             Some(7),

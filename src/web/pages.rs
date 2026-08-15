@@ -1703,6 +1703,7 @@ pub async fn cache_add_to_playlist(
             artist: None,
             duration: entry.duration,
             variant_key: None,
+            is_live: false,
         };
         state.app.db.add_playlist_entry(
             f.playlist_id,

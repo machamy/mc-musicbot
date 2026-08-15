@@ -2593,6 +2593,9 @@ fn track_json(track: &TrackRef) -> Value {
          * 서버는 길이를 알고 있었는데(검색 결과에 157초로 나왔다) 자기가 보낸 이름을
          * 자기가 못 읽어서 잃어버린 것이다. 그러면 웹 재생이 곡을 시작하지 못한다. */
         "duration": track.duration,
+        // 라이브 여부 (§40). 화면은 이걸 보고 진행바 대신 LIVE 를 그리고,
+        // 웹 재생기는 계산한 위치로 되감지 않는다 — 라이브의 "지금" 은 맨 끝이다.
+        "isLive": track.is_live,
         "durationSeconds": track.duration.map(|duration| duration.as_secs_f64()),
         "durationLabel": track.duration.map(|duration| duration.display()),
         "artUrl": Value::Null,
@@ -10842,6 +10845,7 @@ async fn admin_blacklist_test(
         artist: None,
         duration: None,
         variant_key: None,
+            is_live: false,
     };
     match state.app.blacklist.try_get_blocker(guild_id, &probe) {
         Some(rule) => json_ok(json!({
@@ -11020,6 +11024,7 @@ async fn seed_dev_guild(state: &WebState, guild_id: u64, user_id: u64) {
         artist: Some(artist.into()),
         duration: Some(CsTimeSpan::from_secs_f64(seconds)),
         variant_key: None,
+            is_live: false,
     };
     let current = track("jfKfPfyJRdk", "Midnight Study", "Macham Radio", 214.0);
     let first = track("5qap5aO4i9A", "City Lights", "Lofi Collective", 188.0);
@@ -11162,6 +11167,7 @@ mod tests {
             artist: Some("어떤 사람".into()),
             duration: Some(CsTimeSpan::from_secs_f64(157.0)),
             variant_key: None,
+            is_live: false,
         };
 
         // 서버 → 화면 → 서버.
@@ -11811,6 +11817,7 @@ mod tests {
             artist: None,
             duration: Some(CsTimeSpan::from_secs_f64(245.0)),
             variant_key: None,
+            is_live: false,
         };
         let value = track_json(&track);
         assert_eq!(value["durationSeconds"], json!(245.0));
@@ -12114,6 +12121,7 @@ mod tests {
             artist: None,
             duration: Some(CsTimeSpan::from_secs_f64(36_000.0)),
             variant_key: None,
+            is_live: false,
         };
         assert!(!track_too_long(0, &long));
         assert!(track_too_long(3600, &long));

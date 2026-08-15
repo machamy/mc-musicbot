@@ -213,6 +213,14 @@ pub struct TrackRef {
     pub duration: Option<CsTimeSpan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant_key: Option<String>,
+    /// 지금 방송 중인 라이브인가 (§40).
+    ///
+    /// **라이브는 길이가 없는 게 정상이다.** 그래서 "길이를 모르면 넘긴다" 는 규칙에
+    /// 그대로 걸려 버렸다 — 라이브를 담으면 조용히 지나갔다. 이 값이 그 둘을 갈라 준다.
+    ///
+    /// 기본이 `false` 라, 이 값이 없던 저장본은 도입 전과 완전히 같게 동작한다.
+    #[serde(default)]
+    pub is_live: bool,
 }
 
 impl TrackRef {

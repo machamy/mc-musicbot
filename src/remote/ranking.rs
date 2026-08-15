@@ -198,6 +198,7 @@ mod tests {
                 artist: None,
                 duration: None,
                 variant_key: None,
+                is_live: false,
             },
             format!("user-{user_id}"),
             Some(user_id),

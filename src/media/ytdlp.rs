@@ -158,6 +158,45 @@ pub(crate) fn is_transient(error: &str) -> bool {
 }
 
 #[cfg(test)]
+mod live_tests {
+    use super::YtDlp;
+    use crate::models::ProviderKind;
+
+    fn parse(entry: serde_json::Value) -> Option<crate::models::TrackRef> {
+        YtDlp::entry_to_track(&entry, ProviderKind::YouTube)
+    }
+
+    /// **검색과 단일 조회가 라이브를 다른 이름으로 알려 준다.**
+    ///
+    /// `--flat-playlist`(검색)는 `live_status` 만 주고 `is_live` 는 비어 있다. 단일 조회는
+    /// `is_live` 를 준다. 한쪽만 보면 **담는 경로에 따라 라이브인지 아닌지가 달라진다** —
+    /// 검색으로 담으면 라이브로 안 잡혀서 "길이를 모른다" 는 이유로 조용히 넘어간다.
+    #[test]
+    fn live_is_detected_from_either_field() {
+        let from_search = parse(serde_json::json!({
+            "id": "abc", "live_status": "is_live",
+        }));
+        assert!(from_search.expect("트랙").is_live, "검색 결과의 라이브를 놓쳤어요");
+
+        let from_lookup = parse(serde_json::json!({
+            "id": "abc", "is_live": true,
+        }));
+        assert!(from_lookup.expect("트랙").is_live, "단일 조회의 라이브를 놓쳤어요");
+    }
+
+    /// 평범한 곡은 라이브가 아니다. 여기가 뒤집히면 모든 곡이 끝나지 않는 것으로 취급된다.
+    #[test]
+    fn a_normal_track_is_not_live() {
+        let track = parse(serde_json::json!({
+            "id": "abc", "duration": 214.0, "live_status": "not_live",
+        }))
+        .expect("트랙");
+        assert!(!track.is_live);
+        assert!(track.duration.is_some());
+    }
+}
+
+#[cfg(test)]
 mod transient_tests {
     use super::is_transient;
 
@@ -302,6 +341,13 @@ impl YtDlp {
             .and_then(|v| v.as_f64())
             .filter(|d| *d > 0.0)
             .map(CsTimeSpan::from_secs_f64);
+        /* 라이브 판정 (§40).
+         *
+         * 검색(`--flat-playlist`)에서는 `is_live` 가 비어 있고 `live_status` 만 온다.
+         * 단일 조회에서는 `is_live` 가 온다. 둘 다 본다 — 한쪽만 보면 담는 경로에 따라
+         * 라이브인지 아닌지가 달라진다. */
+        let is_live = entry.get("is_live").and_then(|v| v.as_bool()).unwrap_or(false)
+            || entry.get("live_status").and_then(|v| v.as_str()) == Some("is_live");
         let source_url = entry
             .get("webpage_url")
             .or_else(|| entry.get("url"))
@@ -320,6 +366,7 @@ impl YtDlp {
             artist,
             duration,
             variant_key: None,
+            is_live,
         })
     }
 

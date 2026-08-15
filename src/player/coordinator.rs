@@ -514,6 +514,21 @@ impl Coordinator {
          * 물어보면 대개 알 수 있다. 그래도 모르면 **멈춰 있는 것보다 넘기는 게 낫다.** */
         let duration = match current.track.duration {
             Some(value) => Duration::from_secs_f64(value.as_secs_f64()),
+            /* **라이브는 길이가 없는 게 정상이다** (§40).
+             *
+             * 아래 "길이를 모르면 물어보고, 그래도 모르면 넘긴다" 는 규칙에 그대로 걸려서
+             * 라이브를 담으면 조용히 지나갔다. 라이브는 끝나는 시각이 없으므로 끝을 기다리는
+             * 타이머도 걸지 않는다 — 방송이 끝나면 그때 다음 곡으로 넘어간다. */
+            None if current.track.is_live => {
+                app.log.info(
+                    "Playback",
+                    &format!(
+                        "'{}' 은 라이브라 끝나는 시각 없이 틀어요 (guild {guild_id}).",
+                        current.track.display_title()
+                    ),
+                );
+                Duration::ZERO
+            }
             None => {
                 /* 싼 것부터 본다.
                  *
@@ -660,6 +675,13 @@ impl Coordinator {
         duration: Duration,
         start_offset: Duration,
     ) {
+        /* **라이브는 끝나는 시각이 없다** (§40).
+         *
+         * 길이가 0 이면 "이미 끝났다" 로 읽혀서 곡이 시작하자마자 다음으로 넘어간다.
+         * 라이브는 방송이 실제로 끊길 때 넘어가면 되므로 타이머를 아예 안 건다. */
+        if duration.is_zero() {
+            return;
+        }
         let remaining = duration.saturating_sub(start_offset);
         tokio::spawn(async move {
             tokio::time::sleep(remaining).await;

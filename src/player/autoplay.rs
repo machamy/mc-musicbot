@@ -596,6 +596,7 @@ mod tests {
             artist: None,
             duration: None,
             variant_key: None,
+            is_live: false,
         }
     }
 

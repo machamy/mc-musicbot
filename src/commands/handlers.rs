@@ -793,6 +793,7 @@ async fn resolve_input(app: &Arc<App>, input: &str) -> Result<ResolveOutcome, St
                     artist: None,
                     duration: None,
                     variant_key: None,
+            is_live: false,
                 });
             Ok(ResolveOutcome::Single(track))
         }

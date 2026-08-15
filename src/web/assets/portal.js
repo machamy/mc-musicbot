@@ -4690,12 +4690,14 @@ function syncOffsetSeconds() {
    * "모두가 같은 곡 같은 위치" 가 깨진다. 기존 2초 보정은 나와 내 목표 사이만 맞출 뿐
    * 사람 사이 오차를 좁혀 주지 않는다. */
   if (state.player?.voiceConnected === false && state.settings?.webPlayerMode) return server;
-  /* **같이보기 중에도 개인 보정을 안 쓴다** (§39).
+  /* **같이보기 중에도 개인 보정은 그대로 쓴다** (§39).
    *
-   * 위와 정확히 같은 이유다. 보정은 사람마다 ±10초라 두 사람이 최대 20초까지 다른 지점을
-   * 본다. "같이" 본다는 말이 성립하지 않는다. 봇이 음성에 있어도 마찬가지다 — 영상 모드는
-   * 애초에 디스코드로 안 듣는다는 뜻이라(사용자 결정) 맞출 봇 소리도 없다. */
-  if (videoJoined) return server;
+   * 한때 여기서 껐다가 되돌렸다. 논리는 그럴듯했다 — 보정이 사람마다 ±10초라 각자 다른
+   * 지점을 본다는 것. 그런데 **거꾸로다.** 보정은 어긋나라고 있는 값이 아니라
+   * 자기 기기가 밀린 만큼을 되돌려 결국 남들과 맞추라고 있는 값이다. 없애면 1초 밀린
+   * 사람은 그 1초를 고칠 방법이 사라진다 — 같이보기에서 제일 아쉬운 사람이 손을 놓게 된다.
+   *
+   * 위의 가상 재생 예외는 성격이 다르다. 거기는 맞출 기준(봇 소리) 자체가 없어서 끈다. */
   return webOffset + server;
 }
 
@@ -5449,6 +5451,8 @@ function webTick() {
     if (!ytReady || !ytPlayer) return;
     let here = 0;
     try { here = Number(ytPlayer.getCurrentTime()) || 0; } catch { return; }
+    // 라이브는 맞출 기준이 없다. 되감으면 오히려 방송에서 멀어진다 (§40).
+    if (currentIsLive()) return;
     if (Math.abs(there - here) > WEB_SYNC_GAP) {
       try { ytPlayer.seekTo(there, true); ytPlayer.playVideo(); } catch { /* 무시 */ }
     }
@@ -5460,6 +5464,8 @@ function webTick() {
     scWidget.getPosition((ms) => {
       const here = Number(ms) / 1000;
       if (!Number.isFinite(here)) return;
+      // 라이브는 맞출 기준이 없다. 되감으면 오히려 방송에서 멀어진다 (§40).
+      if (currentIsLive()) return;
       if (Math.abs(there - here) > WEB_SYNC_GAP) {
         try { scWidget.seekTo(there * 1000); scWidget.play(); } catch { /* 무시 */ }
       }
