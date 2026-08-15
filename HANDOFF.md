@@ -78,9 +78,23 @@ Discord 개발자 포털의 Redirect URI 도 `https://music.example.com/music/oa
 `scripts\Deploy-Seamless.ps1` 이 전부 한다. **PowerShell 로 돌려야 한다** — Git Bash 의
 ssh 는 다른 에이전트를 봐서 `Permission denied (publickey)` 가 난다.
 
+**기본은 `-Stage` 다. 돌고 있는 봇을 건드리지 않는다.**
+
 ```powershell
-scripts\Deploy-Seamless.ps1 -LocalExe target\release\mc-musicbot.exe -Version v4.10
+scripts\Deploy-Seamless.ps1 -LocalExe target\release\mc-musicbot.exe -Version v4.19 -Stage
 ```
+
+새 exe 를 `bot-mk2\mc-musicbot.exe.next` 로 놓고 버전을 `PENDING_BUILD.txt` 에 적은 뒤
+끝낸다. 프로세스는 그대로 산다(PID 로 확인함). **다음에 봇이 껐다 켜질 때**
+`START-MK2.cmd` 가 부르는 `scripts\Apply-Staged-Update.cmd` 가 갈아 끼우고
+`BUILD_ID.txt` 까지 옮겨 적는다.
+
+준비된 빌드가 있다는 이유만으로 듣고 있는 사람의 노래를 끊을 이유는 없다. 급한 고침이
+아니면 이쪽을 쓴다. `-Stage` 를 빼면 예전처럼 **지금 당장** 바꾼다(약 15초 멈춤).
+
+**런처를 고칠 때는 반드시 파싱을 확인한다.** `START-MK2.cmd` 가 깨지면 봇이 다음에 아예
+안 켜진다. 임시 폴더에 복사해 `start` 줄만 `echo` 로 바꿔 돌려 보면 된다(종료코드 0).
+그 파일은 **ASCII 로만** 쓴다 — cmd 가 OEM 코드페이지로 읽어서 한글이 섞이면 파서가 깨진다.
 
 대상 호스트와 설치 경로는 저장소에 없다. 봇 호스트 PC 에서 한 번만 박아 둔다.
 
