@@ -143,11 +143,12 @@ async fn host_scope_guard(request: Request<Body>, next: Next) -> Response {
 /// 같이보기 한 판 (§39). 휘발성이다 — `WebState::watch_parties` 주석 참고.
 #[derive(Debug, Clone)]
 pub struct WatchParty {
-    /// 판 세대. 비었다가 다시 켜지면 올라간다.
+    /// 판을 가리키는 표. 판마다 새로 발급되고 **절대 재사용되지 않는다.**
     ///
-    /// 클라이언트는 이 값으로 **"이미 물어본 판인가"** 를 기억한다. 세대가 없으면
-    /// 거절한 사람에게 판이 새로 열려도 다시 물어볼 방법이 없다.
-    pub id: u64,
+    /// 클라이언트는 이 값으로 "이미 물어본 판인가" 를 기억한다. 세는 번호로 두면
+    /// **서버가 재시작할 때 1 부터 다시 시작해서**, 탭에 남아 있던 "판 1 은 이미 물어봤다"
+    /// 가 새로 열린 판 1 의 초대를 삼킨다. 배포할 때마다 벌어지는 일이라 실제로 겪었다.
+    pub id: String,
     pub started_by: u64,
     pub started_by_display: String,
     pub watchers: HashSet<u64>,

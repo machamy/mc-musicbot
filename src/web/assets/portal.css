@@ -2760,3 +2760,42 @@ body.gate {
 /* 마지막 하나 남은 창은 못 닫는다 — 눌리는 것처럼 보이면 안 된다 */
 .dk-x.is-locked { opacity: 0.35; cursor: not-allowed; }
 .dk-x.is-locked:hover { background: none; color: var(--text-4); }
+
+/* ═══════════════════════ 같이보기 · 영상 모드 (§39) ═══════════════════════
+ *
+ * **이 블록은 파일 맨 끝이어야 한다.** `:root .now[data-video="1"]` 은 배치별 규칙
+ * (`:root[data-layout="dj"] .now` 등)과 **특이도가 같다**(0,3,0). 같으면 소스 순서로
+ * 결정되므로, 뒤에 있어야 열 군데를 한 번에 이긴다. 하나씩 뒤집으려 들면 반드시 빠뜨린다.
+ * 미디어 쿼리는 특이도를 안 올리므로 반응형 규칙도 여기서 같이 덮인다. */
+
+.bullets { margin: 0; padding-left: 1.1em; display: grid; gap: var(--sp-2); color: var(--text-2); }
+.bullets li { line-height: 1.5; }
+
+/* 숨어 있던 2px 상자가 카드 자리로 나온다. 좌표·크기는 JS 가 매 프레임 맞춘다. */
+.webhost[data-video="1"] {
+  z-index: var(--z-video);
+  opacity: 1;
+  overflow: hidden;
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-3);
+  background: #000;
+}
+.webhost[data-video="1"] iframe { width: 100%; height: 100%; border: 0; display: block; }
+
+/* **클릭은 계속 막아 둔다.** 이게 "유튜브 컨트롤을 노출하지 않는다"의 실행 수단이다 —
+ * 마우스가 iframe 에 닿지 않으므로 hover 오버레이(제목·공유·나중에 보기)도, 클릭
+ * 일시정지도 원천적으로 안 생긴다. `controls:0` 만으로는 hover 오버레이가 안 막힌다.
+ * 거기서 되감으면 그 사람만 어긋나므로 애초에 못 닿게 하는 편이 맞다. */
+
+/* 영상일 때 카드는 한 칸이 되고 자리는 16:9 가 된다. */
+:root .now[data-video="1"] { grid-template-columns: minmax(0, 1fr); align-content: start; }
+:root .now[data-video="1"] .now__artwrap {
+  aspect-ratio: 16 / 9;
+  width: min(100%, calc(min(52vh, 460px) * 16 / 9));
+  max-width: none;
+  margin-inline: auto;
+}
+/* 영상이 뜨기 전 몇 백 ms 를 아트가 받아 준다. 검은 화면이 그대로 보이지 않게. */
+:root .now[data-video="1"] .now__art { filter: blur(18px) brightness(0.5); }
+/* 소리 그림은 영상 뒤에서 의미가 없다. 숨긴다 — 크기 0 이 되어도 rAF 가 안 헛돈다(§v4.20). */
+:root .now[data-video="1"] .viz { display: none; }

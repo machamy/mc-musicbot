@@ -4432,7 +4432,7 @@ function buildStage() {
   el.nextRow = h('div', { class: 'nextrow', hidden: true, dataset: { mqRow: '1' } });
 
   el.nowCard = h('section', { class: 'now', 'data-testid': 'now-playing', dataset: { mqRow: '1' } },
-    h('div', { class: 'now__artwrap' }, el.nowArt),
+    (el.nowArtWrap = h('div', { class: 'now__artwrap' }, el.nowArt)),
     h('div', { class: 'now__side' },
       el.nowEyebrow,
       h('div', { class: 'now__titlerow' }, el.nowTitle, el.nowLink),
@@ -4445,6 +4445,7 @@ function buildStage() {
         el.repeatBtn, el.shuffleBtn, el.autoplayBtn,
         h('span', { class: 'ctrl__spacer' }),
         el.lyricsToggle,
+        el.videoBtn,
         el.webBtn),
       h('div', { class: 'vols' }, el.volumeWrap, el.webVolWrap, el.webSync, el.webNote)),
     el.nextRow);
@@ -4689,6 +4690,12 @@ function syncOffsetSeconds() {
    * "모두가 같은 곡 같은 위치" 가 깨진다. 기존 2초 보정은 나와 내 목표 사이만 맞출 뿐
    * 사람 사이 오차를 좁혀 주지 않는다. */
   if (state.player?.voiceConnected === false && state.settings?.webPlayerMode) return server;
+  /* **같이보기 중에도 개인 보정을 안 쓴다** (§39).
+   *
+   * 위와 정확히 같은 이유다. 보정은 사람마다 ±10초라 두 사람이 최대 20초까지 다른 지점을
+   * 본다. "같이" 본다는 말이 성립하지 않는다. 봇이 음성에 있어도 마찬가지다 — 영상 모드는
+   * 애초에 디스코드로 안 듣는다는 뜻이라(사용자 결정) 맞출 봇 소리도 없다. */
+  if (videoJoined) return server;
   return webOffset + server;
 }
 
@@ -4701,6 +4708,18 @@ function webTargetPosition() {
 }
 
 function buildWebPlayback() {
+  el.videoBtn = bindAct(h('button', {
+    class: 'btn btn--sm btn--ghost videobtn', type: 'button', 'aria-pressed': 'false',
+    tip: '재생 카드에 유튜브 영상을 띄우고 같이 봐요. 소리도 영상에서 나요.',
+  }, '🎬 영상으로 보기'), () => {
+    if (videoJoined) { leaveVideo(); return; }
+    const phase = watchPhase({
+      watch: store.get().watch, meId: store.get().user?.id, joined: false, asked: watchAsked(),
+    });
+    // 이미 한 번 설명을 읽고 답한 사람에게 같은 시트를 또 내밀지 않는다.
+    if (phase === 'start') confirmVideoStart(); else joinVideo();
+  });
+
   el.webBtn = bindAct(h('button', {
     class: 'btn btn--sm btn--ghost webbtn', type: 'button', 'aria-pressed': 'false',
     tip: '이 브라우저에서도 같은 곡을 들어요. 나만 들리고 Discord 쪽은 그대로예요.',
@@ -4753,6 +4772,282 @@ function buildWebPlayback() {
   document.body.appendChild(el.webHost);
 
   window.addEventListener('pagehide', stopWebPlayback);
+}
+
+/* ═══════════════════════ 같이보기 · 영상 오버레이 (§39) ═══════════════════════
+ *
+ * **iframe 을 카드 안으로 옮기면 안 된다.** 부모가 바뀌는 순간 브라우저가 문서를 다시
+ * 불러와 재생이 처음으로 돌아간다. 그리고 이 저장소에서는 그게 이론이 아니다 —
+ * `renderDock` 이 `clear(el.dock)` 로 카드를 통째로 떼었다 붙이고, 배치를 바꿀 때마다
+ * `homePanel` 이 옮긴다. 카드 안에 심으면 배치 전환 한 번에 무너진다.
+ *
+ * 그래서 **옮기지 않고 덮는다.** `.webhost` 는 지금처럼 body 밑에 fixed 로 두고,
+ * 카드 안 자리(`el.nowArtWrap`)의 좌표에 맞춰 크기와 위치만 옮긴다. 화면상으로는
+ * 카드 안에 있는 것처럼 보이는데 DOM 은 한 번도 안 건드린다.
+ */
+
+/** 지금 내가 영상으로 보고 있는가. 서버 명단의 거울이다. */
+let videoJoined = false;
+/** 영상 자리를 따라다니는 rAF. 영상 모드일 때만 돈다. */
+let videoRaf = 0;
+/** 마지막으로 쓴 좌표. 같은 값을 다시 쓰면 레이아웃이 헛되이 무효화된다. */
+let videoBoxKey = '';
+
+/** 이번 방문에 이미 답한 판 id. 계정이 아니라 **탭 수명**으로 기억한다 —
+ *  "거절했다" 가 다른 기기까지 따라다니면 안 된다. */
+function watchAsked() {
+  try { return sessionStorage.getItem(`macham.watchAsked.${ctx.guildId}`) || ''; } catch { return ''; }
+}
+function setWatchAsked(id) {
+  try { sessionStorage.setItem(`macham.watchAsked.${ctx.guildId}`, id || ''); } catch { /* 시크릿 모드 */ }
+}
+
+/** 초대 시트가 열려 있는 동안 또 열리지 않게. */
+let videoSheetOpen = false;
+/** 들어오기 전에 이미 웹으로 듣고 있었나. 나갈 때 그대로 되돌리려고 기억한다. */
+let webWasOnBeforeVideo = false;
+
+/* 지금 무엇을 보여 줄 국면인가 (§39).
+ *
+ * **이 함수 하나가 이 기능의 판정 전부다.** 팝업 중복·늦은 합류·거절 후 재합류·
+ * 탭 두 개가 전부 여기서 갈린다. 그래서 자가검사도 여기에 건다. */
+function watchPhase({ watch, meId, joined, asked }) {
+  const on = !!(watch && watch.on);
+  if (!on) return 'start';
+  if (joined) return 'watching';
+  const me = String(meId || '');
+  const watchers = (watch.watchers || []).map(String);
+  // 다른 탭이 이미 보고 있다. 나에게 다시 물어보면 이상하다.
+  if (me && watchers.includes(me)) return 'rejoin';
+  // 이미 답한 판이면 안 묻는다. 버튼으로는 언제든 합류할 수 있다.
+  if (asked && String(asked) === String(watch.id)) return 'rejoin';
+  return 'invite';
+}
+
+/** 이 곡을 영상으로 보여 줄 수 있는가. 사운드클라우드에는 보여 줄 영상이 없다. */
+function videoShowing() {
+  if (!videoJoined) return false;
+  const source = webSourceOf(store.get().current?.track);
+  return !!source && source.kind === 'yt';
+}
+
+/** 조상들의 `overflow` 클립을 전부 교차한 "실제로 보이는" 사각형. */
+function visibleRect(node) {
+  let rect = node.getBoundingClientRect();
+  let parent = node.parentElement;
+  while (parent && parent !== document.body) {
+    const style = getComputedStyle(parent);
+    if (style.overflow !== 'visible' || style.overflowX !== 'visible' || style.overflowY !== 'visible') {
+      rect = intersectRect(rect, parent.getBoundingClientRect());
+      if (!rect) return null;
+    }
+    parent = parent.parentElement;
+  }
+  return rect;
+}
+
+/** 두 사각형의 교집합. 안 겹치면 `null`. */
+function intersectRect(a, b) {
+  const left = Math.max(a.left, b.left);
+  const top = Math.max(a.top, b.top);
+  const right = Math.min(a.right, b.right);
+  const bottom = Math.min(a.bottom, b.bottom);
+  if (right <= left || bottom <= top) return null;
+  return { left, top, right, bottom, width: right - left, height: bottom - top };
+}
+
+/** 전체 상자 대비 보이는 부분만 남기는 `clip-path`. 안 잘리면 `none`. */
+function insetPath(full, clip) {
+  const top = Math.max(0, Math.round(clip.top - full.top));
+  const right = Math.max(0, Math.round(full.right - clip.right));
+  const bottom = Math.max(0, Math.round(full.bottom - clip.bottom));
+  const left = Math.max(0, Math.round(clip.left - full.left));
+  if (!top && !right && !bottom && !left) return 'none';
+  return `inset(${top}px ${right}px ${bottom}px ${left}px)`;
+}
+
+function hideVideoBox() {
+  if (!el.webHost) return;
+  if (el.webHost.dataset.video === '1') delete el.webHost.dataset.video;
+  el.webHost.style.cssText = '';
+  videoBoxKey = '';
+  if (el.nowCard && el.nowCard.dataset.video === '1') delete el.nowCard.dataset.video;
+}
+
+/** 자리표시자 좌표에 영상 상자를 맞춘다. 보이지 않으면 접는다. */
+function placeVideo() {
+  const slot = el.nowArtWrap;
+  if (!videoShowing() || !slot || !slot.isConnected || slot.offsetParent === null) {
+    hideVideoBox();
+    return;
+  }
+  const full = slot.getBoundingClientRect();
+  const clip = visibleRect(slot);
+  // 너무 작으면 영상이라고 하기 어렵다. 그때는 아트를 그대로 둔다.
+  if (!clip || clip.width < 80 || clip.height < 45) { hideVideoBox(); return; }
+
+  const key = [full.left, full.top, full.width, full.height, clip.top, clip.bottom, clip.left, clip.right]
+    .map((n) => Math.round(n)).join(',');
+  if (key === videoBoxKey) return;
+  videoBoxKey = key;
+
+  el.nowCard.dataset.video = '1';
+  el.webHost.dataset.video = '1';
+  el.webHost.style.left = `${Math.round(full.left)}px`;
+  el.webHost.style.top = `${Math.round(full.top)}px`;
+  el.webHost.style.width = `${Math.round(full.width)}px`;
+  el.webHost.style.height = `${Math.round(full.height)}px`;
+  el.webHost.style.clipPath = insetPath(full, clip);
+  // 1×1 로 만들어진 플레이어라 iframe 에게도 커졌다고 알려 준다.
+  try { ytPlayer?.setSize?.(Math.round(full.width), Math.round(full.height)); } catch { /* 아직 준비 전 */ }
+}
+
+/* 위치를 rAF 로 따라간다.
+ *
+ * 이벤트로 잡으려면 배치 전환·창 크기·패널 드래그·스플리터·스테이지 스크롤·채팅 스크롤·
+ * 드로어 전환… 최소 여덟 곳을 걸어야 하고, 그러면 **반드시 하나를 빠뜨린다.** 빠뜨린
+ * 자리에서 영상이 엉뚱한 데 남는다. 숨은 탭에서는 브라우저가 알아서 멈추고, 값이 안 바뀌면
+ * 좌표를 다시 쓰지도 않아서 비용은 rect 읽기 하나뿐이다. */
+function startVideoLoop() {
+  if (videoRaf) return;
+  const step = () => {
+    videoRaf = 0;
+    if (!videoJoined) { hideVideoBox(); return; }
+    placeVideo();
+    videoRaf = requestAnimationFrame(step);
+  };
+  videoRaf = requestAnimationFrame(step);
+}
+
+function stopVideoLoop() {
+  if (videoRaf) cancelAnimationFrame(videoRaf);
+  videoRaf = 0;
+  hideVideoBox();
+}
+
+/** 들어가고 나가는 실제 동작. 소리는 `웹에서 듣기` 와 **같은 플레이어**를 쓴다. */
+async function joinVideo() {
+  if (videoJoined) return;
+  // 영상 모드는 "디스코드로는 안 듣는다" 는 뜻이다(사용자 결정). 그래서 묻지 않고
+  // 웹에서 듣기를 켠다 — 자동재생 제스처·리스너 보고·싱크 루프를 그 경로가 이미 다 한다.
+  webWasOnBeforeVideo = webOn;
+  videoJoined = true;
+  startVideoLoop();
+  syncVideoUi();
+  if (!webOn) await toggleWebPlayback();
+  try { ytPlayer?.unMute?.(); ytPlayer?.setVolume?.(webVolume); } catch { /* 아직 준비 전 */ }
+
+  const ok = await call(() => api('/watch', { body: { on: true } }));
+  if (!ok) {
+    // 서버가 거절했다(권한 등). 화면도 정확히 되돌린다.
+    videoJoined = false;
+    stopVideoLoop();
+    if (!webWasOnBeforeVideo && webOn) toggleWebPlayback();
+    syncVideoUi();
+    return;
+  }
+  toast('영상으로 같이 봐요. 소리도 영상에서 나요.', 'ok');
+}
+
+function leaveVideo() {
+  if (!videoJoined) return;
+  videoJoined = false;
+  stopVideoLoop();
+  syncVideoUi();
+  api('/watch', { body: { on: false } }).catch(() => { /* 조용히 */ });
+  // 들어오기 전 상태 그대로 되돌린다. 원래 듣고 있었으면 소리는 계속 난다.
+  if (!webWasOnBeforeVideo && webOn) toggleWebPlayback();
+}
+
+/** 켜는 사람이 한 번 확인받는다. 무엇이 바뀌는지 먼저 말한다. */
+async function confirmVideoStart() {
+  const inVoice = (store.get().presence?.listening || [])
+    .map(String)
+    .includes(String(store.get().user?.id || ''));
+  const lines = [
+    '재생 카드에 유튜브 영상이 뜨고, 소리도 영상에서 나요.',
+    '다른 분들께 "같이 볼래요?" 가 뜨고, 수락한 사람만 바뀌어요.',
+    // 해당되는 사람에게만 말한다. 아닌 사람에게는 헛소리다.
+    inVoice ? '지금 디스코드 음성에도 계세요. 소리가 겹치니 그쪽을 줄여 주세요.' : null,
+    '사운드클라우드 곡에는 영상이 없어요. 그때는 앨범 아트로 돌아가요.',
+  ].filter(Boolean);
+  const ok = await sheet({
+    title: '🎬 다 같이 영상으로 볼까요?',
+    body: h('ul', { class: 'bullets' }, ...lines.map((line) => h('li', null, line))),
+    dismissValue: false,
+    actions: [
+      { label: '그만둘게요', kind: 'ghost', value: false },
+      { label: '같이 보기 시작', kind: 'primary', value: true, autofocus: true },
+    ],
+  }).result;
+  if (ok) await joinVideo();
+}
+
+/** 이미 도는 판에 초대한다. **한 판에 한 번만** 뜬다. */
+async function offerVideo(watch) {
+  if (videoSheetOpen) return;
+  videoSheetOpen = true;
+  // **시트를 기다리기 전에** 물어봤다고 적는다. `renderNow` 는 WS 프레임마다 도는데,
+  // 기다리는 사이에 한 번 더 돌면 두 번째 시트가 열린다.
+  setWatchAsked(watch.id);
+  const who = watch.startedByDisplay || '누군가';
+  try {
+    const ok = await sheet({
+      title: '🎬 같이 볼까요?',
+      desc: `${who}님이 지금 영상으로 보고 있어요.`,
+      body: h('ul', { class: 'bullets' },
+        h('li', null, '수락하면 같은 자리에서 같은 영상이 재생돼요.'),
+        h('li', null, '소리는 영상에서 나요.'),
+        h('li', null, '안 해도 지금 듣던 소리는 그대로예요.')),
+      dismissValue: false,
+      actions: [
+        { label: '소리만 들을게요', kind: 'ghost', value: false },
+        { label: '같이 보기', kind: 'primary', value: true, autofocus: true },
+      ],
+    }).result;
+    if (ok) await joinVideo();
+  } finally {
+    videoSheetOpen = false;
+    // 답한 순간 버튼을 다시 그린다. 다음 WS 프레임까지 기다리면 라벨은 바뀌었는데
+    // 강조는 안 바뀐 어중간한 모습으로 몇 초 남는다(실제로 그랬다).
+    syncVideoUi();
+  }
+}
+
+/** 버튼 모양을 지금 국면에 맞춘다. */
+function syncVideoUi() {
+  if (!el.videoBtn) return;
+  const state = store.get();
+  const phase = watchPhase({
+    watch: state.watch, meId: state.user?.id, joined: videoJoined, asked: watchAsked(),
+  });
+  const label = { watching: '🎬 같이 보는 중', rejoin: '🎬 같이 보기', invite: '🎬 같이 보기' }[phase]
+    || '🎬 영상으로 보기';
+  el.videoBtn.textContent = label;
+  el.videoBtn.setAttribute('aria-pressed', String(videoJoined));
+  el.videoBtn.classList.toggle('btn--primary', phase === 'watching' || phase === 'rejoin');
+  // 시작만 권한을 본다. 이미 도는 판에 합류하는 것은 누구나 된다 — 서버도 그렇게 판정한다.
+  const needsPermission = phase === 'start';
+  setLock(el.videoBtn, needsPermission && !can('playback'), lockReason('playback'));
+  el.videoBtn.hidden = !!webBlocked;
+}
+
+/** 서버가 알려 준 판을 화면에 반영한다. WS 와 `/state/hot` 이 같은 모양을 준다. */
+function applyWatchState(watch) {
+  store.patch({ watch: watch || null });
+  const state = store.get();
+  // 서버 명단에서 내가 빠졌으면(다른 기기에서 나갔거나 판이 끝났다) 화면도 접는다.
+  const me = String(state.user?.id || '');
+  const watchers = ((watch && watch.watchers) || []).map(String);
+  if (videoJoined && me && !watchers.includes(me)) {
+    videoJoined = false;
+    stopVideoLoop();
+  }
+  syncVideoUi();
+  const phase = watchPhase({
+    watch, meId: state.user?.id, joined: videoJoined, asked: watchAsked(),
+  });
+  if (phase === 'invite') offerVideo(watch);
 }
 
 function setWebOffset(next) {
@@ -8506,6 +8801,11 @@ async function loadHot() {
     presence: data.presence || store.get().presence,
     hotAt: Date.now(),
   });
+  /* 같이보기 판을 여기서 알게 된다 (§39).
+   *
+   * **진입·새로고침·재연결이 전부 이 경로를 지난다.** 그래서 "이미 켜져 있으면 알려 준다"
+   * 는 요구가 초대 이벤트 없이 이 한 줄로 해결된다. 늦게 들어온 사람도 자동으로 받는다. */
+  applyWatchState(data.watch || null);
   // 서버가 정한 일정 (§31). 진입·재연결 직후부터 정확히 맞아야 한다.
   store.patch({
     schedule: {
@@ -8636,6 +8936,8 @@ async function boot() {
     },
     onChat: onChatArrived,
     onEvent: (type, data) => {
+      // core.js 의 `default` 가 모르는 토픽을 여기로 흘려보낸다 (§39).
+      if (type === 'watch') applyWatchState(data);
       if (type === 'autoplay') loadSeeds();
       if (type === 'skipvote') store.patch({ skipVote: data && data.need ? data : null });
       if (type === 'charts') { chartState = null; if (activeRailTab === 'charts') loadCharts(); }
@@ -8908,6 +9210,37 @@ function selfTest() {
       !!(el.webNote && !el.webNote.hidden && el.webNote.textContent.includes('막혀 있어요')), true);
     if (el.webNote) setWebNote(kept || '');   // 검사 흔적을 지운다
   }
+
+  /* §39 — 같이보기 판정.
+   *
+   * 팝업이 두 번 뜨거나, 늦게 들어온 사람이 안내를 못 받거나, 거절한 사람이 영영 못
+   * 들어오는 것은 전부 **조용히 어긋나는** 종류다. 화면을 봐서는 못 잡는다. */
+  const W = (id, watchers) => ({ on: true, id: String(id), watchers: watchers.map(String) });
+  eq('같이보기: 판이 없으면 시작 국면',
+    watchPhase({ watch: { on: false }, meId: '1', joined: false, asked: '' }), 'start');
+  eq('같이보기: 처음 보는 판이면 물어본다',
+    watchPhase({ watch: W(7, ['2']), meId: '1', joined: false, asked: '' }), 'invite');
+  eq('같이보기: 이미 답한 판은 다시 안 묻는다',
+    watchPhase({ watch: W(7, ['2']), meId: '1', joined: false, asked: '7' }), 'rejoin');
+  eq('같이보기: 판이 새로 열리면 다시 묻는다',
+    watchPhase({ watch: W(8, ['2']), meId: '1', joined: false, asked: '7' }), 'invite');
+  eq('같이보기: 다른 탭이 이미 보고 있으면 안 묻는다',
+    watchPhase({ watch: W(7, ['1']), meId: '1', joined: false, asked: '' }), 'rejoin');
+  eq('같이보기: 보는 중',
+    watchPhase({ watch: W(7, ['1']), meId: '1', joined: true, asked: '7' }), 'watching');
+  eq('같이보기: 판이 끝나면 시작 국면으로 돌아온다',
+    watchPhase({ watch: { on: false }, meId: '1', joined: true, asked: '7' }), 'start');
+
+  /* 오버레이가 카드 밖으로 새면 다른 패널 위에 유튜브가 떠 버린다. */
+  eq('영상 자리: 안 겹치면 null',
+    intersectRect({ left: 0, top: 0, right: 10, bottom: 10 }, { left: 20, top: 20, right: 30, bottom: 30 }),
+    null);
+  eq('영상 자리: 위만 잘린 상자',
+    insetPath({ left: 0, top: 0, right: 100, bottom: 100 }, { left: 0, top: 20, right: 100, bottom: 100 }),
+    'inset(20px 0px 0px 0px)');
+  eq('영상 자리: 안 잘리면 클립 없음',
+    insetPath({ left: 0, top: 0, right: 100, bottom: 100 }, { left: 0, top: 0, right: 100, bottom: 100 }),
+    'none');
 
   console.info(fails.length ? `[자가검사] ${fails.length}건 실패` : '[자가검사] 전부 통과', fails);
   return { fail: fails.length, fails };

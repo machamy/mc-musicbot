@@ -4833,9 +4833,6 @@ async fn api_web_listening(
  * 실으면 **진입·새로고침·재연결 세 경로가 공짜로 같이 맞는다.**
  */
 
-/// 판 세대 발급기. 길드별로 연속일 필요가 없어 전역 하나면 된다.
-static WATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WatchRequest {
@@ -4856,7 +4853,7 @@ pub(crate) fn watch_payload(state: &WebState, guild_id: u64) -> Value {
                 "on": true,
                 // 숫자로 보내면 자바스크립트가 큰 값에서 정밀도를 잃는다. 이 저장소는
                 // 모든 스노플레이크를 문자열로 보낸다 — 판 id 도 같은 규칙을 따른다.
-                "id": party.id.to_string(),
+                "id": party.id.clone(),
                 "startedBy": party.started_by.to_string(),
                 "startedByDisplay": party.started_by_display,
                 "count": watchers.len(),
@@ -4928,7 +4925,7 @@ async fn api_watch(
         let mut parties = state.watch_parties.lock().unwrap();
         if request.on {
             let party = parties.entry(guild_id).or_insert_with(|| WatchParty {
-                id: WATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                id: crate::models::uuid_like(),
                 started_by: user_id,
                 started_by_display: ctx.session.display_name.clone(),
                 watchers: HashSet::new(),
@@ -11183,9 +11180,9 @@ mod tests {
      * `WebState` 를 통째로 만들지 않고 명단 자료구조만 떼어 검사한다. 판정 규칙이
      * 여기 다 들어 있고, 이게 틀리면 "마지막 사람이 나가도 판이 안 끝나는" 식으로 샌다. */
 
-    fn party(id: u64, watchers: &[u64]) -> WatchParty {
+    fn party(id: &str, watchers: &[u64]) -> WatchParty {
         WatchParty {
-            id,
+            id: id.into(),
             started_by: watchers.first().copied().unwrap_or(0),
             started_by_display: "누군가".into(),
             watchers: watchers.iter().copied().collect(),
@@ -11197,7 +11194,7 @@ mod tests {
     #[test]
     fn the_party_ends_when_the_last_watcher_leaves() {
         let mut parties: HashMap<u64, WatchParty> = HashMap::new();
-        parties.insert(1, party(7, &[100, 200]));
+        parties.insert(1, party("abc", &[100, 200]));
 
         // 한 명 나감 — 판은 계속 돈다.
         let p = parties.get_mut(&1).unwrap();
@@ -11213,13 +11210,16 @@ mod tests {
         assert!(parties.get(&1).is_none(), "마지막 사람이 나가면 판이 없어야 한다");
     }
 
-    /// 판이 비었다 다시 열리면 **세대가 올라간다.** 안 그러면 한 번 거절한 사람에게
-    /// 새 판이 열려도 다시 물어볼 방법이 없다.
+    /// 판마다 **다시 안 쓰이는** 표가 붙어야 한다.
+    ///
+    /// 세는 번호로 두면 서버가 재시작할 때 1 부터 다시 시작하고, 브라우저 탭에 남아 있던
+    /// "판 1 은 이미 물어봤다" 가 새로 열린 판 1 의 초대를 삼킨다. 배포마다 벌어진다.
     #[test]
-    fn a_new_party_gets_a_new_generation() {
-        let first = WATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let second = WATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert!(second > first, "판 세대가 올라가야 해요 ({first} → {second})");
+    fn a_new_party_never_reuses_an_old_id() {
+        let first = crate::models::uuid_like();
+        let second = crate::models::uuid_like();
+        assert_ne!(first, second, "판 표가 겹치면 초대가 삼켜져요");
+        assert!(!first.is_empty());
     }
 
     #[test]
