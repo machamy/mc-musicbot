@@ -4507,7 +4507,20 @@ async fn api_search(
         .filter(|track| !state.app.blacklist.is_blocked(guild_id, track))
         .map(|track| track_json(&track))
         .collect();
-    json_ok(json!({ "results": values }))
+    /* **링크였는데 0건이면 이유를 말한다.**
+     *
+     * 주소는 알아봤는데 유튜브에서 정보를 못 읽으면 결과가 빈다. 화면에는 "결과가 없어요"
+     * 만 떠서 *링크를 못 알아본 것*과 구분이 안 된다 — 사람은 링크가 안 먹힌다고 여긴다.
+     * 실제로 그 오해가 있었다. */
+    let note = if values.is_empty() && crate::media::resolver::can_resolve(input) {
+        Value::String(
+            "링크는 알아봤는데 유튜브에서 정보를 못 읽었어요. 비공개·삭제된 영상이거나 잠시 막힌 걸 수 있어요."
+                .into(),
+        )
+    } else {
+        Value::Null
+    };
+    json_ok(json!({ "results": values, "note": note }))
 }
 
 #[derive(Debug, Deserialize)]

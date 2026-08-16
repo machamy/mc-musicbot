@@ -515,6 +515,7 @@ const el = {};                 // 자주 만지는 노드 참조
 let searchResults = [];
 let searchedQuery = '';
 let searchSource = '';         // browser | server | '' — 결과가 어디서 왔는지
+let searchNote = '';           // 링크였는데 못 읽었을 때 서버가 주는 이유 (§42)
 let replyTo = null;            // { id, displayName, preview }
 let lastReadId = 0;
 let unread = 0;
@@ -2359,6 +2360,7 @@ async function runSearch() {
         searchResults = results;
         searchedQuery = query;
         searchSource = 'browser';
+        searchNote = '';
         renderSearchResults();
         syncSearchButton();
         return;
@@ -2371,6 +2373,7 @@ async function runSearch() {
   try {
     const data = await api(`/search?q=${encodeURIComponent(query)}&provider=${encodeURIComponent(el.searchProvider.value)}`);
     searchResults = data?.results || [];
+    searchNote = data?.note || '';
     searchedQuery = query;
     searchSource = browserSearchReady(query) ? 'fallback' : 'server';
     renderSearchResults();
@@ -2395,7 +2398,11 @@ function renderSearchResults() {
     h('button', { class: 'iconbtn', type: 'button', tip: '닫기', 'aria-label': '검색 결과 닫기', onClick: closeSearch }, '✕')));
 
   if (!searchResults.length) {
-    el.searchResults.appendChild(emptyState('🔍', '결과가 없어요', '다른 단어나 링크로 다시 찾아 보세요.'));
+    // 서버가 이유를 알려 줬으면 그걸 그대로 보여준다. "결과가 없어요" 만 뜨면
+    // 링크를 못 알아본 것인지 못 읽은 것인지 구분이 안 된다 (§42).
+    el.searchResults.appendChild(searchNote
+      ? emptyState('🔗', '이 링크는 못 불러왔어요', searchNote)
+      : emptyState('🔍', '결과가 없어요', '다른 단어나 링크로 다시 찾아 보세요.'));
     return;
   }
   for (const track of searchResults) el.searchResults.appendChild(trackRow(track, 'search'));
