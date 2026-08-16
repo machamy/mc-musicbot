@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -548,7 +548,7 @@ const MIGRATION_V15: &str = r#"
 ///   - `internal:...` — 우리가 튼 기록으로 만드는 차트(§15.2b). 외부 호출이 없다.
 ///
 /// 관리 콘솔에서 주소를 바꿀 수 있다. 여기 값은 **처음 한 번만** 심어진다.
-const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 49] = [
+const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 51] = [
     // 우리가 실제로 튼 것으로 만드는 차트 — 자동재생으로 나간 곡은 세지 않는다.
     (ChartCategory::Ours, "우리 서버 인기곡", "Internal", "internal:guild-plays"),
     (ChartCategory::Ours, "우리 서버 사랑받은 곡", "Internal", "internal:guild-love"),
@@ -602,10 +602,23 @@ const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 49] = [
     (ChartCategory::Karaoke, "TJ 팝송", "TJ", "tj:top:2"),
     (ChartCategory::Karaoke, "TJ J-POP", "TJ", "tj:top:3"),
     (ChartCategory::Karaoke, "TJ OST", "TJ", "tj:top:8"),
+    /* 9·10·11 은 오래 빠져 있었다. TJ 가 분류 번호의 뜻을 안 알려 줘서 곡을 보고 하나씩
+     * 채워 온 표인데, 이 셋은 있는지조차 몰랐다. 2026-08-17 에 실제 응답으로 확인했다.
+     *
+     *   10 = 힙합·랩   다이나믹듀오 · 프라이머리 · 김하온 · 우원재 · 아웃사이더
+     *   11 = R&B·소울  브라운아이즈 · 태양 · 이하이 · 나얼 · 박효신 · 헤이즈
+     *    9 = 종합      1·2·3·8(가요·팝송·J-POP·OST)의 상위를 섞어 놓은 것
+     *
+     * 9 를 "가요와 거의 같다" 고 적었다가 세어 보고 고쳤다 — 상위 몇 곡만 같았고
+     * 실제 겹침은 100곡 중 27곡이다. 장르 분류(4~7·10·11)와는 **한 곡도** 안 겹친다.
+     * 1·2·3·8·9 는 최근 기간 기준이고 장르 쪽은 오래된 곡이 상위인, 성격이 다른 표다.
+     * 기존 `TJ 인기 100`(HOT)과도 다르다 — 겹침 3/100. HOT 은 뜨는 곡, TOP 은 많이 부른 곡. */
+    (ChartCategory::Karaoke, "TJ 종합", "TJ", "tj:top:9"),
+    (ChartCategory::Karaoke, "TJ 힙합·랩", "TJ", "tj:top:10"),
+    (ChartCategory::Karaoke, "TJ R&B·소울", "TJ", "tj:top:11"),
     (ChartCategory::Karaoke, "일본 노래방 히트", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kW4l3hmtC_Aq2XCvin1b3h6tziPMH0tsk"),
     // 금영은 공개 API 를 못 찾아서 검색으로 남긴다. 노래방 채널은 개별 곡을 올리므로
     // 인기곡 검색과 달리 모음 영상이 안 잡힌다(2026-08-07 실측: 6/6 개별 반주).
-    (ChartCategory::Karaoke, "금영 인기차트", "YouTube", "ytsearch50:금영노래방 인기차트"),
     // SoundCloud
     (
         ChartCategory::Soundcloud,
@@ -3617,6 +3630,36 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
              * 영영 닿지 않는다. 찾은 가사는 그대로 두고 못 찾은 기록만 지운다. */
             21 => {
                 tx.execute("DELETE FROM remote_lyrics WHERE found = 0", [])?;
+            }
+            /* 옛 기본값 50 을 새 기본값 100 으로 올린다.
+             *
+             * v4.24 에서 기본값을 100 으로 바꾼 이유가 "TJ 도 유튜브 Top 100 도 원본은
+             * 100곡인데 우리가 50에서 잘라 왔다" 였다. 그런데 **이미 있던 서버는 저장된
+             * 50 이 이겨서** 그대로 절반만 봤다 — `가요 100` 이 50곡만 나온다는 신고가
+             * 그것이다. 기본값만 바꾸고 기존 값을 안 옮긴 것이 빠진 절반이었다.
+             *
+             * 정확히 50 인 것만 건드린다. 일부러 30 이나 80 을 고른 서버는 그대로 둔다.
+             * 100 으로 올라간 뒤 다시 50 을 고르면 그 값은 유지된다(이 단계는 한 번만 돈다). */
+            22 => {
+                /* `settings` 는 옛 C# 쪽 표라 `Db::open` 이 만든다. `RemoteStore` 만 연
+                 * DB(테스트 등)에는 없을 수 있으므로 있을 때만 손댄다. */
+                let has_settings: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'",
+                        [],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if has_settings {
+                    tx.execute(
+                        "UPDATE settings
+                            SET json = json_set(json, '$.chartLimit', 100)
+                          WHERE key LIKE 'remote_guild_settings:%'
+                            AND json_extract(json, '$.chartLimit') = 50",
+                        [],
+                    )?;
+                }
             }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
