@@ -1,6 +1,7 @@
 //! 재생 파이프라인 재현 테스트 (디스코드 연결 없이).
 //! ffmpeg → ChildContainer → RawAdapter → symphonia promote + 디코드까지.
-//! 사용: cargo run --release --example parse_test -- <audio-file> [s16le|f32le]
+//! 사용: cargo run --release -p mc-app --example parse_test -- <audio-file> [s16le|f32le]
+//!       (워크스페이스라 `-p mc-app` 이 필요하다 — 루트는 얇은 bin 패키지다)
 
 use songbird::input::core::io::ReadOnlySource;
 use songbird::input::{AudioStream, LiveInput, RawAdapter, codecs};
