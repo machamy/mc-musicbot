@@ -192,12 +192,34 @@ mod virtual_session_tests {
         }
     }
 
+    /// **`App` 도 songbird 도 없이 만드는 코디네이터.** 가상 세션 판단은 전부 이 구조체 안에서
+    /// 끝나므로, 시각표 규칙은 진짜 `Coordinator` 를 세워서 그대로 검사할 수 있다.
+    fn coordinator() -> Coordinator {
+        Coordinator::new(Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        )))
+    }
+
+    /// 이 길드의 가상 세션이 지금 얼려 둔 위치. 세션이 없으면 `None`.
+    async fn frozen_at(coordinator: &Coordinator, guild_id: u64) -> Option<Duration> {
+        let sessions = coordinator.virtual_sessions.lock().await;
+        sessions.get(&guild_id).and_then(|v| v.paused_at)
+    }
+
     /// 흐르는 중에는 시작 시각으로부터 지난 만큼이 위치다.
+    ///
+    /// **위아래를 다 막는다.** 예전에는 `29..=31` 이었는데 시작 시각이 30초 전으로 못 박혀 있어
+    /// 아래쪽 29 는 어차피 닿을 수 없는 값이었다 — 한쪽만 막힌 허용 범위는 그만큼 헐겁다.
+    /// 두 `Utc::now()` 호출 사이의 간격은 마이크로초 단위라 위쪽을 0.5초로 조여도 안 흔들린다.
     #[test]
     fn a_running_session_reports_elapsed_time() {
         let v = session(at(30), None);
-        let pos = v.position().as_secs();
-        assert!((29..=31).contains(&pos), "약 30초여야 하는데 {pos}초");
+        let pos = v.position();
+        let expected = Duration::from_secs(30);
+        assert!(
+            (expected..expected + Duration::from_millis(500)).contains(&pos),
+            "약 30초여야 하는데 {pos:?}"
+        );
     }
 
     /// **미래 `started_utc` 에서 패닉하거나 뒤집히면 안 된다.**
@@ -210,27 +232,74 @@ mod virtual_session_tests {
         assert_eq!(v.position(), Duration::ZERO);
     }
 
-    /// **멈춰 있는 동안에는 위치가 안 흐른다.**
+    /// **멈추라고 하면 그 순간 흐르던 자리를 담는다.**
     ///
-    /// 물리 세션은 songbird 핸들이 멈춰서 저절로 해결되지만 가상은 시각 계산이라
-    /// 얼려 두지 않으면 정지 중에도 계속 간다.
-    #[test]
-    fn a_paused_session_freezes_its_position() {
-        let v = session(at(100), Some(Duration::from_secs(42)));
-        assert_eq!(v.position(), Duration::from_secs(42));
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(v.position(), Duration::from_secs(42), "정지 중에는 안 흘러야 한다");
+    /// 물리 세션은 songbird 핸들이 멈춰서 저절로 해결되지만 가상은 시각 계산이라, 멈춘
+    /// 자리를 담아 두지 않으면 정지 중에도 위치가 계속 간다. 그 담는 판단이 사는 곳은
+    /// `apply_pause` 의 `(true, None)` 갈래라서 **거기를 실제로 부른다.**
+    ///
+    /// 예전 이 테스트는 이미 `paused_at` 이 들어 있는 세션을 손으로 만들어 놓고 `position()`
+    /// 을 두 번 읽었다. `position()` 은 첫 줄에서 그 값을 그대로 돌려주므로 두 번째 단언은
+    /// 첫 번째와 글자만 다른 같은 문장이었고, 사이에 낀 20ms 잠은 아무것도 바꾸지 못했다.
+    #[tokio::test]
+    async fn a_paused_session_freezes_its_position() {
+        let coordinator = coordinator();
+        let guild_id = 900_301;
+        // 42초쯤 흐르고 있는(아직 안 멈춘) 세션.
+        coordinator
+            .virtual_sessions
+            .lock()
+            .await
+            .insert(guild_id, session(at(42), None));
+
+        coordinator.apply_pause(guild_id, true).await;
+
+        let frozen = frozen_at(&coordinator, guild_id)
+            .await
+            .expect("멈췄으면 그 자리를 담아 둬야 한다 — 안 담으면 정지 중에도 위치가 흐른다");
+        assert!(
+            (Duration::from_secs(42)..Duration::from_secs(43)).contains(&frozen),
+            "멈춘 순간 흐르던 위치(약 42초)를 담아야 하는데 {frozen:?}"
+        );
+
+        // 이미 멈춘 세션에 정지가 또 와도 자리를 다시 쓰지 않는다(`_ => {}`).
+        // 동기화는 5초마다 도는데 그때마다 다시 담으면 멈춘 자리가 조금씩 밀린다.
+        coordinator.apply_pause(guild_id, true).await;
+        assert_eq!(
+            frozen_at(&coordinator, guild_id).await,
+            Some(frozen),
+            "두 번 눌러도 멈춘 자리는 그대로여야 한다"
+        );
     }
 
-    /// 재개하면 얼려 둔 지점이 0초 기준이 된다 — `apply_pause` 가 하는 계산과 같은 식.
-    #[test]
-    fn resuming_rebases_the_start_to_the_frozen_point() {
+    /// **재개하면 얼려 둔 지점이 0초 기준이 된다.**
+    ///
+    /// 예전 이 테스트는 `apply_pause` 의 두 줄을 테스트 본문에 그대로 베껴 놓고 그 사본을
+    /// 검사했다. 진짜 `apply_pause` 에서 재개 갈래를 통째로 지워도 초록불이 켜졌다 —
+    /// 규칙을 두 곳에 적으면 테스트는 자기 사본만 지킨다. 그래서 실제 함수를 부른다.
+    #[tokio::test]
+    async fn resuming_rebases_the_start_to_the_frozen_point() {
+        let coordinator = coordinator();
+        let guild_id = 900_302;
         let frozen = Duration::from_secs(42);
-        let mut v = session(at(100), Some(frozen));
-        v.started_utc = chrono::Utc::now() - chrono::Duration::from_std(frozen).unwrap();
-        v.paused_at = None;
-        let pos = v.position().as_secs();
-        assert!((41..=43).contains(&pos), "재개 직후는 얼린 지점이어야 하는데 {pos}초");
+        // 100초 전에 시작했지만 42초 지점에서 멈춰 있는 세션 — 시작 시각을 그대로 두고 풀면
+        // 재개하자마자 100초로 튄다. 그 튐을 막는 것이 재개 갈래의 존재 이유다.
+        coordinator
+            .virtual_sessions
+            .lock()
+            .await
+            .insert(guild_id, session(at(100), Some(frozen)));
+
+        coordinator.apply_pause(guild_id, false).await;
+
+        let sessions = coordinator.virtual_sessions.lock().await;
+        let v = sessions.get(&guild_id).expect("재개가 세션을 없애면 안 된다");
+        assert_eq!(v.paused_at, None, "재개했으면 얼음이 풀려야 한다");
+        let pos = v.position();
+        assert!(
+            (frozen..frozen + Duration::from_millis(500)).contains(&pos),
+            "재개 직후는 얼렸던 42초 지점이어야 하는데 {pos:?}"
+        );
     }
 }
 

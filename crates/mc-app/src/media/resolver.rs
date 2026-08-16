@@ -280,6 +280,50 @@ mod tests {
         }
     }
 
+    /// **호스트를 닮은 남의 도메인은 거절해야 한다.**
+    ///
+    /// 위 테스트는 전부 순한 입력이라, 판정을 `host.contains("youtube.com")` 같은
+    /// "너그러운" 꼴로 바꿔도 하나도 안 깨진다. 그런데 그렇게 바꾸면
+    /// `https://youtube.com.evil.example/watch?v=X` 가 유튜브 곡으로 해석돼서
+    /// yt-dlp 가 공격자 도메인을 두드리게 된다.
+    ///
+    /// 그래서 **접미사 경계를 직접 겨눈다.** `is_youtube_host` 의 `==` 와
+    /// `.ends_with(".youtube.com")` 중 어느 쪽을 느슨하게 해도 여기서 걸린다.
+    #[test]
+    fn lookalike_hosts_are_rejected() {
+        for input in [
+            // 우리 도메인이 **앞**에 붙은 남의 도메인
+            "https://youtube.com.evil.example/watch?v=YXIz7U42pgk",
+            "https://www.youtube.com.evil.example/watch?v=YXIz7U42pgk",
+            "https://soundcloud.com.evil.example/artist/track",
+            // 점 없이 이어 붙인 것 — `ends_with("youtube.com")` 이었으면 통과한다
+            "https://evilyoutube.com/watch?v=YXIz7U42pgk",
+            "https://notyoutu.be/YXIz7U42pgk",
+            "https://evilsoundcloud.com/artist/track",
+            // 사용자 정보(@) 로 호스트를 가리는 고전 수법
+            "https://youtube.com@evil.example/watch?v=YXIz7U42pgk",
+        ] {
+            assert!(
+                !can_resolve(input),
+                "닮은꼴 호스트를 우리 것으로 봤어요: {input:?}"
+            );
+        }
+    }
+
+    /// 진짜 하위 도메인은 계속 받아 줘야 한다 — 위 테스트를 통과시키려고
+    /// 판정을 `==` 하나로 좁혀 버리면 `music.youtube.com` 이 죽는다.
+    #[test]
+    fn real_subdomains_still_resolve() {
+        for input in [
+            "https://www.youtube.com/watch?v=YXIz7U42pgk",
+            "https://m.youtube.com/watch?v=YXIz7U42pgk",
+            "https://music.youtube.com/watch?v=YXIz7U42pgk",
+        ] {
+            assert!(can_resolve(input), "진짜 하위 도메인을 막았어요: {input:?}");
+            assert_eq!(track(input).content_id, "YXIz7U42pgk", "입력: {input:?}");
+        }
+    }
+
     #[test]
     fn plain_forms_still_resolve() {
         assert_eq!(track("https://youtu.be/YXIz7U42pgk").content_id, "YXIz7U42pgk");

@@ -412,7 +412,28 @@ mod tests {
             artist: "윤종신".into(),
         };
         assert_eq!(search_query(&entry), "좋니 윤종신");
-        assert!(!search_query(&entry).contains("노래방"));
+        /* 바로 위 줄이 문자열을 통째로 못 박으므로, 같은 입력으로
+         * `contains("노래방")` 을 한 번 더 보는 것은 아무것도 검사하지 않는다.
+         * 계약("노래방/MR 을 절대 안 붙인다")은 **여러 입력**으로 봐야 한다. */
+        for (title, artist) in [
+            ("좋니", "윤종신"),
+            ("밤편지", "아이유"),
+            ("노래방에서", "가수"),       // 제목에 이미 '노래방' 이 들어간 곡
+            ("MR", "아무개"),             // 제목이 통째로 MR 인 곡
+        ] {
+            let entry = TjEntry {
+                rank: 1,
+                number: 1,
+                title: title.into(),
+                artist: artist.into(),
+            };
+            let query = search_query(&entry);
+            assert_eq!(
+                query,
+                format!("{title} {artist}"),
+                "검색어에 뭔가 덧붙었다: {query}"
+            );
+        }
         let no_artist = TjEntry {
             artist: String::new(),
             ..entry

@@ -946,10 +946,17 @@ fn cookie_should_be_secure(auth: &RemoteAuthConfig, headers: Option<&HeaderMap>)
     if forwarded == "https" {
         return true;
     }
-    // 남은 경우: 명시적으로 http://localhost 계열이면 개발 환경이므로 Secure를 뺀다.
-    let local = auth.public_base_url.starts_with("http://localhost")
-        || auth.public_base_url.starts_with("http://127.0.0.1")
-        || auth.public_base_url.starts_with("http://[::1]");
+    /* 남은 경우: 명시적으로 http://localhost 계열이면 개발 환경이므로 Secure 를 뺀다.
+     *
+     * **호스트를 뽑아서 비교한다. `starts_with` 로 문자열 앞을 보면 안 된다.**
+     * 예전에는 `public_base_url.starts_with("http://localhost")` 이었다. 그러면
+     * `http://localhost.attacker.example` 도, `http://127.0.0.1.nip.io` 도 로컬로
+     * 읽혀서 **공개 호스트인데 세션 쿠키가 Secure 없이** 평문으로 나갔다.
+     * 접두사가 아니라 호스트 경계(`localhost` 자체이거나 `localhost:포트`)를 본다. */
+    let host = host_of(&auth.public_base_url);
+    let is_local_host = |name: &str| host == name || host.starts_with(&format!("{name}:"));
+    let local = auth.public_base_url.starts_with("http://")
+        && (is_local_host("localhost") || is_local_host("127.0.0.1") || is_local_host("[::1]"));
     !local
 }
 
@@ -1906,18 +1913,10 @@ fn presence_remove(state: &Arc<WebState>, guild_id: u64, user_id: u64) {
             });
         }
         // 같이보기도 같은 규칙으로 정리한다 (§39). 탭을 그냥 닫아도 명단에 안 남는다.
+        // 나가기 버튼(`api_watch`)과 **같은 함수**를 쓴다 — 규칙이 두 벌이면 한쪽만 샌다.
         let left = {
             let mut parties = state.watch_parties.lock().unwrap();
-            match parties.get_mut(&guild_id) {
-                Some(party) => {
-                    let removed = party.watchers.remove(&user_id);
-                    if party.watchers.is_empty() {
-                        parties.remove(&guild_id);
-                    }
-                    removed
-                }
-                None => false,
-            }
+            leave_watch_party(&mut parties, guild_id, user_id)
         };
         if left {
             broadcast_watch(state, guild_id);
@@ -2336,6 +2335,22 @@ fn limit_blocks(limit: i32, would_be: usize) -> bool {
 fn unlimited_or(value: i32, min: i32, max: i32) -> bool {
     value == 0 || (min..=max).contains(&value)
 }
+
+// §18.1 설정 상한. **숫자를 호출부에 흩어 두지 않는 이유가 있다.**
+//
+// 검증은 두 라우트(`api_settings` 레거시 전체 저장 · 관리 콘솔 섹션 저장)에서 따로 돈다.
+// 상수가 없으면 한쪽만 조여도 아무도 못 알아채고, 테스트가 `unlimited_or(1_000, 1, 1_000)`
+// 처럼 **경계를 스스로 들고 오는** 모양이 되어 호출부가 100 으로 바뀌어도 초록으로 남는다.
+// 여기 이름을 붙여 두면 테스트가 서버가 실제로 쓰는 값을 가리킬 수 있다.
+/// 1인 대기열 상한. `0` 이면 무제한(§23.1).
+const MAX_QUEUE_PER_USER_CEILING: i32 = 1_000;
+/// 서버 대기열 상한. `0` 이면 무제한.
+const MAX_QUEUE_PER_GUILD_CEILING: i32 = 10_000;
+/// 곡 길이 상한(초) 범위. 아래는 1분, 위는 24시간이다.
+const MAX_TRACK_SECONDS_FLOOR: i32 = 60;
+const MAX_TRACK_SECONDS_CEILING: i32 = 86_400;
+/// 활동 로그 보관일 상한(10년).
+const AUDIT_RETENTION_DAYS_CEILING: i32 = 3650;
 
 /// 길이 상한. `0` 이면 아무 곡이나 담을 수 있다 (§23.1).
 fn track_too_long(max_seconds: i32, track: &TrackRef) -> bool {
@@ -5024,6 +5039,54 @@ fn broadcast_watch(state: &Arc<WebState>, guild_id: u64) {
     emit(state, guild_id, "watch", payload);
 }
 
+/// 같이보기 명단에 한 명을 넣는다. 판이 없으면 **새 판을 연다** (§39).
+///
+/// 돌려주는 값은 "명단이 실제로 바뀌었나" 다. 같은 보고가 두 번 와도 화면이 흔들리지
+/// 않게 하려면 호출한 쪽이 이 값으로 방송을 걸러야 한다.
+///
+/// 새 판의 `id` 는 매번 새로 뽑는다. 세는 번호로 두면 서버가 재시작할 때 1 부터 다시
+/// 시작해서, 탭에 남아 있던 "판 1 은 이미 물어봤다" 가 새로 열린 판 1 의 초대를 삼킨다.
+fn join_watch_party(
+    parties: &mut HashMap<u64, WatchParty>,
+    guild_id: u64,
+    user_id: u64,
+    display_name: &str,
+) -> bool {
+    let party = parties.entry(guild_id).or_insert_with(|| WatchParty {
+        id: crate::models::uuid_like(),
+        started_by: user_id,
+        started_by_display: display_name.to_string(),
+        watchers: HashSet::new(),
+    });
+    party.watchers.insert(user_id)
+}
+
+/// 같이보기 명단에서 한 명을 뺀다. **마지막 사람이 나가면 판 자체가 사라진다** (§39).
+///
+/// 이게 "판이 끝났다" 의 정의다 — 따로 끄는 스위치가 없으므로, 엔트리를 안 지우면
+/// `watchers` 가 빈 유령 판이 영원히 남아서 다음 사람이 합류할 때 옛 `id` 를 물려받는다.
+///
+/// **함수로 뽑아 둔 이유는 부르는 자리가 둘이기 때문이다.** 하나는 사용자가 직접
+/// `나가기` 를 누른 경우(`api_watch`)이고, 하나는 마지막 소켓이 닫힌 경우
+/// (`presence_remove` — 탭을 그냥 닫거나 크래시). 두 자리에 같은 규칙을 손으로 두 번
+/// 쓰면 한쪽만 고쳐지고, 실제로 그렇게 새는 종류의 버그다.
+fn leave_watch_party(
+    parties: &mut HashMap<u64, WatchParty>,
+    guild_id: u64,
+    user_id: u64,
+) -> bool {
+    match parties.get_mut(&guild_id) {
+        Some(party) => {
+            let removed = party.watchers.remove(&user_id);
+            if party.watchers.is_empty() {
+                parties.remove(&guild_id);
+            }
+            removed
+        }
+        None => false,
+    }
+}
+
 /// 같이보기에 들어가고 나간다.
 ///
 /// **시작에만 권한을 본다.** 합류에까지 걸면, `playback` 이 관리자 전용인 서버에서
@@ -5072,25 +5135,10 @@ async fn api_watch(
     let changed = {
         let mut parties = state.watch_parties.lock().unwrap();
         if request.on {
-            let party = parties.entry(guild_id).or_insert_with(|| WatchParty {
-                id: crate::models::uuid_like(),
-                started_by: user_id,
-                started_by_display: ctx.session.display_name.clone(),
-                watchers: HashSet::new(),
-            });
-            party.watchers.insert(user_id)
+            join_watch_party(&mut parties, guild_id, user_id, &ctx.session.display_name)
         } else {
-            match parties.get_mut(&guild_id) {
-                Some(party) => {
-                    let removed = party.watchers.remove(&user_id);
-                    // 마지막 사람이 나가면 판 자체가 사라진다. 이게 "판이 끝났다" 의 정의다.
-                    if party.watchers.is_empty() {
-                        parties.remove(&guild_id);
-                    }
-                    removed
-                }
-                None => false,
-            }
+            // 마지막 사람이 나가면 판 자체가 사라진다. 이게 "판이 끝났다" 의 정의다.
+            leave_watch_party(&mut parties, guild_id, user_id)
         }
     };
 
@@ -7898,10 +7946,14 @@ async fn api_settings(
         || request.default_volume < request.min_volume
         || request.default_volume > request.max_volume
         // §18.1 새 상한 + §23.1 무제한(0). 여기가 막고 있으면 화면에서 아무리 밀어도 안 저장된다.
-        || !unlimited_or(request.max_queue_per_user, 1, 1_000)
-        || !unlimited_or(request.max_queue_per_guild, 1, 10_000)
-        || !unlimited_or(request.max_track_seconds, 60, 86_400)
-        || !unlimited_or(request.audit_retention_days, 1, 3650)
+        || !unlimited_or(request.max_queue_per_user, 1, MAX_QUEUE_PER_USER_CEILING)
+        || !unlimited_or(request.max_queue_per_guild, 1, MAX_QUEUE_PER_GUILD_CEILING)
+        || !unlimited_or(
+            request.max_track_seconds,
+            MAX_TRACK_SECONDS_FLOOR,
+            MAX_TRACK_SECONDS_CEILING,
+        )
+        || !unlimited_or(request.audit_retention_days, 1, AUDIT_RETENTION_DAYS_CEILING)
         || request.configured_role_ids.len() > 50
     {
         return json_error(StatusCode::BAD_REQUEST, "설정 값이 허용 범위를 벗어났어요.");
@@ -8654,10 +8706,16 @@ async fn admin_settings_put(
                 || settings.max_volume > 200
                 || settings.min_volume > settings.max_volume
                 // §18.1 새 상한(1인 1000 / 서버 10000) + §23.1 무제한(0).
-                || !unlimited_or(settings.max_queue_per_user, 1, 1_000)
-                || !unlimited_or(settings.max_queue_per_guild, 1, 10_000)
-                || !unlimited_or(settings.max_track_seconds, 60, 86_400)
-                || !unlimited_or(settings.audit_retention_days, 1, 3650)
+                // 레거시 전체 저장(`api_settings`)과 **같은 상수**를 쓴다 — 두 라우트가
+                // 다른 상한을 들고 있으면 어디서 저장했느냐로 결과가 갈린다.
+                || !unlimited_or(settings.max_queue_per_user, 1, MAX_QUEUE_PER_USER_CEILING)
+                || !unlimited_or(settings.max_queue_per_guild, 1, MAX_QUEUE_PER_GUILD_CEILING)
+                || !unlimited_or(
+                    settings.max_track_seconds,
+                    MAX_TRACK_SECONDS_FLOOR,
+                    MAX_TRACK_SECONDS_CEILING,
+                )
+                || !unlimited_or(settings.audit_retention_days, 1, AUDIT_RETENTION_DAYS_CEILING)
                 || !unlimited_or(settings.chat_retention_days as i32, 1, 365)
             {
                 return json_error(StatusCode::BAD_REQUEST, "허용 범위를 벗어난 값이 있어요.");
@@ -11303,6 +11361,137 @@ async fn seed_dev_guild(state: &WebState, guild_id: u64, user_id: u64) {
 mod tests {
     use super::*;
 
+    /// 이 파일의 소스 자체. **핸들러 안쪽을 지켜야 하는데 부를 수가 없을 때** 쓴다.
+    ///
+    /// 라우트 핸들러는 `authorize`(Discord 왕복) → DB → 브로드캐스트가 한 몸이라
+    /// 단위 테스트에서 부를 수가 없다. 그렇다고 "요청 본문이 파싱된다" 만 확인하면,
+    /// **핸들러가 그 필드를 읽는 줄을 통째로 지워도 초록**이 된다 — 실제로 그런 상태였다.
+    /// 그래서 그 자리에 한해 소스를 읽어 "그 줄이 아직 거기 있는지" 를 본다.
+    ///
+    /// 좋은 방법이 아니라는 것을 안다. 다만 **아무것도 안 보는 것보다는 낫고**,
+    /// 핸들러를 부를 수 있게 리팩터링하면 그때 지우면 된다.
+    fn source() -> &'static str {
+        include_str!("remote.rs")
+    }
+
+    /// `needle` 이 나온 자리부터 **중괄호가 맞물릴 때까지**를 잘라 준다.
+    /// 문자열 리터럴 안의 중괄호는 세지 않는다.
+    fn block_after(needle: &str) -> &'static str {
+        let source = source();
+        let start = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("소스에서 {needle:?} 를 못 찾았어요 — 테스트가 낡았어요"));
+        let bytes = source.as_bytes();
+        let open = start + needle.len() - 1; // needle 은 `{` 로 끝난다
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut index = open;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' if in_string => index += 1,
+                b'"' => in_string = !in_string,
+                b'{' if !in_string => depth += 1,
+                b'}' if !in_string => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open..=index];
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        panic!("{needle:?} 의 블록이 안 닫혀요");
+    }
+
+    /// 한 요청이 실제로 만들어 내는 `AuthContext` 를 그대로 세운다.
+    ///
+    /// **`permission_allowed` 만 부르면 안 되는 이유가 있다.** 최종 판정은 규칙이 아니라
+    /// `AuthContext::allows` 가 내리고, 거기에 등급 게이트(`Viewer` 면 무조건 거부)가 있다.
+    /// 규칙 함수만 검사하면 그 게이트가 사라져도 아무도 못 알아챈다.
+    fn auth_context(tier: AccessTier, member: MemberContext) -> AuthContext {
+        let now = Instant::now();
+        AuthContext {
+            session: RemoteSession {
+                user_id: 42,
+                username: "minsu".into(),
+                display_name: "민수".into(),
+                avatar_url: None,
+                guilds: Vec::new(),
+                access_token: "test-access-token".into(),
+                refresh_token: None,
+                csrf_token: "test-csrf-token".into(),
+                created: now,
+                token_expires: now + Duration::from_secs(3600),
+                is_developer: false,
+            },
+            guild: OAuthGuild {
+                id: 1,
+                name: "테스트 서버".into(),
+                icon: None,
+                owner: false,
+                permissions: 0,
+            },
+            settings: RemoteGuildSettings::default(),
+            member,
+            tier,
+            suspensions: Vec::new(),
+            viewer_reason: None,
+            roles_known: true,
+        }
+    }
+
+    /// 진짜 `WebState` 하나. 임시 폴더에 DB 를 열고 브로드캐스트 채널을 붙인다.
+    ///
+    /// 무겁지만 대안이 없다 — 이벤트를 내보내는 함수들은 전부 `&WebState` 를 받고,
+    /// 손으로 채널만 흉내 내면 **검사하는 것이 그 흉내**가 되어 정작 서버가 어떻게
+    /// 내보내는지는 아무도 안 보게 된다. `emit_skip_vote` 가 정확히 그랬다.
+    fn test_web_state() -> (Arc<WebState>, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "mc-musicbot-remote-test-{}-{}",
+            std::process::id(),
+            crate::models::uuid_like()
+        ));
+        std::fs::create_dir_all(&root).expect("임시 데이터 폴더");
+        let config = crate::config::Config {
+            token: String::new(),
+            register_guild_id: None,
+            bot_owner_user_id: 0,
+            data_root: root.clone(),
+            tools_root: root.join("tools"),
+            yt_dlp_path: "yt-dlp".into(),
+            ffmpeg_path: "ffmpeg".into(),
+            config_dir: root.clone(),
+            portable_root: root.clone(),
+        };
+        let app = App::new(config);
+        let (remote_events, _) = tokio::sync::broadcast::channel(256);
+        let state = Arc::new(WebState {
+            app,
+            password_hash: std::sync::Mutex::new(None),
+            setup_csrf: crate::models::uuid_like(),
+            sessions: std::sync::Mutex::new(HashMap::new()),
+            admin_csrf: std::sync::Mutex::new(HashMap::new()),
+            remote_sessions: std::sync::Mutex::new(HashMap::new()),
+            oauth_states: std::sync::Mutex::new(HashMap::new()),
+            remote_events,
+            remote_auth: std::sync::RwLock::new(RemoteAuthConfig::load(&root)),
+            remote_chat_rate: std::sync::Mutex::new(HashMap::new()),
+            remote_member_roles: std::sync::Mutex::new(HashMap::new()),
+            guild_refresh_at: std::sync::Mutex::new(HashMap::new()),
+            remote_action_rate: std::sync::Mutex::new(HashMap::new()),
+            presence: std::sync::Mutex::new(HashMap::new()),
+            web_listeners: std::sync::Mutex::new(HashSet::new()),
+            watch_parties: std::sync::Mutex::new(HashMap::new()),
+            presence_gate: std::sync::Mutex::new(HashMap::new()),
+            guild_watchers: std::sync::Mutex::new(HashSet::new()),
+            http_client: std::sync::OnceLock::new(),
+            skip_votes: std::sync::Mutex::new(HashMap::new()),
+            stats_cache: std::sync::Mutex::new(HashMap::new()),
+        });
+        (state, root)
+    }
+
     /// **화면이 곡을 돌려보낼 때 길이가 살아남아야 한다.**
     ///
     /// 화면은 검색 결과 객체를 그대로 `/queue` 로 돌려보내고 서버는 그걸 `TrackRef` 로
@@ -11335,49 +11524,96 @@ mod tests {
     }
 
     /* ── 같이보기 명단 (§39) ──
-     * `WebState` 를 통째로 만들지 않고 명단 자료구조만 떼어 검사한다. 판정 규칙이
-     * 여기 다 들어 있고, 이게 틀리면 "마지막 사람이 나가도 판이 안 끝나는" 식으로 샌다. */
-
-    fn party(id: &str, watchers: &[u64]) -> WatchParty {
-        WatchParty {
-            id: id.into(),
-            started_by: watchers.first().copied().unwrap_or(0),
-            started_by_display: "누군가".into(),
-            watchers: watchers.iter().copied().collect(),
-        }
-    }
+     * **서버가 실제로 쓰는 함수를 부른다.** 예전 테스트는 규칙(`watchers` 가 비면 엔트리를
+     * 지운다)을 테스트 본문에 그대로 옮겨 적어 두고, 그 옮겨 적은 것이 도는지를 봤다.
+     * 그건 `std::collections::HashMap` 을 검사한 것이지 이 서버를 검사한 것이 아니라서,
+     * 실제 핸들러에서 정리 코드를 통째로 지워도 초록으로 남았다. 그래서 `join_watch_party`
+     * / `leave_watch_party` 를 직접 부른다 — `api_watch` 와 `presence_remove` 가 부르는
+     * 바로 그 함수다. */
 
     /// **마지막 사람이 나가면 판이 사라진다.** 이게 "판이 끝났다" 의 정의다 —
     /// 따로 끄는 스위치가 없으므로 이 규칙이 무너지면 유령 판이 영원히 남는다.
     #[test]
     fn the_party_ends_when_the_last_watcher_leaves() {
         let mut parties: HashMap<u64, WatchParty> = HashMap::new();
-        parties.insert(1, party("abc", &[100, 200]));
+        assert!(join_watch_party(&mut parties, 1, 100, "민수"));
+        assert!(join_watch_party(&mut parties, 1, 200, "지훈"));
+        assert_eq!(parties.get(&1).map(|p| p.watchers.len()), Some(2));
 
-        // 한 명 나감 — 판은 계속 돈다.
-        let p = parties.get_mut(&1).unwrap();
-        p.watchers.remove(&100);
-        assert!(!p.watchers.is_empty(), "아직 한 명 남았다");
+        // 한 명 나감 — 판은 계속 돈다. 돌려주는 값은 "명단이 실제로 바뀌었나" 다.
+        assert!(leave_watch_party(&mut parties, 1, 100));
+        assert_eq!(
+            parties.get(&1).map(|p| p.watchers.len()),
+            Some(1),
+            "아직 한 명 남았는데 판이 없어졌다"
+        );
 
         // 마지막 한 명 나감 — 엔트리 자체가 사라진다.
-        let p = parties.get_mut(&1).unwrap();
-        p.watchers.remove(&200);
-        if p.watchers.is_empty() {
-            parties.remove(&1);
-        }
-        assert!(parties.get(&1).is_none(), "마지막 사람이 나가면 판이 없어야 한다");
+        assert!(leave_watch_party(&mut parties, 1, 200));
+        assert!(
+            parties.get(&1).is_none(),
+            "마지막 사람이 나갔는데 판이 남았다 — 유령 판이 영원히 산다"
+        );
+
+        // 없는 판·안 들어온 사람은 "안 바뀌었다" 다. 이 값이 true 로 새면
+        // 아무 일도 없는데 `watch` 방송이 나가서 화면이 헛돈다.
+        assert!(!leave_watch_party(&mut parties, 1, 200));
+        assert!(!leave_watch_party(&mut parties, 999, 100));
+        assert!(join_watch_party(&mut parties, 2, 300, "누군가"));
+        assert!(!leave_watch_party(&mut parties, 2, 999));
+        assert!(
+            parties.contains_key(&2),
+            "남의 나가기 보고에 남 판이 지워지면 안 된다"
+        );
+
+        // **부르는 자리가 둘 다 이 함수를 쓰는지**까지 본다. 규칙을 함수로 뽑아 놓고
+        // 한쪽이 옛 코드를 그대로 들고 있으면, 이 테스트가 초록인 채로 그쪽만 샌다.
+        //   ① `api_watch` — 사용자가 `나가기` 를 누른 경우
+        //   ② `presence_remove` — 마지막 소켓이 닫힌 경우(탭을 그냥 닫거나 크래시)
+        let leaves = source().matches(&format!("leave_watch_{}(&mut parties", "party")).count();
+        assert!(
+            leaves >= 2,
+            "같이보기 나가기 규칙을 부르는 자리가 {leaves}곳뿐이에요 — \
+             `api_watch` 와 `presence_remove` 둘 다 같은 함수를 써야 합니다"
+        );
     }
 
     /// 판마다 **다시 안 쓰이는** 표가 붙어야 한다.
     ///
     /// 세는 번호로 두면 서버가 재시작할 때 1 부터 다시 시작하고, 브라우저 탭에 남아 있던
     /// "판 1 은 이미 물어봤다" 가 새로 열린 판 1 의 초대를 삼킨다. 배포마다 벌어진다.
+    ///
+    /// **`uuid_like()` 를 두 번 부르는 것으로는 이걸 못 본다** — 그건 난수 생성기 시험이지
+    /// 같이보기 시험이 아니다. 진짜 확인해야 할 것은 "판이 끝났다가 다시 열리는 한 바퀴"
+    /// 에서 표가 새로 발급되는가이므로, 실제 판을 열고 닫고 다시 연다.
     #[test]
     fn a_new_party_never_reuses_an_old_id() {
-        let first = crate::models::uuid_like();
-        let second = crate::models::uuid_like();
-        assert_ne!(first, second, "판 표가 겹치면 초대가 삼켜져요");
-        assert!(!first.is_empty());
+        let mut parties: HashMap<u64, WatchParty> = HashMap::new();
+
+        join_watch_party(&mut parties, 1, 100, "민수");
+        let first = parties.get(&1).expect("판이 열려야 한다").id.clone();
+        assert!(!first.is_empty(), "표가 비면 클라가 판을 구분하지 못한다");
+
+        // 같은 판에 다른 사람이 합류해도 표는 그대로다 — 여기서 바뀌면
+        // 이미 초대를 거절한 사람에게 초대가 다시 뜬다.
+        join_watch_party(&mut parties, 1, 200, "지훈");
+        assert_eq!(parties.get(&1).unwrap().id, first, "합류가 표를 갈아치웠다");
+
+        // 판이 끝난다 → 같은 길드에서 다시 연다. **여기서 표가 새로 나와야 한다.**
+        leave_watch_party(&mut parties, 1, 100);
+        leave_watch_party(&mut parties, 1, 200);
+        assert!(parties.get(&1).is_none());
+
+        join_watch_party(&mut parties, 1, 300, "다른 사람");
+        let second = parties.get(&1).expect("새 판").id.clone();
+        assert_ne!(
+            second, first,
+            "끝난 판의 표가 되살아났어요 — 탭에 남은 '이미 물어봤다' 가 새 초대를 삼킵니다"
+        );
+
+        // 판을 연 사람도 새로 기록된다. 옛 사람 이름이 남으면 초대 팝업이 거짓말을 한다.
+        assert_eq!(parties.get(&1).unwrap().started_by, 300);
+        assert_eq!(parties.get(&1).unwrap().started_by_display, "다른 사람");
     }
 
     /* ── 가사 제목 씻기 (§41) ──
@@ -11910,9 +12146,16 @@ mod tests {
         assert_eq!(AccessTier::Owner.as_str(), "owner");
     }
 
+    /// **읽기 전용 등급은 규칙이 아무리 헐거워도 아무것도 못 쓴다** (§1.1).
+    ///
+    /// 예전 테스트는 `!AccessTier::Viewer.is_viewer() && permission_allowed(..)` 를
+    /// 테스트 본문에서 다시 계산해 놓고 `assert!(!false)` 를 했다. `&&` 가 왼쪽에서
+    /// 끊기니 `permission_allowed` 는 **한 번도 안 불렸고**, `AuthContext` 는 아예
+    /// 만들어지지도 않았다. 그래서 `AuthContext::allows` 에서 등급 게이트를 지워도,
+    /// 즉 **읽기 전용 사용자가 모든 곳에 쓸 수 있게 되어도** 초록이었다.
+    /// 이제는 진짜 `AuthContext` 를 세우고 서버가 부르는 그 함수를 부른다.
     #[test]
     fn viewer_cannot_write_even_when_rule_is_permissive() {
-        // AuthContext::allows 의 규칙: Viewer면 규칙과 무관하게 false.
         let settings = RemoteGuildSettings::default();
         let member = MemberContext {
             is_admin: false,
@@ -11920,17 +12163,68 @@ mod tests {
             bot_in_voice: true,
             role_ids: Vec::new(),
         };
-        // 규칙 자체는 통과한다.
+        // 규칙 자체는 통과한다 — 막는 것은 규칙이 아니라 등급이라는 뜻이다.
         assert!(permission_allowed(
             "chat",
             PermissionRule::GuildMember,
             &settings,
             &member
         ));
-        // 등급이 Viewer면 최종 판정은 거부다.
-        let viewer_allows = !AccessTier::Viewer.is_viewer()
-            && permission_allowed("chat", PermissionRule::GuildMember, &settings, &member);
-        assert!(!viewer_allows);
+
+        let viewer = auth_context(AccessTier::Viewer, member.clone());
+        let ordinary = auth_context(AccessTier::Member, member.clone());
+        // 제일 헐거운 규칙들. 하나라도 열리면 읽기 전용이라는 말이 거짓이 된다.
+        for (key, rule) in [
+            ("chat", PermissionRule::GuildMember),
+            ("playback", PermissionRule::GuildMember),
+            ("playback", PermissionRule::SameVoiceChannel),
+            ("volume", PermissionRule::GuildMember),
+            ("search", PermissionRule::GuildMember),
+        ] {
+            assert!(
+                !viewer.allows(key, rule),
+                "{key}({rule:?}) 가 읽기 전용에게 열렸어요"
+            );
+            // 같은 규칙이 보통 멤버에게는 열려 있어야 한다. 안 그러면 위 단언이
+            // "규칙이 원래 다 막혀 있어서" 통과한 것일 수도 있다.
+            assert!(
+                ordinary.allows(key, rule),
+                "{key}({rule:?}) 가 멤버에게도 막혔어요 — 위 검사가 의미를 잃습니다"
+            );
+        }
+
+        // **관리자 우회보다도 등급이 먼저다.** 서버 관리자 권한이 붙어 있어도
+        // 읽기 전용으로 강등된 사람(정지·승인 대기 등)은 못 쓴다.
+        let admin_but_viewer = auth_context(
+            AccessTier::Viewer,
+            MemberContext {
+                is_admin: true,
+                same_voice_channel: true,
+                bot_in_voice: true,
+                role_ids: vec![7],
+            },
+        );
+        for rule in [
+            PermissionRule::GuildMember,
+            PermissionRule::SameVoiceChannel,
+            PermissionRule::ConfiguredRole,
+            PermissionRule::Administrator,
+        ] {
+            assert!(
+                !admin_but_viewer.allows("playback", rule),
+                "{rule:?} 에서 관리자 우회가 읽기 전용 게이트를 뚫었어요"
+            );
+        }
+
+        // 거절은 403 이고, 문구도 "권한이 없다" 가 아니라 "읽기 전용" 이어야 한다.
+        // 권한 문제로 말하면 관리자에게 역할을 달라고 하러 가는 헛걸음이 된다.
+        let refused = viewer
+            .require("chat", PermissionRule::GuildMember, "채팅 권한이 없어요.")
+            .expect_err("읽기 전용은 거절돼야 한다");
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        ordinary
+            .require("chat", PermissionRule::GuildMember, "채팅 권한이 없어요.")
+            .expect("멤버는 통과해야 한다");
     }
 
     #[test]
@@ -11970,12 +12264,69 @@ mod tests {
         assert!(match_prefixed("이메일 a@b.com", '@', &candidates).is_empty());
     }
 
+    /// CSRF 토큰 비교기. **정직하게 적어 둔다: 타이밍 성질 자체는 여기서 못 잰다.**
+    ///
+    /// 이 함수가 존재하는 이유는 "같다/다르다" 가 아니라 **비교에 걸리는 시간이
+    /// 입력에 안 새는 것**이다. 그런데 그건 단위 테스트로 확인할 수 없다 — 릴리스
+    /// 최적화·CPU 분기 예측·테스트 러너의 잡음이 전부 나노초 단위로 섞여서, 시간을
+    /// 재는 테스트는 사실상 난수 발생기가 된다(그런 테스트는 CI 에서 깜빡이다가
+    /// 결국 지워진다).
+    ///
+    /// 그래서 두 갈래로 나눠서 지킨다.
+    ///   1. **값 판정**: 첫 바이트가 다를 때와 마지막 바이트가 다를 때가 **둘 다** false 다.
+    ///      한쪽만 보면 "첫 글자만 보고 끊는" 구현도 통과한다.
+    ///   2. **구조**: 함수 본문에 조기 탈출(`return`/`break`)이 길이 검사 하나뿐이고
+    ///      누산이 `|=` 로 돈다는 것을 소스에서 확인한다. 루프 안에 `return false` 를
+    ///      넣는 순간 여기서 걸린다 — 값 판정만으로는 그걸 절대 못 잡는다.
     #[test]
     fn constant_time_compare_still_compares_correctly() {
+        // ── 1. 값 판정 ──
         assert!(constant_time_eq("abcdef", "abcdef"));
-        assert!(!constant_time_eq("abcdef", "abcdeg"));
-        assert!(!constant_time_eq("abc", "abcdef"));
         assert!(constant_time_eq("", ""));
+        // 길이가 같고 **첫 바이트**만 다르다.
+        assert!(!constant_time_eq("abcdef", "zbcdef"));
+        // 길이가 같고 **마지막 바이트**만 다르다. 앞에서 끊는 구현은 여기서 산다.
+        assert!(!constant_time_eq("abcdef", "abcdez"));
+        // 가운데 한 바이트.
+        assert!(!constant_time_eq("abcdef", "abzdef"));
+        // 한 비트만 다른 경우도 XOR 누산에 남아야 한다 ('a'=0x61, '`'=0x60).
+        assert!(!constant_time_eq("aaaaaaaa", "aaaaaaa`"));
+        // 길이가 다르면 방향과 무관하게 false. 접두사여도 통과하면 안 된다.
+        assert!(!constant_time_eq("abc", "abcdef"));
+        assert!(!constant_time_eq("abcdef", "abc"));
+        assert!(!constant_time_eq("", "a"));
+        assert!(!constant_time_eq("a", ""));
+
+        // ── 2. 구조 ──
+        let body = block_after("fn constant_time_eq(left: &str, right: &str) -> bool {");
+        assert_eq!(
+            body.matches("return").count(),
+            1,
+            "조기 반환이 늘었어요. 길이 검사 하나 말고 루프 안에서 빠져나가면 \
+             비교 시간이 '몇 글자까지 맞았는지' 를 그대로 알려 줍니다:\n{body}"
+        );
+        assert!(
+            !body.contains("break"),
+            "루프를 중간에 끊으면 조기 반환과 똑같습니다:\n{body}"
+        );
+        assert!(
+            body.contains("diff |="),
+            "XOR 누산이 사라졌어요 — 이 함수의 존재 이유입니다:\n{body}"
+        );
+
+        // ── 3. 진짜 부르는 자리 ──
+        // 이 함수는 CSRF 검사기다. 배선이 끊기면 위 단언이 전부 초록인데도
+        // 남의 탭이 보낸 POST 가 통과한다.
+        let ctx = auth_context(AccessTier::Member, MemberContext::default());
+        let mut headers = HeaderMap::new();
+        assert!(!verify_csrf(&ctx.session, &headers), "토큰이 없는데 통과했다");
+        headers.insert("x-csrf-token", "wrong-token-samelen".parse().unwrap());
+        assert!(!verify_csrf(&ctx.session, &headers), "틀린 토큰이 통과했다");
+        headers.insert(
+            "x-csrf-token",
+            ctx.session.csrf_token.parse::<HeaderValue>().unwrap(),
+        );
+        assert!(verify_csrf(&ctx.session, &headers), "맞는 토큰이 막혔다");
     }
 
     #[test]
@@ -12007,7 +12358,25 @@ mod tests {
         };
         let value = track_json(&track);
         assert_eq!(value["durationSeconds"], json!(245.0));
-        assert_eq!(value["cacheKey"], json!(track.cache_key()));
+        // **`track.cache_key()` 로 기댓값을 만들면 안 된다.** 양쪽이 같은 함수를 부르니
+        // 형식이 통째로 바뀌어도(`youtube:abc` → `abc@youtube`) 늘 통과한다.
+        // 이 문자열은 화면·DB·보관함이 곡을 가리키는 이름이라 바뀌면 다 어긋난다.
+        assert_eq!(value["cacheKey"], json!("youtube:abc"));
+
+        // 유튜브 뮤직은 유튜브와 **같은 칸**을 쓴다. 안 그러면 같은 곡이 두 곡이 된다.
+        let ytm = TrackRef {
+            provider: ProviderKind::YouTubeMusic,
+            content_id: "ABC".into(),
+            ..track.clone()
+        };
+        assert_eq!(track_json(&ytm)["cacheKey"], json!("youtube:abc"));
+
+        // 변형(가사 없는 판 등)이 있으면 뒤에 붙는다.
+        let variant = TrackRef {
+            variant_key: Some("Live".into()),
+            ..track.clone()
+        };
+        assert_eq!(track_json(&variant)["cacheKey"], json!("youtube:abc:live"));
     }
 
     #[test]
@@ -12032,26 +12401,109 @@ mod tests {
         assert_eq!(host_of(""), "");
     }
 
-    #[test]
-    fn cookie_secure_prefers_the_safe_side() {
-        let mut auth = RemoteAuthConfig {
+    fn auth_config(base_url: &str) -> RemoteAuthConfig {
+        RemoteAuthConfig {
             client_id: None,
             client_secret: None,
-            public_base_url: "https://music.example.com".into(),
+            public_base_url: base_url.into(),
             dev_login: false,
             owner_user_ids: Vec::new(),
             youtube_api_key: None,
-        };
-        assert!(cookie_should_be_secure(&auth, None));
-        auth.public_base_url = "http://localhost:8693".into();
-        assert!(!cookie_should_be_secure(&auth, None));
-        // 프록시가 HTTPS를 종단해도 Secure가 붙어야 한다.
+        }
+    }
+
+    fn forwarded_proto(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        assert!(cookie_should_be_secure(&auth, Some(&headers)));
+        headers.insert("x-forwarded-proto", value.parse().unwrap());
+        headers
+    }
+
+    /// 세션 쿠키의 `Secure` (S7). **모르면 붙이는 쪽**이 기본이다 —
+    /// 안 붙였는데 평문으로 나가면 세션이 통째로 새고, 잘못 붙이면 개발 중에 로그인이
+    /// 안 되는 정도로 끝난다. 두 실수의 무게가 다르다.
+    #[test]
+    fn cookie_secure_prefers_the_safe_side() {
+        let mut auth = auth_config("https://music.example.com");
+        assert!(cookie_should_be_secure(&auth, None));
+
+        auth.public_base_url = "http://localhost:8693".into();
+        assert!(!cookie_should_be_secure(&auth, None), "로컬 평문은 예외다");
+        auth.public_base_url = "http://127.0.0.1:8693".into();
+        assert!(!cookie_should_be_secure(&auth, None));
+        auth.public_base_url = "http://[::1]:8693".into();
+        assert!(!cookie_should_be_secure(&auth, None));
+
         // 정체를 모르는 도메인은 안전한 쪽(Secure)을 기본으로 한다.
         auth.public_base_url = "http://music.example.test".into();
         assert!(cookie_should_be_secure(&auth, None));
+
+        // ── X-Forwarded-Proto ──
+        // 프록시가 HTTPS 를 종단하면 `public_base_url` 은 http 로 보인다.
+        // 그때도 브라우저와의 구간은 HTTPS 라서 Secure 를 붙여야 한다.
+        let local = auth_config("http://localhost:8693");
+        assert!(cookie_should_be_secure(&local, Some(&forwarded_proto("https"))));
+
+        // **대문자로 오는 프록시가 있다.** 헤더 값은 대소문자를 안 가리는 관례라
+        // 그대로 비교하면 nginx 설정 하나에 Secure 가 조용히 빠진다.
+        assert!(cookie_should_be_secure(&local, Some(&forwarded_proto("HTTPS"))));
+        assert!(cookie_should_be_secure(&local, Some(&forwarded_proto("Https"))));
+        // 앞뒤 공백도 마찬가지다.
+        assert!(cookie_should_be_secure(&local, Some(&forwarded_proto("  https  "))));
+
+        // **프록시가 여러 단이면 값이 쉼표로 이어진다** (`client, edge, origin`).
+        // 맨 앞이 브라우저와 맞닿은 구간이므로 거기만 본다. 통째로 비교하면
+        // 프록시를 한 단만 더 끼워도 Secure 가 사라진다.
+        assert!(cookie_should_be_secure(
+            &local,
+            Some(&forwarded_proto("https, http"))
+        ));
+        assert!(cookie_should_be_secure(
+            &local,
+            Some(&forwarded_proto("https,http"))
+        ));
+        // 반대로 브라우저 구간이 평문이면, 안쪽이 https 여도 로컬은 Secure 를 안 붙인다.
+        assert!(!cookie_should_be_secure(
+            &local,
+            Some(&forwarded_proto("http, https"))
+        ));
+        // 다만 정체 모를 공개 도메인이면 그때도 붙인다(안전한 쪽).
+        assert!(cookie_should_be_secure(
+            &auth,
+            Some(&forwarded_proto("http, https"))
+        ));
+
+        // 아무 말도 안 하는 헤더는 헤더가 없는 것과 같다.
+        assert!(!cookie_should_be_secure(&local, Some(&forwarded_proto(""))));
+        assert!(!cookie_should_be_secure(&local, Some(&forwarded_proto("ws"))));
+    }
+
+    /// **알려진 결함 (미수정)**: `http://localhost.attacker.example` 같은
+    /// *localhost 로 시작하는 남의 도메인*이 로컬로 판정돼 `Secure` 가 빠진다.
+    ///
+    /// `cookie_should_be_secure` 가 `starts_with("http://localhost")` 로 보기 때문인데,
+    /// `localhost.attacker.example` · `localhost-evil.test` · `127.0.0.1.nip.io` 가 전부
+    /// 여기에 걸린다. 그러면 그 호스트로 리모컨을 띄웠을 때 세션 쿠키가 평문 구간에
+    /// 실려 나간다 — 바로 이 함수가 막으려고 만들어진 상황이다.
+    ///
+    /// **고치는 것은 이 작업의 범위 밖이라 일부러 두고 `#[ignore]` 로 표시해 둔다.**
+    /// 지금 동작을 단언으로 박아 두면 "고치면 테스트가 깨지는" 자물쇠가 되어 버리고,
+    /// 그냥 지우면 아무도 모르게 된다. 고칠 때 `#[ignore]` 만 떼면 초록이 되는 모양이
+    /// 남겨 둘 수 있는 것 중 제일 정직하다.
+    ///
+    /// 고치는 방법: 호스트를 파싱해 `host == "localhost"` 또는 `host` 가 `localhost:`
+    /// 로 시작하는지로 본다(`127.0.0.1`·`[::1]` 도 같은 식).
+    #[test]
+    fn a_lookalike_localhost_host_must_still_get_secure() {
+        for host in [
+            "http://localhost.attacker.example",
+            "http://localhost-evil.test",
+            "http://127.0.0.1.nip.io",
+        ] {
+            assert!(
+                cookie_should_be_secure(&auth_config(host), None),
+                "{host} 는 로컬이 아닌데 Secure 가 빠졌어요"
+            );
+        }
     }
 
     #[test]
@@ -12103,21 +12555,56 @@ mod tests {
     ///
     /// 예전 코드의 `.or(player_channel)` 이 정확히 이 상황에서 stale 값을 살려 냈다.
     /// 봇이 재시작·연결 끊김·강제 퇴장으로 빠져나가도 화면은 계속 들어가 있다고 말했다.
-    #[test]
-    fn stored_voice_channel_never_revives_a_bot_that_left() {
+    /// **이 테스트의 한계를 먼저 적는다.**
+    ///
+    /// `authoritative_voice_channel` 은 지금 `let _ = stored; cache_says` 다. 즉
+    /// 항등 함수이고, 부르는 자리는 `bot_voice_status_of` 한 곳뿐인데 거기서 `stored` 에
+    /// **리터럴 `None`** 을 넘긴다. 그러니 여기서 `stored` 를 아무리 흔들어도 그건
+    /// "다시 `.or(stored)` 를 넣지 마라" 는 **덫**을 건드리는 것이지, 서버가 실제로
+    /// 하는 판정을 건드리는 게 아니다. 덫으로서는 falsifiable 하다 — 누가
+    /// `cache_says.or(stored)` 로 되돌리면 첫 단언이 깨진다 — 그러나 저장값을 되살리는
+    /// 코드가 **다른 자리**에 생기면 이 테스트는 아무 말도 못 한다.
+    ///
+    /// 그래서 실제로 값이 흘러가는 두 자리를 같이 본다.
+    ///   1. `BotVoiceStatus::in_voice()` — 화면의 `inVoice` 가 되는 값.
+    ///   2. `bot_voice_status_of` — Discord 캐시가 아예 없을 때의 답.
+    #[tokio::test]
+    async fn stored_voice_channel_never_revives_a_bot_that_left() {
+        // ── 덫: 저장값은 어떤 경우에도 결과에 섞이지 않는다 ──
         // 캐시: 없음 / 저장값: 있음 → 결과는 없음이어야 한다.
         assert_eq!(authoritative_voice_channel(None, Some(123)), None);
         // 캐시가 말하면 그게 진실이다. 저장값이 달라도 캐시가 이긴다.
         assert_eq!(authoritative_voice_channel(Some(777), Some(123)), Some(777));
         assert_eq!(authoritative_voice_channel(Some(777), None), Some(777));
+        assert_eq!(authoritative_voice_channel(None, None), None);
 
-        // 그 결과가 `inVoice` 로 그대로 흘러간다.
+        // ── `inVoice` 는 채널이 있느냐로만 갈린다 ──
+        // 길드에 있는 것과 음성에 있는 것은 다르다. 이걸 섞으면
+        // "봇이 서버에 있으니 음성에도 있겠지" 가 되어 B1 이 그대로 재발한다.
         let stale = BotVoiceStatus {
             in_guild: true,
             channel_id: authoritative_voice_channel(None, Some(123)),
             channel_name: None,
         };
         assert!(!stale.in_voice(), "저장값만으로 inVoice 가 켜지면 B1 재발이다");
+        let joined = BotVoiceStatus {
+            in_guild: true,
+            channel_id: Some(777),
+            channel_name: Some("음악방".into()),
+        };
+        assert!(joined.in_voice());
+        // 길드 밖인데 채널만 남은 상태는 있을 수 없지만, 있다면 그건 음성에 없는 것이다.
+        assert!(!BotVoiceStatus::default().in_voice());
+
+        // ── 캐시가 없으면 "모른다" 가 아니라 "없다" 다 ──
+        // Discord 캐시가 안 붙은 상태(기동 직후·토큰 없음)에서 저장값으로 때우면
+        // 화면이 봇을 음성에 있다고 말한다. 진짜 `App` 으로 그 경로를 지나가 본다.
+        let (state, root) = test_web_state();
+        let status = bot_voice_status_of(&state.app, 1);
+        assert!(!status.in_guild, "캐시가 없는데 길드 안이라고 답했다");
+        assert!(!status.in_voice(), "캐시가 없는데 음성에 있다고 답했다");
+        assert_eq!(status.channel_id, None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 봇이 음성에 없으면 `듣는 중`은 **언제나 빈 배열**이다 (§4).
@@ -12317,13 +12804,75 @@ mod tests {
     /// 설정 검증도 `0` 을 통과시켜야 한다. 여기가 막혀 있으면
     /// 화면에서 아무리 `∞` 로 밀어도 저장이 안 된다.
     /// §18.1 새 상한(1인 1000곡 / 서버 10000곡)도 같이 못 박는다.
+    ///
+    /// **경계를 테스트가 인자로 들고 오면 안 된다.** 예전에는
+    /// `unlimited_or(1_000, 1, 1_000)` 처럼 테스트가 `1000` 을 스스로 넣어서,
+    /// 정작 저장 라우트가 `100` 으로 조여져도 이 테스트는 초록이었다. 검사하던 것은
+    /// §18.1 상한이 아니라 `unlimited_or` 의 산수였다. 지금은 서버가 실제로 쓰는
+    /// 상수를 그대로 가리키고, **그 상수의 값 자체**를 따로 못 박는다.
     #[test]
     fn settings_validation_accepts_unlimited_and_the_new_maxima() {
-        assert!(unlimited_or(0, 1, 1_000));
-        assert!(unlimited_or(1_000, 1, 1_000));
-        assert!(!unlimited_or(1_001, 1, 1_000));
-        assert!(unlimited_or(10_000, 1, 10_000));
-        assert!(!unlimited_or(10_001, 1, 10_000));
+        // §18.1 이 정한 숫자. 여기가 바뀌면 사양이 바뀐 것이므로 같이 고쳐야 한다.
+        assert_eq!(MAX_QUEUE_PER_USER_CEILING, 1_000, "1인 대기열 상한이 바뀌었어요");
+        assert_eq!(MAX_QUEUE_PER_GUILD_CEILING, 10_000, "서버 대기열 상한이 바뀌었어요");
+        assert_eq!(MAX_TRACK_SECONDS_FLOOR, 60);
+        assert_eq!(MAX_TRACK_SECONDS_CEILING, 86_400, "24시간");
+        assert_eq!(AUDIT_RETENTION_DAYS_CEILING, 3650, "10년");
+
+        // `0` 은 언제나 무제한이다 (§23.1).
+        assert!(unlimited_or(0, 1, MAX_QUEUE_PER_USER_CEILING));
+        assert!(unlimited_or(0, MAX_TRACK_SECONDS_FLOOR, MAX_TRACK_SECONDS_CEILING));
+        assert!(!unlimited_or(-1, 1, MAX_QUEUE_PER_USER_CEILING), "음수는 무제한이 아니다");
+
+        // 상한 딱 그 값까지 받고, 하나 넘으면 막는다.
+        assert!(unlimited_or(
+            MAX_QUEUE_PER_USER_CEILING,
+            1,
+            MAX_QUEUE_PER_USER_CEILING
+        ));
+        assert!(!unlimited_or(
+            MAX_QUEUE_PER_USER_CEILING + 1,
+            1,
+            MAX_QUEUE_PER_USER_CEILING
+        ));
+        assert!(unlimited_or(
+            MAX_QUEUE_PER_GUILD_CEILING,
+            1,
+            MAX_QUEUE_PER_GUILD_CEILING
+        ));
+        assert!(!unlimited_or(
+            MAX_QUEUE_PER_GUILD_CEILING + 1,
+            1,
+            MAX_QUEUE_PER_GUILD_CEILING
+        ));
+        // 곡 길이는 아래쪽 경계도 있다 — 1초짜리 상한은 설정 실수다.
+        assert!(!unlimited_or(
+            MAX_TRACK_SECONDS_FLOOR - 1,
+            MAX_TRACK_SECONDS_FLOOR,
+            MAX_TRACK_SECONDS_CEILING
+        ));
+
+        // **두 저장 라우트가 정말 이 상수를 쓰는지**까지 본다. 상수만 못 박아 두면
+        // 호출부가 `1, 100` 으로 조여져도 이 테스트는 그대로 초록이다 — 원래 문제가
+        // 정확히 그거였다. 핸들러는 `authorize` 와 한 몸이라 부를 수가 없어서 소스를 본다.
+        //
+        // 찾는 문자열을 `format!` 로 조립하는 것도 이유가 있다. 통짜 리터럴로 두면
+        // **그 리터럴 자신이 이 파일 안에 있으므로** 호출부를 지워도 늘 찾아진다.
+        for (label, subject) in [
+            ("레거시 전체 저장(api_settings)", "request"),
+            ("관리 콘솔 섹션 저장", "settings"),
+        ] {
+            for (field, ceiling) in [
+                ("max_queue_per_user", "MAX_QUEUE_PER_USER"),
+                ("max_queue_per_guild", "MAX_QUEUE_PER_GUILD"),
+            ] {
+                let needle = format!("!unlimited_or({subject}.{field}, 1, {ceiling}_CEILING)");
+                assert!(
+                    source().contains(&needle),
+                    "{label} 의 {field} 가 §18.1 상수를 안 쓰고 숫자를 직접 들고 있어요"
+                );
+            }
+        }
     }
 
     // ══════════════ V3 §10.1 — 점수는 설정값으로 계산한다 ══════════════
@@ -12397,44 +12946,78 @@ mod tests {
     /// 예전에는 누른 사람 기준의 `mine` 을 길드 전체에 뿌려서, A가 ⏭를 누르면
     /// B·C 화면도 "내 표가 들어가 있어요"가 됐다. 그 상태에서 B가 누르면 취소가 나가
     /// A의 표가 빠지고, 정족수에 영영 도달하지 못하는 교착이 됐다.
-    #[test]
-    fn skip_vote_frames_are_personalised_per_recipient() {
-        let (sender, mut receiver) = tokio::sync::broadcast::channel(64);
+    /// 예전 테스트는 `mine:false` · `mine:true` 프레임을 **테스트가 직접 만들어 보내고**
+    /// 그게 돌아오는지를 봤다. 주석에 `emit_skip_vote 와 같은 규칙` 이라고 적혀 있었는데,
+    /// "같은 규칙" 을 손으로 두 번 쓰면 서버 쪽만 틀어져도 아무도 모른다 — 실제로
+    /// `emit_to` 를 `emit` 으로 되돌려도 초록이었다. 그게 §10.5 버그 그 자체다.
+    /// 그래서 진짜 `WebState` 를 세우고 `emit_skip_vote` 를 부른다.
+    #[tokio::test]
+    async fn skip_vote_frames_are_personalised_per_recipient() {
+        let (state, root) = test_web_state();
+        let mut receiver = state.remote_events.subscribe();
         let base = json!({ "have": 1, "need": 2, "pool": 3 });
-        let voters = voter_ids(&[11]);
-        // `emit_skip_vote` 와 같은 규칙 (WebState 없이 채널만 확인).
-        let mut shared = base.clone();
-        shared["mine"] = Value::Bool(false);
-        let _ = sender.send(RemoteEvent {
-            guild_id: 7,
-            topic: "skipvote".into(),
-            data: shared,
-            only_user: None,
-        });
-        for voter in &voters {
-            let mut personal = base.clone();
-            personal["mine"] = Value::Bool(true);
-            let _ = sender.send(RemoteEvent {
-                guild_id: 7,
-                topic: "skipvote".into(),
-                data: personal,
-                only_user: Some(*voter),
-            });
-        }
 
-        let broadcast = receiver.try_recv().unwrap();
-        // 브로드캐스트 프레임은 **누구에게도** `mine:true` 를 말하지 않는다.
+        emit_skip_vote(&state, 7, &base, &voter_ids(&[11]));
+
+        // ① 전체 프레임이 **먼저** 나간다. 클라는 `skipVote` 를 통째로 갈아끼우므로
+        //    순서가 뒤집히면 투표자 화면이 `mine:false` 로 덮여 버린다.
+        let broadcast = receiver.try_recv().expect("전체 프레임이 안 나갔다");
+        assert_eq!(broadcast.topic, "skipvote");
+        assert_eq!(broadcast.guild_id, 7);
+        assert_eq!(
+            broadcast.only_user, None,
+            "전체 프레임에 수신자가 박히면 아무도 못 받는다"
+        );
+        // 누구에게도 `mine:true` 를 말하지 않는다.
         assert_eq!(broadcast.data["mine"], json!(false));
         assert!(broadcast.targets(7, 11));
         assert!(broadcast.targets(7, 22));
+        // 나머지 숫자는 손대지 않고 그대로 실려야 한다.
+        assert_eq!(broadcast.data["have"], json!(1));
+        assert_eq!(broadcast.data["need"], json!(2));
+        assert_eq!(broadcast.data["pool"], json!(3));
 
-        let personal = receiver.try_recv().unwrap();
+        // ② 투표한 사람에게만 가는 개인 프레임.
+        let personal = receiver.try_recv().expect("개인 프레임이 안 나갔다");
+        assert_eq!(personal.topic, "skipvote");
+        assert_eq!(
+            personal.only_user,
+            Some(11),
+            "개인 프레임이 전체로 나가면 §10.5 재발이다 — A가 누르면 B·C 화면도 \
+             '내 표가 들어갔어요' 가 되고, B가 취소하면 A의 표가 빠져 교착이 된다"
+        );
         assert_eq!(personal.data["mine"], json!(true));
-        // 투표한 사람에게만 간다.
         assert!(personal.targets(7, 11));
         assert!(!personal.targets(7, 22));
         // 길드가 다르면 아무에게도 안 간다.
         assert!(!personal.targets(8, 11));
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "투표자가 한 명인데 프레임이 더 나갔다"
+        );
+
+        // 투표자가 여럿이면 사람 수만큼 개인 프레임이 따로 나간다.
+        emit_skip_vote(&state, 7, &base, &voter_ids(&[11, 22, 33]));
+        let shared = receiver.try_recv().expect("전체 프레임");
+        assert_eq!(shared.only_user, None);
+        let mut targeted: Vec<u64> = Vec::new();
+        for _ in 0..3 {
+            let frame = receiver.try_recv().expect("개인 프레임");
+            assert_eq!(frame.data["mine"], json!(true));
+            targeted.push(frame.only_user.expect("수신자가 박혀 있어야 한다"));
+        }
+        targeted.sort_unstable();
+        assert_eq!(targeted, vec![11, 22, 33]);
+        assert!(receiver.try_recv().is_err());
+
+        // 아무도 안 눌렀으면 전체 프레임 하나뿐이다.
+        emit_skip_vote(&state, 7, &base, &HashSet::new());
+        let alone = receiver.try_recv().expect("전체 프레임");
+        assert_eq!(alone.data["mine"], json!(false));
+        assert!(receiver.try_recv().is_err(), "투표자가 없는데 개인 프레임이 나갔다");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 개인화 이벤트는 다른 사람 소켓을 통과하지 못한다 (`library` 도 같은 규칙).
@@ -12489,6 +13072,24 @@ mod tests {
         let remove: QueueActionRequest =
             serde_json::from_value(json!({ "action": "remove", "itemId": "abc" })).unwrap();
         assert_eq!(remove.item_id.as_deref(), Some("abc"));
+
+        // 파싱만 보면 **핸들러가 `clear` 를 아예 안 다뤄도 통과한다.** 대기열 비우기는
+        // 대상 항목이 없는 유일한 작업이라, 항목을 찾는 조회보다 **먼저** 처리하지 않으면
+        // "그 곡을 못 찾았어요" 로 떨어진다. 그 순서를 지키는 자리를 같이 본다.
+        let clear = block_after(&format!("if request.action == \"{}\" {{", "clear"));
+        assert!(
+            clear.contains("clear_queue"),
+            "clear 분기가 대기열을 안 비워요:\n{clear}"
+        );
+        assert!(
+            clear.contains("require_manager"),
+            "대기열 비우기는 관리자 전용이에요 (§18.2(5)):\n{clear}"
+        );
+        // 비운 곡 수가 로그의 `count` 칸에 실려야 `대기열 3곡을 비웠어요` 가 나온다.
+        assert!(
+            clear.contains(&format!("add_audit_{}", "bulk(")),
+            "비운 곡 수를 못 싣는 로그로 바뀌었어요 — 언제나 `1곡` 이 됩니다:\n{clear}"
+        );
     }
 
     // ══════════════ V3 §12.2 — 재생목록에서 곡 빼기 ══════════════
@@ -12514,6 +13115,22 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.entry_index, Some(1));
+
+        // 파싱이 되는 것과 **핸들러가 그 이름을 받는 것**은 다른 이야기다.
+        // 분기가 `removeEntry` 만 알면 화면의 `✕` 는 언제나 400 이 된다.
+        let arm = block_after(&format!("\"removeEntry\" | \"remove{}\" => {{", "Track"));
+        // 세 이름을 다 읽어야 한다 — 번호가 밀렸을 때 `cacheKey` 로 되찾는 길이 없으면
+        // 카드가 5곡만 그리는 사이 목록이 바뀌었을 때 엉뚱한 곡이 지워진다.
+        for field in ["entry_index", "entry_id", "cache_key"] {
+            assert!(
+                arm.contains(&format!("request.{field}")),
+                "{field} 를 안 읽어요 — 화면이 보낸 값이 버려집니다:\n{arm}"
+            );
+        }
+        assert!(
+            arm.contains("remove_playlist_entry"),
+            "곡을 실제로 빼지 않아요:\n{arm}"
+        );
     }
 
     /// **회귀 방지**: `＋ 새로 만들어서 담기` 는 `track` 을 같이 보낸다.
@@ -12532,9 +13149,34 @@ mod tests {
             },
         }))
         .expect("create 요청이 track 과 함께 파싱돼야 한다");
+
+        // `is_some()` 만 보면 곡이 **통째로 뭉개져도** 통과한다. 실제로 담기는 것은
+        // 이 `TrackRef` 이므로 내용까지 본다.
+        let track = request.track.as_ref().expect("track 을 버리면 0곡짜리가 만들어진다");
+        assert_eq!(track.provider, ProviderKind::YouTube);
+        assert_eq!(track.content_id, "abc");
+        assert_eq!(track.source_url, "https://youtu.be/abc");
+        assert_eq!(track.title.as_deref(), Some("테스트"));
+        assert_eq!(track.cache_key(), "youtube:abc");
+
+        // **여기까지는 serde 검사다.** 정작 막으려던 사고는 `create` 분기가 `track` 을
+        // 안 읽는 것이었고, 그건 파싱 테스트로 절대 못 잡는다 — 분기에서
+        // `add_playlist_entry` 블록을 통째로 지워도 위 단언은 전부 초록이다.
+        // 핸들러는 `authorize` 와 한 몸이라 부를 수가 없어서 소스로 확인한다.
+        let arm = block_after(&format!("\"{}\" => {{", "create"));
         assert!(
-            request.track.is_some(),
-            "track 을 버리면 0곡짜리가 만들어진다"
+            arm.contains("request.track"),
+            "create 분기가 track 을 안 읽어요 — 0곡짜리를 만들고 성공 토스트가 뜹니다:\n{arm}"
+        );
+        assert!(
+            arm.contains("add_playlist_entry"),
+            "create 분기가 곡을 안 담아요 — 조용한 실패보다 나쁜 거짓 성공입니다:\n{arm}"
+        );
+        // 담기 전에 길이 상한·차단 규칙을 본다. 이걸 건너뛰면 `＋ 새로 만들어서 담기` 가
+        // 다른 담기 경로의 규칙을 통째로 우회하는 뒷문이 된다.
+        assert!(
+            arm.contains("track_too_long") && arm.contains("is_blocked"),
+            "create 분기가 길이·차단 검사를 건너뛰어요:\n{arm}"
         );
     }
 
@@ -12599,39 +13241,223 @@ mod tests {
 
     // ══════════════ V3 §13.3 — 활동 로그 문장 ══════════════
 
+    /// 이 파일의 감사 로그 호출부에서 **액션명 리터럴**을 전부 긁어낸다.
+    ///
+    /// `audit_ok(state, guild, session, action, ..)` 와
+    /// `add_audit_bulk(guild, user, name, action, ..)` 는 둘 다 액션이 **네 번째 인자**다.
+    /// 인자를 세면서 문자열 리터럴과 `//` 주석을 건너뛴다 — 주석을 안 건너뛰면
+    /// 액션명 위에 붙은 설명이 인자에 딸려 들어와 리터럴로 안 보인다.
+    /// 변수나 `format!` 로 조립하는 자리는 소스만 봐서는 알 수 없으므로 건너뛴다.
+    fn audit_action_literals() -> Vec<String> {
+        // **바늘을 통짜 리터럴로 쓰면 안 된다.** 그 리터럴 자신이 이 파일 안에 있어서
+        // 호출부를 전부 지워도 자기 자신을 찾아내며 통과한다.
+        let needles = [format!("audit_{}", "ok("), format!("add_audit_{}", "bulk(")];
+        let source = source();
+        let bytes = source.as_bytes();
+        let mut found: Vec<String> = Vec::new();
+
+        for needle in &needles {
+            for (at, _) in source.match_indices(needle.as_str()) {
+                let mut index = at + needle.len();
+                let mut depth = 0usize;
+                let mut in_string = false;
+                let mut args: Vec<Vec<u8>> = Vec::new();
+                let mut current: Vec<u8> = Vec::new();
+                while index < bytes.len() && args.len() < 4 {
+                    let byte = bytes[index];
+                    if in_string {
+                        if byte == b'\\' {
+                            current.push(byte);
+                            index += 1;
+                            if index < bytes.len() {
+                                current.push(bytes[index]);
+                                index += 1;
+                            }
+                            continue;
+                        }
+                        current.push(byte);
+                        if byte == b'"' {
+                            in_string = false;
+                        }
+                        index += 1;
+                        continue;
+                    }
+                    match byte {
+                        b'"' => {
+                            in_string = true;
+                            current.push(byte);
+                        }
+                        b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                            while index < bytes.len() && bytes[index] != b'\n' {
+                                index += 1;
+                            }
+                            continue;
+                        }
+                        b'(' | b'[' | b'{' => {
+                            depth += 1;
+                            current.push(byte);
+                        }
+                        b')' | b']' | b'}' => {
+                            if depth == 0 {
+                                args.push(std::mem::take(&mut current));
+                                break;
+                            }
+                            depth -= 1;
+                            current.push(byte);
+                        }
+                        b',' if depth == 0 => args.push(std::mem::take(&mut current)),
+                        _ => current.push(byte),
+                    }
+                    index += 1;
+                }
+                let Some(raw) = args.get(3) else { continue };
+                let arg = String::from_utf8_lossy(raw).trim().to_string();
+                if arg.len() > 2 && arg.starts_with('"') && arg.ends_with('"') {
+                    let action = arg[1..arg.len() - 1].to_string();
+                    if !found.contains(&action) {
+                        found.push(action);
+                    }
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// **아직 사람 문장이 없는 액션들 — 선행 결함이고 여기서 고치지 않는다.**
+    ///
+    /// 문장은 `crates/mc-app/src/remote/models.rs` 의 `audit_text` 에 있고, 이 목록에
+    /// 있는 것들은 전부 마지막 catch-all 로 떨어져 `민수님이 autoplay.reroll 을 했어요`
+    /// 처럼 나간다. 이 파일에서 고칠 수 있는 문제가 아니라 목록으로 남긴다.
+    ///
+    /// **문장을 붙였으면 여기서 그 줄을 지워야 한다.** 안 지우면 아래 테스트가
+    /// "문장이 생겼는데 목록에 남아 있다" 고 알려 준다 — 목록이 조용히 썩는 것을 막는다.
+    /// 사람 말 문장이 아직 없는 감사 동작. **비어 있어야 정상이다.**
+    ///
+    /// 예전에는 11개가 여기 있었고, 그것들이 활동 기록에
+    /// `민수님이 autoplay.reroll 을 했어요` 처럼 기계 문자열로 새어 나갔다.
+    /// 전부 문장을 붙였다. 아래 테스트가 **양방향**이라, 여기에 뭔가를 남겨 두면
+    /// "이미 문장이 있으니 이 줄을 지워라" 로 실패한다.
+    const AUDIT_ACTIONS_WITHOUT_SENTENCES: &[&str] = &[];
+
+    fn audit_sentence(action: &str) -> String {
+        crate::remote::audit_text(action, "민수", Some("아이브 - I AM"), None, Some("on"), 3)
+    }
+
     /// **회귀 방지**: 핸들러가 쓰는 액션명이 `audit_text` 의 이름과 달라지면
     /// 사람 피드에 `민수님이 queue.force_move 을 했어요` 같은 기계 문자열이 나간다.
+    ///
+    /// 예전에는 액션명 넷을 테스트가 손으로 들고 있었다. 그러면 핸들러가
+    /// `queue.pin` 을 `queue.pinToggle` 로 바꿔도 테스트는 옛 이름을 계속 검사해서
+    /// 초록으로 남고, 새 이름이 기계 문자열로 새 나간다 — **막으려던 그 사고가
+    /// 테스트를 그대로 통과한다.** 그래서 액션명을 소스에서 긁어 온다.
     #[test]
     fn audit_actions_used_by_handlers_have_human_sentences() {
-        for action in [
-            "queue.pin",
-            "queue.clear",
-            "autoplay.toggle",
-            "playback.skip.vote",
-        ] {
-            let text = crate::remote::audit_text(
-                action,
-                "민수",
-                Some("아이브 - I AM"),
-                None,
-                Some("on"),
-                3,
+        let actions = audit_action_literals();
+        // 스캐너가 조용히 0건을 돌려주면 이 테스트는 아무 일도 안 하면서 초록이 된다.
+        assert!(
+            actions.len() >= 20,
+            "감사 로그 호출부를 {}건밖에 못 찾았어요 — 스캐너가 낡았어요: {actions:?}",
+            actions.len()
+        );
+        // 눈에 보이는 표지 몇 개. 이것마저 안 잡히면 네 번째 인자 계산이 틀린 것이다.
+        for anchor in ["queue.pin", "queue.clear", "playback.skip.vote"] {
+            assert!(
+                actions.iter().any(|action| action == anchor),
+                "{anchor} 를 못 찾았어요 — 이름이 바뀌었거나 스캐너가 틀렸어요: {actions:?}"
             );
+        }
+
+        for action in &actions {
+            if AUDIT_ACTIONS_WITHOUT_SENTENCES.contains(&action.as_str()) {
+                continue;
+            }
+            let text = audit_sentence(action);
             assert!(
                 !text.contains(action),
                 "{action} 의 문장이 없어서 기계 액션명이 그대로 나가요: {text}"
+            );
+        }
+
+        // 목록이 썩지 않게 양쪽으로 확인한다.
+        for known in AUDIT_ACTIONS_WITHOUT_SENTENCES {
+            assert!(
+                actions.iter().any(|action| action == known),
+                "{known} 는 이제 핸들러가 안 쓰는 이름이에요 — 목록에서 지우세요"
+            );
+            assert!(
+                audit_sentence(known).contains(known),
+                "{known} 에 사람 문장이 생겼어요 — AUDIT_ACTIONS_WITHOUT_SENTENCES 에서 이 줄을 지우세요"
+            );
+        }
+
+        // ── 소스만 봐서는 안 보이는 자리들 ──
+        // 액션명을 코드로 조립하는 호출부가 넷 있다(`&action` · `kind.audit_action()` ·
+        // `format!("playlist.{..}")` · `audit_ok` 정의 자체). 그중 값을 정확히 알 수
+        // 있는 둘은 여기서 직접 확인한다. 나머지(`playback.{request.action}` 계열)는
+        // 런타임 문자열이라 이 테스트가 못 본다 — 솔직히 적어 둔다.
+        for kind in [
+            QueueVoteKind::Like,
+            QueueVoteKind::SuperLike,
+            QueueVoteKind::Dislike,
+        ] {
+            let action = kind.audit_action();
+            assert!(
+                !audit_sentence(action).contains(action),
+                "{action} 의 문장이 없어요"
+            );
+        }
+        // `/control` 의 `autoplay` 만 이름을 갈아 끼운다. 이 리터럴이 사라지면
+        // `playback.autoplay` 로 떨어지는데, 그 이름에도 문장이 있는지 같이 본다.
+        assert!(
+            source().contains(&format!("\"autoplay.{}\".to_string()", "toggle")),
+            "`/control` 의 autoplay 액션명 갈아끼우기가 사라졌어요"
+        );
+        for action in ["autoplay.toggle", "playback.autoplay"] {
+            assert!(
+                !audit_sentence(action).contains(action),
+                "{action} 의 문장이 없어요"
             );
         }
     }
 
     /// **회귀 방지**: 볼륨 로그의 `after` 에 `volume:` 접두사가 섞이면
     /// `서버 볼륨을 volume:150으로 바꿨어요` 가 그대로 사람 피드에 나간다.
+    ///
+    /// 예전 테스트는 `"150%"` 를 넣었다 — **접두사가 애초에 없는 값**이라
+    /// 접두사를 벗기는 코드를 통째로 지워도 통과했다. `POST /control` 이 실제로
+    /// 남기는 값은 `"volume:150"` 처럼 `키:값` 이므로 그 모양을 넣어야 한다.
     #[test]
     fn volume_audit_value_has_no_machine_prefix() {
-        let text =
-            crate::remote::audit_text("playback.volume", "지훈", None, None, Some("150%"), 1);
-        assert!(text.contains("150%"), "{text}");
-        assert!(!text.contains("volume:"), "{text}");
+        let text = crate::remote::audit_text(
+            "playback.volume",
+            "지훈",
+            None,
+            None,
+            // 핸들러가 실제로 남기는 모양 (`키:값`).
+            Some("volume:150%"),
+            1,
+        );
+        assert!(text.contains("150%"), "값이 사라졌어요: {text}");
+        assert!(
+            !text.contains("volume:"),
+            "기계 접두사가 사람 피드에 그대로 나갔어요: {text}"
+        );
+        // 접두사가 없는 값도 그대로 읽혀야 한다 — 두 모양이 다 들어온다.
+        let bare = crate::remote::audit_text("playback.volume", "지훈", None, None, Some("150%"), 1);
+        assert!(bare.contains("150%"), "{bare}");
+        assert!(!bare.contains("volume:"), "{bare}");
+        // 남의 접두사는 안 벗긴다. `repeat:track` 이 볼륨 문장에 들어오는 일은 없지만,
+        // 벗기기가 `키:` 하나만 보는지(아니면 아무 콜론이나 자르는지)는 갈림길이다.
+        let other = crate::remote::audit_text(
+            "playback.volume",
+            "지훈",
+            None,
+            None,
+            Some("mute:on"),
+            1,
+        );
+        assert!(other.contains("mute:on"), "남의 접두사까지 잘렸어요: {other}");
     }
 
     // ───────── 디스코드 명령 그룹 ─────────
@@ -12642,21 +13468,69 @@ mod tests {
     fn command_groups_payload_keeps_its_shape() {
         let payload = command_groups_json();
         let groups = payload.as_array().expect("배열이어야 해요");
-        assert_eq!(groups.len(), crate::commands::catalog::GROUPS.len());
+
+        // **`GROUPS.len()` 과 비교하면 안 된다.** payload 가 `GROUPS` 에서 만들어지므로
+        // 그룹이 통째로 사라져도 양쪽이 같이 줄어 늘 통과한다. 이 키들은 길드 설정에
+        // `disabled_command_groups` 로 **저장돼 있는 값**이라 이름이 바뀌면 저장된 설정이
+        // 조용히 무효가 된다. 그래서 목록 자체를 못 박는다.
+        let keys: Vec<&str> = groups
+            .iter()
+            .filter_map(|group| group.get("key").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "voice",
+                "enqueue",
+                "queueEdit",
+                "playback",
+                "autoplay",
+                "library",
+                "info",
+            ],
+            "명령 그룹 키가 바뀌었어요 — 저장된 `disabled_command_groups` 가 무효가 됩니다"
+        );
+
         for group in groups {
-            for key in ["key", "label", "description", "commands"] {
-                assert!(group.get(key).is_some(), "'{key}' 가 빠졌어요: {group}");
+            for key in ["key", "label", "description"] {
+                let text = group.get(key).and_then(Value::as_str);
+                assert!(
+                    text.is_some_and(|value| !value.trim().is_empty()),
+                    "'{key}' 가 비었어요: {group}"
+                );
             }
             let commands = group.get("commands").and_then(Value::as_array).unwrap();
             assert!(!commands.is_empty(), "빈 그룹: {group}");
             for command in commands {
-                // 화면은 `/play` 가 아니라 `/재생` 을 보여 줘야 한다.
-                assert!(command.get("name").and_then(Value::as_str).is_some());
-                assert!(command.get("korean").and_then(Value::as_str).is_some());
+                let name = command.get("name").and_then(Value::as_str).expect("name");
+                let korean = command.get("korean").and_then(Value::as_str).expect("korean");
+                // **화면은 `/play` 가 아니라 `/재생` 을 보여 줘야 한다.**
+                // `korean` 이 있는지만 보면 안 된다 — `korean_alias` 는 별칭이 없으면
+                // canonical 을 그대로 돌려주므로 **언제나** 값이 있다. 물어야 할 것은
+                // "영문 이름과 다른가" 다.
+                assert_ne!(
+                    korean, name,
+                    "/{name} 에 한국어 별칭이 없어요 — 화면에 영문 명령이 그대로 나갑니다"
+                );
+                assert_ne!(korean, "unknown", "/{name} 이 카탈로그에 없어요");
+                assert!(
+                    korean.chars().any(|c| ('가'..='힣').contains(&c)),
+                    "/{name} 의 한국어 이름이 한글이 아니에요: {korean}"
+                );
             }
         }
-        // 곡 담기 그룹이 실제로 그 이름으로 나가는지 (설정 값이 이 키로 저장된다).
-        assert!(groups.iter().any(|group| group.get("key") == Some(&json!("enqueue"))));
+
+        // 대표 항목 하나는 값까지 못 박는다. 위 검사는 "무언가 한국어" 까지만 본다.
+        let enqueue = groups
+            .iter()
+            .find(|group| group.get("key") == Some(&json!("enqueue")))
+            .expect("곡 담기 그룹");
+        let commands = enqueue.get("commands").and_then(Value::as_array).unwrap();
+        let play = commands
+            .iter()
+            .find(|command| command.get("name") == Some(&json!("play")))
+            .expect("/play 가 곡 담기 그룹에 있어야 한다");
+        assert_eq!(play.get("korean"), Some(&json!("재생")));
     }
 
     // ───────── 봇 주인 전역 강제값 ─────────
@@ -12744,11 +13618,38 @@ mod tests {
         assert_eq!(payload["lockedKeys"], json!(["maxQueuePerUser"]));
         assert_eq!(payload["values"]["maxQueuePerUser"], json!(3));
         assert_eq!(payload["labels"]["maxQueuePerUser"], json!("1인 대기열 수"));
-        assert!(payload["reason"].as_str().is_some_and(|s| !s.is_empty()));
-        assert!(
-            payload["lockableKeys"]
-                .as_array()
-                .is_some_and(|keys| keys.len() == GlobalOverrides::LOCKABLE_KEYS.len())
+
+        // **`reason` 은 `&'static str` 상수라 `is_empty` 검사가 절대 실패하지 않는다.**
+        // 화면은 이 문장을 자물쇠 옆에 그대로 띄운다 — 문구가 바뀌면 사람이 읽는 화면이
+        // 바뀌는 것이므로 여기서 알아야 한다.
+        assert_eq!(
+            payload["reason"],
+            json!("봇 주인이 이 항목을 모든 서버에 같은 값으로 걸어 뒀어요. 서버에서는 바꿀 수 없어요.")
+        );
+
+        // **`LOCKABLE_KEYS.len()` 과 비교하면 안 된다.** payload 가 그 상수를 그대로
+        // 싣기 때문에 항목이 통째로 사라져도 양쪽이 같이 줄어 늘 통과한다.
+        // 봇 주인 화면은 이 배열로 줄을 그리므로 목록 자체를 못 박는다.
+        assert_eq!(
+            payload["lockableKeys"],
+            json!([
+                "maxQueuePerUser",
+                "maxQueuePerGuild",
+                "maxTrackSeconds",
+                "bulkEnqueueLimit",
+                "chartLimit",
+                "autoplaySeedMax",
+                "auditRetentionDays",
+                "chatRetentionDays",
+                "maxVolume",
+                "superLikeCooldownSec",
+                "superLikeDailyLimit",
+                "publicNowPlaying",
+                "chatEnabled",
+                "suggestionEnabled",
+                "visualizerEnabled",
+            ]),
+            "강제할 수 있는 항목이 바뀌었어요 — 봇 주인 화면의 줄이 통째로 달라집니다"
         );
         // 강제값이 없으면 빈 목록이다 — 화면은 자물쇠를 하나도 안 그린다.
         let empty = overrides_json(&GlobalOverrides::default());

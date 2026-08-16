@@ -144,62 +144,318 @@ pub async fn serve_manifest(headers: HeaderMap) -> Response {
 
 #[cfg(test)]
 mod tests {
+    //! ## 왜 전부 핸들러를 통과시키나
+    //!
+    //! 예전 테스트 셋은 `(assets().get)(name)` 만 불렀다. 그건 이 파일의 코드가 아니라
+    //! `mc-assets::get` 이고, 그쪽 크레이트에 **같은 이름의 같은 테스트가 이미 있다.**
+    //! 그래서 `serve_asset`·`serve_service_worker`·`serve_manifest`·`respond`·`etag_of`·
+    //! `short_hex` 를 통째로 지워도 이 파일의 테스트는 전부 초록이었다 — 304 재검증도,
+    //! 404 갈래도, `nosniff` 도 아무도 안 보고 있었다.
+    //!
+    //! 그래서 여기서는 **핸들러를 실제로 부른다.** 핸들러가 `async fn` 이라 `#[tokio::test]`
+    //! 가 필요하고, 추출자(`Path`·`Query`·`HeaderMap`)는 손으로 만든다. axum 라우터를
+    //! 세우지 않는 이유는 그러면 검사하는 것이 라우팅 표가 되어 버려서, 정작 이 파일의
+    //! 응답 조립 코드가 다시 사각지대로 들어가기 때문이다.
+
     use super::*;
     use crate::assets_di::install_test_assets;
+    use axum::http::Request;
 
-    #[test]
-    fn every_known_asset_resolves() {
-        install_test_assets();
-        for name in [
-            "tokens.css",
-            "portal.css",
-            "console.css",
-            "apidoc.css",
-            "core.js",
-            "portal.js",
-            "console.js",
+    /// 자산 이름 → 이 서버가 약속한 MIME. **화면이 이 값으로 동작이 갈린다** —
+    /// `text/javascript` 가 아니면 브라우저가 ES 모듈을 아예 실행하지 않는다.
+    const EXPECTED: &[(&str, &str)] = &[
+        ("tokens.css", "text/css; charset=utf-8"),
+        ("portal.css", "text/css; charset=utf-8"),
+        ("console.css", "text/css; charset=utf-8"),
+        ("apidoc.css", "text/css; charset=utf-8"),
+        ("core.js", "text/javascript; charset=utf-8"),
+        ("portal.js", "text/javascript; charset=utf-8"),
+        ("console.js", "text/javascript; charset=utf-8"),
+        (
             "manifest.webmanifest",
-            "favicon.svg",
-            "icon-192.png",
-            "icon-512.png",
-            "icon-180.png",
+            "application/manifest+json; charset=utf-8",
+        ),
+        ("favicon.svg", "image/svg+xml; charset=utf-8"),
+        ("icon-192.png", "image/png"),
+        ("icon-512.png", "image/png"),
+        ("icon-180.png", "image/png"),
+    ];
+
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    /// `?v=abc` 같은 질의 문자열을 실제 요청과 **같은 경로로** 판다.
+    /// 손으로 `HashMap` 을 채우면 추출자가 안 쓰이므로, 라우팅이 주는 것과
+    /// 다른 모양을 넣어도 아무도 못 잡는다.
+    fn query_of(raw: &str) -> Query<HashMap<String, String>> {
+        let uri = format!("http://x/music/assets/x{raw}");
+        let request = Request::builder().uri(uri).body(()).unwrap();
+        let (parts, ()) = request.into_parts();
+        Query::try_from_uri(&parts.uri).expect("질의 문자열을 읽을 수 있어야 한다")
+    }
+
+    async fn body_bytes(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("본문을 읽을 수 있어야 한다")
+            .to_vec()
+    }
+
+    fn header_of(response: &Response, name: header::HeaderName) -> Option<String> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// 등록된 자산은 **200 + 본문 + 제 MIME + `nosniff`** 로 나간다.
+    ///
+    /// `nosniff` 가 빠지면 브라우저가 내용을 보고 타입을 추측한다. 사용자가 올린 것이
+    /// 섞이지 않는 자산이라도, 추측이 한 번 어긋나면 CSS 가 HTML 로 읽혀 화면이
+    /// 통째로 안 그려진다. 헤더 한 줄이라 조용히 사라지기 딱 좋아서 여기서 못 박는다.
+    #[tokio::test]
+    async fn every_known_asset_is_served_with_its_type_and_nosniff() {
+        install_test_assets();
+        for (name, mime) in EXPECTED {
+            let response =
+                serve_asset(Path((*name).to_string()), query_of(""), HeaderMap::new()).await;
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            assert_eq!(
+                header_of(&response, header::CONTENT_TYPE).as_deref(),
+                Some(*mime),
+                "{name} 의 MIME 이 달라졌다"
+            );
+            assert_eq!(
+                header_of(&response, header::X_CONTENT_TYPE_OPTIONS).as_deref(),
+                Some("nosniff"),
+                "{name} 에 nosniff 가 없다"
+            );
+            // `?v=` 없이 온 요청은 매번 재검증이다 (`portal.js` 가 정적 import 하는 `core.js`).
+            assert_eq!(
+                header_of(&response, header::CACHE_CONTROL).as_deref(),
+                Some("no-cache"),
+                "{name}"
+            );
+            let etag = header_of(&response, header::ETAG).expect("ETag 가 있어야 한다");
+            // `"` 로 감싼 16자리 hex — 따옴표를 빼먹으면 브라우저가 ETag 로 안 읽는다.
+            assert_eq!(etag.len(), 18, "{name} 의 ETag 모양이 다르다: {etag}");
+            assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+            assert!(
+                etag[1..17].chars().all(|c| c.is_ascii_hexdigit()),
+                "{etag}"
+            );
+
+            let body = body_bytes(response).await;
+            assert!(!body.is_empty(), "{name} 이 빈 본문으로 나갔다");
+            if name.ends_with(".png") {
+                assert!(body.starts_with(b"\x89PNG"), "{name} 이 PNG 가 아니다");
+            } else {
+                // `is_empty` 가 아니라 `trim`. 공백만 든 자산도 잡아야 한다.
+                let text = std::str::from_utf8(&body).expect("텍스트 자산");
+                assert!(!text.trim().is_empty(), "{name} 이 비었다");
+            }
+        }
+    }
+
+    /// 자산은 **파일 읽기가 아니라 화이트리스트 조회**다. 없는 이름은 404 로 끝난다.
+    /// 여기가 파일 시스템을 건드리게 되는 순간 `../../` 이 통하는 서버가 된다.
+    #[tokio::test]
+    async fn an_unknown_name_is_a_404_and_never_a_file_read() {
+        install_test_assets();
+        for name in ["../../secret.txt", "portal.js.map", "", "core.js "] {
+            let response =
+                serve_asset(Path(name.to_string()), query_of(""), HeaderMap::new()).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{name:?}");
+            // 404 는 자산 응답 조립을 아예 안 탄다 — ETag 를 붙이면 없는 것을 캐시하게 된다.
+            assert!(header_of(&response, header::ETAG).is_none(), "{name:?}");
+        }
+    }
+
+    /// **재검증은 본문을 안 보낸다.** 자산 열두 개가 매 새로고침마다 통째로 다시 나가면
+    /// 리모컨은 열 때마다 수백 KB 를 다시 받는다. 그 절약이 실제로 도는지 확인한다.
+    #[tokio::test]
+    async fn a_matching_if_none_match_earns_a_304_with_no_body() {
+        install_test_assets();
+        let first = serve_asset(
+            Path("core.js".to_string()),
+            query_of(""),
+            HeaderMap::new(),
+        )
+        .await;
+        let etag = header_of(&first, header::ETAG).expect("ETag");
+        let full = body_bytes(first).await;
+        assert!(!full.is_empty());
+
+        // 같은 ETag 로 다시 물으면 304 + 빈 본문.
+        let again = serve_asset(
+            Path("core.js".to_string()),
+            query_of(""),
+            headers_with(&[("if-none-match", &etag)]),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(header_of(&again, header::ETAG).as_deref(), Some(&*etag));
+        assert_eq!(
+            header_of(&again, header::CACHE_CONTROL).as_deref(),
+            Some("no-cache")
+        );
+        assert!(body_bytes(again).await.is_empty(), "304 에 본문이 실렸다");
+
+        // 브라우저는 캐시에 여러 판이 있으면 **쉼표로 이어 붙여** 보낸다.
+        // 목록을 통째로 한 값으로 비교하면 이 흔한 경우가 영원히 200 이 된다.
+        let listed = serve_asset(
+            Path("core.js".to_string()),
+            query_of(""),
+            headers_with(&[("if-none-match", &format!("\"0000000000000000\", {etag}"))]),
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::NOT_MODIFIED);
+
+        // 남의 ETag 면 당연히 본문을 보낸다.
+        let stale = serve_asset(
+            Path("core.js".to_string()),
+            query_of(""),
+            headers_with(&[("if-none-match", "\"0000000000000000\"")]),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::OK);
+        assert_eq!(body_bytes(stale).await, full);
+
+        // 자산이 다르면 ETag 도 달라야 한다 — 같으면 한쪽이 영원히 갱신되지 않는다.
+        let other = serve_asset(
+            Path("portal.js".to_string()),
+            query_of(""),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_ne!(header_of(&other, header::ETAG).as_deref(), Some(&*etag));
+    }
+
+    /// 서비스워커와 매니페스트는 **전용 경로**로 나간다. 스코프가 경로에서 파생되므로
+    /// `sw.js` 가 하위 디렉터리로 내려가면 `/music/*` 를 제어하지 못한다.
+    /// 둘 다 절대 immutable 이 아니다 — 갱신을 못 받으면 앱이 옛 판에 갇힌다.
+    #[tokio::test]
+    async fn the_service_worker_and_manifest_have_their_own_routes() {
+        install_test_assets();
+        for (label, response) in [
+            ("sw.js", serve_service_worker(HeaderMap::new()).await),
+            ("manifest", serve_manifest(HeaderMap::new()).await),
         ] {
-            assert!((assets().get)(name).is_some(), "{name} 자산이 등록되지 않았다");
+            assert_eq!(response.status(), StatusCode::OK, "{label}");
+            assert_eq!(
+                header_of(&response, header::CACHE_CONTROL).as_deref(),
+                Some("no-cache"),
+                "{label} 에 영구 캐시가 걸리면 앱이 옛 판에 갇힌다"
+            );
+            assert_eq!(
+                header_of(&response, header::X_CONTENT_TYPE_OPTIONS).as_deref(),
+                Some("nosniff"),
+                "{label}"
+            );
+            assert!(!body_bytes(response).await.is_empty(), "{label} 이 비었다");
         }
+
+        let sw = serve_service_worker(HeaderMap::new()).await;
+        assert_eq!(
+            header_of(&sw, header::CONTENT_TYPE).as_deref(),
+            Some("text/javascript; charset=utf-8")
+        );
+        let etag = header_of(&sw, header::ETAG).expect("ETag");
+        let revalidated = serve_service_worker(headers_with(&[("if-none-match", &etag)])).await;
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+
+        let manifest = serve_manifest(HeaderMap::new()).await;
+        assert_eq!(
+            header_of(&manifest, header::CONTENT_TYPE).as_deref(),
+            Some("application/manifest+json; charset=utf-8")
+        );
+        let etag = header_of(&manifest, header::ETAG).expect("ETag");
+        let revalidated = serve_manifest(headers_with(&[("if-none-match", &etag)])).await;
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
     }
 
-    #[test]
-    fn unknown_asset_is_rejected() {
-        install_test_assets();
-        assert!((assets().get)("../../secret.txt").is_none());
-        assert!((assets().get)("portal.js.map").is_none());
-        assert!((assets().get)("").is_none());
-    }
-
-    #[test]
-    fn assets_are_not_empty() {
-        install_test_assets();
-        for name in ["core.js", "portal.js", "portal.css", "console.js", "apidoc.css"] {
-            let (body, _) = (assets().get)(name).expect("등록된 자산");
-            // `is_empty` 가 아니라 `trim`. 공백만 든 자산도 잡아야 한다 (이사 전 단언).
-            let text = std::str::from_utf8(body).expect("텍스트 자산");
-            assert!(!text.trim().is_empty(), "{name} 이 비었다");
-        }
-        assert!((assets().get)("icon-192.png").unwrap().0.starts_with(b"\x89PNG"));
-        assert!((assets().get)("icon-512.png").unwrap().0.starts_with(b"\x89PNG"));
-    }
-
-    /// `?v=` 가 현재 버전과 정확히 같을 때만 영구 캐시를 준다.
-    /// 이게 틀어지면 `core.js` 가 브라우저에 영원히 박힌다.
+    /// `?v=` 가 현재 버전과 **정확히** 같을 때만 영구 캐시를 준다.
+    ///
+    /// 예전 단언은 `cache_policy(Some(version()))` 이 immutable 이라는 것뿐이었는데,
+    /// 그건 `version()` 이 `""` 를 돌려줘도 통과한다 — 그러면 `?v=` 가 비어 오는
+    /// 정적 import 요청까지 1년 immutable 을 받아서 `core.js` 가 브라우저에 영원히 박힌다.
+    /// 그래서 **버전 문자열 자체의 모양**을 먼저 못 박고, 빈 값·앞자리만 같은 값·
+    /// 남의 값이 전부 재검증으로 떨어지는지를 본다.
+    ///
+    /// 해시 리터럴을 그대로 박지 않는 이유: 이 값은 자산 열세 개의 내용 해시라
+    /// CSS 한 줄만 고쳐도 바뀐다. 그 리터럴을 박으면 이 저장소에서 제일 잦은 작업이
+    /// 매번 테스트를 깨뜨리고, 결국 아무 생각 없이 갱신하는 줄이 된다.
     #[test]
     fn only_an_exact_version_query_earns_immutable() {
         install_test_assets();
         let current = version();
-        assert_eq!(
-            cache_policy(Some(current)),
-            "public, max-age=31536000, immutable"
+        // SHA-256 앞 16자리 hex. 빈 문자열·짧은 값이면 여기서 걸린다.
+        assert_eq!(current.len(), 16, "자산 버전 모양이 달라졌다: {current:?}");
+        assert!(
+            current.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "자산 버전은 소문자 hex 여야 한다: {current}"
         );
+
+        const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+        assert_eq!(cache_policy(Some(current)), IMMUTABLE);
         assert_eq!(cache_policy(None), "no-cache");
         assert_eq!(cache_policy(Some("deadbeef")), "no-cache");
+        // 빈 `?v=` — `portal.js` 가 `./core.js` 를 정적 import 할 때 실제로 이렇게 온다.
+        assert_eq!(cache_policy(Some("")), "no-cache");
+        // 앞자리만 같은 값도 안 된다. 접두사 비교로 느슨해지면 옛 판이 영구 캐시된다.
+        assert_eq!(cache_policy(Some(&current[..8])), "no-cache");
+        assert_eq!(cache_policy(Some(&format!("{current}x"))), "no-cache");
+    }
+
+    /// 정책이 **응답 헤더까지** 그대로 흘러가는지. `cache_policy` 만 맞고 배선이 끊기면
+    /// 단위 테스트는 초록인데 브라우저는 아무것도 캐시하지 않는다.
+    #[tokio::test]
+    async fn the_cache_policy_reaches_the_response() {
+        install_test_assets();
+        let hit = serve_asset(
+            Path("core.js".to_string()),
+            query_of(&format!("?v={}", version())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(
+            header_of(&hit, header::CACHE_CONTROL).as_deref(),
+            Some("public, max-age=31536000, immutable")
+        );
+
+        let miss = serve_asset(
+            Path("core.js".to_string()),
+            query_of("?v=deadbeef"),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(
+            header_of(&miss, header::CACHE_CONTROL).as_deref(),
+            Some("no-cache")
+        );
+
+        // 304 로 떨어져도 캐시 정책은 같이 나가야 한다. 안 그러면 브라우저가
+        // 재검증 뒤에 정책을 잃고 다음 번에 또 통째로 받아 간다.
+        let etag = header_of(&hit, header::ETAG).expect("ETag");
+        let revalidated = serve_asset(
+            Path("core.js".to_string()),
+            query_of(&format!("?v={}", version())),
+            headers_with(&[("if-none-match", &etag)]),
+        )
+        .await;
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            header_of(&revalidated, header::CACHE_CONTROL).as_deref(),
+            Some("public, max-age=31536000, immutable")
+        );
     }
 }

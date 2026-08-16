@@ -607,6 +607,29 @@ mod tests {
         }
     }
 
+    /// **네트워크를 안 타는 진짜 엔진.** 후보를 거르는 `weigh` 가 만지는 바깥 세계는
+    /// 차단 규칙 조회와 로그 두 개뿐이다 — `ytdlp` 는 후보를 *모을 때*만 쓰이므로
+    /// 실행 파일이 없어도 상관없다. 그래서 빈 임시 DB 와 임시 로그 폴더만 있으면
+    /// 규칙이 실제로 사는 자리에서 검사할 수 있다 (`manager.rs` 의 `temp_player` 와 같은 방식).
+    fn temp_engine(tag: &str) -> (AutoplayEngine, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "macham-autoplay-{tag}-{}",
+            crate::models::uuid_like()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Arc::new(crate::db::Db::open(&root.join("musicbot.sqlite")).unwrap());
+        let engine = AutoplayEngine {
+            ytdlp: YtDlp {
+                exe: "yt-dlp".into(),
+                browser_profile: String::new(),
+                cookie_file: None,
+            },
+            blacklist: Arc::new(Blacklist::new(db)),
+            log: Arc::new(LogService::new(root.join("logs"))),
+        };
+        (engine, root)
+    }
+
     /// 커서는 길드마다 따로 돈다. 다른 테스트와 겹치지 않게 전용 길드 id를 쓴다.
     #[test]
     fn seed_cursor_rotates_per_guild() {
@@ -617,8 +640,19 @@ mod tests {
         assert_eq!(next_seed_index(b, 2), 0);
         assert_eq!(next_seed_index(b, 2), 1);
         assert_eq!(next_seed_index(b, 2), 0);
-        // 곡 수가 줄어도 인덱스가 범위를 벗어나지 않는다.
-        assert!(next_seed_index(a, 1) < 1);
+        /* 곡 수가 줄어도 인덱스가 범위를 벗어나지 않는다.
+         *
+         * 예전에는 `assert!(next_seed_index(a, 1) < 1)` 이었는데, 길이가 1이면 무엇을
+         * 돌려주든 `x % 1 == 0` 이라 **참일 수밖에 없는** 단언이었다. 실제로 위험한 건
+         * 기준 곡을 지워서 목록이 짧아졌을 때 커서가 옛 길이대로 남아 있는 경우다 —
+         * 그때 남은 곡 수로 다시 접지 않으면 `seeds[index]` 가 그 자리에서 터진다. */
+        let c = 900_104;
+        assert_eq!(next_seed_index(c, 3), 0);
+        assert_eq!(next_seed_index(c, 3), 1);
+        // 여기서 커서는 2 — 그런데 기준 곡이 2곡으로 줄었다.
+        assert_eq!(next_seed_index(c, 2), 0, "짧아진 길이로 다시 접어야 한다");
+        assert_eq!(next_seed_index(c, 2), 1, "접은 뒤에도 그대로 돌아간다");
+        // 목록이 통째로 비면 뽑을 것이 없으니 0 (호출부가 빈 목록을 먼저 걸러낸다).
         assert_eq!(next_seed_index(a, 0), 0);
     }
 
@@ -643,8 +677,17 @@ mod tests {
         assert_eq!(index, None);
         assert_eq!(chosen.content_id, "현재곡");
 
-        // 아직 아무 곡도 안 튼 서버라도 기준 곡만 있으면 추천을 시작할 수 있다.
-        assert!(pick_seed(guild, None, &seeds).is_some());
+        /* 아직 아무 곡도 안 튼 서버라도 기준 곡만 있으면 추천을 시작할 수 있다.
+         *
+         * `is_some()` 만 보면 안 된다 — 기준 곡이 비어 있지 않은 한 **무조건 참**이라,
+         * 라운드로빈이 통째로 죽어서 늘 첫 곡만 돌려줘도 통과한다. 어떤 곡을 집었는지와
+         * 다음 호출이 다음 곡으로 넘어가는지까지 봐야 규칙을 지킨다. */
+        let (index, chosen) = pick_seed(guild, None, &seeds).unwrap();
+        assert_eq!(index, Some(1), "참고할 곡이 없어도 커서는 이어서 돈다");
+        assert_eq!(chosen.content_id, "기준2");
+        let (index, chosen) = pick_seed(guild, None, &seeds).unwrap();
+        assert_eq!(index, Some(0), "다음 호출은 다음 기준 곡이다");
+        assert_eq!(chosen.content_id, "기준1");
         // 둘 다 없으면 이번 추천은 건너뛴다.
         assert!(pick_seed(guild, None, &[]).is_none());
     }
@@ -676,7 +719,9 @@ mod tests {
     fn recent_history_fades_instead_of_banning_forever() {
         assert_eq!(decay_factor(None, 24), 1.0);
         assert_eq!(decay_factor(Some(0.0), 24), 0.0);
-        assert!(decay_factor(Some(6.0), 24) - 0.25 < 1e-9);
+        // **`.abs()` 가 빠지면 안 된다.** `x - 0.25 < 1e-9` 는 0.0 이든 음수든 다 통과해서
+        // 감쇠가 통째로 죽어도 초록불이 켜진다 — 부동소수 비교는 반드시 양쪽으로 재야 한다.
+        assert!((decay_factor(Some(6.0), 24) - 0.25).abs() < 1e-9);
         assert_eq!(decay_factor(Some(24.0), 24), 1.0);
         assert_eq!(decay_factor(Some(100.0), 24), 1.0);
         // 감쇠를 끄면 옛 동작 — 최근 목록에 있으면 그냥 제외.
@@ -718,14 +763,62 @@ mod tests {
     }
 
     /// 아티스트 쿨다운은 **최근 N곡 안**의 가수만 막는다. N을 넘어선 가수는 다시 나올 수 있다.
+    ///
+    /// **규칙이 사는 자리(`AutoplayEngine::weigh`)를 직접 돌린다.** 예전 이 테스트는 자기 손으로
+    /// `recent.iter().take(2)` 집합을 만들고 그 집합에만 물어봤다 — `weigh` 에서 쿨다운을 통째로
+    /// 지워도 초록불이 켜지는, 아무것도 지키지 못하는 테스트였다. 규칙을 두 번 적는 순간
+    /// 테스트는 자기 복사본만 검사하게 된다.
     #[test]
     fn artist_cooldown_only_covers_the_recent_window() {
+        let (engine, root) = temp_engine("cooldown");
+        let guild_id = 900_201u64;
+        // 최신순(소문자 정규화 완료). 쿨다운이 2면 앞의 둘만 막힌다.
         let recent = ["아이브".to_string(), "뉴진스".to_string(), "에스파".to_string()];
-        let blocked: HashSet<&str> = recent.iter().take(2).map(String::as_str).collect();
-        assert!(blocked.contains(artist_key(&track_by("a", "아이브")).unwrap().as_str()));
-        assert!(blocked.contains(artist_key(&track_by("b", " 뉴진스 ")).unwrap().as_str()));
-        assert!(!blocked.contains(artist_key(&track_by("c", "에스파")).unwrap().as_str()));
-        // 아티스트가 없는 곡은 쿨다운에 걸리지 않는다.
-        assert!(artist_key(&track("d")).is_none());
+        let candidates = vec![
+            track_by("a", "아이브"),
+            // 공백·대소문자가 달라도 같은 가수다 — `artist_key` 가 다듬어서 비교한다.
+            track_by("b", " 뉴진스 "),
+            track_by("c", "에스파"),
+            // 아티스트가 아예 없는 곡은 쿨다운이 잡을 근거가 없다.
+            track("d"),
+        ];
+        let (excluded, blocked, ages) = (HashSet::new(), HashSet::new(), HashMap::new());
+        let ctx = AutoplayContext {
+            excluded: &excluded,
+            blocked: &blocked,
+            recent_ages: &ages,
+            recent_artists: &recent,
+            tuning: AutoplayTuning {
+                artist_cooldown: 2,
+                ..AutoplayTuning::default()
+            },
+        };
+        let survivors = |ctx: &AutoplayContext<'_>, relax| -> Vec<usize> {
+            engine
+                .weigh(guild_id, &candidates, ctx, AutoplayPolicy::Balanced, relax)
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect()
+        };
+
+        assert_eq!(
+            survivors(&ctx, Relax::None),
+            vec![2, 3],
+            "창(2곡) 안의 가수만 빠지고, 창 밖 가수와 무명 곡은 남아야 한다"
+        );
+        // 다 걸러져서 빈손이 되면 쿨다운부터 푼다 (§8.5-4). 그때는 아무도 안 막힌다.
+        assert_eq!(survivors(&ctx, Relax::NoArtistCooldown), vec![0, 1, 2, 3]);
+
+        // 횟수 계열의 `0` 은 "끔"이다 (§23.1) — 막을 곡 수가 0이면 아무도 안 막는다.
+        let off = AutoplayContext {
+            tuning: AutoplayTuning {
+                artist_cooldown: 0,
+                ..ctx.tuning
+            },
+            ..ctx
+        };
+        assert_eq!(survivors(&off, Relax::None), vec![0, 1, 2, 3]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -262,16 +262,45 @@ mod tests {
         assert_eq!(ids(&items), vec!["민수1", "민수2", "민수3", "지훈1", "수연1"]);
     }
 
+    /// 공평제의 **첫 번째 결정자는 라운드**다 — 마지막 재생 시각은 같은 라운드끼리만 본다.
+    ///
+    /// 예전 이 테스트는 민수의 세 곡에 **같은** `last_played_utc` 를 넣었다. 그러면
+    /// 라운드를 안 봐도(= `compare_fair` 에서 라운드 비교를 통째로 지워도) 마지막 재생 시각이
+    /// 셋 다 같아 등록순 꼬리 비교로 넘어가고, 결과 순서가 **한 글자도 안 바뀐다.**
+    /// 공평제가 선입선출로 주저앉아도 초록불이라는 뜻이다.
+    ///
+    /// 그래서 세 곡에 **서로 다른** 시각을 준다. 그것도 라운드와 **반대 방향**으로 —
+    /// 민수의 3번째 곡이 가장 오래 기다린 것(가장 이른 시각)이 되게 한다. 라운드를 보면
+    /// 민수1 → 민수2 → 민수3 이고, 라운드를 안 보면 시각순인 민수3 → 민수2 → 민수1 이라
+    /// 두 동작이 확실히 갈린다.
     #[test]
     fn fair_mode_gives_everyone_a_turn_before_seconds() {
         let (mut items, mut scores) = three_people();
-        // 민수는 방금 한 곡 재생됐고, 지훈·수연은 아직 한 곡도 못 틀었다.
-        for id in ["민수1", "민수2", "민수3"] {
-            scores.get_mut(id).unwrap().last_played_utc = Some("2026-08-06T10:00:00+00:00".into());
+        // 민수는 이미 여러 곡을 틀었고, 지훈·수연은 아직 한 곡도 못 틀었다(빈 문자열).
+        // 시각을 라운드의 역순으로 박아 둔다 — 라운드 비교가 살아 있어야만 등록순이 이긴다.
+        for (id, played) in [
+            ("민수1", "2026-08-06T12:00:00+00:00"),
+            ("민수2", "2026-08-06T11:00:00+00:00"),
+            ("민수3", "2026-08-06T10:00:00+00:00"),
+        ] {
+            scores.get_mut(id).unwrap().last_played_utc = Some(played.into());
         }
         sort_queue(&mut items, &scores, QueueSortMode::Fair, &points());
-        // 1라운드: 지훈1·수연1(미재생) → 민수1. 그 다음에야 민수의 2·3번째 곡.
+        // 0라운드: 민수1·지훈1·수연1 — 셋 중에서는 아직 못 튼 사람(빈 문자열)이 앞선다.
+        // 1·2라운드는 그 뒤이며, 그 안에서도 라운드가 시각을 이겨 민수2 → 민수3 이다.
         assert_eq!(ids(&items), vec!["지훈1", "수연1", "민수1", "민수2", "민수3"]);
+
+        // 같은 라운드 안에서는 마지막 재생 시각이 결정자다 — 위 순서에서 지훈1·수연1 이
+        // 민수1 을 앞선 이유가 등록순(민수1 이 0번)이 아니라 "아직 못 틀었다" 임을 못 박는다.
+        let (mut only_round_zero, mut scores) = three_people();
+        only_round_zero.retain(|item| ["민수1", "지훈1", "수연1"].contains(&item.id.as_str()));
+        scores.get_mut("민수1").unwrap().last_played_utc = Some("2026-08-06T12:00:00+00:00".into());
+        sort_queue(&mut only_round_zero, &scores, QueueSortMode::Fair, &points());
+        assert_eq!(
+            ids(&only_round_zero),
+            vec!["지훈1", "수연1", "민수1"],
+            "라운드가 같으면 미재생이 앞선다"
+        );
     }
 
     #[test]

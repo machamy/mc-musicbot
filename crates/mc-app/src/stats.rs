@@ -1433,12 +1433,54 @@ mod tests {
         assert_eq!(chart[0].plays_user, 1);
     }
 
+    /// 정렬 컬럼은 **화이트리스트 밖이면 무조건 거부**다 (`top_user_tracks`).
+    ///
+    /// 예전 이 테스트는 `"1; DROP TABLE …"` 하나만 넣어 봤다. 그 값은 SQL 자체가 깨져서
+    /// `prepare` 가 실패하고 빈 목록이 나온다 — **화이트리스트를 통째로 지우고 `order` 를
+    /// 그대로 박아도 똑같이 빈 목록**이라, 막는 코드가 사라진 걸 이 테스트가 못 봤다.
+    ///
+    /// 그래서 **문법이 멀쩡한** 값을 같이 넣는다. `played` · `last_utc` 는 이 표에 실재하는
+    /// 컬럼이라 화이트리스트가 없으면 SQL 이 그대로 돌아 **행이 나온다**. 밑에서 두 값이
+    /// 각각 몇 줄을 만들어 내는지 먼저 확인해 두고(`requested` 정렬로 2줄, 재생 1줄),
+    /// 그 다음 같은 값을 정렬 컬럼으로 넘겨 빈 목록임을 단언한다.
     #[test]
     fn top_tracks_reject_unknown_order_columns() {
         let stats = open_temp();
-        apply_now(&stats, &[queued(1, 10, "a", false)]);
-        assert_eq!(stats.top_user_tracks(1, 10, "requested", 5).len(), 1);
-        // SQL 에 그대로 들어가는 값이라 화이트리스트 밖은 빈 결과로 막는다
+        apply_now(
+            &stats,
+            &[
+                queued(1, 10, "a", false),
+                queued(1, 10, "b", false),
+                played(1, Some(10), "b"),
+            ],
+        );
+        // 허용된 값은 정상 동작한다 — 거부가 "아무것도 안 나온다"의 다른 이름이면 안 된다.
+        assert_eq!(stats.top_user_tracks(1, 10, "requested", 5).len(), 2);
+
+        // `played > 0` 인 줄이 실제로 있다. 화이트리스트가 없으면 아래 호출이 이 줄을 준다.
+        let played_rows: i64 = {
+            let conn = stats.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM stat_user_track WHERE guild_id = 1 AND user_id = 10 AND played > 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(played_rows, 1, "이 단언이 0이면 아래 거부 검사가 헛돈다");
+
+        // 문법이 멀쩡한 실재 컬럼 — 화이트리스트가 살아 있어야만 빈 목록이다.
+        assert!(
+            stats.top_user_tracks(1, 10, "played", 5).is_empty(),
+            "허용 목록에 없는 실재 컬럼(played)이 정렬에 쓰였다"
+        );
+        // TEXT 컬럼이라 `last_utc > 0` 은 SQLite 타입 순서상 모든 줄에서 참이다 —
+        // 막는 코드가 없으면 두 줄이 통째로 나온다.
+        assert!(
+            stats.top_user_tracks(1, 10, "last_utc", 5).is_empty(),
+            "허용 목록에 없는 실재 컬럼(last_utc)이 정렬에 쓰였다"
+        );
+        // 문법이 깨지는 고전적인 주입 문자열도 물론 막는다.
         assert!(
             stats
                 .top_user_tracks(1, 10, "1; DROP TABLE stat_user_track", 5)

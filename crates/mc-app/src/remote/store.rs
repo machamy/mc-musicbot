@@ -4102,6 +4102,34 @@ mod tests {
         }
     }
 
+    /// `PRAGMA user_version` 만 되감아 **진짜 러너**를 그 버전부터 다시 태운다.
+    ///
+    /// 마이그레이션 단계는 러너를 거쳐야 의미가 있다 — `migrate` 의 `match` 팔이 곧 배선이고,
+    /// 그 팔이 사라지면 단계 함수가 아무리 멀쩡해도 실제 DB 는 안 고쳐진다. 그런데 단계 함수를
+    /// 테스트가 직접 부르면 팔을 통째로 지워도 초록불이라, 그 사고를 아무도 못 잡는다.
+    ///
+    /// 그래서 완성된 DB 의 **버전 표시만** 뒤로 돌리고 러너를 다시 돌린다. "각 단계는 전부
+    /// 멱등하다"가 이 러너의 규약이므로 되감아 다시 태우는 것 자체가 안전하고,
+    /// 동시에 그 규약을 확인하는 일이 된다.
+    fn rewind_and_migrate(store: &RemoteStore, to_version: i64) {
+        let mut conn = store.conn.lock().unwrap();
+        conn.pragma_update(None, "user_version", to_version).unwrap();
+        migrate(&mut conn).expect("되감은 뒤에도 러너는 끝까지 가야 한다");
+        let now: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(now, SCHEMA_VERSION, "되감은 러너가 최신까지 안 갔다");
+    }
+
+    /// 러너가 **실제로 스키마를 만들어 놓고** 끝나며, 같은 파일에 두 번 돌아도 안 망친다.
+    ///
+    /// 예전 이 테스트는 두 쪽 다 비어 있었다. `assert_eq!(version, SCHEMA_VERSION)` 은
+    /// 루프가 `while version < SCHEMA_VERSION` 이라 **정의상 참**이다 — 단계를 하나도 안 쓰고
+    /// 상수만 올려도 통과한다. "다시 열어도 안전하다" 는 쪽은 단언이 아예 없었고, 애초에
+    /// v22 짜리 DB 를 다시 여는 건 단계를 한 번도 안 돌리는 일이라 아무것도 못 본다.
+    ///
+    /// 그래서 (1) 뒤쪽 단계들이 남긴 **스키마·데이터 자국**을 직접 확인하고,
+    /// (2) 같은 파일에 러너를 **0번부터 두 번** 태워 오류도 중복도 없음을 확인한다.
     #[test]
     fn migration_runner_reaches_latest_and_is_idempotent() {
         let (store, path) = temp_store("migrate");
@@ -4111,11 +4139,103 @@ mod tests {
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(version, SCHEMA_VERSION);
+
+            // 버전 숫자는 아무것도 증명하지 않는다. 단계가 남긴 자국을 본다.
+            for (table, column, why) in [
+                ("remote_lyrics", "found", "v8 — 가사 못 찾음 표시"),
+                ("remote_queue_scores", "last_played_utc", "v7 — 공평제 재생 시각"),
+                ("remote_audit_logs", "kind", "v13 — 활동 기록 분류"),
+                ("remote_autoplay_blocked", "track_json", "v20 — 빼 둔 곡 제목"),
+            ] {
+                assert!(
+                    column_exists(&conn, table, column).unwrap(),
+                    "{why} 단계가 안 돌았다 ({table}.{column} 없음)"
+                );
+            }
+            // 마지막 시더 단계(v21)가 새로 심은 차트. 이게 없으면 기존 DB 에서만 차트가 빈다.
+            for name in ["TJ 가요 100", "TJ OST"] {
+                let rows: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM remote_charts WHERE builtin = 1 AND name = ?1",
+                        params![name],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(rows, 1, "기본 차트 {name} 이 심기지 않았다");
+            }
         }
+
+        // 같은 파일·같은 연결에 뒷단계 사슬을 **두 번 더** 태운다. 멱등이 아니면 여기서
+        // 터지거나(UNIQUE 위반 · 중복 ALTER) 차트가 두 벌 세 벌이 된다.
+        //
+        // 되감는 자리를 15 로 잡은 이유: `MIGRATION_V15`(= `14 =>` 팔) 안에 조건 없는
+        // `ALTER TABLE remote_web_sessions ADD COLUMN csrf_token` 이 있어 그 팔만은 다시 돌면
+        // `duplicate column name` 으로 죽는다. **실제로는 그럴 일이 없다** — 러너는 단계와
+        // `user_version` 갱신을 같은 트랜잭션에서 커밋하므로 커밋된 단계가 다시 도는 경로가
+        // 없고, 중간에 죽으면 통째로 롤백돼 처음 상태에서 다시 시작한다. 그래서 여기서는
+        // 러너가 실제로 겪을 수 있는 범위(= 15 이후 사슬)를 두 번 태워 본다.
+        let charts_once: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM remote_charts", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert!(charts_once > 0, "기본 차트가 아예 안 심겼다");
+        rewind_and_migrate(&store, 15);
+        rewind_and_migrate(&store, 15);
+        {
+            let conn = store.conn.lock().unwrap();
+            let charts_thrice: i64 = conn
+                .query_row("SELECT COUNT(*) FROM remote_charts", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(charts_thrice, charts_once, "러너를 다시 돌리자 차트가 늘어났다");
+            // 컬럼도 한 번만 붙는다 — `add_column` 이 확인 없이 ALTER 를 쏘면 위에서 죽는다.
+            assert!(column_exists(&conn, "remote_autoplay_blocked", "track_json").unwrap());
+        }
+
         drop(store);
         // 같은 파일을 다시 열어도 ALTER TABLE 이 두 번 돌지 않는다.
         let store = RemoteStore::open(&path).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+        }
         cleanup(store, path);
+    }
+
+    /// **`SCHEMA_VERSION` 만 올리고 단계를 안 쓴 것**을 잡는다.
+    ///
+    /// `migrate` 의 마지막 팔이 `_ => {}` 라, 상수를 23 으로 올려 놓고 `22 => …` 팔을 깜빡하면
+    /// 러너는 아무 일도 안 하고 조용히 버전만 올린다. 새 DB 는 최신 스키마로 만들어지니
+    /// 개발 중에는 아무 증상이 없고, **기존 DB 만** 새 단계를 영영 못 받는다.
+    ///
+    /// 팔의 존재는 실행으로는 볼 수 없어(안 도는 것과 없는 것이 구분이 안 된다) 소스를
+    /// 직접 읽는다. `include_str!` 는 컴파일 시점 파일이라 항상 이 파일 자신이다.
+    #[test]
+    fn every_schema_version_has_a_migration_arm() {
+        const SOURCE: &str = include_str!("store.rs");
+        let start = SOURCE
+            .find("fn migrate(conn: &mut Connection)")
+            .expect("러너 함수를 못 찾았다 — 이름이 바뀌었으면 이 테스트도 같이 고친다");
+        let body = &SOURCE[start..];
+        let end = body
+            .find("_ => {}")
+            .expect("포괄 팔(_ => {})을 못 찾았다 — 러너 모양이 바뀌었다");
+        let arms = &body[..end];
+
+        for target in 1..=SCHEMA_VERSION {
+            // v{target} 로 올리는 팔의 이름표는 **직전 버전 숫자**다 (`0 => …` 가 v1 을 만든다).
+            let label = format!("{} =>", target - 1);
+            let found = arms
+                .lines()
+                .any(|line| line.trim_start().starts_with(&label));
+            assert!(
+                found,
+                "v{target} 로 올리는 단계가 없다 — `{label}` 팔을 쓰지 않고 SCHEMA_VERSION 만 올렸다"
+            );
+        }
     }
 
     #[test]
@@ -4495,6 +4615,14 @@ mod tests {
     /// 회귀: 승인 게이트를 켠 순간 **쓰던 서버가 통째로 잠겼다.** 실제로 배포하고 나서
     /// 서버 3개가 명령어도 리모컨도 못 쓰게 됐다. 게이트는 앞으로 초대될 서버용이지
     /// 어제까지 잘 쓰던 서버를 막으려던 게 아니다.
+    ///
+    /// 예전 이 테스트는 `migrate_v17_grandfather_guilds` 를 **직접** 불렀다. 그러면 러너의
+    /// `16 =>` · `17 =>` 팔을 통째로 지워도 초록불이다 — 함수는 멀쩡한데 아무도 안 부르니
+    /// 실제 서버는 여전히 잠겨 있는, 정확히 그 사고의 모양이다. 그래서 이제 DB 를
+    /// **마이그레이션 직전 버전으로 되감아 진짜 러너를 태운다.**
+    ///
+    /// (`16` 팔과 `17` 팔은 같은 함수를 부른다 — `16` 만 지우면 `17` 이 대신 해 주므로
+    /// 아래 두 번째 시나리오가 `17` 팔을 따로 못 박는다.)
     #[test]
     fn existing_guilds_are_grandfathered_but_decisions_survive() {
         use crate::remote::GuildApprovalStatus as S;
@@ -4518,10 +4646,8 @@ mod tests {
         store.register_guild(4242, Some("오래된 서버"));
         assert_eq!(store.guild_approval(4242).map(|r| r.status), Some(S::Pending));
 
-        {
-            let conn = store.conn.lock().unwrap();
-            migrate_v17_grandfather_guilds(&conn).unwrap();
-        }
+        // v16 짜리 DB(= 게이트를 막 켠 상태)를 흉내내고 러너에 맡긴다.
+        rewind_and_migrate(&store, 16);
 
         // 알던 서버는 승인으로 넘어온다.
         assert_eq!(store.guild_approval(4242).map(|r| r.status), Some(S::Approved));
@@ -4529,6 +4655,18 @@ mod tests {
         assert_eq!(store.guild_approval(777).map(|r| r.status), Some(S::Blocked));
         // 모르는 서버는 여전히 없다.
         assert!(store.guild_approval(9999).is_none());
+
+        // v17 팔 단독 확인: 첫 수정본이 놓쳤던 "이미 pending 으로 박혀 있던 서버" 를
+        // 다시 만들고, 이번엔 v17 부터만 태운다.
+        store.decide_guild(4242, S::Pending, 1, None);
+        assert_eq!(store.guild_approval(4242).map(|r| r.status), Some(S::Pending));
+        rewind_and_migrate(&store, 17);
+        assert_eq!(
+            store.guild_approval(4242).map(|r| r.status),
+            Some(S::Approved),
+            "17 팔이 대기 중인 옛 서버를 안 올렸다"
+        );
+        assert_eq!(store.guild_approval(777).map(|r| r.status), Some(S::Blocked));
         cleanup(store, path);
     }
 
@@ -5177,6 +5315,10 @@ mod tests {
 
     /// v20 이전에 쌓인 줄은 트랙이 없다. **이미 빼 둔 곡이 문제의 전부**라
     /// 컬럼만 붙이고 끝내면 화면은 그대로 코드를 보여 준다. 이웃 표에서 찾아 채운다.
+    ///
+    /// 예전 이 테스트는 `backfill_blocked_tracks` 를 **직접** 불렀다. 그러면 러너의 `19 =>`
+    /// 팔을 지워도 초록불이다 — 함수는 멀쩡한데 아무도 안 부르니 실제 기존 DB 의 빼 둔 곡은
+    /// 영원히 코드로만 보인다. 이제 v19 로 되감아 **진짜 러너**가 채우게 한다.
     #[test]
     fn old_blocked_rows_get_their_titles_back_from_neighbours() {
         let (store, path) = temp_store("blocked-backfill");
@@ -5207,8 +5349,9 @@ mod tests {
                 )
                 .unwrap();
             }
-            backfill_blocked_tracks(&conn).unwrap();
         }
+        // v19 짜리 DB 를 흉내내고 러너에 맡긴다 — `19 =>` 팔이 컬럼을 붙이고 채운다.
+        rewind_and_migrate(&store, 19);
 
         let found: std::collections::HashMap<String, Option<String>> = store
             .list_blocked_autoplay(1)
@@ -5229,6 +5372,56 @@ mod tests {
             found.get(&orphan.cache_key()).cloned().flatten().is_none(),
             "흔적이 없으면 못 찾는 게 맞다 — 화면이 그 사정을 말한다"
         );
+        cleanup(store, path);
+    }
+
+    /// v22 단계: **"가사 없음" 으로 박아 둔 기록만 지운다** (§41).
+    ///
+    /// 가사를 찾는 방법을 고쳤는데(제목을 씻고 여러 번 물어본다) 예전에 못 찾아서
+    /// `found = 0` 으로 캐시된 곡은 **다시 안 찾아본다** — 고친 보람이 그 곡들에는 영영
+    /// 닿지 않는다. 그래서 못 찾은 기록만 비우고 **찾아 둔 가사는 그대로 둔다**
+    /// (찾은 것까지 지우면 서버가 뜨자마자 전 곡을 다시 긁는다).
+    ///
+    /// 이 단계에는 테스트가 아예 없었다 — `21 =>` 팔을 지워도 아무도 몰랐다.
+    #[test]
+    fn the_lyrics_not_found_marks_are_cleared_but_real_lyrics_survive() {
+        let (store, path) = temp_store("lyrics-v22");
+
+        // v21 시절 캐시를 흉내낸다: 못 찾음 두 줄 · 찾음 한 줄.
+        {
+            let conn = store.conn.lock().unwrap();
+            for (key, payload, found) in [
+                ("youtube:못찾은곡", "{}", 0),
+                ("youtube:또못찾은곡", "{}", 0),
+                ("youtube:찾은곡", r#"{"lines":[]}"#, 1),
+            ] {
+                conn.execute(
+                    "INSERT INTO remote_lyrics(cache_key, payload_json, fetched_utc, found)
+                     VALUES(?1, ?2, ?3, ?4)",
+                    params![key, payload, RemoteStore::now_iso(), found],
+                )
+                .unwrap();
+            }
+        }
+
+        rewind_and_migrate(&store, 21);
+
+        let conn = store.conn.lock().unwrap();
+        let keys: Vec<String> = {
+            let mut statement = conn
+                .prepare("SELECT cache_key FROM remote_lyrics ORDER BY cache_key")
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap();
+            rows.flatten().collect()
+        };
+        assert_eq!(
+            keys,
+            vec!["youtube:찾은곡".to_string()],
+            "못 찾음 기록만 지우고 찾아 둔 가사는 남아야 한다"
+        );
+        drop(conn);
         cleanup(store, path);
     }
 

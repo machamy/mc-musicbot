@@ -286,6 +286,8 @@ mod wiring_tests {
             root, mine,
             "루트와 mc-app 의 버전이 갈라졌다 — /상태 와 User-Agent 가 {mine} 를 보고하는데              배포본은 {root} 다. 두 Cargo.toml 을 같이 올려야 한다."
         );
-        assert_eq!(mine, env!("CARGO_PKG_VERSION"));
+        /* `assert_eq!(mine, env!("CARGO_PKG_VERSION"))` 은 넣지 않는다 —
+         * 둘 다 같은 매니페스트를 같은 컴파일에서 읽으므로 항상 참이다.
+         * 값어치 있는 것은 위의 **루트 ↔ mc-app** 비교 하나뿐이다. */
     }
 }

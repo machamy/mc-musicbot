@@ -47,6 +47,14 @@ pub struct SearchSession {
     pub created: Instant,
 }
 
+/// 재정렬 tick 이 이만큼 일찍 깨도 "이번 차례" 로 쳐 준다.
+///
+/// **리터럴로 두면 안 된다.** `player/manager.rs` 의 `SORT_DUE_SLACK`(화면 카운트다운
+/// 쪽 관문)이 이 값보다 넉넉해야 두 관문이 서로 싸우지 않는데, 예전에는 그쪽 테스트가
+/// 이 숫자를 **손으로 베껴** 적어 두고 있었다. 그러면 여기를 고쳐도 테스트는 옛 숫자를
+/// 계속 지킨다 — 경고 문구가 말하는 바로 그 상황이 조용히 벌어진다.
+pub(crate) const QUEUE_SORT_EARLY_SLACK_MS: i64 = 250;
+
 /// 마지막 재정렬 시각과 주기로 "지금 이 길드를 돌릴 차례인가"를 판정한다.
 ///
 /// 시계를 인자로 받는 순수 함수라 테스트가 실제 시간을 기다리지 않아도 된다.
@@ -61,7 +69,7 @@ fn queue_sort_due_at(
         return true; // 한 번도 안 돌았으면 바로 차례다.
     };
     let millis = (interval.as_secs() as i64).max(1) * 1000;
-    now - last >= chrono::Duration::milliseconds(millis - 250)
+    now - last >= chrono::Duration::milliseconds(millis - QUEUE_SORT_EARLY_SLACK_MS)
 }
 
 /// 다음 재정렬 예정 시각. 루프가 밀렸으면 이미 지난 시각을 주지 않고 다음 주기로 넘긴다.

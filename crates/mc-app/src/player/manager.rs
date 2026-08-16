@@ -1319,8 +1319,22 @@ mod tests {
         let state = player.advance(guild_id).await;
         assert_eq!(current_id(&state), "민수2");
 
-        // 공평제는 대기 점수를 순서에 쓰지 않으므로 곡 경계마다 점수를 올리지 않는다.
+        /* 공평제는 대기 점수를 순서에 쓰지 않으므로 곡 경계마다 점수를 올리지 않는다.
+         *
+         * **셀 것이 있는지부터 확인한다.** `all()` 은 빈 map 에서도 참이라, 점수 행이 통째로
+         * 안 만들어져도(=`ensure_queue_items` 가 죽어도) 이 단언은 초록불이었다. 아무것도
+         * 없는 것과 전부 0인 것은 다른 이야기인데 `all()` 하나로는 구분이 안 된다.
+         *
+         * 지금 남아 있어야 할 행은 둘이다 — 지금 곡(민수2)과 대기열에 남은 민수3.
+         * 끝난 곡(민수1·지훈1)의 행은 넘어갈 때 `clear_item_runtime` 이 지운다. */
         let scores = remote.queue_scores(guild_id);
+        assert_eq!(
+            scores.len(),
+            2,
+            "지금 곡과 남은 대기열의 점수 행이 있어야 한다 — 있는 것: {:?}",
+            scores.keys().collect::<Vec<_>>()
+        );
+        assert!(scores.contains_key("민수2") && scores.contains_key("민수3"));
         assert!(scores.values().all(|score| score.wait_score == 0));
         cleanup(player, remote, root);
     }
@@ -1393,27 +1407,61 @@ mod tests {
         let stats = Stats::open(&root.join("musicbot-stats.sqlite"), log).expect("통계 DB 열기");
         player.attach_stats(stats.clone());
         let guild_id = 1;
+        // 재생 순서를 등록순으로 못 박는다 — 아래 기다리기가 "제일 마지막 이벤트"에 기대기 때문이다.
+        player.set_sort_mode(guild_id, QueueSortMode::Fifo);
 
+        /* **곡을 서로 다르게 둔다.**
+         *
+         * 예전에는 자동재생 항목이 사람 곡과 같은 `TrackRef` 를 들고 있었다. 차트는 곡(cache_key)
+         * 단위라 애초에 오를 수 있는 줄이 하나뿐이었고, 그래서 `chart.len() == 1` 은 무엇을 세든
+         * 참이었다 — 자동재생이 순위에 그대로 섞여 들어와도 초록불이 켜졌다는 뜻이다.
+         * 곡을 갈라 두면 "자동재생만으로 나간 곡"이 차트에 나타나는지로 판정이 갈린다. */
         let human = user_item("사람곡", 7);
         let human_key = human.track.cache_key();
-        let mut auto = QueueItem::new_autoplay(human.track.clone());
-        // 자동재생도 사람이 신청한 곡과 **같은 곡**으로 둔다. 그래야 신청자 유무가 아니라
-        // request_kind 로 갈리는지가 드러난다.
-        auto.id = "자동곡".into();
+        let mut auto = QueueItem::new_autoplay(user_item("자동곡", 7).track);
+        auto.id = "자동곡항목".into();
+        let auto_key = auto.track.cache_key();
+        /* 자동재생으로도 나가고 사람도 신청한 곡 하나.
+         *
+         * 차트는 `plays_user > 0` 인 줄만 주기 때문에, 자동재생 재생이 **세지긴 센다**는 것은
+         * 사람 재생이 한 번이라도 있는 곡에서만 눈으로 확인할 수 있다. */
+        let mut both_auto = QueueItem::new_autoplay(user_item("둘다곡", 7).track);
+        both_auto.id = "둘다곡자동".into();
+        let both = user_item("둘다곡", 7);
+        let both_key = both.track.cache_key();
 
         player.enqueue(guild_id, human, false).await;
         player.enqueue(guild_id, auto, false).await;
-        player.advance(guild_id).await; // 사람곡 종료
-        player.advance(guild_id).await; // 자동곡 종료
+        player.enqueue(guild_id, both_auto, false).await;
+        player.enqueue(guild_id, both, false).await;
+        for _ in 0..4 {
+            player.advance(guild_id).await;
+        }
 
         // 통계 쓰기는 배치라서 바로 보이지 않는다 — 재생 경로를 안 막는 대가다.
-        let row = wait_for_plays(&stats, guild_id, 2).await;
-        assert_eq!(row.cache_key, human_key);
-        assert_eq!(row.plays_user, 1, "사람이 신청한 재생만 순위에 든다");
-        assert_eq!(row.plays_autoplay, 1, "자동재생도 세긴 세되 순위에는 안 쓴다");
-
-        let chart = stats.chart(guild_id, ChartKind::Plays, ChartWindow::All, 2, 10);
-        assert_eq!(chart.len(), 1);
+        let chart = wait_for_chart_row(&stats, guild_id, &both_key).await;
+        assert_eq!(
+            chart.len(),
+            2,
+            "사람이 신청한 곡만 차트에 오른다 — 오른 것: {:?}",
+            chart.iter().map(|row| &row.cache_key).collect::<Vec<_>>()
+        );
+        assert!(
+            chart.iter().all(|row| row.cache_key != auto_key),
+            "자동재생으로만 나간 곡은 차트에 아예 없어야 한다"
+        );
+        let human_row = chart
+            .iter()
+            .find(|row| row.cache_key == human_key)
+            .expect("사람이 신청한 곡은 차트에 있다");
+        assert_eq!(human_row.plays_user, 1);
+        assert_eq!(human_row.plays_autoplay, 0);
+        let both_row = chart
+            .iter()
+            .find(|row| row.cache_key == both_key)
+            .expect("둘 다 나간 곡도 차트에 있다");
+        assert_eq!(both_row.plays_user, 1, "사람이 신청한 재생만 순위에 든다");
+        assert_eq!(both_row.plays_autoplay, 1, "자동재생도 세긴 세되 순위에는 안 쓴다");
         cleanup(player, remote, root);
     }
 
@@ -1531,25 +1579,26 @@ mod tests {
         panic!("사람 통계가 5초 안에 반영되지 않았다");
     }
 
-    /// 배치 쓰기가 `total` 건 반영될 때까지 기다린다. 고정 sleep 은 느리거나 불안정해서 폴링한다.
-    /// **합계**로 기다려야 갈림(사람/자동재생)이 틀렸을 때도 멈추지 않고 그 자리에서 단언이 깨진다.
-    async fn wait_for_plays(
+    /// 그 곡의 줄이 차트에 뜰 때까지 기다렸다가 **그때의 차트 전체**를 준다.
+    /// 고정 sleep 은 느리거나 불안정해서 폴링한다.
+    ///
+    /// **"없어야 할 곡이 없다" 를 경주 없이 단언하려고 이 모양이다.** 통계 기록기는 한 줄로 서서
+    /// 순서대로 쓰므로(단일 writer + FIFO 대기줄), **제일 마지막에 던진 재생**이 보이면 그 앞의
+    /// 것들은 이미 다 반영돼 있다. 아직 안 써진 곡을 "차트에 없다"고 읽는 헛초록불이 안 생긴다.
+    async fn wait_for_chart_row(
         stats: &Arc<Stats>,
         guild_id: u64,
-        total: i64,
-    ) -> crate::stats::ChartRow {
+        cache_key: &str,
+    ) -> Vec<crate::stats::ChartRow> {
         use crate::stats::{ChartKind, ChartWindow};
         for _ in 0..50 {
-            // 사랑받은 곡 기준으로 뽑으면 plays_user 가 0인 행도 보여서, 갈림이 틀린 경우도 잡힌다.
             let chart = stats.chart(guild_id, ChartKind::Plays, ChartWindow::All, 2, 10);
-            if let Some(row) = chart.into_iter().next() {
-                if row.plays_user + row.plays_autoplay >= total {
-                    return row;
-                }
+            if chart.iter().any(|row| row.cache_key == cache_key) {
+                return chart;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("통계 {total}건이 5초 안에 반영되지 않았다");
+        panic!("'{cache_key}' 재생 통계가 5초 안에 반영되지 않았다");
     }
 
     /// 대기열이 500곡을 넘으면 재정렬 주기가 15초로 늘어난다(v3 §18.2 (3)).
@@ -1579,11 +1628,24 @@ mod tests {
         player.resort_if_changed_at(1, t0).await;
         assert!(!player.sort_due_at(1, t0), "방금 돌았으면 차례가 아니다");
         assert!(player.sort_due_at(1, t0 + base));
-        // 안쪽 관문은 바깥(재정렬 루프)보다 느슨해야 한다 — 더 빡빡하면 루프가 통과시킨 tick 을
-        // 여기서 되돌려 15초가 20초가 된다.
+        /* 안쪽 관문은 바깥(재정렬 루프)보다 느슨해야 한다 — 더 빡빡하면 루프가 통과시킨 tick 을
+         * 여기서 되돌려 15초가 20초가 된다.
+         *
+         * **아래 250 은 `app.rs` 의 값을 손으로 베낀 숫자다. 참조가 아니다.**
+         * 바깥 관문은 `app.rs` 의 `queue_sort_due_at` 안에 `millis - 250` 이라는 리터럴로 박혀
+         * 있는데, 그 함수도 그 숫자도 `app` 모듈 바깥에서는 안 보인다(비공개 `fn` + 리터럴).
+         * 그래서 여기서 이름으로 부를 방법이 지금은 없다 — 저쪽이 바뀌면 이 테스트는 조용히
+         * 옛 숫자를 지킨다. 제대로 묶으려면 `app.rs` 에서 그 250 을 `pub(crate) const` 로 빼내
+         * 양쪽이 같은 이름을 보게 해야 한다(동작은 안 바뀐다). 이번 변경은 `player/` 안쪽만
+         * 손대기로 되어 있어 남겨 둔다. */
+        /* **`app.rs` 의 값을 직접 참조한다.** 예전에는 여기 `250` 이 리터럴로 적혀
+         * 있어서, `app.rs` 를 고쳐도 이 테스트는 옛 숫자를 계속 지켰다. 경고 문구가
+         * 말하는 "두 관문이 싸우는" 상황을 정작 못 잡는 셈이었다. */
         assert!(
-            SORT_DUE_SLACK >= Duration::from_millis(250),
-            "app.rs 의 여유(250ms)보다 좁으면 두 관문이 서로 싸운다"
+            SORT_DUE_SLACK
+                >= Duration::from_millis(crate::app::QUEUE_SORT_EARLY_SLACK_MS as u64),
+            "화면 관문(SORT_DUE_SLACK={SORT_DUE_SLACK:?})이 app.rs 의 여유({}ms)보다 좁으면              두 관문이 서로 싸운다",
+            crate::app::QUEUE_SORT_EARLY_SLACK_MS
         );
 
         // 500곡을 실제로 넣으면 테스트가 느려지기만 하니 길이만 밀어 넣는다.

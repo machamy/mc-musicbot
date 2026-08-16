@@ -1534,6 +1534,37 @@ pub fn audit_text(
             None => format!("{actor}님이 자동 재생 기준 곡을 뺐어요"),
         },
         "autoplay.seed.reorder" => format!("{actor}님이 자동 재생 기준 곡 순서를 바꿨어요"),
+        /* **핸들러가 쓰는데 문장이 없던 11개.**
+         *
+         * 없으면 맨 아래 폴백으로 떨어져서 활동 기록에
+         * `민수님이 autoplay.reroll 을 했어요` 같은 기계 문자열이 그대로 나갔다.
+         * 화면은 사람이 읽는 곳이라 그러면 안 된다. */
+        "autoplay.reroll" => format!("{actor}님이 자동 추천을 다시 뽑았어요"),
+        "autoplay.reset" => format!("{actor}님이 자동 재생 기준을 초기화했어요"),
+        "autoplay.config" => format!("{actor}님이 자동 재생 설정을 바꿨어요"),
+        "autoplay.recent.remove" => match item {
+            Some(song) => format!("{actor}님이 최근 곡에서 {song} 을(를) 뺐어요"),
+            None => format!("{actor}님이 최근 곡에서 한 곡을 뺐어요"),
+        },
+        "autoplay.blocked.remove" => match item {
+            Some(song) => format!("{actor}님이 {song} 의 자동 추천 차단을 풀었어요"),
+            None => format!("{actor}님이 자동 추천 차단을 풀었어요"),
+        },
+        "chart.refresh" => match item {
+            Some(chart) => format!("{actor}님이 {chart} 차트를 새로 받아왔어요"),
+            None => format!("{actor}님이 차트를 새로 받아왔어요"),
+        },
+        "library.change" => format!("{actor}님이 보관함을 정리했어요"),
+        "chat.report" => format!("{actor}님이 메시지를 신고했어요"),
+        "chat.report.resolve" => format!("{actor}님이 신고를 처리했어요"),
+        "suggestion.create" => match item {
+            Some(title) => format!("{actor}님이 건의를 올렸어요 — {title}"),
+            None => format!("{actor}님이 건의를 올렸어요"),
+        },
+        "suggestion.status" => match after {
+            Some(status) => format!("{actor}님이 건의 상태를 {status} 로 바꿨어요"),
+            None => format!("{actor}님이 건의 상태를 바꿨어요"),
+        },
         "chat.delete" => format!("{actor}님이 메시지를 지웠어요"),
         "user.suspend" => match item {
             Some(who) => format!("{actor}님이 {who}님을 정지했어요"),
@@ -2733,26 +2764,107 @@ mod tests {
         assert!(settings.command_group_enabled("info"));
     }
 
-    #[test]
-    fn rule_for_covers_all_permission_keys_and_rejects_unknown() {
-        let settings = RemoteGuildSettings::default();
-        for key in PERMISSION_KEYS {
-            assert!(settings.rule_for(key).is_some(), "키 {key} 규칙 누락");
+    /// 권한 키 하나만 표시를 달고 나머지는 전부 같은 값으로 눌러 둔 설정을 만든다.
+    ///
+    /// `rule_for` 가 **어느 필드를 보는지**를 확인하려면 키마다 값이 달라야 하는데,
+    /// `PermissionRule` 은 변종이 5개뿐이라 10개 키에 서로 다른 값을 한 번에 줄 수 없다.
+    /// 그래서 한 번에 한 키씩 "이 키만 다른 값" 상태를 만들어 열 번 확인한다 —
+    /// 어떤 두 키가 뒤바뀌어도 반드시 한쪽에서 걸린다.
+    ///
+    /// 이 함수의 `match` 는 **프로덕션 배선을 테스트가 따로 한 번 더 적어 둔 것**이다.
+    /// 여기와 `rule_for` 가 갈라지면 그게 곧 배선 사고다.
+    fn only_this_key_is_marked(key: &str, marked: PermissionRule) -> RemoteGuildSettings {
+        let muted = PermissionRule::Disabled;
+        let mut settings = RemoteGuildSettings {
+            search_rule: muted,
+            vote_rule: muted,
+            chat_rule: muted,
+            playback_rule: muted,
+            seek_rule: muted,
+            volume_rule: muted,
+            queue_edit_rule: muted,
+            skip_rule: muted,
+            autoplay_rule: muted,
+            bulk_enqueue_rule: muted,
+            ..Default::default()
+        };
+        match key {
+            "search" => settings.search_rule = marked,
+            "vote" => settings.vote_rule = marked,
+            "chat" => settings.chat_rule = marked,
+            "playback" => settings.playback_rule = marked,
+            "skip" => settings.skip_rule = marked,
+            "seek" => settings.seek_rule = marked,
+            "volume" => settings.volume_rule = marked,
+            "queueEdit" => settings.queue_edit_rule = marked,
+            "autoplay" | "autoplaySeed" => settings.autoplay_rule = marked,
+            "bulkEnqueue" => settings.bulk_enqueue_rule = marked,
+            other => panic!("테스트가 모르는 권한 키 {other} — 배선 표를 같이 늘려야 한다"),
         }
-        assert!(settings.rule_for("nope").is_none());
+        settings
     }
 
+    /// `rule_for` 가 키마다 **자기 필드**를 보는지 확인한다.
+    ///
+    /// 예전 이 테스트는 `is_some()` 만 봤다. 기본값에서는 네 키가 전부 `GuildMember`,
+    /// 여섯 키가 전부 `SameVoiceChannel` 이라 **키를 서로 바꿔 배선해도**(예: `"volume"` 이
+    /// `chat_rule` 을 읽어도) 값이 같아 아무 일도 안 일어난 것처럼 보였다.
+    /// 볼륨 권한이 채팅 권한을 따라가는 사고가 초록불이라는 뜻이다.
+    #[test]
+    fn rule_for_covers_all_permission_keys_and_rejects_unknown() {
+        for key in PERMISSION_KEYS {
+            let settings = only_this_key_is_marked(key, PermissionRule::Administrator);
+            assert_eq!(
+                settings.rule_for(key),
+                Some(PermissionRule::Administrator),
+                "키 {key} 가 자기 필드가 아닌 다른 규칙을 읽고 있다"
+            );
+            // 다른 값으로도 한 번 더 — 표시값 자체가 어딘가에 박혀 있는 경우를 막는다.
+            let settings = only_this_key_is_marked(key, PermissionRule::ConfiguredRole);
+            assert_eq!(
+                settings.rule_for(key),
+                Some(PermissionRule::ConfiguredRole),
+                "키 {key} 가 값을 그대로 전하지 않는다"
+            );
+        }
+
+        // 옛 이름도 같은 필드를 봐야 한다 — 저장된 설정 JSON 과 관리 콘솔의 과거 요청이 산다.
+        let legacy = only_this_key_is_marked("autoplay", PermissionRule::Administrator);
+        assert_eq!(
+            legacy.rule_for("autoplaySeed"),
+            Some(PermissionRule::Administrator),
+            "옛 이름 autoplaySeed 가 autoplay_rule 을 안 본다"
+        );
+
+        assert!(RemoteGuildSettings::default().rule_for("nope").is_none());
+    }
+
+    /// 레거시 지정 역할 펼치기는 **역할 목록을 그대로 복사**해야 한다.
+    ///
+    /// 예전 이 테스트는 `rule_role_ids.len()` 만 셌다. 그런데 `insert` 하는 값을
+    /// `Vec::new()` 로 바꿔도 키 개수는 그대로 10개라 초록불이었다 — 즉 레거시 서버가
+    /// 지정해 둔 역할을 **전부 잃어버려도** 이 테스트는 아무 말도 안 했다.
+    /// 그래서 키마다 실제 내용까지 본다.
     #[test]
     fn expanding_legacy_roles_pins_the_current_behaviour() {
         let mut settings = RemoteGuildSettings {
-            configured_role_ids: vec![7],
+            configured_role_ids: vec![7, 8],
             ..Default::default()
         };
         settings.expand_legacy_roles();
         assert_eq!(settings.rule_role_ids.len(), PERMISSION_KEYS.len());
-        assert_eq!(settings.manager_role_ids, vec![7]);
+        for key in PERMISSION_KEYS {
+            assert_eq!(
+                settings.rule_role_ids.get(key).map(Vec::as_slice),
+                Some(&[7u64, 8][..]),
+                "키 {key} 에 레거시 역할이 그대로 복사되지 않았다"
+            );
+            // 펼친 뒤에는 폴백이 아니라 자기 칸을 봐도 같은 답이 나와야 한다.
+            assert_eq!(settings.roles_for(key), &[7, 8], "키 {key} 조회 결과가 다르다");
+        }
+        assert_eq!(settings.manager_role_ids, vec![7, 8]);
 
-        // 이미 분리돼 있으면 덮어쓰지 않는다.
+        // 이미 분리돼 있으면 덮어쓰지 않는다 — 관리자가 손으로 좁혀 둔 칸이 살아야 한다.
         let mut kept = RemoteGuildSettings {
             configured_role_ids: vec![7],
             ..Default::default()
@@ -2760,6 +2872,7 @@ mod tests {
         kept.rule_role_ids.insert("chat".into(), vec![1]);
         kept.expand_legacy_roles();
         assert_eq!(kept.rule_role_ids.len(), 1);
+        assert_eq!(kept.rule_role_ids.get("chat").map(Vec::as_slice), Some(&[1u64][..]));
     }
 
     #[test]
@@ -2922,7 +3035,22 @@ mod tests {
         assert_eq!(settings.max_queue_per_guild, 10_000);
         assert_eq!(settings.vote_skip_ratio, 10);
         assert_eq!(settings.like_points, VOTE_POINT_MAX);
-        assert_eq!(settings.default_volume, settings.max_volume);
+        // 500 을 넣었으니 상한(기본 max_volume = 200)까지만 내려와야 한다.
+        //
+        // 예전엔 `default_volume == max_volume` 이라고 적었는데, 둘 다 `sanitize` 를 지난
+        // **같은 구조체**에서 꺼낸 값이라 클램프가 통째로 사라져도(둘이 나란히 500 이 돼도)
+        // 초록불이었다. 기대값을 숫자로 못 박아야 실제로 조인 것을 본다.
+        assert_eq!(settings.max_volume, 200);
+        assert_eq!(settings.default_volume, 200, "상한 위로 튀어나온 기본 볼륨");
+        // 아래쪽도 같은 이유로 숫자로 본다 — 하한 아래로 내려가면 안 된다.
+        let mut low = RemoteGuildSettings {
+            min_volume: 40,
+            max_volume: 80,
+            default_volume: 5,
+            ..Default::default()
+        };
+        low.sanitize();
+        assert_eq!(low.default_volume, 40, "하한 아래로 떨어진 기본 볼륨");
 
         // 위쪽 상한은 그대로 산다.
         let mut too_many = RemoteGuildSettings {
@@ -3230,17 +3358,43 @@ mod tests {
         assert_eq!(QueueVoteKind::SuperLike.api_key(), "superLike");
     }
 
+    /// 권한 키 10종에 **각자의 설명 문장**이 있어야 한다.
+    ///
+    /// 예전 이 테스트는 `!is_empty()` 만 봤다. 그런데 `permission_description` 은 끝에
+    /// 포괄 팔(`_ => "이 동작을 누가 할 수 있는지 정해요."`)이 있어서 **열 개 팔을 통째로
+    /// 지워도** 빈 문자열은 절대 안 나온다 — 관리 콘솔의 열 줄이 전부 같은 문장으로
+    /// 뭉개져도 초록불이었다.
+    ///
+    /// 그래서 두 가지를 본다: (1) 열 문장이 서로 **다르다**, (2) 그중 어느 것도
+    /// 포괄 팔의 문장이 **아니다**. 팔 하나만 지워도 그 키가 포괄 문장으로 떨어져 걸린다.
     #[test]
     fn permission_keys_cover_every_rule_and_stay_at_ten() {
         assert_eq!(PERMISSION_KEYS.len(), 10);
+        // 포괄 팔이 실제로 무슨 문장을 내는지 — 목록에 없는 키로 한 번 꺼내 온다.
+        let fallback = RemoteGuildSettings::permission_description("이런키는없다");
+        assert!(!fallback.is_empty(), "포괄 설명까지 비면 화면에 빈 줄이 나간다");
+
         let settings = RemoteGuildSettings::default();
+        let mut seen: BTreeMap<&'static str, &'static str> = BTreeMap::new();
         for key in PERMISSION_KEYS {
             assert!(settings.rule_for(key).is_some(), "키 {key} 규칙 누락");
-            assert!(
-                !RemoteGuildSettings::permission_description(key).is_empty(),
-                "키 {key} 설명 누락"
+            let description = RemoteGuildSettings::permission_description(key);
+            assert!(!description.is_empty(), "키 {key} 설명 누락");
+            assert_ne!(
+                description, fallback,
+                "키 {key} 에 전용 설명이 없어 포괄 문장으로 떨어졌다"
             );
+            if let Some(other) = seen.insert(description, key) {
+                panic!("키 {key} 와 {other} 의 설명이 같다 — 화면에서 둘을 구분할 수 없다");
+            }
         }
+        assert_eq!(seen.len(), PERMISSION_KEYS.len(), "설명 문장이 열 개가 아니다");
+
+        // 옛 이름도 새 이름과 같은 문장을 쓴다 — 콘솔이 키를 바꿔 물어도 말이 안 바뀐다.
+        assert_eq!(
+            RemoteGuildSettings::permission_description("autoplaySeed"),
+            RemoteGuildSettings::permission_description("autoplay")
+        );
     }
 }
 

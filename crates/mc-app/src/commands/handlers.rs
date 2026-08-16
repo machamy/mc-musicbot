@@ -2398,7 +2398,40 @@ mod tests {
         for name in ["join", "참여", "부르기", "입장"] {
             assert!(names.iter().any(|n| n == name), "'{name}' 이(가) 등록 안 됐어요");
         }
-        assert!(!names.iter().any(|n| n == "ㅊㅇ"), "초성 별칭은 등록하지 않는다");
+        /* **초성 별칭은 하나도 등록되면 안 된다.**
+         *
+         * 예전에는 `"ㅊㅇ"` 하나만 확인했다. 그러면 `is_chosung_alias` 를
+         * `def.name != "ㅊㅇ"` 같은 것으로 바꿔 놔도 통과한다 — 나머지 초성 별칭
+         * 여섯 개(`ㅈㅅ`·`ㅂㄹㅈㅅ`·`ㄷㄱㅇ`·`ㅅㅍ`·`ㅂㅂ`·`ㅅㅌ` …)가 전부
+         * 디스코드에 다시 등록돼도 아무도 모른다.
+         *
+         * 그래서 카탈로그에서 초성 별칭을 **전부 뽑아** 하나도 안 새는지 본다.
+         * 목록을 손으로 적지 않는 것이 요점이다 — 카탈로그에 초성 별칭이
+         * 새로 늘어도 이 테스트가 저절로 따라간다. */
+        let chosung: Vec<&str> = catalog::ALL
+            .iter()
+            .map(|def| def.name)
+            .filter(|name| catalog::is_chosung_alias(name))
+            .collect();
+        assert!(
+            chosung.len() >= 7,
+            "카탈로그에서 초성 별칭을 못 찾았다 — 판별 함수가 망가졌을 수 있다 ({chosung:?})"
+        );
+        for name in &chosung {
+            assert!(
+                !names.iter().any(|n| n == name),
+                "초성 별칭 '{name}' 이(가) 등록됐어요 — 초성은 등록하지 않기로 했다"
+            );
+        }
+        // 반대 방향도 본다: 초성이 아닌 별칭은 **전부** 등록돼야 한다.
+        // 판별 함수가 너무 넓어지면(예: 모든 한글을 초성으로 봄) 정상 명령이 사라진다.
+        for def in catalog::ALL.iter().filter(|d| !catalog::is_chosung_alias(d.name)) {
+            assert!(
+                names.iter().any(|n| n == def.name),
+                "'{}' 이(가) 등록에서 빠졌어요",
+                def.name
+            );
+        }
     }
 
     /// "봇과 같은 방인가" 는 라이브 연결로만 판단한다 (v3 §16 B1).

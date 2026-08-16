@@ -631,9 +631,21 @@ mod tests {
         let keys: BTreeSet<&str> = GROUPS.iter().map(|group| group.key).collect();
         assert_eq!(keys.len(), GROUPS.len(), "그룹 키가 겹쳐요");
         for group in GROUPS {
-            assert_eq!(group_for_key(group.key).map(|g| g.key), Some(group.key));
+            /* **키만 비교하면 부족하다.** `group_for_key` 가 `find(|g| g.key == key)` 라
+             * "찾은 것의 키가 질의와 같다" 는 구현상 늘 참이다. 라벨이나 설명이 딴
+             * 그룹 것으로 바뀌어도 통과한다 — 화면에는 엉뚱한 이름이 뜨는데 초록불이다.
+             * 그래서 **같은 그룹인지**를 필드로 본다. */
+            let found = group_for_key(group.key).expect("등록된 키는 찾혀야 한다");
+            assert_eq!(found.key, group.key);
+            assert_eq!(found.label, group.label, "'{}' 의 라벨이 다르다", group.key);
+            assert_eq!(
+                found.description, group.description,
+                "'{}' 의 설명이 다르다",
+                group.key
+            );
         }
         assert!(group_for_key("없는그룹").is_none());
+        assert!(group_for_key("").is_none());
     }
 
     /// 새로 붙인 `/참여` 의 별칭이 전부 같은 canonical 로 접히는지.
