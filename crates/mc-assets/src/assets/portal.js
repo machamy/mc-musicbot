@@ -291,13 +291,25 @@ function prefJson(key) {
 }
 
 /** 값이 실제로 바뀔 때만 거울에 적고 서버로 보낸다. */
+/* 개인 설정 하나를 바꾼다. `null`·`undefined`·빈 문자열은 **"기본으로 되돌리기"** 다.
+ *
+ * **되돌리기도 서버로 보낸다.** 예전에는 `if (next !== null)` 이라 지우기가 로컬에만
+ * 남았다 — 다른 기기에서 열거나 서버 값을 다시 받으면 지운 값이 되살아났다.
+ * 서버는 `null` 을 "그 키를 지운다" 로 읽는다.
+ *
+ * **빈 문자열을 그대로 보내면 안 된다.** `''` 는 서버 검증을 통과하지 못하는데,
+ * `api_prefs_put` 은 키 하나만 틀려도 **배치 전체를 400 으로 거절**한다. 화면은 300ms
+ * 동안 여러 설정을 모아 한 번에 보내므로, 콘솔 자리를 초기화하는 순간 같은 배치에 실린
+ * 볼륨·싱크 보정 저장까지 같이 날아갔다 — 실측으로 확인했다. (`nowVoters`·`devPos` 에
+ * 이어 같은 사고가 세 번째다. 그래서 이제 여기서 `null` 로 접는다.) */
 function prefSet(key, value) {
-  const next = value === null || value === undefined ? null : String(value);
+  const next =
+    value === null || value === undefined || value === '' ? null : String(value);
   if (String(prefsCache[key] ?? '') === String(next ?? '')) return;
   if (next === null) delete prefsCache[key];
   else prefsCache[key] = next;
   writePrefsMirror();
-  if (next !== null) prefsPending.set(key, next);
+  prefsPending.set(key, next);
   pushPrefs();
 }
 

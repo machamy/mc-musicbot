@@ -224,7 +224,7 @@ mod tests {
     /// (워크스페이스 이사 때는 `d44ff894b8ef9398` 이 그대로 유지되는 것으로 무변경을 증명했다.)
     #[test]
     fn version_hash_is_pinned() {
-        assert_eq!(version(), "f7f5698bc1622067");
+        assert_eq!(version(), "a0cc4bf2ff4792ee");
     }
 
     /// 이름과 바이트가 서로 **뒤바뀌어도** 버전 해시는 그대로다(같은 것을 다 더하므로).
@@ -254,7 +254,7 @@ mod tests {
             ),
             (
                 "portal.js",
-                "f6c0e763c5f8d40bbdf432400053b1277f7778f82e05b30d2f0b431aea3427f3",
+                "ba12ae5e10ad1c95e79f707681108d4b9c57d74e51e0fa4d29de25f4456789ee",
             ),
             (
                 "console.js",
@@ -297,6 +297,40 @@ mod tests {
             sha256_hex(apidoc_body().as_bytes()),
             "94b5c25d7519cb2cebdfd3ece99ae59aac1001fa762ab18abbd7765664c0763a"
         );
+    }
+
+    /// **회귀 가드: 화면이 개인 설정에 빈 문자열을 보내면 배치가 통째로 거절된다.**
+    ///
+    /// 서버(`api_prefs_put`)는 키 하나만 값이 이상해도 **400 으로 배치 전체를 버린다.**
+    /// 화면은 300ms 동안 여러 설정을 모아 한 번에 보내므로, 개발자 콘솔 자리를
+    /// 초기화하는 순간 같은 배치에 실린 볼륨·싱크 보정 저장까지 같이 날아갔다 —
+    /// 로컬 인스턴스로 실측해 확인했다(`devPos: ""` → 400, `webVolume` 미저장).
+    ///
+    /// 같은 사고가 `nowVoters`(v4.20) · `devPos`(v4.24) 에 이어 세 번째였다.
+    /// 그래서 `prefSet` 이 빈 문자열을 `null`("기본으로 되돌리기")로 접는지,
+    /// 그리고 그 `null` 을 **서버로 실제로 보내는지**를 여기서 본다.
+    #[test]
+    fn the_screen_never_sends_an_empty_pref_value() {
+        let js = PORTAL_JS;
+        let start = js
+            .find("function prefSet(")
+            .expect("prefSet 이 있어야 한다");
+        // **문자 경계로 자른다.** `start + 700` 을 그대로 쓰면 한글 주석 한가운데를
+        // 잘라 슬라이스가 패닉한다 (실제로 그랬다).
+        let body: String = js[start..].chars().take(400).collect();
+        let body = body.as_str();
+
+        assert!(
+            body.contains("value === ''"),
+            "prefSet 이 빈 문자열을 되돌리기로 접지 않는다 — 그대로 보내면 배치가 400 으로 죽는다"
+        );
+        /* 되돌리기가 **서버까지** 가야 한다. 예전에는 `if (next !== null)` 로 감싸져
+         * 있어서 지우기가 로컬에만 남았고, 다른 기기에서 열면 지운 값이 되살아났다. */
+        assert!(
+            !body.contains("if (next !== null) prefsPending.set"),
+            "되돌리기가 서버로 안 나간다 — 로컬에서만 지워진다"
+        );
+        assert!(body.contains("prefsPending.set(key, next)"));
     }
 
     /// 전용 접근자의 MIME 도 못 박는다 — 여기가 틀리면 서비스워커 등록이 조용히 실패한다.
