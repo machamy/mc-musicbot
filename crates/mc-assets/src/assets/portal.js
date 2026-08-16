@@ -2140,6 +2140,23 @@ function updateTabDrag(event) {
   const group = findGroup((node) => node.__gid === groupEl.dataset.gid);
   if (!group) { hideDropHint(); dockDrag.target = null; return; }
 
+  /* **탭 바 위에서는 분할하지 않는다 — 순서를 바꾼다.**
+   *
+   * 예전에는 드롭 존을 그룹 박스 전체 기준으로만 계산했다. 그런데 탭 바는 그룹의
+   * 맨 위에 있어서 `ry` 가 항상 작고, 그래서 **탭을 끌어 순서를 바꾸려 하면 어김없이
+   * `top` 으로 잡혀 위아래로 쪼개졌다.** 순서를 바꿀 방법이 아예 없었다.
+   *
+   * 이제 포인터가 탭 바 안에 있으면 끼워 넣을 자리를 계산한다. 분할은 탭 바 **아래**
+   * 본문 가장자리로 끌었을 때만 일어난다 — 두 동작이 서로 다른 자리를 쓴다. */
+  const tabsEl = under?.closest?.('.dk-tabs');
+  if (tabsEl && tabsEl.closest('.dk-group') === groupEl) {
+    dockDrag.target = group;
+    dockDrag.zone = 'tabs';
+    dockDrag.index = tabInsertIndex(tabsEl, event.clientX);
+    showTabInsertHint(tabsEl, dockDrag.index);
+    return;
+  }
+
   const box = groupEl.getBoundingClientRect();
   const rx = (event.clientX - box.left) / Math.max(1, box.width);
   const ry = (event.clientY - box.top) / Math.max(1, box.height);
@@ -2154,7 +2171,36 @@ function updateTabDrag(event) {
   }
   dockDrag.target = group;
   dockDrag.zone = zone;
+  dockDrag.index = null;
   showDropHint(groupEl, zone);
+}
+
+/** 탭 바에서 포인터 x 가 몇 번째 자리인지. 탭 중앙을 기준으로 앞/뒤를 가른다. */
+function tabInsertIndex(tabsEl, clientX) {
+  const tabs = [...tabsEl.querySelectorAll('.dk-tab')];
+  for (let i = 0; i < tabs.length; i += 1) {
+    const box = tabs[i].getBoundingClientRect();
+    if (clientX < box.left + box.width / 2) return i;
+  }
+  return tabs.length;
+}
+
+/** 끼워 넣을 자리에 얇은 세로 막대를 보여 준다. 분할 미리보기(면)와 구분되어야 한다. */
+function showTabInsertHint(tabsEl, index) {
+  const overlay = dropOverlay();
+  const dockBox = el.dock.getBoundingClientRect();
+  const tabs = [...tabsEl.querySelectorAll('.dk-tab')];
+  const barBox = tabsEl.getBoundingClientRect();
+  let x;
+  if (!tabs.length) x = barBox.left + 4;
+  else if (index >= tabs.length) x = tabs[tabs.length - 1].getBoundingClientRect().right;
+  else x = tabs[index].getBoundingClientRect().left;
+  overlay.style.left = `${x - dockBox.left - 1}px`;
+  overlay.style.top = `${barBox.top - dockBox.top + 2}px`;
+  overlay.style.width = '3px';
+  overlay.style.height = `${Math.max(8, barBox.height - 4)}px`;
+  overlay.dataset.zone = 'tabs';
+  overlay.hidden = false;
 }
 
 function showDropHint(groupEl, zone) {
@@ -2192,10 +2238,40 @@ function cancelTabDrag() {
 function endTabDrag() {
   if (!dockDrag) return;
   const { id, target, zone } = dockDrag;
+  // `cancelTabDrag` 가 `dockDrag` 를 지우므로 끼워 넣을 자리를 먼저 빼 둔다.
+  const dockDrag_lastIndex = dockDrag.index;
   cancelTabDrag();
   if (!target || !zone) return;
 
   const source = findGroup((node) => node.panels.includes(id));
+
+  /* 탭 바에 떨궜다 — 순서만 바꾼다. 트리는 그대로 둔다.
+   * 같은 그룹 안이면 `detachPanel` 을 태우지 않는다. 그 함수는 그룹이 비면 트리를
+   * 접어 버려서, 탭 두 개짜리 그룹에서 순서를 바꾸는 것만으로 배치가 흔들린다. */
+  if (zone === 'tabs' && target) {
+    const index = Number.isInteger(dockDrag_lastIndex) ? dockDrag_lastIndex : target.panels.length;
+    if (source === target) {
+      const from = target.panels.indexOf(id);
+      if (from < 0) return;
+      let to = index;
+      if (to > from) to -= 1;              // 자기 자리를 뺀 뒤의 자리로 보정
+      if (to === from) { activateDockPanel(target, id); return; }
+      target.panels.splice(from, 1);
+      target.panels.splice(to, 0, id);
+      target.active = id;
+    } else {
+      detachPanel(id);
+      const alive = findGroup((node) => node.__gid === target.__gid);
+      if (!alive) { addDockPanel(id); return; }
+      alive.panels.splice(Math.min(index, alive.panels.length), 0, id);
+      alive.active = id;
+    }
+    renderDock();
+    savePanelLayout();
+    onPanelShown(id);
+    return;
+  }
+
   if (source === target && zone === 'center') { activateDockPanel(target, id); return; }
   if (source === target && source.panels.length === 1) return;   // 혼자 있는 패널을 자기 자리에 다시 떨구면 아무 일도 없다
 
