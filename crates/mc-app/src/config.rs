@@ -177,7 +177,16 @@ impl Config {
 
         Ok(Config {
             token: settings.token,
-            register_guild_id: settings.register_guild_id,
+            /* **0 은 "설정 안 함" 이다.** 같은 파일의 `botOwnerUserId` 도 0 을 그 뜻으로
+             * 쓰고, 실제 배포본의 `botsettings.json` 이 `"registerGuildId": 0` 이다.
+             *
+             * 그대로 두면 `Some(0)` 이 되어 `GuildId::new(0)` 이 **패닉**한다
+             * (serenity 의 id 는 `NonZeroU64` 다). 그 패닉이 명령 등록을 매 기동마다
+             * 죽였고, 예전에는 등록을 `ready` 안에서 직접 await 했기 때문에 **핸들러가
+             * 통째로 죽어서** 그 뒤의 길드 메타 동기화·아바타·로그 정리, 그리고
+             * 재시작 이어듣기까지 전부 안 돌았다. 새 명령(`/부르기`)이 디스코드에
+             * 안 뜨던 것도 이것 때문이다. (2026-08-17 운영 로그로 확인) */
+            register_guild_id: settings.register_guild_id.filter(|id| *id != 0),
             bot_owner_user_id: settings
                 .bot_owner_user_id_override
                 .or(settings.bot_owner_user_id)

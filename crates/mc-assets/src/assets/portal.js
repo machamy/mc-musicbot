@@ -3328,7 +3328,11 @@ function apRecentSection() {
         tip: '이 기록만 참고에서 빼요', 'aria-label': '이 기록만 빼기',
       }, '✕'), () => removeRecent(Number(item.id))), !editable, reason)
       : null;
-    const sub = [fmtAgo(item.playedUtc), item.artist || track.artist].filter(Boolean).join(' · ');
+    /* 지금 나오는 곡은 아직 '최근 기록' 이 아니라 재생 시각이 없다. `fmtAgo` 를 태우면
+     * 빈 값이나 엉뚱한 값이 나오므로 그 자리에 무엇인지 적어 준다. 서버는 이 줄을
+     * 엔진(`recent_seeds`)과 같은 순서로 맨 앞에 놓아 준다. */
+    const when = item.current ? '지금 나오는 곡' : fmtAgo(item.playedUtc);
+    const sub = [when, item.artist || track.artist].filter(Boolean).join(' · ');
     return apRow(track, sub, [toSeed, drop], idle, `최근 ${limit}곡만 참고해서 이 곡은 지금 영향이 없어요`);
   });
 

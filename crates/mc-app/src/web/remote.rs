@@ -7154,8 +7154,19 @@ fn autoplay_seed_json(state: &WebState, guild_id: u64, seed: &AutoplaySeed) -> V
 }
 
 /// 목록 + 상한 + 내가 고칠 수 있는지. 권한이 없어도 **보이기는 한다**(V3 §8.5).
-fn autoplay_payload(state: &WebState, guild_id: u64, can_edit: bool) -> Value {
+async fn autoplay_payload(state: &WebState, guild_id: u64, can_edit: bool) -> Value {
     let settings = state.app.remote.load_guild_settings(guild_id);
+    /* **엔진과 같은 출처를 본다.** 바구니는 "추천이 무엇을 참고하는가" 를 보여 주는
+     * 화면인데, 엔진(`recent_seeds`)은 `state.current_item` 을 맨 앞에 두는 반면
+     * 여기서는 DB 의 `remote_recent_tracks` 만 읽고 있었다. 그래서 **지금 나오는 곡이
+     * 추천에 실제로 쓰이는데도 바구니에는 안 보였다.** */
+    let current_track = state
+        .app
+        .player
+        .get_state(guild_id)
+        .await
+        .current_item
+        .map(|item| item.track);
     let seeds: Vec<Value> = state
         .app
         .remote
@@ -7186,24 +7197,62 @@ fn autoplay_payload(state: &WebState, guild_id: u64, can_edit: bool) -> Value {
         "genreOptions": genre_options(state, guild_id),
         // **무엇이 추천 근거로 쌓이고 있는지** (V3 §8.7). 화면이 이걸 그대로 보여준다.
         // 이게 없으면 자동재생은 "어디서 나온지 모를 곡을 트는 기계"로 보인다.
-        "basket": autoplay_basket(state, guild_id, &settings),
+        "basket": autoplay_basket(state, guild_id, &settings, current_track.as_ref()),
     })
 }
+
+/// 최근 튼 곡을 "무제한(0)" 으로 둔 서버에서 바구니가 한 번에 보여 줄 최대 줄 수.
+///
+/// 화면(`portal.js` 의 `apRecentSection`)이 12줄로 자르므로 그보다 많이 보내 봐야
+/// 트래픽만 는다. 무제한은 "몇 곡까지 참고하나" 의 상한이 없다는 뜻이지
+/// "화면에 다 그린다" 는 뜻이 아니다.
+const BASKET_RECENT_DISPLAY_CAP: usize = 12;
 
 /// 추천 바구니의 지금 상태. 담긴 것 · 자동으로 쌓인 것 · 빼 둔 것 세 칸이다.
 fn autoplay_basket(
     state: &WebState,
     guild_id: u64,
     settings: &RemoteGuildSettings,
+    current: Option<&TrackRef>,
 ) -> Value {
-    // 추천이 실제로 참고하는 만큼만 보여준다. 설정값보다 많이 보여주면
-    // "이 곡도 참고하나 보다" 하고 오해한다.
-    let window = settings.autoplay_recent_count.max(1) as usize;
-    let recent: Vec<Value> = state
+    /* 추천이 실제로 참고하는 만큼만 보여준다. 설정값보다 많이 보여주면
+     * "이 곡도 참고하나 보다" 하고 오해한다.
+     *
+     * **`.max(1)` 을 쓰면 안 된다.** `0` 은 §23.1 에서 **무제한**이라, 0 을 1 로
+     * 둔갑시키면 "무제한" 이 "가장 빡빡함" 이 된다 — `recent_seeds` 의 주석이 정확히
+     * 그것을 경고하는데 이 화면이 그 실수를 하고 있었다. 무제한일 때는 화면이 감당할
+     * 만큼만 가져온다(클라이언트도 12줄로 자른다). */
+    let window = settings
+        .recent_count_limit()
+        .map(|limit| limit as usize)
+        .unwrap_or(BASKET_RECENT_DISPLAY_CAP);
+    /* **지금 나오는 곡을 맨 앞에 둔다.** 엔진의 `recent_seeds` 와 같은 순서다.
+     *
+     * `id` 를 안 붙인다 — 그 값은 `remote_recent_tracks` 의 행 번호이고, 지금 나오는
+     * 곡은 아직 그 표에 없다. 화면은 `id` 가 없으면 "이 기록만 빼기" 버튼을 안 단다
+     * (지금 나오는 곡을 최근 기록에서 뺀다는 말이 성립하지 않으므로 그게 맞다). */
+    let mut recent: Vec<Value> = Vec::new();
+    if let Some(track) = current {
+        recent.push(json!({
+            "title": track.title.clone().unwrap_or_else(|| "제목 없음".into()),
+            "artist": track.artist,
+            "cacheKey": track.cache_key(),
+            "current": true,
+            "track": track_json(track),
+        }));
+    }
+    let current_key = current.map(|track| track.cache_key());
+    let rows: Vec<Value> = state
         .app
         .remote
         .list_recent(guild_id, window)
         .iter()
+        // 지금 나오는 곡이 최근 기록에도 있으면 두 번 보이지 않게 접는다.
+        .filter(|item| {
+            current_key
+                .as_ref()
+                .is_none_or(|key| !item.track.cache_key().eq_ignore_ascii_case(key))
+        })
         .map(|item| {
             json!({
                 // 한 줄만 지우려면 화면이 그 줄을 지목할 수 있어야 한다. 같은 곡을 여러 번
@@ -7220,6 +7269,8 @@ fn autoplay_basket(
             })
         })
         .collect();
+    recent.extend(rows);
+    recent.truncate(window.max(1));
 
     let blocked: Vec<Value> = state
         .app
@@ -7319,7 +7370,7 @@ async fn api_autoplay_reset(
     );
 
     let can_edit = ctx.allows("autoplay", ctx.settings.autoplay_rule);
-    let mut payload = autoplay_payload(&state, guild_id, can_edit);
+    let mut payload = autoplay_payload(&state, guild_id, can_edit).await;
     payload["message"] = json!(summary);
     json_ok(payload)
 }
@@ -7436,9 +7487,9 @@ async fn api_autoplay_put(
             crate::player::side_effects::refresh_preview(app, guild_id).await;
         });
     }
-    broadcast_autoplay(&state, guild_id);
+    broadcast_autoplay(&state, guild_id).await;
     emit_bare(&state, guild_id, "settings");
-    json_ok(json!({ "ok": true, "autoplay": autoplay_payload(&state, guild_id, true) }))
+    json_ok(json!({ "ok": true, "autoplay": autoplay_payload(&state, guild_id, true).await }))
 }
 
 /// `GET .../autoplay` — 시드 + 추천 방식 (V3 §8.6).
@@ -7452,12 +7503,12 @@ async fn api_autoplay_get(
         Err(response) => return response,
     };
     let can_edit = ctx.allows("autoplay", ctx.settings.autoplay_rule);
-    json_ok(autoplay_payload(&state, guild_id, can_edit))
+    json_ok(autoplay_payload(&state, guild_id, can_edit).await)
 }
 
 /// 시드가 바뀌면 보고 있는 사람 모두에게 알린다. 개인화 필드가 없어서 그대로 보내도 된다.
-fn broadcast_autoplay(state: &Arc<WebState>, guild_id: u64) {
-    let payload = autoplay_payload(state, guild_id, true);
+async fn broadcast_autoplay(state: &Arc<WebState>, guild_id: u64) {
+    let payload = autoplay_payload(state, guild_id, true).await;
     emit(state, guild_id, "autoplay", payload);
 }
 
@@ -7471,7 +7522,7 @@ async fn api_autoplay_seeds(
         Err(response) => return response,
     };
     let can_edit = ctx.allows("autoplay", ctx.settings.autoplay_rule);
-    json_ok(autoplay_payload(&state, guild_id, can_edit))
+    json_ok(autoplay_payload(&state, guild_id, can_edit).await)
 }
 
 /// 기준 곡 편집 공통 게이트 — 권한 + 신청 정지.
@@ -7530,7 +7581,7 @@ async fn api_autoplay_seed_add(
                 Some(&title),
                 Some("added"),
             );
-            broadcast_autoplay(&state, guild_id);
+            broadcast_autoplay(&state, guild_id).await;
             json_ok(json!({ "ok": true, "message": SeedAddOutcome::Added.message() }))
         }
         // 거절 사유 문구는 저장소가 들고 있는 걸 그대로 쓴다 — 화면과 서버가 다른 말을 하면 안 된다.
@@ -7573,7 +7624,7 @@ async fn api_autoplay_seed_remove(
                 Some(request.cache_key.trim()),
                 Some("removed"),
             );
-            broadcast_autoplay(&state, guild_id);
+            broadcast_autoplay(&state, guild_id).await;
             json_ok(json!({ "ok": true }))
         }
         Ok(false) => json_error(StatusCode::NOT_FOUND, "그 기준 곡을 찾지 못했어요."),
@@ -7613,7 +7664,7 @@ async fn api_autoplay_recent_remove(
                 Some(&request.id.to_string()),
                 Some("removed"),
             );
-            broadcast_autoplay(&state, guild_id);
+            broadcast_autoplay(&state, guild_id).await;
             json_ok(json!({ "ok": true }))
         }
         Ok(false) => json_error(StatusCode::NOT_FOUND, "그 기록을 찾지 못했어요."),
@@ -7653,7 +7704,7 @@ async fn api_autoplay_blocked_remove(
                 Some(key),
                 Some("unblocked"),
             );
-            broadcast_autoplay(&state, guild_id);
+            broadcast_autoplay(&state, guild_id).await;
             json_ok(json!({ "ok": true }))
         }
         Ok(false) => json_error(StatusCode::NOT_FOUND, "그 곡은 빼 둔 목록에 없어요."),
@@ -7697,7 +7748,7 @@ async fn api_autoplay_seeds_reorder(
         .reorder_autoplay_seeds(guild_id, &request.cache_keys)
     {
         Ok(()) => {
-            broadcast_autoplay(&state, guild_id);
+            broadcast_autoplay(&state, guild_id).await;
             json_ok(json!({ "ok": true }))
         }
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),

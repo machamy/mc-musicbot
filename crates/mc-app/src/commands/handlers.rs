@@ -282,7 +282,10 @@ pub fn build_commands() -> Vec<CreateCommand> {
 
 pub async fn register_commands(app: &Arc<App>, ctx: &Context) {
     let commands = build_commands();
-    let result = match app.config.register_guild_id {
+    /* `Some(0)` 은 `Config` 가 이미 `None` 으로 접어 준다. 여기서 한 번 더 거르는 것은
+     * `GuildId::new(0)` 이 **패닉**하기 때문이다 — 설정 파일 하나 때문에 명령 등록이
+     * 통째로 죽는 일을 두 겹으로 막는다. */
+    let result = match app.config.register_guild_id.filter(|id| *id != 0) {
         Some(gid) => GuildId::new(gid)
             .set_commands(&ctx.http, commands)
             .await
@@ -2381,6 +2384,40 @@ mod tests {
         // 공개 주소가 아직 없어도 문구가 끊기면 안 된다.
         let no_url = command_group_denied_text(group, "play", None, false);
         assert!(no_url.contains("리모컨"), "{no_url}");
+    }
+
+    /// **회귀 가드: `registerGuildId: 0` 이 명령 등록을 패닉으로 죽이던 문제.**
+    ///
+    /// 배포본의 `botsettings.json` 은 "설정 안 함" 을 `0` 으로 쓴다(`botOwnerUserId` 도 같다).
+    /// 그런데 그 값이 `Some(0)` 으로 그대로 넘어가면 `GuildId::new(0)` 이 패닉한다 —
+    /// serenity 의 id 는 `NonZeroU64` 다.
+    ///
+    /// 그 패닉이 실제로 운영에서 명령 등록을 매 기동마다 죽였고, 등록을 `ready` 안에서
+    /// 직접 await 하던 시절에는 **핸들러가 통째로 죽어서** 뒤의 길드 메타 동기화·아바타·
+    /// 로그 정리·재시작 이어듣기까지 전부 안 돌았다. 로그에는 `Registering commands...`
+    /// 만 남고 성공도 실패도 안 찍혔다(2026-08-17 운영 로그 전수 확인).
+    ///
+    /// **패닉은 테스트로 잡기 어렵다** — 그래서 패닉하기 **전에** 0 이 걸러지는지를 본다.
+    #[test]
+    fn a_zero_register_guild_id_means_global_not_a_panic() {
+        // serenity 의 id 는 NonZeroU64 다. 이 사실이 바뀌면 이 가드의 전제도 바뀐다.
+        assert!(
+            std::panic::catch_unwind(|| serenity::all::GuildId::new(0)).is_err(),
+            "GuildId::new(0) 이 더 이상 패닉하지 않는다면 이 가드를 다시 써야 한다"
+        );
+
+        // `Config` 가 0 을 None 으로 접는다.
+        let folded: Option<u64> = Some(0u64).filter(|id| *id != 0);
+        assert_eq!(folded, None, "0 은 '설정 안 함' 으로 접혀야 한다");
+        assert_eq!(Some(123u64).filter(|id| *id != 0), Some(123));
+
+        // 실제 설정 파싱에도 그 접기가 있는지 소스로 확인한다 —
+        // 여기만 고치고 config.rs 를 되돌리면 다시 죽는다.
+        let cfg = include_str!("../config.rs");
+        assert!(
+            cfg.contains("register_guild_id: settings.register_guild_id.filter("),
+            "config.rs 가 registerGuildId 0 을 안 접는다"
+        );
     }
 
     /// 새 `/참여` 가 실제로 등록되는지 — 카탈로그에만 있고 등록이 안 되면 아무도 못 쓴다.
