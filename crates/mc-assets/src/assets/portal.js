@@ -4879,16 +4879,34 @@ function buildWebPlayback() {
    * 고장으로 보이는데, 실제로는 봇이 음성에서 빠졌거나 누가 일시정지한 것이다. */
   el.videoVeil = h('div', { class: 'videochrome__veil', hidden: true });
   el.videoCount = h('span', { class: 'videochrome__count' });
-  el.videoSizeLabel = h('span', { class: 'videosize__label' });
-  /* 크기 조절은 **슬라이더**다. 볼륨과 같은 어법이라 처음 봐도 뭘 하는 물건인지 안다.
-   * 단계가 넷뿐이라 `step=1` 로 딱딱 떨어진다. 안내막은 클릭을 안 받지만 이 줄만 예외다. */
-  el.videoSizeRange = h('input', {
-    class: 'vol__range videosize__range', type: 'range',
-    min: '1', max: String(VIDEO_SIZES.length), step: '1',
+  /* **크기는 영상 모서리를 끌어서 바꾼다.**
+   *
+   * 처음에는 안내막 안에 슬라이더를 뒀는데, 안내막은 영상 자리를 rAF 로 쫓아간다.
+   * 그래서 슬라이더를 끌면 → 영상이 커지고 → 안내막이 따라 움직이고 →
+   * **슬라이더가 손가락 밑에서 빠져나갔다.** 컨트롤이 도망다니는 꼴이었다.
+   *
+   * 창 크기 조절과 같은 어법으로 바꾼다. 끄는 대상이 곧 크기가 바뀌는 대상이라
+   * 도망갈 것이 없다. 영상은 가운데 정렬이라 한쪽을 dx 만큼 끌면 폭은 2·dx 만큼 변한다.
+   *
+   * 키보드로도 된다 — 패널 분할선(`buildDivider`)과 같은 `role=separator` 규약이다. */
+  el.videoSizeLabel = h('span', { class: 'videosize__readout' });
+  const grip = (side) => h('div', {
+    class: `videogrip videogrip--${side}`,
+    role: 'separator', tabindex: '0',
+    'aria-orientation': 'vertical',
     'aria-label': '영상 크기',
-    onInput: () => setVideoSize(Number(el.videoSizeRange.value)),
+    'aria-valuemin': String(VIDEO_W_MIN),
+    'aria-valuemax': String(VIDEO_W_MAX),
+    onPointerdown: (event) => startVideoResize(event, side),
+    onKeydown: (event) => {
+      const step = event.shiftKey ? 10 : 2;
+      if (event.key === 'ArrowRight' || event.key === 'ArrowUp') { event.preventDefault(); nudgeVideoWidth(step); }
+      else if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') { event.preventDefault(); nudgeVideoWidth(-step); }
+      else if (event.key === 'Home') { event.preventDefault(); setVideoWidth(VIDEO_W_DEFAULT); }
+    },
   });
-  el.videoSizeBox = h('div', { class: 'videosize' }, el.videoSizeRange, el.videoSizeLabel);
+  el.videoGrips = ['w', 'e'].map(grip);
+
   /* **자막 켜고 끄기.**
    *
    * 영상 자체는 `pointer-events: none` 이라 유튜브의 CC 버튼을 누를 수 없다 — 그건
@@ -4900,11 +4918,13 @@ function buildWebPlayback() {
   el.videoCcBtn = h('button', {
     class: 'iconbtn videocc', type: 'button',
     'aria-pressed': 'false',
-    onClick: () => setVideoCaptions(!videoCaptionsOn()),
+    onClick: () => { wakeVideoChrome(); setVideoCaptions(!videoCaptionsOn()); },
   }, 'CC');
+
   el.videoChrome = h('div', { class: 'videochrome', hidden: true },
-    el.videoVeil, el.videoCount, el.videoCcBtn, el.videoSizeBox);
+    el.videoVeil, el.videoCount, el.videoCcBtn, el.videoSizeLabel, ...el.videoGrips);
   document.body.appendChild(el.videoChrome);
+  bindVideoChromeIdle();
 
   window.addEventListener('pagehide', stopWebPlayback);
 }
@@ -4927,6 +4947,8 @@ let videoJoined = false;
 let videoRaf = 0;
 /** 마지막으로 쓴 좌표. 같은 값을 다시 쓰면 레이아웃이 헛되이 무효화된다. */
 let videoBoxKey = '';
+/** 크기 슬라이더를 끄는 중인가. 그동안 안내막을 얼려 둔다. */
+let videoSizeDragging = false;
 
 /** 이번 방문에 이미 답한 판 id. 계정이 아니라 **탭 수명**으로 기억한다 —
  *  "거절했다" 가 다른 기기까지 따라다니면 안 된다. */
@@ -4968,12 +4990,13 @@ function watchPhase({ watch, meId, joined, asked }) {
  * 마지막 단계는 카드 좌우 여백까지 밀어내 **가장자리까지** 채운다. 그래야 "제일 크게" 가
  * 실제로 제일 크다. 높이는 16:9 를 지키되 화면을 넘지 않게 상한을 같이 둔다.
  */
-const VIDEO_SIZES = [
-  { w: '60%', bleed: false, label: '작게' },
-  { w: '80%', bleed: false, label: '보통' },
-  { w: '100%', bleed: false, label: '크게' },
-  { w: '100%', bleed: true, label: '꽉 차게' },
-];
+/* 영상 폭(카드 대비 %). 단계가 아니라 **연속값**이다 — 창 크기 조절처럼 원하는 만큼.
+ * 100% 를 넘으면 카드 여백까지 밀어내 가장자리를 채운다(`--video-bleed`). */
+const VIDEO_W_MIN = 40;
+const VIDEO_W_MAX = 112;
+const VIDEO_W_DEFAULT = 80;
+/** 이 값을 넘으면 카드 여백을 밀어낸다. */
+const VIDEO_W_BLEED_FROM = 100;
 
 /** 자막을 켜 둘 것인가. 기본은 꺼짐. */
 function videoCaptionsOn() {
@@ -5001,29 +5024,112 @@ function applyVideoCaptions() {
   }
 }
 
-function videoSizeStep() {
-  const raw = Number(prefGet('videoSize'));
-  return Number.isInteger(raw) && raw >= 1 && raw <= VIDEO_SIZES.length ? raw : 3;
+function videoWidthPct() {
+  const raw = Number(prefGet('videoWidth'));
+  return Number.isFinite(raw) && raw >= VIDEO_W_MIN && raw <= VIDEO_W_MAX ? raw : VIDEO_W_DEFAULT;
+}
+
+/* **가만두면 사라진다.**
+ *
+ * 영상 위에 무언가 계속 떠 있으면 그게 곧 방해다. 마우스를 움직이면 나타나고,
+ * 잠시 안 건드리면 사라진다 — 영상 플레이어의 보통 어법이다.
+ *
+ * `pointermove` 를 안내막에 못 건다: 안내막은 `pointer-events: none` 이라
+ * 이벤트가 안 온다(그게 유튜브 컨트롤을 막는 수단이다). 그래서 문서에서 듣고
+ * 좌표가 영상 안인지 본다. */
+const VIDEO_CHROME_IDLE_MS = 2000;
+let videoChromeIdleTimer = 0;
+
+function wakeVideoChrome() {
+  if (!el.videoChrome) return;
+  el.videoChrome.dataset.idle = '0';
+  clearTimeout(videoChromeIdleTimer);
+  videoChromeIdleTimer = setTimeout(() => {
+    // 끄는 중에는 안 숨긴다. 손이 올라가 있는데 사라지면 당황스럽다.
+    if (videoSizeDragging) { wakeVideoChrome(); return; }
+    if (el.videoChrome) el.videoChrome.dataset.idle = '1';
+  }, VIDEO_CHROME_IDLE_MS);
+}
+
+function bindVideoChromeIdle() {
+  document.addEventListener('pointermove', (event) => {
+    if (!videoShowing() || !el.videoChrome || el.videoChrome.hidden) return;
+    const box = el.videoChrome.getBoundingClientRect();
+    const inside = event.clientX >= box.left && event.clientX <= box.right
+      && event.clientY >= box.top && event.clientY <= box.bottom;
+    if (inside) wakeVideoChrome();
+  }, { passive: true });
+  // 키보드로 그립에 들어와도 보여야 한다.
+  document.addEventListener('focusin', (event) => {
+    if (el.videoChrome?.contains(event.target)) wakeVideoChrome();
+  });
 }
 
 function applyVideoSize() {
-  const size = VIDEO_SIZES[videoSizeStep() - 1];
+  const pct = videoWidthPct();
   const root = document.documentElement.style;
-  root.setProperty('--video-w', size.w);
-  root.setProperty('--video-bleed', size.bleed ? 'var(--sp-4)' : '0px');
-  /* **가운데로 세운다.** 꽉 차게는 좌우로 똑같이 밀어내므로 그것도 가운데다.
+  root.setProperty('--video-w', `${pct}%`);
+  /* **여백 밀어내기를 연속으로 준다.**
+   *
+   * 예전에는 100% 를 넘는 순간 `var(--sp-4)` 가 통째로 붙어서 끄는 도중 폭이 36px
+   * **한 번에 튀었다.** 단계형(작게/보통/크게/꽉 차게)일 때는 어차피 계단이라 티가
+   * 안 났는데, 연속으로 끌게 되니 그 계단이 그대로 손에 걸린다.
+   * 100%→최대 구간에 걸쳐 0 에서 최대치까지 고르게 늘린다. */
+  const over = Math.max(0, pct - VIDEO_W_BLEED_FROM) / (VIDEO_W_MAX - VIDEO_W_BLEED_FROM);
+  root.setProperty('--video-bleed', `calc(${over.toFixed(3)} * var(--sp-4))`);
+  /* **가운데로 세운다.** 넘치는 크기도 좌우로 똑같이 밀어내므로 그것도 가운데다.
    * 예전에 `margin-inline: auto` 를 빼는 바람에 작은 크기에서 왼쪽에 붙어 있었다. */
-  root.setProperty('--video-margin', size.bleed ? 'calc(-1 * var(--sp-4))' : 'auto');
-  if (el.videoSizeLabel) el.videoSizeLabel.textContent = size.label;
-  if (el.videoSizeRange) el.videoSizeRange.value = String(videoSizeStep());
-  // 자리 크기가 바뀌었으니 다음 프레임에 오버레이가 따라온다(rAF 가 알아서 다시 잰다).
+  root.setProperty('--video-margin', over > 0 ? `calc(-${over.toFixed(3)} * var(--sp-4))` : 'auto');
+  if (el.videoSizeLabel) el.videoSizeLabel.textContent = `${Math.round(pct)}%`;
+  for (const g of el.videoGrips || []) g.setAttribute('aria-valuenow', String(Math.round(pct)));
 }
 
-function setVideoSize(step) {
-  const next = Math.min(VIDEO_SIZES.length, Math.max(1, Math.round(step) || 1));
-  if (next === videoSizeStep()) return;
-  prefSet('videoSize', String(next));
+function setVideoWidth(pct) {
+  const next = Math.min(VIDEO_W_MAX, Math.max(VIDEO_W_MIN, Math.round(pct)));
+  if (next === videoWidthPct()) return;
+  prefSet('videoWidth', String(next));
   applyVideoSize();
+}
+
+function nudgeVideoWidth(delta) {
+  wakeVideoChrome();
+  setVideoWidth(videoWidthPct() + delta);
+}
+
+/** 모서리를 끌어 크기를 바꾼다. 영상이 가운데라 한쪽을 dx 끌면 폭은 2·dx 변한다. */
+function startVideoResize(event, side) {
+  if (event.button !== 0) return;
+  const slot = el.nowArtWrap;
+  if (!slot) return;
+  event.preventDefault();
+  const startX = event.clientX;
+  const startW = slot.getBoundingClientRect().width;
+  const startPct = videoWidthPct();
+  /* **지금 상태로 눈금을 잡는다.** `--video-w` 의 `%` 는 카드가 아니라 자리표시자의
+   * 컨테이닝 블록 기준으로 풀린다(안쪽 패딩만큼 좁다). 그 폭을 따로 재려 하면
+   * 어느 요소가 기준인지 계속 맞춰야 하고, 배치가 바뀌면 또 틀어진다.
+   * 지금 폭이 곧 지금 %이므로 그 둘의 비를 쓰면 컨테이너를 몰라도 정확하다. */
+  const pctPerPx = startPct / Math.max(1, startW);
+  videoSizeDragging = true;
+  document.body.dataset.resizing = 'col';
+  const dir = side === 'e' ? 1 : -1;
+  const move = (e) => {
+    wakeVideoChrome();
+    // 가운데 정렬이라 한쪽을 dx 끌면 폭은 2·dx 변한다.
+    setVideoWidth(startPct + dir * (e.clientX - startX) * 2 * pctPerPx);
+  };
+  const done = () => {
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', done);
+    document.removeEventListener('pointercancel', done);
+    videoSizeDragging = false;
+    delete document.body.dataset.resizing;
+    videoBoxKey = '';   // 얼어 있는 동안 건너뛴 자리를 다시 계산한다
+    placeVideo();
+  };
+  document.addEventListener('pointermove', move);
+  document.addEventListener('pointerup', done);
+  document.addEventListener('pointercancel', done);
 }
 
 /** 지금 곡이 라이브인가 (§40). 라이브의 "지금" 은 계산한 위치가 아니라 **맨 끝**이다. */
@@ -5107,8 +5213,16 @@ function placeVideo() {
   el.webHost.style.width = `${Math.round(full.width)}px`;
   el.webHost.style.height = `${Math.round(full.height)}px`;
   el.webHost.style.clipPath = insetPath(full, clip);
-  // 안내막도 같은 자리로. 영상 위에 정확히 겹쳐야 한다.
-  if (el.videoChrome) {
+  /* 안내막도 같은 자리로. 영상 위에 정확히 겹쳐야 한다.
+   *
+   * **단, 크기 슬라이더를 끄는 동안은 얼린다.** 안내막은 영상 자리를 rAF 로 쫓아가는데,
+   * 그 안에 크기 슬라이더가 들어 있다. 그래서 슬라이더를 끌면 → 영상이 커지고 →
+   * 안내막이 따라 움직이고 → **슬라이더가 손가락 밑에서 빠져나갔다.** 끄는 내내
+   * 컨트롤이 도망다니는 꼴이었다.
+   *
+   * 영상은 그대로 실시간으로 커진다(미리보기는 살아 있다). 손을 뗄 때 안내막을
+   * 새 자리로 옮긴다. */
+  if (el.videoChrome && !videoSizeDragging) {
     el.videoChrome.hidden = false;
     el.videoChrome.style.left = el.webHost.style.left;
     el.videoChrome.style.top = el.webHost.style.top;
@@ -5165,6 +5279,8 @@ async function joinVideo() {
   // 웹에서 듣기를 켠다 — 자동재생 제스처·리스너 보고·싱크 루프를 그 경로가 이미 다 한다.
   webWasOnBeforeVideo = webOn;
   videoJoined = true;
+  // 처음 켤 때 한 번 보여 준다 — 크기를 바꿀 수 있다는 걸 알려야 한다. 곧 사라진다.
+  wakeVideoChrome();
   startVideoLoop();
   syncVideoUi();
   if (!webOn) await toggleWebPlayback();
@@ -6714,10 +6830,39 @@ function updateUnreadBadges() {
   notify.badge(titleBadgeOn() ? unread : 0);
 }
 
+/** 채팅이 **지금 실제로 눈앞에 있는가.**
+ *
+ * 예전 판정은 `activeSideTab === 'chat' && !hidden` 이었고, 배치를 전혀 몰랐다.
+ * 그래서 양쪽으로 틀렸다.
+ *
+ * ① **드로어가 닫혀 있는데 '읽고 있다'고 쳤다.** 집중 배치는 폭과 무관하게 항상,
+ *    3단은 1280px 미만, 2단은 981px 미만, DJ·수다도 좁아지면 사이드가 화면 밖으로
+ *    빠진다. 그런데 채팅 pane 자체는 `hidden` 이 아니라서 `active === true` 가 됐다.
+ *    결과: 미읽음이 안 오르고, 헤더 배지도 안 뜨고, **나를 부른 멘션 토스트조차
+ *    안 떴다.** 닫힌 문 뒤로 대화가 다 지나갔다.
+ *
+ * ② **패널 배치에서는 채팅이 눈앞인데 배지가 쌓였다.** 도크 탭을 눌러도
+ *    `activateDockPanel` 은 `activeSideTab` 을 갱신하지 않는다. 지난 세션 값이
+ *    `audit` 이면 채팅을 보고 있어도 미읽음이 계속 올랐다.
+ *
+ * `offsetParent` 로 퉁칠 수 없다 — 드로어는 `position: fixed` 라 열려 있어도
+ * `offsetParent` 가 `null` 이다. 그래서 배치별로 정직하게 나눠 본다. */
+function chatIsOnScreen() {
+  if (document.hidden) return false;
+  const pane = el.sidePanes?.chat;
+  if (!pane || pane.hidden) return false;
+  // 패널 배치: 활성 탭 여부가 곧 `pane.hidden` 이다. `activeSideTab` 은 안 따라온다.
+  if (panelMode()) return true;
+  if (activeSideTab !== 'chat') return false;
+  // 사이드가 드로어로 빠지는 구간이면 **열려 있어야** 보이는 것이다.
+  if (drawerActive()) return el.side?.dataset.open === '1';
+  return true;
+}
+
 function onChatArrived(message) {
   const state = store.get();
   const mine = String(message.userId) === String(state.user?.id);
-  const active = activeSideTab === 'chat' && !document.hidden && !el.sidePanes.chat.hidden;
+  const active = chatIsOnScreen();
   if (!mine && !active) {
     unread += 1;
     updateUnreadBadges();
@@ -9205,7 +9350,7 @@ async function boot() {
   scheduleViz();
   startSortTick();
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) { scheduleViz(); marquee.scan(); if (activeSideTab === 'chat') markChatRead(); }
+    if (!document.hidden) { scheduleViz(); marquee.scan(); if (chatIsOnScreen()) markChatRead(); }
   });
 
   bindShortcuts();

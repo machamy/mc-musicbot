@@ -645,7 +645,7 @@ pub const PREF_KEYS: [&str; 16] = [
     "lyricsOpen",
     "webPlayback",
     "nowVoters",
-    "videoSize",
+    "videoWidth",
     "videoCaptions",
     "devPos",
     "devSize",
@@ -693,8 +693,13 @@ pub fn is_valid_pref(key: &str, value: &str) -> bool {
         // 한 번에 보낸다. 그래서 명단을 접었다 폈다 하는 동안 같은 배치에 실린
         // `webVolume`·`webOffset` 저장까지 같이 날아갔다 — 실제로 그랬다.
         "lyricsOpen" | "webPlayback" | "nowVoters" | "videoCaptions" => matches!(value, "0" | "1"),
-        // 영상 크기 1~4 (§40). 목록에 없으면 저장이 통째로 실패한다 — `nowVoters` 가 그랬다.
-        "videoSize" => matches!(value, "1" | "2" | "3" | "4"),
+        /* 영상 폭(카드 대비 %). **단계가 아니라 연속값이다** — 모서리를 끌어서 바꾼다.
+         * 예전에는 1~4 단계였는데, 그 슬라이더가 안내막 안에 있어서 끌면 영상과 같이
+         * 움직여 손 밑에서 도망갔다. 창 크기 조절 어법으로 바꾸면서 값도 연속이 됐다.
+         * 상한이 100 을 넘는 것은 카드 여백까지 밀어내는 "꽉 차게" 구간이다. */
+        "videoWidth" => value
+            .parse::<u32>()
+            .is_ok_and(|pct| (40..=112).contains(&pct) && !value.starts_with('+')),
         /* 개발자 콘솔 창의 자리와 크기. `"x,y"` · `"w,h"` 꼴의 정수 두 개다.
          *
          * **`devPos` 는 화면이 보내는데 여기 없었다.** 그래서 콘솔을 옮겨 놔도 다음에
@@ -753,7 +758,7 @@ const PREF_SAMPLES: [(&str, &str); 16] = [
     ("lyricsOpen", "1"),
     ("webPlayback", "1"),
     ("nowVoters", "1"),
-    ("videoSize", "3"),
+    ("videoWidth", "80"),
     ("videoCaptions", "1"),
     ("devPos", "120,80"),
     ("devSize", "640,360"),
@@ -4876,7 +4881,7 @@ mod tests {
             ("webVolume", "60"),
             ("webOffset", "0"),
             ("nowVoters", "0"),
-            ("videoSize", "3"),
+            ("videoWidth", "80"),
             ("devPos", "120,80"),
             ("devSize", "640,420"),
         ] {

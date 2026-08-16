@@ -2828,14 +2828,6 @@ body.gate {
   font-weight: var(--fw-semi);
 }
 /* 크기 조절만 클릭을 받는다. 나머지 안내막은 유튜브에 마우스가 안 닿게 그대로 막아 둔다. */
-.videosize {
-  position: absolute; right: var(--sp-2); top: var(--sp-2);
-  display: flex; align-items: center; gap: var(--sp-1);
-  padding: 2px var(--sp-1);
-  border-radius: var(--r-full);
-  background: rgba(0, 0, 0, 0.55);
-  pointer-events: auto;
-}
 /* 자막 토글. 안내막은 클릭을 안 받지만 이 버튼과 크기 슬라이더만 예외다. */
 .videocc {
   pointer-events: auto;
@@ -2850,7 +2842,6 @@ body.gate {
   box-shadow: inset 0 0 0 1px var(--accent);
 }
 
-.videosize__range { width: 96px; flex: none; accent-color: #fff; }
 .videosize__label { color: #fff; font-size: var(--fs-xs); min-width: 3.6em; text-align: center; }
 
 .videochrome__count {
@@ -2879,3 +2870,76 @@ body.gate {
 :root .now[data-video="1"] .now__art { filter: blur(18px) brightness(0.5); }
 /* 소리 그림은 영상 뒤에서 의미가 없다. 숨긴다 — 크기 0 이 되어도 rAF 가 안 헛돈다(§v4.20). */
 :root .now[data-video="1"] .viz { display: none; }
+
+/* ── 집중 배치: 채팅을 여는 버튼이 넓은 화면에서 사라지던 문제 ──
+ *
+ * `.hdr__drawer` 는 기본이 `display: none` 이고 `max-width: 1279px` 에서만 켜진다.
+ * 그런데 집중 배치는 **폭과 무관하게** 사이드가 항상 오버레이다(`drawerUnder: 99999`).
+ * 그래서 1280px 이상에서 집중을 고르면 채팅·멤버·최근·로그를 **마우스로는 영영 열 수
+ * 없었다.** 미읽음 배지도 그 버튼 안에 있어서 같이 사라졌다. 왼쪽 레일은 전용 버튼
+ * (`.hdr__raildrawer`)을 따로 만들어 줬는데 오른쪽만 빠져 있었다.
+ *
+ * 파일 맨 끝에 두는 이유: 배치별 규칙(`:root[data-layout=...]`)과 특이도가 같아서
+ * 소스 순서로 결정된다. 위쪽 미디어 쿼리보다 뒤에 와야 이긴다. */
+:root[data-layout='focus'] .hdr__drawer {
+  display: inline-flex;
+}
+
+/* ── 영상 컨트롤: 가만두면 사라진다 ──
+ *
+ * 영상 위에 뭔가 계속 떠 있으면 그게 곧 방해다. 마우스를 움직이면 나타나고
+ * 2초 안 건드리면 사라진다. 베일(멈춤 안내)은 예외 — 그건 상태 설명이라 남아야 한다. */
+.videochrome[data-idle='1'] .videocc,
+.videochrome[data-idle='1'] .videochrome__count,
+.videochrome[data-idle='1'] .videosize__readout,
+.videochrome[data-idle='1'] .videogrip {
+  opacity: 0;
+  pointer-events: none;
+}
+.videocc,
+.videochrome__count,
+.videosize__readout,
+.videogrip {
+  transition: opacity var(--t-med) var(--ease);
+}
+
+/* 좌우 모서리 손잡이. 창 크기 조절과 같은 어법이라 설명이 필요 없다.
+ * 폭을 넉넉히 잡되(손이 닿아야 한다) 눈에는 거의 안 보이게 둔다. */
+.videogrip {
+  position: absolute;
+  top: 12%;
+  bottom: 12%;
+  width: 14px;
+  pointer-events: auto;
+  cursor: ew-resize;
+  border-radius: 999px;
+  background: transparent;
+}
+.videogrip::after {
+  content: '';
+  position: absolute;
+  inset: 0 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.28);
+  opacity: 0;
+  transition: opacity var(--t-fast) var(--ease);
+}
+.videogrip:hover::after,
+.videogrip:focus-visible::after { opacity: 1; }
+.videogrip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.videogrip--w { left: 0; }
+.videogrip--e { right: 0; }
+
+/* 끄는 동안 지금 몇 %인지. 평소엔 있는 줄도 모르게 작다. */
+.videosize__readout {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.72);
+  background: rgba(0, 0, 0, 0.42);
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  pointer-events: none;
+}
