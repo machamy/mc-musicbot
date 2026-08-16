@@ -4788,13 +4788,15 @@ function buildWebPlayback() {
   el.videoVeil = h('div', { class: 'videochrome__veil', hidden: true });
   el.videoCount = h('span', { class: 'videochrome__count' });
   el.videoSizeLabel = h('span', { class: 'videosize__label' });
-  // 크기 조절. 안내막은 클릭을 안 받지만 이 줄만 예외로 받는다.
-  el.videoSizeBox = h('div', { class: 'videosize' },
-    h('button', { class: 'iconbtn', type: 'button', tip: '영상을 작게', 'aria-label': '영상 작게',
-      onClick: () => bumpVideoSize(-1) }, '−'),
-    el.videoSizeLabel,
-    h('button', { class: 'iconbtn', type: 'button', tip: '영상을 크게', 'aria-label': '영상 크게',
-      onClick: () => bumpVideoSize(1) }, '＋'));
+  /* 크기 조절은 **슬라이더**다. 볼륨과 같은 어법이라 처음 봐도 뭘 하는 물건인지 안다.
+   * 단계가 넷뿐이라 `step=1` 로 딱딱 떨어진다. 안내막은 클릭을 안 받지만 이 줄만 예외다. */
+  el.videoSizeRange = h('input', {
+    class: 'vol__range videosize__range', type: 'range',
+    min: '1', max: String(VIDEO_SIZES.length), step: '1',
+    'aria-label': '영상 크기',
+    onInput: () => setVideoSize(Number(el.videoSizeRange.value)),
+  });
+  el.videoSizeBox = h('div', { class: 'videosize' }, el.videoSizeRange, el.videoSizeLabel);
   el.videoChrome = h('div', { class: 'videochrome', hidden: true },
     el.videoVeil, el.videoCount, el.videoSizeBox);
   document.body.appendChild(el.videoChrome);
@@ -4878,12 +4880,16 @@ function applyVideoSize() {
   const root = document.documentElement.style;
   root.setProperty('--video-w', size.w);
   root.setProperty('--video-bleed', size.bleed ? 'var(--sp-4)' : '0px');
+  /* **가운데로 세운다.** 꽉 차게는 좌우로 똑같이 밀어내므로 그것도 가운데다.
+   * 예전에 `margin-inline: auto` 를 빼는 바람에 작은 크기에서 왼쪽에 붙어 있었다. */
+  root.setProperty('--video-margin', size.bleed ? 'calc(-1 * var(--sp-4))' : 'auto');
   if (el.videoSizeLabel) el.videoSizeLabel.textContent = size.label;
+  if (el.videoSizeRange) el.videoSizeRange.value = String(videoSizeStep());
   // 자리 크기가 바뀌었으니 다음 프레임에 오버레이가 따라온다(rAF 가 알아서 다시 잰다).
 }
 
-function bumpVideoSize(step) {
-  const next = Math.min(VIDEO_SIZES.length, Math.max(1, videoSizeStep() + step));
+function setVideoSize(step) {
+  const next = Math.min(VIDEO_SIZES.length, Math.max(1, Math.round(step) || 1));
   if (next === videoSizeStep()) return;
   prefSet('videoSize', String(next));
   applyVideoSize();

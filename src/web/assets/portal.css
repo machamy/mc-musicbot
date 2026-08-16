@@ -2823,7 +2823,7 @@ body.gate {
   background: rgba(0, 0, 0, 0.55);
   pointer-events: auto;
 }
-.videosize .iconbtn { color: #fff; width: 24px; height: 24px; }
+.videosize__range { width: 96px; flex: none; accent-color: #fff; }
 .videosize__label { color: #fff; font-size: var(--fs-xs); min-width: 3.6em; text-align: center; }
 
 .videochrome__count {
@@ -2845,7 +2845,7 @@ body.gate {
     calc(var(--video-w, 100%) + 2 * var(--video-bleed, 0px)),
     calc(84vh * 16 / 9)
   );
-  margin-inline: calc(-1 * var(--video-bleed, 0px));
+  margin-inline: var(--video-margin, auto);
   max-width: none;
 }
 /* 영상이 뜨기 전 몇 백 ms 를 아트가 받아 준다. 검은 화면이 그대로 보이지 않게. */
