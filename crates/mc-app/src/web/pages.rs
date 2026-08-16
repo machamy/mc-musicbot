@@ -441,10 +441,14 @@ pub async fn diagnostics(State(state): Ctx, cookies: Cookies) -> Response {
     let mut cards = String::new();
     for gid in app.db.list_known_guild_ids() {
         let s = app.player.get_state(gid).await;
-        let name = meta
-            .get(&gid)
-            .map(|m| m.name.clone())
-            .unwrap_or_else(|| format!("서버 {gid}"));
+        // **이스케이프해서 담는다.** 길드 이름은 디스코드에서 그대로 오는 값이라
+        // 그 서버 주인이 마음대로 정할 수 있다(`events.rs` 의 `guild.name`).
+        let name = html_escape(
+            &meta
+                .get(&gid)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| format!("서버 {gid}")),
+        );
         let icon = guild_icon_html(meta.get(&gid));
         let current = s
             .current_item
@@ -1427,6 +1431,7 @@ pub async fn cache_page(
     let total_bytes: i64 = entries.iter().map(|e| e.size_bytes).sum();
     let total_plays: i64 = entries.iter().map(|e| e.play_count).sum();
     // 서버(길드)별 통계 툴팁에 쓸 이름 맵.
+    // escaped-at-use: 여기서는 모으기만 한다. 렌더는 아래 plays_tip 이 하고 거기서 이스케이프한다.
     let guild_names: std::collections::HashMap<u64, String> = app
         .db
         .list_guild_metadata()
@@ -1575,10 +1580,14 @@ pub async fn cache_page(
                 .per_guild
                 .iter()
                 .map(|(gid, st)| {
-                    let name = guild_names
-                        .get(gid)
-                        .cloned()
-                        .unwrap_or_else(|| format!("서버 {gid}"));
+                    // `title="{plays_tip}"` 속성 안으로 들어간다. 이스케이프 없이는
+                    // 따옴표 하나로 속성을 빠져나갈 수 있다.
+                    let name = html_escape(
+                        &guild_names
+                            .get(gid)
+                            .cloned()
+                            .unwrap_or_else(|| format!("서버 {gid}")),
+                    );
                     format!("{name}: {}회", st.count)
                 })
                 .collect();
@@ -1925,6 +1934,8 @@ pub async fn playlists_page(
     layout(&state, "플레이리스트", "/playlists", &body).into_response()
 }
 
+/// 길드 이름 원문. **이스케이프되지 않은 값이다** — HTML 에 넣기 전에 반드시 감싸라.
+// escaped-at-use: 유일한 호출부(플레이리스트 <option>)가 html_escape 로 감싼다.
 fn meta_name(app: &crate::app::App, gid: u64) -> String {
     app.db
         .list_guild_metadata()
@@ -2066,7 +2077,7 @@ pub async fn blacklist_page(
         "전역".to_string()
     } else {
         meta.get(&scope_gid)
-            .map(|m| format!("{} ({scope_gid})", m.name))
+            .map(|m| format!("{} ({scope_gid})", html_escape(&m.name)))
             .unwrap_or_else(|| format!("길드 {scope_gid}"))
     };
     let entries = if scope_gid == 0 {
@@ -2514,4 +2525,58 @@ pub async fn botsettings_cookies_post(
         "등록은 했는데 로그인 쿠키가 안 보여요. 로그아웃 상태에서 뽑으셨을 수 있어요 — 403 이 계속되면 다시 뽑아 주세요."
     };
     redirect_flash("/settings#cookies", note, !sum.logged_in)
+}
+
+#[cfg(test)]
+mod escaping_guard {
+    /// **회귀 가드: 길드 이름이 이스케이프 없이 HTML 로 새어 나가던 문제.**
+    ///
+    /// 길드 이름은 `events.rs` 가 디스코드 게이트웨이에서 받은 값을 그대로 저장한다.
+    /// 즉 봇을 초대한 서버의 주인이 마음대로 정할 수 있는 문자열이다. 그게 관리자
+    /// 패널에 이스케이프 없이 찍히면, 서버 이름을 `<img src=x onerror=...>` 로 바꿔 두고
+    /// 운영자가 그 화면을 열기만 기다리면 된다. 관리자 CSRF 토큰이 같은 페이지에 있어서
+    /// 패널이 통째로 넘어간다.
+    ///
+    /// 실제로 **세 곳**이 그랬다 — 대시보드 `<span>{name}</span>`, 캐시 라이브러리의
+    /// `title="{plays_tip}"`(속성 안이라 따옴표 하나로 빠져나갈 수 있었다), 차단 목록의
+    /// `<h2>({scope_label})</h2>`. 같은 파일의 다른 예닐곱 자리는 제대로 하고 있었다.
+    ///
+    /// 그래서 사람의 주의력 대신 기계로 본다: 길드 이름을 만지는 줄 근처에는
+    /// 반드시 `html_escape` 가 있어야 한다.
+    #[test]
+    fn guild_names_never_reach_html_unescaped() {
+        let src = include_str!("pages.rs");
+        // 이 테스트 모듈 자신은 스캔 대상이 아니다 (자기 패턴 문자열에 걸린다).
+        let src = src.split("mod escaping_guard").next().unwrap_or(src);
+        let lines: Vec<&str> = src.lines().collect();
+        let mut offenders = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let touches_name = line.contains("m.name")
+                || line.contains(".name.clone()")
+                || line.contains("guild_names");
+            // 주석·문서주석과, "쓰는 자리에서 이스케이프한다" 고 표식을 단 수집 지점은 뺀다.
+            // 표식은 일부러 남기는 것이라, 새로 넣는 사람이 그 판단을 의식하게 된다.
+            let trimmed = line.trim_start();
+            let exempt = trimmed.starts_with("///")
+                || trimmed.starts_with("//")
+                || lines[i.saturating_sub(6)..(i + 1).min(lines.len())]
+                    .iter()
+                    .any(|l| l.contains("escaped-at-use"));
+            if !touches_name || exempt {
+                continue;
+            }
+            let lo = i.saturating_sub(5);
+            let hi = (i + 6).min(lines.len());
+            if !lines[lo..hi].iter().any(|l| l.contains("html_escape")) {
+                offenders.push(format!("  {}행: {}", i + 1, line.trim()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "길드 이름을 이스케이프 없이 다루는 자리가 있다 (관리자 패널 저장형 XSS):
+{}",
+            offenders.join("
+")
+        );
+    }
 }

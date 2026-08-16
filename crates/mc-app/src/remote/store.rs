@@ -629,9 +629,14 @@ pub const AUTOPLAY_BLOCK_DAYS: i64 = 7;
 /// 사람이 다시 눌러 보는 주기보다는 짧아야 한다.
 const CHART_FETCH_STALE_SECS: i64 = 180;
 
-/// 서버가 받아 주는 개인 설정 키. 여기 없는 키는 조용히 버린다 —
+/// 서버가 받아 주는 개인 설정 키 전부. 여기 없는 키는 거절한다 —
 /// 아무 값이나 저장되면 개인 설정 테이블이 남의 키-밸류 저장소가 돼 버린다.
-pub const PREF_KEYS: [&str; 11] = [
+///
+/// **[`is_valid_pref`] 의 `match` 팔과 반드시 같아야 한다.** 예전에 이 목록이 죽은
+/// 상수였을 때 실제로 갈라졌다 — `nowVoters`·`videoSize`·`devPos`·`devSize` 네 개가
+/// 여기 없는 채로 `is_valid_pref` 만 받아 주고 있었다. 이제는 [`is_known_pref`] 가
+/// 이 목록을 쓰고, 아래 테스트가 둘의 일치를 강제한다.
+pub const PREF_KEYS: [&str; 15] = [
     "layout",
     "theme",
     "layoutSizes",
@@ -639,11 +644,24 @@ pub const PREF_KEYS: [&str; 11] = [
     "panelSlots",
     "lyricsOpen",
     "webPlayback",
+    "nowVoters",
+    "videoSize",
+    "devPos",
+    "devSize",
     "webVolume",
     "webOffset",
     "auditFilter",
     "notify",
 ];
+
+/// 이 키를 서버가 아는가. **값과 무관하게** 키만 본다.
+///
+/// `null`(= 기본으로 되돌리기)로 지울 때 쓴다. 지우는 것뿐이라 피해는 없었지만,
+/// 예전에는 null 이면 검사를 아예 건너뛰어서 "모르는 키는 거절한다" 는 계약이
+/// 값이 있을 때만 지켜지고 있었다.
+pub fn is_known_pref(key: &str) -> bool {
+    PREF_KEYS.contains(&key)
+}
 
 /// 웹에서 듣기 싱크 보정의 한계(초). 사람마다 회선과 버퍼가 달라서 봇과 어긋난다.
 /// ±10초면 실제로 겪는 어긋남은 다 덮는다. 그보다 크면 곡을 잘못 맞춘 것이다.
@@ -721,6 +739,27 @@ pub fn is_valid_pref(key: &str, value: &str) -> bool {
         _ => false,
     }
 }
+
+/// 각 설정 키가 실제로 받아 주는 값 하나. `PREF_KEYS` 와 `is_valid_pref` 의
+/// 일치를 강제하는 테스트가 쓴다.
+#[cfg(test)]
+const PREF_SAMPLES: [(&str, &str); 15] = [
+    ("layout", "panel"),
+    ("theme", "nord"),
+    ("layoutSizes", "{}"),
+    ("panelLayout", "{}"),
+    ("panelSlots", "{}"),
+    ("lyricsOpen", "1"),
+    ("webPlayback", "1"),
+    ("nowVoters", "1"),
+    ("videoSize", "3"),
+    ("devPos", "120,80"),
+    ("devSize", "640,360"),
+    ("webVolume", "80"),
+    ("webOffset", "-1.5"),
+    ("auditFilter", "none"),
+    ("notify", "{}"),
+];
 
 /// JSON 문자열 설정: 길이 상한을 넘거나 JSON이 아니면 거부한다.
 fn is_valid_json_pref(value: &str, max_bytes: usize) -> bool {
@@ -4358,7 +4397,6 @@ mod tests {
         cleanup(store, path);
     }
 
-    #[test]
     /// 회귀: 역할 캐시가 메모리에만 있어서 재시작 뒤 429 가 나면 지정 역할 권한자가
     /// "권한이 없어요" 를 봤다. 디스크에 남아야 재시작을 건너뛰어도 등급이 유지된다.
     ///
@@ -5114,7 +5152,6 @@ mod tests {
     }
 
     /// 이력 감쇠·아티스트 쿨다운이 쓸 입력을 한 번의 조회로 만든다 (§8.5-1·2).
-    #[test]
     /// 빼 둔 곡은 **제목이 같이 남아야** 한다 (§8.7).
     ///
     /// 예전에는 `cache_key` 만 저장해서 화면이 `youtube:xxx` 를 제목 자리에 그렸다.
@@ -5665,4 +5702,36 @@ mod tests {
         assert!(effective.default_volume <= 80);
         cleanup(store, path);
     }
+    /// **`PREF_KEYS` 와 `is_valid_pref` 가 갈라지면 여기서 걸린다.**
+    ///
+    /// 실제로 갈라져 있었다 — `PREF_KEYS` 는 죽은 상수라 아무도 안 봤고,
+    /// `is_valid_pref` 만 네 키를 더 받고 있었다. 그동안 `PREF_KEYS` 를 믿고
+    /// 코드를 읽은 사람은 틀린 목록을 본 것이다.
+    #[test]
+    fn the_pref_key_list_and_the_validator_agree() {
+        // ① 목록의 모든 키를 검증기가 받아 준다.
+        for (key, sample) in PREF_SAMPLES {
+            assert!(
+                PREF_KEYS.contains(&key),
+                "{key} 가 PREF_SAMPLES 에는 있는데 PREF_KEYS 에 없다"
+            );
+            assert!(
+                is_valid_pref(key, sample),
+                "{key} 는 PREF_KEYS 에 있는데 is_valid_pref 가 {sample} 를 거절한다"
+            );
+            assert!(is_known_pref(key));
+        }
+        // ② 표본이 모든 키를 덮는다.
+        assert_eq!(
+            PREF_SAMPLES.len(),
+            PREF_KEYS.len(),
+            "새 설정 키를 넣었으면 PREF_SAMPLES 에도 표본을 넣어야 한다"
+        );
+        // ③ 목록에 없는 키는 값이 뭐든 거절한다.
+        for unknown in ["", "nope", "layout2", "theme ", "__proto__"] {
+            assert!(!is_known_pref(unknown), "{unknown} 를 아는 키로 봤다");
+            assert!(!is_valid_pref(unknown, "1"), "{unknown} 값을 받아 줬다");
+        }
+    }
+
 }

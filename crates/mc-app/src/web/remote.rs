@@ -984,10 +984,17 @@ fn origin_allowed(state: &WebState, headers: &HeaderMap) -> bool {
     origin_host == "music.example.com"
 }
 
+/// 주소에서 호스트만 뽑는다.
+///
+/// **`rsplit` 이 아니라 `split_once` 다.** 예전에는 `rsplit("://")` 이라 **마지막**
+/// `://` 뒤를 봤다 — `https://evil.example/r?u=https://music.example.com` 이
+/// `music.example.com` 으로 읽혀서 허용 목록을 통과했다. 브라우저가 보내는 `Origin`
+/// 에는 경로가 없어서 실제로 뚫린 적은 없지만, 허용 목록을 파싱하는 함수가
+/// 입력의 뒷부분을 믿는 것 자체가 틀렸다.
 fn host_of(url: &str) -> String {
-    url.rsplit("://")
-        .next()
-        .unwrap_or("")
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
         .split('/')
         .next()
         .unwrap_or("")
@@ -3364,7 +3371,14 @@ fn parse_pref_patch(
     for (key, value) in object {
         let text = match value {
             // null = "기본으로 되돌리기". 지운 키는 다시 미선택 상태가 된다.
+            //
+            // **모르는 키는 여기서도 거절한다.** 예전에는 null 이면 검사를 건너뛰어서
+            // `{"아무거나": null}` 이 그대로 통과했다. 지우는 것뿐이라 피해는 없었지만,
+            // "모르는 키는 거절한다" 는 계약이 값이 있을 때만 지켜지고 있었다.
             Value::Null => {
+                if !crate::remote::store::is_known_pref(key) {
+                    return Err(format!("{key}: 모르는 설정이에요."));
+                }
                 removals.push(key.clone());
                 continue;
             }
@@ -5233,17 +5247,24 @@ async fn api_control(
             }
             state.app.player.skip(guild_id).await;
             if !session.is_developer {
+                let lead = Duration::from_millis(ctx.settings.skip_lead_ms as u64);
                 state.app.coordinator.sync_guild(&state.app, guild_id).await;
                 // 스킵도 모두가 같은 순간에 0초부터 시작하게 조금 미래로 잡는다 (§31).
                 state
                     .app
                     .coordinator
-                    .schedule_start_in(
-                        guild_id,
-                        Duration::from_millis(ctx.settings.skip_lead_ms as u64),
-                        Duration::ZERO,
-                    )
+                    .schedule_start_in(guild_id, lead, Duration::ZERO)
                     .await;
+                /* **자동재생 보충.** 디스코드 스킵은 `settle_manual_skip` 으로 이걸
+                 * 부르는데 여기만 안 불렀다. 그래서 대기열이 빈 채로 리모컨에서 넘기면
+                 * 다음 추천곡이 화면에 떠 있어도 재생되지 않고 침묵으로 끝났다.
+                 * 위의 `sync_guild` 는 현재 곡이 없으면 송출만 멈추고 돌아간다. */
+                crate::player::side_effects::refill_after_skip(
+                    state.app.clone(),
+                    state.app.coordinator.clone(),
+                    guild_id,
+                    lead,
+                );
             }
             queue_changed = true;
             Ok("skipped".into())

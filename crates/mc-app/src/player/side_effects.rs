@@ -345,6 +345,46 @@ pub async fn prefetch_next(app: Arc<App>, _coordinator: Arc<Coordinator>, guild_
 }
 
 /// 곡 종료/스킵 후 autoplay 후보를 큐에 채운다 (C# EnsureAutoplayCandidateAsync).
+/// **수동 스킵 뒤의 자동재생 보충.** 디스코드와 웹이 반드시 같은 것을 써야 한다.
+///
+/// 이게 따로 놀아서 실제로 깨져 있었다. 디스코드 `/스킵` 과 버튼 스킵은
+/// `settle_manual_skip` 을 거쳐 [`ensure_autoplay`] 를 불렀는데, **웹 리모컨의 스킵만
+/// 안 불렀다**(`web/remote.rs` 의 `api_control`). 그래서 대기열이 빈 상태에서 리모컨으로
+/// 넘기면 화면에 다음 추천곡이 떠 있는데도 아무것도 재생되지 않고 침묵으로 끝났다.
+/// `sync_guild` 는 현재 곡이 없으면 그냥 송출을 멈추고 돌아갈 뿐 추천을 채우지 않는다
+/// (`coordinator.rs` 의 "현재 곡 없음 → 송출 중지").
+///
+/// `lead` 는 §31 의 스킵 선행 시간이다. 모두가 같은 순간에 0초부터 출발하게 만든다.
+/// 디스코드 쪽은 그 개념이 없으므로 `Duration::ZERO` 를 넘긴다.
+///
+/// **이미 다음 곡이 앉아 있으면 재생을 건드리지 않는다.** 그 경우 호출부가 이미
+/// 동기화를 마쳤고, 여기서 또 `sync_guild` 를 부르면 방금 시작한 곡을 다시 만진다.
+pub fn refill_after_skip(
+    app: Arc<App>,
+    coordinator: Arc<Coordinator>,
+    guild_id: u64,
+    lead: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let state = app.player.get_state(guild_id).await;
+        let already_playing_next = state.current_item.is_some();
+        if already_playing_next {
+            // 넘어간 자리에 이미 곡이 앉았다. 옛 곡 기준으로 풀어 둔 추천은 버린다 —
+            // 새 현재 곡이 자기 것을 따로 채운다.
+            app.player.clear_preview(guild_id);
+        }
+        ensure_autoplay(app.clone(), coordinator.clone(), guild_id, true).await;
+        if !already_playing_next {
+            // 자동재생이 채웠을 때만 맞춘다.
+            coordinator.sync_guild(&app, guild_id).await;
+            coordinator
+                .schedule_start_in(guild_id, lead, std::time::Duration::ZERO)
+                .await;
+        }
+        prefetch_next(app, coordinator, guild_id).await;
+    });
+}
+
 pub async fn ensure_autoplay(
     app: Arc<App>,
     _coordinator: Arc<Coordinator>,
@@ -601,5 +641,60 @@ mod tests {
         let a = vec![track("겹침"), track("A2")];
         let b = vec![track("겹침"), track("B2")];
         assert_eq!(ids(&genre_seeds(vec![a, b])), vec!["겹침", "A2", "B2"]);
+    }
+}
+
+#[cfg(test)]
+mod skip_settlement_tests {
+    /// **회귀 가드: 스킵 경로가 둘인데 한쪽만 자동재생을 보충하던 문제.**
+    ///
+    /// 디스코드 스킵(`/스킵`·버튼)은 `settle_manual_skip` → `ensure_autoplay` 를 거쳤는데
+    /// 웹 리모컨 스킵만 안 거쳤다. 그래서 대기열이 빈 상태에서 리모컨으로 넘기면
+    /// 다음 추천곡이 화면에 떠 있는데도 침묵으로 끝났다.
+    ///
+    /// 구현이 둘로 갈린 것이 원인이라, **양쪽이 보충을 부르는지**를 소스에서 직접 본다.
+    /// 동작 테스트로는 못 잡는다 — 한쪽만 지워도 다른 쪽 테스트는 그대로 통과한다.
+    #[test]
+    fn both_skip_paths_refill_autoplay() {
+        let web = include_str!("../web/remote.rs");
+        let discord = include_str!("../commands/handlers.rs");
+
+        // 웹은 api_control 의 "skip" 갈래에서 보충을 부른다.
+        assert!(
+            web.contains("refill_after_skip"),
+            "웹 스킵이 자동재생 보충을 안 부른다 — 큐가 빈 채로 리모컨에서 넘기면 침묵으로 끝난다"
+        );
+        // 디스코드는 settle_manual_skip 을 거쳐 ensure_autoplay 를 부른다.
+        assert!(
+            discord.contains("settle_manual_skip"),
+            "디스코드 스킵이 뒷정리를 안 거친다"
+        );
+        assert!(
+            discord.contains("ensure_autoplay"),
+            "디스코드 스킵 뒷정리가 자동재생 보충을 안 부른다"
+        );
+
+        // 웹의 스킵 갈래 안에 실제로 들어 있는지 (파일 어딘가가 아니라).
+        let arm = web
+            .split("\"skip\" => {")
+            .nth(1)
+            .expect("api_control 에 skip 갈래가 있어야 한다");
+        let arm = &arm[..arm.len().min(1400)];
+        /* **주석을 걷어내고 본다.** 바로 위에 `refill_after_skip` 을 언급하는 설명
+         * 주석이 있어서, 그냥 `contains` 만 하면 호출을 지우고 주석만 남겨도 통과한다.
+         * 실제로 이 테스트의 첫 판이 그랬다. */
+        let code: String = arm
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| {
+                !line.starts_with("//") && !line.starts_with('*') && !line.starts_with("/*")
+            })
+            .collect::<Vec<_>>()
+            .join("
+");
+        assert!(
+            code.contains("refill_after_skip("),
+            "skip 갈래의 **코드**에서 보충을 불러야 한다 (주석만으로는 안 된다)"
+        );
     }
 }
