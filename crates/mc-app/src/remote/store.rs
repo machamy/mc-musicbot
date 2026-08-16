@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -3661,6 +3661,32 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                     )?;
                 }
             }
+            /* 새 기본 차트(TJ 종합·힙합·랩·R&B·소울)를 이미 있는 DB 에도 심고,
+             * 금영을 뺀다.
+             *
+             * **시더만으로는 부족하다.** `seed_builtin_charts` 는 `INSERT OR IGNORE` 라
+             * 새 차트는 들어가지만 없어진 차트는 안 지워진다. 그리고 시더 자체가
+             * 마이그레이션에서 불러 줘야 기존 DB 에 닿는다 — 새 DB 만 최신 목록을 받고
+             * 쓰던 서버는 영영 옛 목록으로 남는다(v4.38 배포 직후 실제로 그랬다).
+             *
+             * 금영은 **관리자가 손대지 않은 것만** 지운다 (v15 가 세운 규칙). 주소가
+             * 옛 기본값과 정확히 같을 때만 건드린다. 캐시도 같이 지운다. */
+            23 => {
+                tx.execute(
+                    "DELETE FROM remote_chart_cache WHERE chart_id IN (
+                         SELECT id FROM remote_charts
+                          WHERE builtin = 1 AND name = '금영 인기차트'
+                            AND url = 'ytsearch50:금영노래방 인기차트')",
+                    [],
+                )?;
+                tx.execute(
+                    "DELETE FROM remote_charts
+                      WHERE builtin = 1 AND name = '금영 인기차트'
+                        AND url = 'ytsearch50:금영노래방 인기차트'",
+                    [],
+                )?;
+                seed_builtin_charts(&tx)?;
+            }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -5945,6 +5971,55 @@ mod tests {
         assert!(effective.default_volume <= 80);
         cleanup(store, path);
     }
+    /// **회귀 가드: 기본 차트를 늘려 놓고 기존 DB 에 안 심던 문제.**
+    ///
+    /// `BUILTIN_CHARTS` 에 항목을 더해도 그것만으로는 **이미 쓰던 서버에 안 들어간다.**
+    /// 시더(`seed_builtin_charts`)를 마이그레이션이 불러 줘야 닿는데, v4.38 에서 TJ
+    /// 차트 셋을 더하면서 그 단계를 빼먹었다 — 배포하고 운영 DB 를 열어 보니 차트가
+    /// 49개 그대로였다.
+    ///
+    /// 그래서 **재시드 단계가 실제로 새 차트를 심는지**를 옛 버전에서부터 확인한다.
+    #[test]
+    fn a_reseed_step_brings_new_builtin_charts_to_an_old_database() {
+        let (store, path) = temp_store("chart-reseed");
+        {
+            let conn = store.conn.lock().unwrap();
+            // 새 차트 셋을 지우고 금영을 되살려 v22 상태를 흉내 낸다.
+            for name in ["TJ 종합", "TJ 힙합·랩", "TJ R&B·소울"] {
+                conn.execute("DELETE FROM remote_charts WHERE builtin = 1 AND name = ?1", params![name])
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO remote_charts (guild_id, category, name, provider, url, sort_order, builtin)
+                 VALUES (NULL, 'karaoke', '금영 인기차트', 'YouTube', 'ytsearch50:금영노래방 인기차트', 999, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let before: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM remote_charts WHERE builtin = 1", [], |r| r.get(0))
+                .unwrap()
+        };
+        rewind_and_migrate(&store, 23);
+
+        let conn = store.conn.lock().unwrap();
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM remote_charts WHERE builtin = 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for want in ["TJ 종합", "TJ 힙합·랩", "TJ R&B·소울"] {
+            assert!(names.iter().any(|n| n == want), "{want} 가 안 심겼다 ({before}개에서 시작)");
+        }
+        assert!(
+            !names.iter().any(|n| n == "금영 인기차트"),
+            "금영이 안 지워졌다 — 반주(MR)만 나오는 차트다"
+        );
+    }
+
     /// **`PREF_KEYS` 와 `is_valid_pref` 가 갈라지면 여기서 걸린다.**
     ///
     /// 실제로 갈라져 있었다 — `PREF_KEYS` 는 죽은 상수라 아무도 안 봤고,
