@@ -224,7 +224,7 @@ mod tests {
     /// (워크스페이스 이사 때는 `d44ff894b8ef9398` 이 그대로 유지되는 것으로 무변경을 증명했다.)
     #[test]
     fn version_hash_is_pinned() {
-        assert_eq!(version(), "ef839235401c374f");
+        assert_eq!(version(), "06d40361e53c07cb");
     }
 
     /// 이름과 바이트가 서로 **뒤바뀌어도** 버전 해시는 그대로다(같은 것을 다 더하므로).
@@ -238,7 +238,7 @@ mod tests {
             ),
             (
                 "portal.css",
-                "e87da5c9112b2cab5cd22f90078cf6a647070146b1bf5c5a6e7b40ba2a4844b1",
+                "c001c815c0534280ca80339de08ec179b7504316d8e2118ca7ab29883df8e4a9",
             ),
             (
                 "console.css",
@@ -254,7 +254,7 @@ mod tests {
             ),
             (
                 "portal.js",
-                "27065e5708e5d5a2934420e535a3ee61ee5a8d707cd24591006a941c385fb378",
+                "14fce29fd18473071cbb580b221810f13a8df773a25d8a7f595dd3fa0dbc0471",
             ),
             (
                 "console.js",

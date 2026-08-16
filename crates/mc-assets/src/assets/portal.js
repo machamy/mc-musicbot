@@ -2440,35 +2440,91 @@ async function runSearch() {
   el.searchResults.hidden = false;
   clear(el.searchResults).appendChild(skeletonRows(4));
 
-  // 브라우저 검색이 가능하면 먼저 시도한다. 실패하면 조용히 서버 검색으로 내려간다.
-  if (browserSearchReady(query)) {
-    try {
-      const results = await youtubeSearch(query, el.searchProvider.value);
-      if (results.length) {
-        searchResults = results;
-        searchedQuery = query;
-        searchSource = 'browser';
-        searchNote = '';
-        renderSearchResults();
-        syncSearchButton();
-        return;
-      }
-    } catch (error) {
-      console.warn('[search] 브라우저 검색이 실패해서 서버로 넘겨요', error);
-    }
-  }
-
   try {
-    const data = await api(`/search?q=${encodeURIComponent(query)}&provider=${encodeURIComponent(el.searchProvider.value)}`);
-    searchResults = data?.results || [];
-    searchNote = data?.note || '';
+    const found = await searchTracks(query, el.searchProvider.value);
+    searchResults = found.results;
+    searchNote = found.note;
+    searchSource = found.source;
     searchedQuery = query;
-    searchSource = browserSearchReady(query) ? 'fallback' : 'server';
     renderSearchResults();
   } catch (error) {
     clear(el.searchResults).appendChild(emptyState('⚠', '검색하지 못했어요', error.message));
   }
   syncSearchButton();
+}
+
+/** 검색 한 번. **검색 패널과 대기열 안 검색이 같은 것을 쓴다** —
+ * 갈라 두면 한쪽만 고치고 다른 쪽은 옛 동작으로 남는다(스킵 경로에서 겪은 그 사고). */
+async function searchTracks(query, provider) {
+  if (browserSearchReady(query)) {
+    try {
+      const results = await youtubeSearch(query, provider);
+      if (results.length) return { results, note: '', source: 'browser' };
+    } catch (error) {
+      console.warn('[search] 브라우저 검색이 실패해서 서버로 넘겨요', error);
+    }
+  }
+  const data = await api(`/search?q=${encodeURIComponent(query)}&provider=${encodeURIComponent(provider)}`);
+  return {
+    results: data?.results || [],
+    note: data?.note || '',
+    source: browserSearchReady(query) ? 'fallback' : 'server',
+  };
+}
+
+/* ── 대기열 안에서 바로 찾기 (C안) ── */
+let qsQuery = '';
+let qsList = [];
+let qsNote = '';
+
+async function runQueueSearch() {
+  const query = el.qsInput.value.trim();
+  if (!query) { el.qsInput.focus(); return; }
+  el.qsResults.hidden = false;
+  /* **불러오는 동안에도 닫을 수 있어야 한다.** 예전에는 결과가 다 온 뒤에야 닫기 줄이
+   * 그려져서, 검색이 느리거나 실패하는 동안 결과 칸을 접을 방법이 없었다. */
+  clear(el.qsResults).append(qsMetaRow('찾는 중이에요'), skeletonRows(3));
+  try {
+    const found = await searchTracks(query, 'YouTube');
+    qsList = found.results;
+    qsNote = found.note;
+    qsQuery = query;
+    renderQueueSearch();
+  } catch (error) {
+    clear(el.qsResults).append(qsMetaRow('검색 실패'), emptyState('⚠', '검색하지 못했어요', error.message));
+  }
+}
+
+/** 결과 칸 머리줄. 언제 그리든 **닫기가 늘 붙어 있어야 한다.** */
+function qsMetaRow(label) {
+  return h('div', { class: 'qsearch__meta' },
+    h('span', null, label),
+    h('button', {
+      class: 'iconbtn', type: 'button', tip: '결과를 닫고 대기열만 봐요',
+      'aria-label': '검색 결과 닫기',
+      onClick: () => { el.qsInput.value = ''; closeQueueSearch(); },
+    }, '✕'));
+}
+
+function closeQueueSearch() {
+  qsQuery = '';
+  qsList = [];
+  qsNote = '';
+  if (el.qsResults) { el.qsResults.hidden = true; clear(el.qsResults); }
+}
+
+function renderQueueSearch() {
+  if (!el.qsResults || el.qsResults.hidden) return;
+  clear(el.qsResults);
+  el.qsResults.appendChild(qsMetaRow(`검색 결과 ${qsList.length}곡`));
+  if (!qsList.length) {
+    el.qsResults.appendChild(qsNote
+      ? emptyState('🔗', '이 링크는 못 불러왔어요', qsNote)
+      : emptyState('🔍', '결과가 없어요', '다른 단어나 링크로 다시 찾아 보세요.'));
+    return;
+  }
+  for (const track of qsList) el.qsResults.appendChild(trackRow(track, 'search'));
+  marquee.scan(el.qsResults);
 }
 
 const SEARCH_SOURCE_NOTE = {
@@ -2655,6 +2711,41 @@ function buildQueuePane() {
   el.queueList = h('div', { class: 'queue__list scroll', 'data-testid': 'queue-list' });
   el.queueList.addEventListener('scroll', onQueueScroll, { passive: true });
 
+  /* ── 대기열 안에서 바로 찾기 (C안) ──
+   *
+   * 검색 결과를 **대기열 위 칸**에 끼워 넣는다. 담으면 바로 아래에 쌓이는 게 보이는 것이
+   * 이 안의 요점이다 — 탭을 오갈 필요가 없다.
+   *
+   * 검토 때 걱정했던 셋을 설계로 막는다:
+   * ① 좁은 패널에서 둘 다 반쪽이 된다 → 결과 칸에 **자기 스크롤과 높이 상한**을 준다.
+   *    대기열은 어떤 경우에도 자기 자리를 잃지 않는다.
+   * ② 담은 곡이 두 군데에 보인다 → 그걸 **피드백으로 뒤집는다.** 이미 담긴 곡은
+   *    결과에서 `✓ 담김` 으로 바뀐다. 중복이 아니라 '내려갔다' 는 표시다.
+   * ③ 스크롤이 한 통이라 서로 민다 → 두 칸이 각자 스크롤한다.
+   *
+   * 검색 패널은 **그대로 남긴다.** 패널 배치에서 둘을 나란히 쓰던 사람이 잃는 게 없어야 한다. */
+  el.qsInput = h('input', {
+    class: 'field', type: 'search', 'data-testid': 'queue-search-input',
+    placeholder: '여기서 바로 찾아 담기 · 링크도 돼요',
+    autocomplete: 'off', enterkeyhint: 'search',
+    onKeydown: (event) => {
+      if (event.key === 'Enter') { event.preventDefault(); runQueueSearch(); }
+      if (event.key === 'Escape') { event.preventDefault(); closeQueueSearch(); }
+    },
+    onInput: () => { if (!el.qsInput.value.trim()) closeQueueSearch(); },
+  });
+  el.qsBtn = bindAct(h('button', {
+    class: 'btn btn--primary btn--icon', type: 'button',
+    tip: '검색', 'aria-label': '대기열에서 검색',
+  }, '🔎'), runQueueSearch);
+  el.qsResults = h('div', {
+    class: 'qsearch__results scroll', hidden: true,
+    role: 'region', 'aria-label': '검색 결과',
+  });
+  el.qsRow = h('div', { class: 'qsearch' },
+    h('div', { class: 'qsearch__row' }, el.qsInput, el.qsBtn),
+    el.qsResults);
+
   const head = h('div', { class: 'queue__head' },
     h('h2', null, '대기열'),
     el.queueCount,
@@ -2665,6 +2756,7 @@ function buildQueuePane() {
   bindContextTarget(head, () => queueHeadMenu());
 
   return h('div', { class: 'tabpane', role: 'tabpanel', 'aria-labelledby': 'railtab-queue' },
+    el.qsRow,
     head,
     el.whyOrder,
     buildSeedBox(),
@@ -2901,6 +2993,10 @@ async function maybeLoadMoreQueue() {
 }
 
 function renderQueue(state) {
+  /* **담으면 결과 줄이 `✓ 담김` 으로 바뀐다.** 그게 C안의 요점이다 —
+   * 같은 곡이 결과에도 대기열에도 보이는 것이 중복이 아니라 '내려갔다' 는 피드백이 된다.
+   * `trackRow` 가 대기열을 보고 그 표시를 정하므로, 대기열이 바뀔 때 같이 다시 그린다. */
+  renderQueueSearch();
   renderQueueHead(state);
   const items = state.queue;
   noteQueueScores(items);

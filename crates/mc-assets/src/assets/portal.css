@@ -2943,3 +2943,38 @@ body.gate {
   border-radius: var(--r-sm);
   pointer-events: none;
 }
+
+/* ── 대기열 안에서 바로 찾기 (C안) ──
+ *
+ * 검토 때 이 안의 위험으로 꼽았던 것이 '좁은 패널에서 결과와 대기열이 둘 다 반쪽이 된다'
+ * 였다. 그래서 결과 칸에 **높이 상한과 자기 스크롤**을 준다 — 결과가 아무리 많아도
+ * 대기열이 밀려나지 않는다. 둘이 한 통에서 스크롤을 다투지도 않는다. */
+.qsearch { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4) 0; }
+.qsearch__row { display: flex; gap: var(--sp-2); align-items: center; }
+.qsearch__row .field { flex: 1; min-width: 0; }
+.qsearch__results {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* 결과는 여기까지만. 나머지는 이 칸 안에서 스크롤한다. */
+  max-height: min(42vh, 300px);
+  overflow-y: auto;
+  padding: var(--sp-2);
+  background: var(--surface-inset);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-md);
+}
+.qsearch__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 12px;
+  color: var(--text-3);
+  padding: 0 var(--sp-1) var(--sp-1);
+}
+.qsearch__meta > span:first-child { flex: 1; }
+
+/* 아주 낮은 창에서는 결과 칸을 더 조인다. 대기열이 세 줄은 남아야 한다. */
+@media (max-height: 720px) {
+  .qsearch__results { max-height: 34vh; }
+}
