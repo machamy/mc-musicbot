@@ -15,6 +15,11 @@ pub struct Handler {
     pub ready_once: AtomicBool,
 }
 
+/// 명령 등록에 줄 시간. 이걸 넘기면 포기하고 로그를 남긴다.
+///
+/// 등록이 늦는 것보다 **기동 절차가 통째로 멈추는 것**이 훨씬 나쁘다.
+const COMMAND_REGISTER_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[serenity::async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
@@ -32,7 +37,40 @@ impl EventHandler for Handler {
                 app.build_id
             ),
         );
-        handlers::register_commands(&app, &ctx).await;
+        /* **명령 등록을 기다리지 않는다.** 예전에는 여기서 `.await` 했는데, 운영에서
+         * 이 호출이 **반환하지 않았다** — 로그에 `Registering commands...` 만 남고
+         * `Registered N slash commands.` 도 `connected as` 도 한 번도 안 찍혔다
+         * (2026-08-17 운영 로그 전수 확인).
+         *
+         * 그래서 그 아래에 있던 것이 **전부 안 돌았다**: 길드 메타 동기화, 아바타,
+         * 로그 보관 정리, 그리고 **재시작 이어듣기(`resume_after_restart`)까지.**
+         * 재시작해도 봇이 음성에 안 들어오던 원인이 §24 의 종료 신호 말고 하나 더
+         * 있었던 셈이다. 새 명령(`/부르기` 등)이 디스코드에 안 뜨던 것도 같은 이유다.
+         *
+         * 등록은 느려도 되는 일이고 이어듣기는 늦으면 안 되는 일이다. 갈라 놓는다.
+         * 제한 시간을 두는 것은 "영원히 매달린 태스크" 를 남기지 않기 위해서다 —
+         * 원인이 무엇이든 로그에는 반드시 결과가 남아야 한다. */
+        {
+            let app2 = app.clone();
+            let ctx2 = ctx.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    COMMAND_REGISTER_LIMIT,
+                    handlers::register_commands(&app2, &ctx2),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(_) => app2.log.warn(
+                        "Bot",
+                        &format!(
+                            "명령 등록이 {}초를 넘겨서 이번 기동에서는 포기해요.                              기존에 등록된 명령은 그대로 쓸 수 있고, 새 명령만 아직 안 보여요.",
+                            COMMAND_REGISTER_LIMIT.as_secs()
+                        ),
+                    ),
+                }
+            });
+        }
         app.log.info(
             "Bot",
             &format!(

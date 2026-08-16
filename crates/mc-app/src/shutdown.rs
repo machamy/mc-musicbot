@@ -22,10 +22,31 @@
 //! 배포 스크립트는 exe 를 먼저 옆에 복사해 두고 나서 신호를 보낸다. 그래야 멈춘 시간이
 //! "복사 + 기동" 이 아니라 "기동" 만 남는다.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::app::App;
+
+/// 바깥에서 "정상 종료해 달라" 고 부탁하는 파일. `data_root` 아래에 둔다.
+///
+/// **왜 파일인가.** 윈도우 콘솔 앱에는 바깥에서 Ctrl+Break 를 넣을 방법이 마땅치 않다
+/// (프로세스 그룹이 다르다). `CloseMainWindow` 는 콘솔 앱에 안 먹고, 그래서 배포 스크립트가
+/// `Stop-Process -Force` 로 떨어졌다. 그 결과 **이 파일의 절차가 한 번도 안 돌았다** —
+/// 운영 로그 전체에서 `Shutdown` 카테고리가 0줄이었다(2026-08-17 확인). 재생 위치가
+/// 안 남으니 다음 기동에서 이어 붙일 것도 없었고, 부팅 경로의 유일한 `sync_guild` 가
+/// 그 기록에 매달려 있어서 **봇이 음성에 스스로 안 들어왔다.**
+///
+/// HTTP 엔드포인트도 후보였지만 리모컨이 공개 주소라 인증 표면이 는다. 파일은 인증
+/// 실수의 여지가 없고, 신호가 실제로 갔는지도 파일 존재로 눈에 보인다.
+pub const SHUTDOWN_REQUEST_FILE: &str = "SHUTDOWN.request";
+
+/// 요청 파일을 얼마나 자주 보는가. 파일 하나 stat 하는 비용이라 1초면 충분하다.
+const REQUEST_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn request_path(app: &App) -> PathBuf {
+    app.config.data_root.join(SHUTDOWN_REQUEST_FILE)
+}
 
 /// 종료 절차가 시작됐는지. 웹이 이걸 보고 "곧 돌아와요" 를 내보낸다.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
@@ -40,8 +61,26 @@ pub fn is_shutting_down() -> bool {
 
 /// 종료 신호를 기다렸다가 정리하고 프로세스를 끝낸다. 기동 직후 한 번만 띄운다.
 pub fn watch(app: Arc<App>) {
+    /* **기동 시 남은 요청 파일을 먼저 지운다.** 안 지우면 다음 기동이 그 파일을 보고
+     * 곧바로 스스로 종료한다 — 껐다 켜도 안 켜지는 것처럼 보인다. */
+    let path = request_path(&app);
+    if path.exists() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => app.log.info(
+                "Shutdown",
+                "지난 종료 요청 파일이 남아 있어서 지웠어요.",
+            ),
+            Err(error) => app.log.warn(
+                "Shutdown",
+                &format!(
+                    "종료 요청 파일을 못 지웠어요({error}). 이대로면 기동하자마자 다시 꺼질 수 있어요."
+                ),
+            ),
+        }
+    }
+
     tokio::spawn(async move {
-        wait_for_signal().await;
+        wait_for_signal(&app).await;
         if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
             return; // 두 번째 신호는 무시한다. 정리 중에 또 부르면 상태가 반쪽으로 남는다.
         }
@@ -102,8 +141,36 @@ async fn drain(app: &Arc<App>) {
 /// 윈도우는 Ctrl+C 하나만 봐서는 부족하다. 예약 작업이나 배포 스크립트가 창을 닫는
 /// 방식으로 끝내면 `ctrl_close` 로 온다. 그 경우 **OS 가 주는 유예가 짧아서**
 /// 정리를 오래 붙들면 그냥 죽는다 — 그래서 [`DRAIN_LIMIT`] 이 짧다.
+/// 종료 요청 파일이 생길 때까지 기다린다.
+///
+/// 감시자(inotify 류)를 쓰지 않고 폴링하는 이유: 크로스 플랫폼 감시 크레이트를 하나 더
+/// 들이는 값에 비해 얻는 게 없다. 1초에 파일 하나를 보는 비용은 없는 것과 같다.
+async fn wait_for_request_file(app: &Arc<App>) {
+    let path = request_path(app);
+    loop {
+        tokio::time::sleep(REQUEST_POLL).await;
+        if path.exists() {
+            app.log.info(
+                "Shutdown",
+                "종료 요청 파일을 봤어요. 정상 절차로 내려갈게요.",
+            );
+            // 처리했으니 지운다. 남겨 두면 다음 기동이 이걸 또 본다.
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+    }
+}
+
+/// OS 신호 **또는** 요청 파일. 둘 중 먼저 오는 것으로 내려간다.
+async fn wait_for_signal(app: &Arc<App>) {
+    tokio::select! {
+        _ = wait_for_os_signal() => {}
+        _ = wait_for_request_file(app) => {}
+    }
+}
+
 #[cfg(windows)]
-async fn wait_for_signal() {
+async fn wait_for_os_signal() {
     use tokio::signal::windows;
     let mut c = windows::ctrl_c().expect("ctrl_c 핸들러");
     let mut brk = windows::ctrl_break().expect("ctrl_break 핸들러");
@@ -118,7 +185,7 @@ async fn wait_for_signal() {
 }
 
 #[cfg(not(windows))]
-async fn wait_for_signal() {
+async fn wait_for_os_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM 핸들러");
     tokio::select! {

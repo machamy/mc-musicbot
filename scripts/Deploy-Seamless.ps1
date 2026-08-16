@@ -107,8 +107,17 @@ $swap = Invoke-Remote @"
 `$next = "`$exe.next"
 `$sw = [Diagnostics.Stopwatch]::StartNew()
 
-# 종료 신호. CloseMainWindow 가 콘솔 앱에는 안 먹을 수 있어서, 안 죽으면 강제로 간다.
-# **강제로 가더라도 앞서 저장한 재생 위치는 남아 있다** — 그게 이 설계의 요점이다.
+# 종료 신호. **파일로 부탁한다.**
+#
+# 예전에는 CloseMainWindow 만 썼는데 콘솔 앱에는 안 먹어서, 늘 아래 Stop-Process -Force
+# 로 떨어졌다. 그래서 봇의 정상 종료 절차(§24)가 **한 번도 안 돌았다** — 운영 로그에
+# Shutdown 카테고리가 0줄이었다. 재생 위치가 안 남으니 다음 기동에 이어 붙일 것도 없고,
+# 부팅 경로의 유일한 sync_guild 가 그 기록에 매달려 있어 봇이 음성에 안 들어왔다.
+#
+# 이제 data_root 에 SHUTDOWN.request 를 써 두면 봇이 1초 안에 보고 스스로 내려간다.
+# CloseMainWindow 도 그대로 둔다 — 둘 다 실패해도 아래 강제 종료가 받아 준다.
+`$req = Join-Path `$root 'data\SHUTDOWN.request'
+try { Set-Content -Path `$req -Value (Get-Date -Format o) -Encoding utf8 -ErrorAction Stop } catch {}
 `$procs = Get-Process mc-musicbot -ErrorAction SilentlyContinue
 foreach (`$p in `$procs) { try { `$null = `$p.CloseMainWindow() } catch {} }
 `$deadline = (Get-Date).AddSeconds(8)
@@ -116,7 +125,13 @@ while ((Get-Date) -lt `$deadline -and (Get-Process mc-musicbot -ErrorAction Sile
     Start-Sleep -Milliseconds 200
 }
 `$left = Get-Process mc-musicbot -ErrorAction SilentlyContinue
-if (`$left) { `$left | Stop-Process -Force; Start-Sleep -Milliseconds 400 }
+if (`$left) {
+    Write-Host '[deploy] 정상 종료가 8초 안에 안 끝나서 강제로 내립니다 (이어듣기 기록이 없을 수 있어요).'
+    `$left | Stop-Process -Force; Start-Sleep -Milliseconds 400
+}
+# 요청 파일은 봇이 처리하면서 지운다. 강제 종료로 갔으면 남아 있으니 여기서 치운다 —
+# 남겨 두면 다음 기동이 그걸 보고 곧바로 스스로 꺼진다.
+if (Test-Path `$req) { Remove-Item `$req -Force -ErrorAction SilentlyContinue }
 
 # **`Move-Item -Force` 만으로는 부족하다.** 방금 죽인 프로세스가 exe 핸들을 잠깐 더 쥐고 있어
 # `파일이 이미 있으므로 만들 수 없습니다` 로 실패한다(실측).
