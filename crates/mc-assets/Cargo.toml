@@ -1,0 +1,12 @@
+# 프런트엔드 자산 바이트와 그 버전 해시. **의존을 늘리지 마라.**
+#
+# 이 크레이트가 가벼운 덕분에 JS/CSS 수정이 본체 재컴파일을 안 부른다.
+# axum 이나 도메인 타입을 여기로 끌어오는 순간 그 이점이 사라진다.
+[package]
+name = "mc-assets"
+version = "0.7.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+sha2 = "0.11.0"

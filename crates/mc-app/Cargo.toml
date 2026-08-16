@@ -1,0 +1,38 @@
+# 봇 본체 — 지금까지의 `src/` 전부.
+#
+# **`[dependencies]` 에 `mc-assets` 를 넣지 마라.** 자산은 얇은 bin 이 주입한다
+# (`lib.rs` 의 `install_assets`). 여기에 넣으면 CSS 한 줄에 이 크레이트 전체가
+# 다시 컴파일된다 — 이 워크스페이스가 존재하는 이유가 바로 그것이다.
+# `[dev-dependencies]` 는 괜찮다. dev 의존은 릴리스 lib 타깃 지문에 안 들어간다(실측).
+[package]
+name = "mc-app"
+version = "0.7.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = { version = "0.8.9", features = ["ws", "multipart"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+dotenvy = "0.15.7"
+rand = "0.10.1"
+regex = "1.12.4"
+# yt-dlp 자동 다운로드용 HTTP 클라이언트 (serenity 가 이미 reqwest+rustls 를 끌어옴).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache", "voice"] }
+sha2 = "0.11.0"
+songbird = { version = "0.6.0", features = ["serenity", "driver", "rustls"] }
+# songbird 는 symphonia 를 default-features=false 로 가져와 PCM 디코더가 빠진다.
+# ffmpeg raw 파이프(RawAdapter → CODEC_TYPE_PCM_F32LE)를 디코드하려면 "pcm" feature 필수 —
+# 없으면 모든 트랙이 "no compatible track found" 로 즉사한다 (2026-06-11 실측).
+symphonia = { version = "0.5.2", default-features = false, features = ["pcm"] }
+tokio = { version = "1.52.3", features = ["full"] }
+tower-cookies = "0.11.0"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[dev-dependencies]
+# 테스트 둘이 진짜 자산 바이트를 요구한다 (apidoc.html + remote.rs 를 동시에 본다).
+mc-assets = { path = "../mc-assets" }

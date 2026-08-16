@@ -1975,12 +1975,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
-name = "mc-musicbot"
+name = "mc-app"
 version = "0.7.0"
 dependencies = [
  "axum",
  "chrono",
  "dotenvy",
+ "mc-assets",
  "rand 0.10.1",
  "regex",
  "reqwest",
@@ -1995,6 +1996,21 @@ dependencies = [
  "tower-cookies",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "mc-assets"
+version = "0.7.0"
+dependencies = [
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "mc-musicbot"
+version = "0.7.0"
+dependencies = [
+ "mc-app",
+ "mc-assets",
 ]
 
 [[package]]

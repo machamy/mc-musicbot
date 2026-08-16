@@ -71,7 +71,7 @@ Discord 개발자 포털의 Redirect URI 도 `https://music.example.com/music/oa
 - `mc-musicbot.exe` SHA256: `5E6260674507C6F34ED3AB95EB0E093DB6F68749BEE0B8C7E22B698B4AE1B59A`
 - 설치 경로: 봇 호스트의 포터블 루트 (`$PORTABLE_ROOT`)
 - 기동: 예약 작업 `MusicBot Portable` → 루트 `START-MK2.cmd` (로그온 트리거)
-- `cargo test`: **240 passed / 0 failed**
+- `cargo test --workspace --release`: **276 passed / 0 failed**
 
 ### 로컬 개발 — 실서버를 안 건드리고 전부 확인한다
 
@@ -201,8 +201,14 @@ setx MUSICBOT_DEPLOY_ROOT   "<포터블 루트>"
 
 ## 프런트엔드
 
-**Rust 문자열이 아니라 진짜 파일이다.** `src/web/assets/` 에 있고
-`src/web/assets.rs` 가 `include_str!` / `include_bytes!` 로 컴파일 시 임베드한다.
+**Rust 문자열이 아니라 진짜 파일이다.** `crates/mc-assets/src/assets/` 에 있고
+`crates/mc-assets/src/lib.rs` 가 `include_str!` / `include_bytes!` 로 컴파일 시 임베드한다.
+
+**본체(`mc-app`)는 이 크레이트를 의존하지 않는다.** 얇은 `src/main.rs` 가 함수 포인터로
+주입하고(`crates/mc-app/src/assets_di.rs`), 본체는 그 통로로만 자산을 얻는다.
+그 덕분에 JS·CSS 한 글자를 고쳐도 본체 40,000줄이 다시 컴파일되지 않는다
+(54.4초 → 2.4초, 실측). **`mc-app` 의 `[dependencies]` 에 `mc-assets` 를 넣지 마라 —
+그 순간 원래대로 돌아간다.**
 
 ```
 tokens.css   디자인 토큰(테마 7종). portal/console 이 공유한다. 색은 여기서만 정의한다.
@@ -216,7 +222,8 @@ sw.js        서비스워커        manifest.webmanifest · icon-*.png · favico
 
 ### 캐시 — 셋이 겹치면 "배포했는데 화면이 그대로"가 된다
 
-1. 에셋 버전은 `BUILD_ID` 가 아니라 **에셋 내용 해시**로 계산한다(`assets::version()`).
+1. 에셋 버전은 `BUILD_ID` 가 아니라 **에셋 내용 해시**로 계산한다
+   (`mc_assets::version()`, 본체에서는 주입된 `web::assets::version()`).
    `BUILD_ID.txt` 는 포터블 배포본에만 있어 개발 중에는 비고, 빈 `?v=` + `immutable` 은 영구 캐시가 된다.
 2. `portal.js` 가 `./core.js` 를 정적 import 해서 그 요청에는 `?v=` 가 안 붙는다.
    그래서 `?v=` 가 현재 버전과 **정확히 일치할 때만** `immutable` 을 주고 나머지는 ETag 재검증(304)이다.
@@ -231,7 +238,7 @@ sw.js        서비스워커        manifest.webmanifest · icon-*.png · favico
 
 ```powershell
 cd <이 저장소 경로>
-cargo test              # 199 passed 여야 한다
+cargo test --workspace --release   # 276 passed 여야 한다
 cargo build --release
 ```
 

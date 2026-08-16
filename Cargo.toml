@@ -1,3 +1,11 @@
+# 워크스페이스 루트 + 얇은 실행 파일.
+#
+# **이 bin 이 얇은 것에 이유가 있다.** 자산(`mc-assets`)과 본체(`mc-app`)를 여기서만
+# 잇는다. `mc-app` 이 `mc-assets` 를 의존하면 자산 한 글자를 고칠 때마다 40,000줄이
+# 다시 컴파일된다(실측 54.4초). 지금은 자산과 이 파일만 다시 컴파일된다.
+[workspace]
+members = ["crates/mc-app", "crates/mc-assets"]
+
 [package]
 name = "mc-musicbot"
 version = "0.7.0"
@@ -6,24 +14,5 @@ publish = false
 license-file = "LICENSE"
 
 [dependencies]
-axum = { version = "0.8.9", features = ["ws", "multipart"] }
-chrono = { version = "0.4.45", features = ["serde"] }
-dotenvy = "0.15.7"
-rand = "0.10.1"
-regex = "1.12.4"
-# yt-dlp 자동 다운로드용 HTTP 클라이언트 (serenity 가 이미 reqwest+rustls 를 끌어옴).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache", "voice"] }
-sha2 = "0.11.0"
-songbird = { version = "0.6.0", features = ["serenity", "driver", "rustls"] }
-# songbird 는 symphonia 를 default-features=false 로 가져와 PCM 디코더가 빠진다.
-# ffmpeg raw 파이프(RawAdapter → CODEC_TYPE_PCM_F32LE)를 디코드하려면 "pcm" feature 필수 —
-# 없으면 모든 트랙이 "no compatible track found" 로 즉사한다 (2026-06-11 실측).
-symphonia = { version = "0.5.2", default-features = false, features = ["pcm"] }
-tokio = { version = "1.52.3", features = ["full"] }
-tower-cookies = "0.11.0"
-tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
+mc-app = { path = "crates/mc-app" }
+mc-assets = { path = "crates/mc-assets" }

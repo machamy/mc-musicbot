@@ -338,7 +338,11 @@ pub fn public_now(guild_id: u64, build_id: &str) -> String {
 /// **에셋 테이블(`assets.rs` 의 `lookup`)에는 일부러 넣지 않았다.** 거기 넣으면
 /// `/music/assets/apidoc.html` 이 인증 없이 열리고, 아래 페이지에 걸어 둔 세션 검사가
 /// 우회된다. 여기서 `include_str!` 로 읽어 셸 안에서만 내보낸다.
-const APIDOC_BODY: &str = include_str!("assets/apidoc.html");
+/// 자산 크레이트에서 온다 — 여기서 `include_str!` 하면 `mc-assets` 를 의존해야 하고,
+/// 그러면 자산 한 글자에 이 크레이트 전체가 다시 컴파일된다.
+fn apidoc_body() -> &'static str {
+    super::assets::apidoc_body()
+}
 
 /// `GET /music/apidoc` — API 가이드 문서.
 ///
@@ -349,6 +353,7 @@ const APIDOC_BODY: &str = include_str!("assets/apidoc.html");
 /// (테마 깜빡임 방지 스크립트만 예외 — 스타일시트보다 먼저 돌아야 한다.)
 pub fn apidoc() -> String {
     let build = super::assets::version();
+    let body = apidoc_body();
     format!(
         r#"<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -358,7 +363,7 @@ pub fn apidoc() -> String {
 <link rel="icon" href="/music/assets/favicon.svg?v={build}">
 <link rel="stylesheet" href="/music/assets/tokens.css?v={build}">
 <link rel="stylesheet" href="/music/assets/apidoc.css?v={build}">
-</head><body>{APIDOC_BODY}</body></html>"#
+</head><body>{body}</body></html>"#
     )
 }
 
@@ -412,7 +417,7 @@ mod tests {
         const SKIP: &[&str] = &["/healthz"]; // mod.rs 의 라우터에 있다
 
         let mut checked = 0;
-        for chunk in APIDOC_BODY.split("<code>").skip(1) {
+        for chunk in apidoc_body().split("<code>").skip(1) {
             let Some(text) = chunk.split("</code>").next() else {
                 continue;
             };

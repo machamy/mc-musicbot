@@ -10139,7 +10139,7 @@ fn option_json(policy: crate::models::EmptyVoiceChannelPolicy) -> Value {
 /// 문서와 화면이 갈라질 수 없다. 마크다운 해석은 클라이언트가 한다 — 서버가 HTML 을
 /// 만들어 주면 거기서 이스케이프 실수가 나면 곧장 XSS 다.
 async fn api_changelog(headers: HeaderMap) -> Response {
-    let text = crate::web::assets::CHANGELOG_MD;
+    let text = crate::web::assets::changelog();
     // 첫 `## ` 제목이 최신 버전 이름이다. 새 버전 안내 문구에 쓴다.
     let latest = text
         .lines()
