@@ -117,6 +117,18 @@ mod win {
 /// 호출 전에 [`install_assets`] 가 먼저 불려야 한다 — 웹 화면이 자산을 그 통로로 얻는다.
 #[tokio::main]
 pub async fn run() {
+    /* **자산 배선을 여기서 한 번 만져 본다.**
+     *
+     * `assets()` 는 설치 전에 부르면 패닉하는데, 그 호출이 전부 요청 핸들러 안에 있다.
+     * 그대로 두면 배선이 틀려도 봇은 멀쩡히 뜨고 디스코드에 붙고 음악까지 튼 뒤,
+     * **첫 브라우저 요청에서** axum 태스크가 조용히 패닉한다 — 프로세스는 안 죽고,
+     * 로그 뷰어도 같은 핸들러라 아무것도 안 남는다. 정확히 막으려던 그 상황이다.
+     *
+     * 그래서 기동 경로에서 미리 한 번 만진다. 틀렸으면 여기서 바로 죽는다.
+     * 덤으로 자산 버전을 로그에 남긴다 — "배포했는데 화면이 그대로" 를 추적할 때
+     * 브라우저의 `?v=` 와 대조할 값이다. */
+    let asset_version = (assets_di::assets().version)();
+
     // 윈도우 타이머 해상도 1ms — 소프트 타이머 정밀도 (송신 페이싱 보조).
     #[cfg(windows)]
     unsafe {
@@ -154,7 +166,7 @@ pub async fn run() {
     }
     app.log.info(
         "Bot",
-        &format!("Starting mc-musicbot (build {}).", app.build_id),
+        &format!("Starting mc-musicbot (build {}, assets {asset_version}).", app.build_id),
     );
     if let Some(path) = env_file {
         app.log
@@ -247,5 +259,33 @@ pub async fn run() {
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    /// `env!("CARGO_PKG_VERSION")` 이 이제 **루트가 아니라 `mc-app`** 을 읽는다.
+    ///
+    /// 그 값이 나가는 곳이 둘이다 — `/상태` 임베드(`commands/handlers.rs`)와
+    /// 바깥으로 나가는 HTTP User-Agent(`web/remote.rs`). 릴리스 때 루트만 올리면
+    /// **아무것도 실패하지 않은 채** 봇이 옛 버전을 보고하게 된다.
+    ///
+    /// 두 매니페스트를 컴파일 시점에 같이 읽어 못 박는다.
+    #[test]
+    fn the_two_manifests_agree_on_the_version() {
+        fn version_of(manifest: &str) -> &str {
+            manifest
+                .lines()
+                .find(|line| line.trim_start().starts_with("version"))
+                .and_then(|line| line.split('"').nth(1))
+                .expect("version 줄이 있어야 한다")
+        }
+        let root = version_of(include_str!("../../../Cargo.toml"));
+        let mine = version_of(include_str!("../Cargo.toml"));
+        assert_eq!(
+            root, mine,
+            "루트와 mc-app 의 버전이 갈라졌다 — /상태 와 User-Agent 가 {mine} 를 보고하는데              배포본은 {root} 다. 두 Cargo.toml 을 같이 올려야 한다."
+        );
+        assert_eq!(mine, env!("CARGO_PKG_VERSION"));
     }
 }

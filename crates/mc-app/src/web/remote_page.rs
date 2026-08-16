@@ -392,6 +392,11 @@ mod tests {
     /// `portal.css` 가 같이 실리면 문서 화면이 리모컨 레이아웃을 뒤집어쓴다.
     #[test]
     fn apidoc_links_tokens_then_only_its_own_stylesheet() {
+        // 자산은 얇은 bin 이 주입한다. 단위 테스트는 main() 을 안 거치므로 스스로 꽂는다 —
+        // 이게 없으면 이 테스트만 따로 돌릴 때(`cargo test remote_page`·nextest·IDE 실행)
+        // assets() 에서 패닉한다. 전체 실행에서 통과하던 건 다른 테스트가 먼저 꽂아 준
+        // 실행 순서 덕분이었고, 그건 보장이 아니다.
+        crate::assets_di::install_test_assets();
         let html = apidoc();
         let tokens = html.find("tokens.css").expect("tokens.css 링크가 없다");
         let own = html.find("apidoc.css").expect("apidoc.css 링크가 없다");
@@ -410,6 +415,7 @@ mod tests {
     /// 않는 값에는 접두사를 붙여서 찾는다.
     #[test]
     fn every_path_in_the_apidoc_exists_in_the_router() {
+        crate::assets_di::install_test_assets();
         // 테스트에서만 원문을 읽는다. 배포 바이너리에 소스가 딸려 들어가면 안 된다.
         let router_source = include_str!("remote.rs");
 

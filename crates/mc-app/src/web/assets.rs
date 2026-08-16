@@ -181,7 +181,9 @@ mod tests {
         install_test_assets();
         for name in ["core.js", "portal.js", "portal.css", "console.js", "apidoc.css"] {
             let (body, _) = (assets().get)(name).expect("등록된 자산");
-            assert!(!body.is_empty(), "{name} 이 비었다");
+            // `is_empty` 가 아니라 `trim`. 공백만 든 자산도 잡아야 한다 (이사 전 단언).
+            let text = std::str::from_utf8(body).expect("텍스트 자산");
+            assert!(!text.trim().is_empty(), "{name} 이 비었다");
         }
         assert!((assets().get)("icon-192.png").unwrap().0.starts_with(b"\x89PNG"));
         assert!((assets().get)("icon-512.png").unwrap().0.starts_with(b"\x89PNG"));
