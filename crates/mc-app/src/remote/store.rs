@@ -636,7 +636,7 @@ const CHART_FETCH_STALE_SECS: i64 = 180;
 /// 상수였을 때 실제로 갈라졌다 — `nowVoters`·`videoSize`·`devPos`·`devSize` 네 개가
 /// 여기 없는 채로 `is_valid_pref` 만 받아 주고 있었다. 이제는 [`is_known_pref`] 가
 /// 이 목록을 쓰고, 아래 테스트가 둘의 일치를 강제한다.
-pub const PREF_KEYS: [&str; 15] = [
+pub const PREF_KEYS: [&str; 16] = [
     "layout",
     "theme",
     "layoutSizes",
@@ -646,6 +646,7 @@ pub const PREF_KEYS: [&str; 15] = [
     "webPlayback",
     "nowVoters",
     "videoSize",
+    "videoCaptions",
     "devPos",
     "devSize",
     "webVolume",
@@ -691,7 +692,7 @@ pub fn is_valid_pref(key: &str, value: &str) -> bool {
         // `api_prefs_put` 이 배치 전체를 거절하는데, 화면은 300ms 동안 여러 설정을 모아
         // 한 번에 보낸다. 그래서 명단을 접었다 폈다 하는 동안 같은 배치에 실린
         // `webVolume`·`webOffset` 저장까지 같이 날아갔다 — 실제로 그랬다.
-        "lyricsOpen" | "webPlayback" | "nowVoters" => matches!(value, "0" | "1"),
+        "lyricsOpen" | "webPlayback" | "nowVoters" | "videoCaptions" => matches!(value, "0" | "1"),
         // 영상 크기 1~4 (§40). 목록에 없으면 저장이 통째로 실패한다 — `nowVoters` 가 그랬다.
         "videoSize" => matches!(value, "1" | "2" | "3" | "4"),
         /* 개발자 콘솔 창의 자리와 크기. `"x,y"` · `"w,h"` 꼴의 정수 두 개다.
@@ -743,7 +744,7 @@ pub fn is_valid_pref(key: &str, value: &str) -> bool {
 /// 각 설정 키가 실제로 받아 주는 값 하나. `PREF_KEYS` 와 `is_valid_pref` 의
 /// 일치를 강제하는 테스트가 쓴다.
 #[cfg(test)]
-const PREF_SAMPLES: [(&str, &str); 15] = [
+const PREF_SAMPLES: [(&str, &str); 16] = [
     ("layout", "panel"),
     ("theme", "nord"),
     ("layoutSizes", "{}"),
@@ -753,6 +754,7 @@ const PREF_SAMPLES: [(&str, &str); 15] = [
     ("webPlayback", "1"),
     ("nowVoters", "1"),
     ("videoSize", "3"),
+    ("videoCaptions", "1"),
     ("devPos", "120,80"),
     ("devSize", "640,360"),
     ("webVolume", "80"),

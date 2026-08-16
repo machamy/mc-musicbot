@@ -4889,8 +4889,21 @@ function buildWebPlayback() {
     onInput: () => setVideoSize(Number(el.videoSizeRange.value)),
   });
   el.videoSizeBox = h('div', { class: 'videosize' }, el.videoSizeRange, el.videoSizeLabel);
+  /* **자막 켜고 끄기.**
+   *
+   * 영상 자체는 `pointer-events: none` 이라 유튜브의 CC 버튼을 누를 수 없다 — 그건
+   * 일부러 그렇게 뒀다(유튜브 컨트롤로 되감으면 그 사람만 어긋난다). 그래서 자막이
+   * 켜진 채로 뜨면 **끌 방법이 아예 없었다.** 우리 안내막에 토글을 단다.
+   *
+   * 기본은 꺼짐이다. 보는 사람이 원해서 켠 게 아니라 계정 설정이나 영상 쪽 강제 자막으로
+   * 켜지는 경우가 대부분이라, 켜진 채로 시작하면 '왜 이게 떠 있지' 가 된다. */
+  el.videoCcBtn = h('button', {
+    class: 'iconbtn videocc', type: 'button',
+    'aria-pressed': 'false',
+    onClick: () => setVideoCaptions(!videoCaptionsOn()),
+  }, 'CC');
   el.videoChrome = h('div', { class: 'videochrome', hidden: true },
-    el.videoVeil, el.videoCount, el.videoSizeBox);
+    el.videoVeil, el.videoCount, el.videoCcBtn, el.videoSizeBox);
   document.body.appendChild(el.videoChrome);
 
   window.addEventListener('pagehide', stopWebPlayback);
@@ -4961,6 +4974,32 @@ const VIDEO_SIZES = [
   { w: '100%', bleed: false, label: '크게' },
   { w: '100%', bleed: true, label: '꽉 차게' },
 ];
+
+/** 자막을 켜 둘 것인가. 기본은 꺼짐. */
+function videoCaptionsOn() {
+  return prefGet('videoCaptions') === '1';
+}
+
+function setVideoCaptions(on) {
+  prefSet('videoCaptions', on ? '1' : null);   // 꺼짐이 기본이라 끌 때는 지운다
+  applyVideoCaptions();
+}
+
+/** 지금 설정을 실제 플레이어에 건다. 곡이 바뀌어도 다시 불러야 한다. */
+function applyVideoCaptions() {
+  const on = videoCaptionsOn();
+  if (el.videoCcBtn) {
+    el.videoCcBtn.setAttribute('aria-pressed', String(on));
+    el.videoCcBtn.dataset.on = on ? '1' : '0';
+    el.videoCcBtn.dataset.tip = on ? '자막을 꺼요' : '자막을 켜요';
+  }
+  if (!ytPlayer || !ytReady) return;
+  /* 유튜브 IFrame API 는 자막을 **모듈**로 다룬다. `captions` 와 `cc` 두 이름이
+   * 플레이어 버전에 따라 갈려서 둘 다 건드린다. 없는 모듈을 내리면 조용히 무시된다. */
+  for (const mod of ['captions', 'cc']) {
+    try { on ? ytPlayer.loadModule(mod) : ytPlayer.unloadModule(mod); } catch { /* 무시 */ }
+  }
+}
 
 function videoSizeStep() {
   const raw = Number(prefGet('videoSize'));
@@ -5290,11 +5329,17 @@ function createYtPlayer() {
     try {
       ytPlayer = new window.YT.Player('macham-yt', {
         height: '1', width: '1',
-        playerVars: { autoplay: 0, controls: 0, disablekb: 1, playsinline: 1, rel: 0, origin: location.origin },
+        // `cc_load_policy: 0` — 영상이 강제로 자막을 켜는 것을 막는다. 그래도 계정
+        //  기본값으로 켜지는 경우가 있어서, 준비되면 아래에서 모듈째로 내린다.
+        playerVars: {
+          autoplay: 0, controls: 0, disablekb: 1, playsinline: 1, rel: 0,
+          cc_load_policy: 0, origin: location.origin,
+        },
         events: {
           onReady: () => {
             ytReady = true;
             try { ytPlayer.setVolume(webVolume); } catch { /* 무시 */ }
+            applyVideoCaptions();
             resolve(ytPlayer);
           },
           onError: (event) => onWebError(event?.data),
@@ -5504,6 +5549,8 @@ function syncWebNow(force) {
   if (next.kind === 'sc' && !window.SC?.Widget) { ensureSoundCloud(); return; }
 
   setWebNote('');
+  // 곡이 바뀌면 유튜브가 자막 모듈을 다시 올린다. 설정을 매번 다시 건다.
+  applyVideoCaptions();
   const paused = !!state.player?.isPaused;
   const position = webTargetPosition();
   const changed = force || !webSource || webSource.kind !== next.kind || webSource.key !== next.key;

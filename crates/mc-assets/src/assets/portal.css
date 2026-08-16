@@ -2836,6 +2836,20 @@ body.gate {
   background: rgba(0, 0, 0, 0.55);
   pointer-events: auto;
 }
+/* 자막 토글. 안내막은 클릭을 안 받지만 이 버튼과 크기 슬라이더만 예외다. */
+.videocc {
+  pointer-events: auto;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  opacity: 0.55;
+}
+.videocc[data-on='1'] {
+  opacity: 1;
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
 .videosize__range { width: 96px; flex: none; accent-color: #fff; }
 .videosize__label { color: #fff; font-size: var(--fs-xs); min-width: 3.6em; text-align: center; }
 
