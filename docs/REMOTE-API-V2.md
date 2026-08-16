@@ -1,6 +1,6 @@
 # 리모컨 v2 — 백엔드 API 계약
 
-`src/web/assets/portal.js`(유저 UI)와 `src/web/assets/console.js`(서버 관리 콘솔)가
+`crates/mc-assets/src/assets/portal.js`(유저 UI)와 `crates/mc-assets/src/assets/console.js`(서버 관리 콘솔)가
 **이미 이 계약대로 작성되어 있다.** 백엔드가 여기에 맞춘다. 프런트를 고치지 말고 서버를 맞춰라.
 
 - 베이스: `/music/api/guilds/{guildId}`

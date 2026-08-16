@@ -5,6 +5,10 @@
 # 다시 컴파일된다(실측 54.4초). 지금은 자산과 이 파일만 다시 컴파일된다.
 [workspace]
 members = ["crates/mc-app", "crates/mc-assets"]
+# **이게 없으면 `cargo test` 가 0개를 돌리고 통과한다.** 루트 패키지가 있는 워크스페이스는
+# 기본 대상이 루트 하나뿐인데, 루트는 20줄짜리 얇은 bin 이라 테스트가 없다.
+# 그러면 "테스트 통과" 가 아무것도 의미하지 않는 상태가 조용히 만들어진다.
+default-members = [".", "crates/mc-app", "crates/mc-assets"]
 
 [package]
 name = "mc-musicbot"

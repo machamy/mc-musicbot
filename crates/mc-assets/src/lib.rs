@@ -219,10 +219,12 @@ mod tests {
 
     /// 배포된 브라우저의 캐시 키다. **바뀌면 전원이 자산을 다시 받는다.**
     ///
-    /// 크레이트를 옮기면서 개행 처리나 파일 순서가 틀어지면 여기서 먼저 걸린다.
+    /// 자산을 일부러 고쳤으면 이 값을 같이 갱신한다 — 그 갱신이 곧
+    /// "자산이 바뀌었다" 는 명시적 선언이다. 의도 없이 바뀌면 여기서 먼저 걸린다.
+    /// (워크스페이스 이사 때는 `d44ff894b8ef9398` 이 그대로 유지되는 것으로 무변경을 증명했다.)
     #[test]
-    fn version_hash_is_unchanged_by_the_move() {
-        assert_eq!(version(), "d44ff894b8ef9398");
+    fn version_hash_is_pinned() {
+        assert_eq!(version(), "f7f5698bc1622067");
     }
 
     /// 이름과 바이트가 서로 **뒤바뀌어도** 버전 해시는 그대로다(같은 것을 다 더하므로).
@@ -256,7 +258,7 @@ mod tests {
             ),
             (
                 "console.js",
-                "7110abeeb2fb9ca72885411d8ab7daed3b2b8662e18be2d532bc5a75927700b4",
+                "c87150228e51132dcb167140ec4b1298a080ad4162f402ee5aef52a094918b18",
             ),
             (
                 "manifest.webmanifest",
@@ -293,7 +295,7 @@ mod tests {
         }
         assert_eq!(
             sha256_hex(apidoc_body().as_bytes()),
-            "e4b2485c204dff12c9f463d4906243bb6c5d7f3e33c9e4f4cbebb6e194d3f834"
+            "94b5c25d7519cb2cebdfd3ece99ae59aac1001fa762ab18abbd7765664c0763a"
         );
     }
 

@@ -4,14 +4,14 @@
      셸 안에 넣는다. 에셋으로 등록하면 `/music/assets/apidoc.html` 이 로그인 게이트 밖에서
      열려서, 페이지에 걸어 둔 세션 검사가 아무 의미가 없어진다.
 
-     내용의 출처는 `src/web/remote.rs` 의 `router()` 등록부다. 라우트를 고쳤으면 여기도 같이
+     내용의 출처는 `crates/mc-app/src/web/remote.rs` 의 `router()` 등록부다. 라우트를 고쳤으면 여기도 같이
      고쳐야 한다 — 문서에만 있고 코드에 없는 경로를 적으면 이 문서는 그 순간 거짓말이 된다. -->
 
 <header class="doc-top">
   <span class="doc-top__mark" aria-hidden="true">♫</span>
   <div>
     <div class="doc-top__title">마참뮤직 리모컨 API 가이드</div>
-    <div class="doc-top__sub">경로·메서드·권한은 <code>src/web/remote.rs</code> 의 라우트 등록부에서 뽑았어요</div>
+    <div class="doc-top__sub">경로·메서드·권한은 <code>crates/mc-app/src/web/remote.rs</code> 의 라우트 등록부에서 뽑았어요</div>
   </div>
   <span class="doc-top__spacer"></span>
   <a class="btn btn--ghost btn--sm" href="/music">← 리모컨으로</a>
@@ -49,7 +49,7 @@
         모든 경로는 <code>/music</code> 아래에 있어요. 이건 취향이 아니라 제약이에요 —
         리모컨 도메인(<code>MUSICBOT_REMOTE_HOST</code>)에서는
         <code>/music/*</code> 와 <code>/healthz</code> 를 뺀 나머지가 전부 404 예요
-        (<code>src/web/mod.rs</code> 의 <code>host_scope_guard</code>).
+        (<code>crates/mc-app/src/web/mod.rs</code> 의 <code>host_scope_guard</code>).
         운영 패널과 리모컨을 같은 프로세스에서 서빙하면서도 서로의 화면이 새어 나가지 않게 하는 장치예요.
       </p>
       <div class="note">
@@ -532,7 +532,7 @@ ws.onclose = (event) =&gt; {
 
       <p class="doc-foot">
         이 문서는 링크를 아는 사람만 들어와요. 진입 버튼이나 메뉴는 일부러 만들지 않았어요.
-        내용이 실제와 어긋나 보이면 <code>src/web/remote.rs</code> 의 <code>router()</code> 가 언제나 정답이에요.
+        내용이 실제와 어긋나 보이면 <code>crates/mc-app/src/web/remote.rs</code> 의 <code>router()</code> 가 언제나 정답이에요.
       </p>
     </section>
 

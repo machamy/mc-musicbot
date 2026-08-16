@@ -2061,7 +2061,7 @@ function renderQueuePreview(box) {
  * 서버를 새로 파지 않는 이유: 이 데이터는 고정이고 정렬 규칙도 순수 함수라 클라에서 계산하면 끝이다.
  * 미리보기 하나 보자고 엔드포인트를 늘리면 유휴 상태 쿼리 0회 기준(§23.2)만 갉아먹는다.
  *
- * 대신 **정렬 규칙은 반드시 서버와 같아야 한다**. 아래 비교 함수들은 `src/remote/ranking.rs` 의
+ * 대신 **정렬 규칙은 반드시 서버와 같아야 한다**. 아래 비교 함수들은 `crates/mc-app/src/remote/ranking.rs` 의
  * `compare_score` / `compare_fifo` / `compare_fair` 를 그대로 옮긴 것이고, 점수는 화면에서
  * 편집 중인 점수표(`draftVotePoints`)를 쓴다 — 서버의 `QueueScore::total_score` 와 같은 식이다.
  * 샘플에는 수동 우선순위(핀·붐따)가 없어서 `compare_manual` 단계만 빠져 있다.

@@ -1116,7 +1116,7 @@ pub bulk_enqueue_rule: PermissionRule,   // 기본 GuildMember
 `coordinator.rs:236` 주석은 "songbird 의 라이브 연결이 권위 소스"라고 정확히 적어 뒀는데,
 **웹만 저장값을 읽고 있었어요.**
 
-`src/web/remote.rs` 의 `bot_voice_status` 에 같은 함정이 다시 들어갔어요:
+`crates/mc-app/src/web/remote.rs` 의 `bot_voice_status` 에 같은 함정이 다시 들어갔어요:
 
 ```rust
 let channel_id = guild.voice_states.get(&bot_id)

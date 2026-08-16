@@ -20,7 +20,7 @@ REM and set the admin password (first-time setup is allowed from localhost only)
 set MUSICBOT_WEB_URLS=http://0.0.0.0:8693
 REM Public hostnames are per-deployment. Set them in bot\remote.env.cmd, which is
 REM called below and wins over anything set here. Leaving the two *_HOST values
-REM empty disables the admin/remote split (see src\web\mod.rs host_scope_guard).
+REM empty disables the admin/remote split (see crates\mc-app\src\web\mod.rs host_scope_guard).
 REM Keep OAuth secrets outside the update manifest. Create bot\remote.env.cmd from
 REM bot\remote.env.sample.cmd on the host; updates preserve the local file.
 if exist "bot\remote.env.cmd" call "bot\remote.env.cmd"

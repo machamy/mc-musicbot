@@ -28,7 +28,7 @@ MK2는 봇 호스트 PC에서 실행한다. NAS에서 musicbot 컨테이너를 �
 | `musicbot.example.com` | 봇 주인용 **운영 패널** (대시보드·캐시·블랙리스트·OAuth·로그) | Cloudflare Access + 웹 비밀번호 |
 | `music.example.com` | **웹 리모컨** (유저 UI + 서버 관리 콘솔) | Discord OAuth. **Access 없음** |
 
-`src/web/mod.rs` 의 `host_scope_guard` 가 Host 헤더로 갈라낸다.
+`crates/mc-app/src/web/mod.rs` 의 `host_scope_guard` 가 Host 헤더로 갈라낸다.
 - 리모컨 도메인에서 `/music/*` 와 `/healthz` 외 경로는 **404**
 - 리모컨 도메인의 `/` 는 `/music` 으로
 - 관리자 도메인의 `/music/*` 는 리모컨 도메인으로 리다이렉트

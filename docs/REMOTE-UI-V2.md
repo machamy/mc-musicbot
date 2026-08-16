@@ -458,7 +458,7 @@ CREATE INDEX idx_web_sessions_expiry ON remote_web_sessions(expires_utc);
 ### 8.1 파일 배치 (번들러 없음, 단일 exe 유지)
 
 ```
-src/web/assets/
+crates/mc-assets/src/assets/
   tokens.css        디자인 토큰 (다크/라이트 양쪽)
   portal.css        유저 UI
   console.css       서버 관리 콘솔
@@ -470,7 +470,8 @@ src/web/assets/
   icon-192.png / icon-512.png / favicon.svg
 ```
 
-`src/web/assets.rs`에서 `include_str!`/`include_bytes!`로 컴파일 시 임베드.
+`crates/mc-assets/src/lib.rs`에서 `include_str!`/`include_bytes!`로 컴파일 시 임베드.
+(HTTP 응답 쪽 절반은 `crates/mc-app/src/web/assets.rs` 에 따로 있다.)
 라우트는 `/music/assets/{name}` + `?v={build_id}` 캐시버스팅, `Cache-Control: immutable`.
 **`tower-http`/`ServeDir` 금지** — 포터블 1241파일 매니페스트와 "exe 하나 SHA 하나" 계약을 깨뜨린다.
 
