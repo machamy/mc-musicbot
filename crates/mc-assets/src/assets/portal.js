@@ -5154,6 +5154,9 @@ let videoJoined = false;
 let videoRaf = 0;
 /** 마지막으로 쓴 좌표. 같은 값을 다시 쓰면 레이아웃이 헛되이 무효화된다. */
 let videoBoxKey = '';
+/* 마지막으로 `setSize` 에 넘긴 크기. 좌표가 아니라 **크기**만 담는다 — 스크롤 중에도
+ * 크기는 안 바뀌므로, 이 값이 iframe 재배치를 초당 60번에서 0번으로 줄인다. */
+let videoSizeKey = '';
 /** 크기 슬라이더를 끄는 중인가. 그동안 안내막을 얼려 둔다. */
 let videoSizeDragging = false;
 
@@ -5387,12 +5390,28 @@ function insetPath(full, clip) {
   return `inset(${top}px ${right}px ${bottom}px ${left}px)`;
 }
 
-function hideVideoBox() {
+/* 오버레이만 접는다. **카드 배치는 안 건드린다.**
+ *
+ * 이 구분이 이 파일에서 제일 중요하다. 예전에는 하나였고, 그래서 스크롤이 다음 고리를
+ * 돌았다 — 가려짐 → 카드까지 원래대로 → 자리가 작아져 다시 다 보임 → 영상 켬 →
+ * 16:9 로 커져 화면 밖으로 나감 → 가려짐. **60fps 로 켜졌다 꺼졌다 했다.**
+ * 2단에서 스크롤을 내리면 눈에 보일 만큼 심했다(실측: 표본 14곳 중 10곳이 두 상태에서
+ * 서로 반대로 판정했다).
+ *
+ * 규칙: **카드 배치는 `videoShowing()` 만 따른다.** 그건 스크롤과 무관하므로 고리가 없다.
+ * 스크롤에 따라 변하는 것은 오버레이의 좌표와 클립뿐이다. */
+function collapseVideoOverlay() {
   if (!el.webHost) return;
   if (el.webHost.dataset.video === '1') delete el.webHost.dataset.video;
   el.webHost.style.cssText = '';
   videoBoxKey = '';
+  videoSizeKey = '';
   if (el.videoChrome) { el.videoChrome.hidden = true; el.videoChrome.style.cssText = ''; }
+}
+
+/** 영상 모드에서 완전히 나온다. 카드도 원래 배치로 되돌린다. */
+function hideVideoBox() {
+  collapseVideoOverlay();
   if (el.nowCard && el.nowCard.dataset.video === '1') delete el.nowCard.dataset.video;
 }
 
@@ -5403,17 +5422,27 @@ function placeVideo() {
     hideVideoBox();
     return;
   }
+  /* **카드 배치가 먼저다.** 스크롤과 무관한 `videoShowing()` 만 보고 정한다
+   * (`collapseVideoOverlay` 주석의 고리를 끊는 자리). 자리 크기를 재기 전에 해야 한다 —
+   * 영상 배치가 아닌 상태에서 잰 자리는 작은 앨범아트라 항상 "너무 작다" 로 판정된다. */
+  if (el.nowCard.dataset.video !== '1') el.nowCard.dataset.video = '1';
+
   const full = slot.getBoundingClientRect();
+  /* 자리 자체가 영상이라고 하기 어려울 만큼 작으면 오버레이만 접는다.
+   * **보이는 부분이 아니라 자리 크기로 판단한다** — 보이는 부분으로 재면 스크롤이
+   * 판정을 흔들고, 그게 앞서 말한 고리였다. 자리 크기는 스크롤과 무관하다. */
+  if (full.width < 80 || full.height < 45) { collapseVideoOverlay(); return; }
+
+  /* 가려진 만큼은 `clip-path` 로 잘라 낸다. 영상이 줄어드는 게 아니라 **잘리는** 것이라
+   * 임계값이 필요 없다 — 끝까지 매끄럽게 사라진다. 완전히 벗어나면 접는다. */
   const clip = visibleRect(slot);
-  // 너무 작으면 영상이라고 하기 어렵다. 그때는 아트를 그대로 둔다.
-  if (!clip || clip.width < 80 || clip.height < 45) { hideVideoBox(); return; }
+  if (!clip) { collapseVideoOverlay(); return; }
 
   const key = [full.left, full.top, full.width, full.height, clip.top, clip.bottom, clip.left, clip.right]
     .map((n) => Math.round(n)).join(',');
   if (key === videoBoxKey) return;
   videoBoxKey = key;
 
-  el.nowCard.dataset.video = '1';
   el.webHost.dataset.video = '1';
   el.webHost.style.left = `${Math.round(full.left)}px`;
   el.webHost.style.top = `${Math.round(full.top)}px`;
@@ -5438,8 +5467,16 @@ function placeVideo() {
     el.videoChrome.style.clipPath = el.webHost.style.clipPath;
     paintVideoChrome();
   }
-  // 1×1 로 만들어진 플레이어라 iframe 에게도 커졌다고 알려 준다.
-  try { ytPlayer?.setSize?.(Math.round(full.width), Math.round(full.height)); } catch { /* 아직 준비 전 */ }
+  /* 1×1 로 만들어진 플레이어라 iframe 에게도 커졌다고 알려 준다.
+   *
+   * **크기가 실제로 바뀔 때만 부른다.** 위 `key` 에는 좌표가 들어 있어서 스크롤하는 동안
+   * 매 프레임 바뀐다. 그대로 두면 크기가 그대로인데도 `setSize` 를 초당 60번 부르게 되고,
+   * 그때마다 iframe 이 다시 배치된다 — 그 자체로 영상이 깜빡인다. */
+  const sizeKey = `${Math.round(full.width)}x${Math.round(full.height)}`;
+  if (sizeKey !== videoSizeKey) {
+    videoSizeKey = sizeKey;
+    try { ytPlayer?.setSize?.(Math.round(full.width), Math.round(full.height)); } catch { /* 아직 준비 전 */ }
+  }
 }
 
 /** 지금 무엇을 알려야 하나. 멈춰 있으면 그 이유를 말한다. */
