@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -548,7 +548,7 @@ const MIGRATION_V15: &str = r#"
 ///   - `internal:...` — 우리가 튼 기록으로 만드는 차트(§15.2b). 외부 호출이 없다.
 ///
 /// 관리 콘솔에서 주소를 바꿀 수 있다. 여기 값은 **처음 한 번만** 심어진다.
-const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 51] = [
+const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 61] = [
     // 우리가 실제로 튼 것으로 만드는 차트 — 자동재생으로 나간 곡은 세지 않는다.
     (ChartCategory::Ours, "우리 서버 인기곡", "Internal", "internal:guild-plays"),
     (ChartCategory::Ours, "우리 서버 사랑받은 곡", "Internal", "internal:guild-love"),
@@ -574,24 +574,50 @@ const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 51] = [
     (ChartCategory::Region, "대만 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn68Qgd3kW_hKrqMhxAHz62W"),
     (ChartCategory::Region, "인도 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4pTWyM3t61lOyZ6_4jcNOw"),
     (ChartCategory::Region, "인도네시아 인기곡", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5ObxTlEPlkkornHXUiKX1z"),
-    // 장르 — 같은 채널의 "Top 50 <장르> Music Videos". 미국 기준이라 이름에 나라를 안 붙였다.
-    (ChartCategory::Genre, "팝", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn77aK7sAW2AT0oOzo5inWY8"),
-    (ChartCategory::Genre, "힙합", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4fmCoF1vKHLtivI0f9yHiF"),
-    (ChartCategory::Genre, "록", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5LOptOQixqnzXNGjNXAgYY"),
-    (ChartCategory::Genre, "하드록·메탈", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4w4wTTgOmP_S80PoCtbGrL"),
-    (ChartCategory::Genre, "댄스·일렉트로닉", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4rBU0RHnR6-b1_uE20CzRH"),
-    (ChartCategory::Genre, "라틴", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5O8siDeZuI_4hbk6JWtTX1"),
-    (ChartCategory::Genre, "재즈", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn7Wkr6Ll6ds1AhA42rT8uaU"),
-    (ChartCategory::Genre, "컨트리", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4EBsWVeFpcSAVOFMfhyipg"),
-    // J-POP 계열은 위 "Top 50 …United States" 묶음에 아예 없다. 그래서 나라별에만 있고
-    // 장르에서는 빠져 있었다. 유튜브 뮤직이 직접 큐레이션한 재생목록(`RDCLAK5uy_…`)으로 채운다.
-    // 2026-08-08 곡 수·길이 확인함.
-    (ChartCategory::Genre, "J-POP", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_nbK9qSkqYZvtMXH1fLCMmC1yn8HEm0W90"),
-    (ChartCategory::Genre, "J-POP 최신", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_lwbizuU3lWX-XkvD8tvEd8phxcIneMvwc"),
-    (ChartCategory::Genre, "J-POP 봄노래", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_lRj2PxRYIUGDG0p0KjsQ62d2lLYLfgXAw"),
-    (ChartCategory::Genre, "애니송", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_mRcc2Y3l-RoZsDt27qu8CBGpKt-5w7v8g"),
-    (ChartCategory::Genre, "시티팝", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_nEjjAWEM3M3fk2tT4Lhb5JOr_HoD0tjnk"),
-    (ChartCategory::Genre, "시티팝 최신", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_muPPezCrTrwoL7Ep_9a69YkIaBjsyKTg0"),
+    /* 한국 장르 (§15.2d). **한국 장르 차트가 하나도 없었다.**
+     *
+     * 장르 칸에 "힙합" 이 있는데 그게 전세계(미국) 기준이라, 한국 힙합을 찾던 사람이
+     * 그걸 눌러 보고 없다고 신고했다. 한국 것은 `TJ 힙합·랩` 하나뿐이었고 그건 노래방
+     * 칸에 있어서 장르를 훑는 눈에는 안 걸린다.
+     *
+     * 예전에 `ytsearch:한국힙합` 류로 채우려다 접었다 — 개별 곡이 아니라 한 시간짜리
+     * 믹스 영상만 올라온다(§15.2 의 `ytsearchN:` 주의사항). 대신 유튜브 뮤직이 직접
+     * 큐레이션한 `RDCLAK5uy_…` 재생목록을 쓴다. J-POP 을 채울 때와 같은 방식이다.
+     * 2026-08-17 에 열 개 전부 yt-dlp 로 곡 수·길이를 확인했다(괄호가 그때 곡 수). */
+    (ChartCategory::KoreaGenre, "한국 힙합", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_mpo2HfrX06wHjprd9QMKU3_kB14qh5EGw"), // 100
+    (ChartCategory::KoreaGenre, "한국 힙합 최신", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_n0GWMmsPfhEskbfm_bwY5b7iYZa8HA99I"), // 50
+    (ChartCategory::KoreaGenre, "한국 R&B·소울", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_ksS_w6iD9_BbnCccQrUOq5oawpqNcOGZ4"), // 49
+    (ChartCategory::KoreaGenre, "한국 발라드", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_n8bBzXEwnWtfpCFL6fiqyV0bLzGASpjhM"), // 100
+    (ChartCategory::KoreaGenre, "한국 인디", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_lv3f6y86nI_XtP-joi28deZotw69rTpoU"), // 84
+    (ChartCategory::KoreaGenre, "한국 록", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_lEmAyyZCKfbVwr4IUJ-vQ0impyGVQg7_A"), // 50
+    (ChartCategory::KoreaGenre, "한국 트로트", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kjJjsGNNkfQJJLuL4w5gVB2l62gW-cYWA"), // 97
+    (ChartCategory::KoreaGenre, "한국 드라마 OST", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_miHnhrZJWX7HvNEX7CaSZzfk77iwWhBLI"), // 100
+    (ChartCategory::KoreaGenre, "한국 시티팝", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_liOSeWRlYLVP6ISQv31FVe9jEzCkmpFCs"), // 43
+    (ChartCategory::KoreaGenre, "K-POP", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_nv-tvtQSHjI9sEnN3M6QgK3m5JeaE-6zE"), // 100
+    /* 전세계 장르 — 같은 채널의 "Top 50 <장르> Music Videos".
+     *
+     * 이름이 그냥 `힙합`·`팝` 이었다. 미국·전세계 기준인데 그걸 알 방법이 없었고,
+     * 자동 재생 장르 칩은 **차트 이름만** 보여줘서(`portal.js:apGenreSection`) 분류 이름에
+     * 기대는 것도 안 통한다. 그래서 이름 자체에 `전세계` 를 박는다. */
+    (ChartCategory::Genre, "전세계 팝", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn77aK7sAW2AT0oOzo5inWY8"),
+    (ChartCategory::Genre, "전세계 힙합", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4fmCoF1vKHLtivI0f9yHiF"),
+    (ChartCategory::Genre, "전세계 록", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5LOptOQixqnzXNGjNXAgYY"),
+    (ChartCategory::Genre, "전세계 하드록·메탈", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4w4wTTgOmP_S80PoCtbGrL"),
+    (ChartCategory::Genre, "전세계 댄스·일렉트로닉", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4rBU0RHnR6-b1_uE20CzRH"),
+    (ChartCategory::Genre, "전세계 라틴", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn5O8siDeZuI_4hbk6JWtTX1"),
+    (ChartCategory::Genre, "전세계 재즈", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn7Wkr6Ll6ds1AhA42rT8uaU"),
+    (ChartCategory::Genre, "전세계 컨트리", "YouTube", "https://music.youtube.com/playlist?list=PL4fGSI1pDJn4EBsWVeFpcSAVOFMfhyipg"),
+    /* 일본 장르. J-POP 계열은 위 "Top 50 …United States" 묶음에 아예 없어서 유튜브 뮤직이
+     * 직접 큐레이션한 재생목록(`RDCLAK5uy_…`)으로 채웠다. 2026-08-08 곡 수·길이 확인함.
+     *
+     * `시티팝` 은 이름을 반드시 고쳐야 했다 — 한국 시티팝 재생목록이 따로 있어서
+     * 그냥 `시티팝` 이면 어느 쪽인지 알 수 없다. */
+    (ChartCategory::JapanGenre, "일본 J-POP", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_nbK9qSkqYZvtMXH1fLCMmC1yn8HEm0W90"),
+    (ChartCategory::JapanGenre, "일본 J-POP 최신", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_lwbizuU3lWX-XkvD8tvEd8phxcIneMvwc"),
+    (ChartCategory::JapanGenre, "일본 J-POP 봄노래", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_lRj2PxRYIUGDG0p0KjsQ62d2lLYLfgXAw"),
+    (ChartCategory::JapanGenre, "일본 애니송", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_mRcc2Y3l-RoZsDt27qu8CBGpKt-5w7v8g"),
+    (ChartCategory::JapanGenre, "일본 시티팝", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_nEjjAWEM3M3fk2tT4Lhb5JOr_HoD0tjnk"),
+    (ChartCategory::JapanGenre, "일본 시티팝 최신", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_muPPezCrTrwoL7Ep_9a69YkIaBjsyKTg0"),
     // 노래방 — TJ 는 공식 API 를 직접 긁는다. 검색으로 흉내내지 않는다.
     (ChartCategory::Karaoke, "TJ 인기 100", "TJ", "tj:hot"),
     (ChartCategory::Karaoke, "TJ 가요 100", "TJ", "tj:top:1"),
@@ -3687,6 +3713,49 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                 )?;
                 seed_builtin_charts(&tx)?;
             }
+            /* 장르 차트에 나라를 적고, 일본 것을 따로 떼고, 한국 장르를 새로 심는다 (§15.2d).
+             *
+             * "차트쪽에 한국힙합은 어디있는거야" 라는 물음에서 시작했다. `장르 > 힙합` 은
+             * 전세계(미국) 기준인데 이름에 그게 안 적혀 있었고, 한국 장르 차트는 아예 없었다.
+             *
+             * **이름을 바꾸는 마이그레이션은 처음이다.** 그래서 v15 규칙을 그대로 지킨다 —
+             * 이름과 주소가 **둘 다** 옛 기본값과 정확히 같을 때만 건드린다. 관리자가 이름을
+             * 바꿨거나 주소를 갈아 끼웠으면 그 줄은 그대로 둔다. 그런 줄은 아래 시더가
+             * 새 이름으로 한 벌 더 심는다(이름 유니크 인덱스에 안 걸린다). 중복이 보기
+             * 싫을 수는 있어도, 관리자가 손댄 것을 말없이 덮어쓰는 것보다 낫다.
+             *
+             * 캐시는 `chart_id` 에 붙어 있어 이름을 바꿔도 살아남는다. 지울 필요가 없다. */
+            24 => {
+                const RETITLE: [(&str, &str, &str, &str); 14] = [
+                    ("팝", "전세계 팝", "genre", "PL4fGSI1pDJn77aK7sAW2AT0oOzo5inWY8"),
+                    ("힙합", "전세계 힙합", "genre", "PL4fGSI1pDJn4fmCoF1vKHLtivI0f9yHiF"),
+                    ("록", "전세계 록", "genre", "PL4fGSI1pDJn5LOptOQixqnzXNGjNXAgYY"),
+                    ("하드록·메탈", "전세계 하드록·메탈", "genre", "PL4fGSI1pDJn4w4wTTgOmP_S80PoCtbGrL"),
+                    ("댄스·일렉트로닉", "전세계 댄스·일렉트로닉", "genre", "PL4fGSI1pDJn4rBU0RHnR6-b1_uE20CzRH"),
+                    ("라틴", "전세계 라틴", "genre", "PL4fGSI1pDJn5O8siDeZuI_4hbk6JWtTX1"),
+                    ("재즈", "전세계 재즈", "genre", "PL4fGSI1pDJn7Wkr6Ll6ds1AhA42rT8uaU"),
+                    ("컨트리", "전세계 컨트리", "genre", "PL4fGSI1pDJn4EBsWVeFpcSAVOFMfhyipg"),
+                    ("J-POP", "일본 J-POP", "japan_genre", "RDCLAK5uy_nbK9qSkqYZvtMXH1fLCMmC1yn8HEm0W90"),
+                    ("J-POP 최신", "일본 J-POP 최신", "japan_genre", "RDCLAK5uy_lwbizuU3lWX-XkvD8tvEd8phxcIneMvwc"),
+                    ("J-POP 봄노래", "일본 J-POP 봄노래", "japan_genre", "RDCLAK5uy_lRj2PxRYIUGDG0p0KjsQ62d2lLYLfgXAw"),
+                    ("애니송", "일본 애니송", "japan_genre", "RDCLAK5uy_mRcc2Y3l-RoZsDt27qu8CBGpKt-5w7v8g"),
+                    ("시티팝", "일본 시티팝", "japan_genre", "RDCLAK5uy_nEjjAWEM3M3fk2tT4Lhb5JOr_HoD0tjnk"),
+                    ("시티팝 최신", "일본 시티팝 최신", "japan_genre", "RDCLAK5uy_muPPezCrTrwoL7Ep_9a69YkIaBjsyKTg0"),
+                ];
+                for (old_name, new_name, new_category, list_id) in RETITLE {
+                    tx.execute(
+                        "UPDATE remote_charts
+                            SET name = ?2, category = ?3
+                          WHERE builtin = 1 AND name = ?1
+                            AND url = 'https://music.youtube.com/playlist?list=' || ?4",
+                        params![old_name, new_name, new_category, list_id],
+                    )?;
+                }
+                /* 자동 재생이 고른 장르는 차트 **ID** 로 저장돼 있어(`autoplay_genres`)
+                 * 이름이 바뀌어도 그대로 붙어 있다. 확인함 — `genre_options` 의 `key` 가
+                 * `chart.id.to_string()` 이다. 여기서 손댈 것이 없다. */
+                seed_builtin_charts(&tx)?;
+            }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -4278,6 +4347,105 @@ mod tests {
                 .unwrap();
             assert_eq!(version, SCHEMA_VERSION);
         }
+        cleanup(store, path);
+    }
+
+    /// v24 — 장르 차트 이름·분류를 고치되 **관리자가 손댄 줄은 안 건드린다** (§15.2d).
+    ///
+    /// 이름을 바꾸는 마이그레이션은 이게 처음이라 사고 반경이 넓다. 조건을 하나만 놓쳐
+    /// `WHERE name = ?` 만 남으면, 주소를 갈아 끼워 쓰던 서버의 차트가 말없이 기본값으로
+    /// 되돌아간다. 그 실수를 잡으려고 **주소를 바꿔 놓은 줄**을 일부러 하나 만들어 둔다.
+    #[test]
+    fn the_genre_rename_spares_charts_the_admin_touched() {
+        let (store, path) = temp_store("genre-rename");
+        // 새로 만든 DB 는 이미 새 이름이다. v23 시절 모습으로 손수 되돌려 놓는다.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM remote_charts WHERE builtin = 1 AND category = 'korea_genre'",
+                [],
+            )
+            .unwrap();
+            for (old, new) in [("힙합", "전세계 힙합"), ("시티팝", "일본 시티팝")] {
+                conn.execute(
+                    "UPDATE remote_charts SET name = ?1, category = 'genre'
+                      WHERE builtin = 1 AND name = ?2",
+                    params![old, new],
+                )
+                .unwrap();
+            }
+            // 관리자가 주소를 갈아 끼운 줄. 이름은 옛 기본값 그대로다.
+            conn.execute(
+                "UPDATE remote_charts
+                    SET name = '재즈', category = 'genre',
+                        url = 'https://music.youtube.com/playlist?list=ADMIN_EDIT'
+                  WHERE builtin = 1 AND name = '전세계 재즈'",
+                [],
+            )
+            .unwrap();
+        }
+
+        rewind_and_migrate(&store, 24);
+
+        let conn = store.conn.lock().unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        let builtin = "FROM remote_charts WHERE builtin = 1 AND";
+
+        // 손 안 댄 줄은 이름과 분류가 같이 옮겨 간다.
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) {builtin} name = '전세계 힙합' AND category = 'genre'"
+            )),
+            1,
+            "전세계 장르에 나라가 안 붙었다"
+        );
+        assert_eq!(
+            count(&format!("SELECT COUNT(*) {builtin} name = '힙합'")),
+            0,
+            "옛 이름이 남아 있다 — 이름만 바뀐 게 아니라 한 벌 더 생겼다"
+        );
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) {builtin} name = '일본 시티팝' AND category = 'japan_genre'"
+            )),
+            1,
+            "일본 장르가 따로 안 떨어졌다"
+        );
+
+        // 관리자가 갈아 끼운 주소는 이름도 분류도 그대로다.
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) {builtin} name = '재즈' AND url LIKE '%ADMIN_EDIT'"
+            )),
+            1,
+            "관리자가 갈아 끼운 차트를 마이그레이션이 덮어썼다"
+        );
+        // 대신 시더가 새 이름으로 기본값을 한 벌 더 심는다. 이게 의도한 결과다 —
+        // 관리자의 것을 지우지 않으면서 새 기본 차트도 받게 하는 유일한 방법이다.
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) {builtin} name = '전세계 재즈' AND url NOT LIKE '%ADMIN_EDIT'"
+            )),
+            1,
+            "관리자가 손댄 자리에 기본 차트가 새로 안 심겼다"
+        );
+
+        // 한국 장르는 **기존 DB 에도** 닿아야 한다. 시더만 고치면 새 DB 만 받는다(v4.38 사고).
+        assert_eq!(
+            count(&format!("SELECT COUNT(*) {builtin} category = 'korea_genre'")),
+            BUILTIN_CHARTS
+                .iter()
+                .filter(|(category, ..)| *category == ChartCategory::KoreaGenre)
+                .count() as i64,
+            "한국 장르가 기존 DB 에 안 심겼다"
+        );
+        assert_eq!(
+            count(&format!("SELECT COUNT(*) {builtin} name = '한국 힙합'")),
+            1,
+            "정작 물어본 한국 힙합이 없다"
+        );
+
+        drop(conn);
         cleanup(store, path);
     }
 

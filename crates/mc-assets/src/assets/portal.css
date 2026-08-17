@@ -1223,6 +1223,11 @@ body[data-dragging="tab"] { user-select: none; }
 .ap__count { color: var(--text-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
 .ap__note { color: var(--text-3); font-size: var(--fs-xs); line-height: var(--lh-base); }
 .ap__note--idle { color: var(--text-4); }
+/* 자동 재생 장르 칩을 분류별로 묶는다 (§15.2d). 묶음 사이만 벌리고 머리글은 붙여 둔다 —
+   그래야 머리글이 아래 칩 묶음에 속한 것으로 읽힌다. */
+.ap__genres { display: flex; flex-direction: column; gap: var(--sp-1); }
+.ap__genres > .ap__note { margin-top: var(--sp-2); }
+.ap__genres > .ap__note:first-child { margin-top: 0; }
 .ap__rows { display: grid; gap: 2px; }
 .ap__pick { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-1); }
 .ap__chip {

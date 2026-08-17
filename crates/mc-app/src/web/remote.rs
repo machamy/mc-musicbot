@@ -7378,6 +7378,9 @@ async fn api_autoplay_reset(
 /// 자동 재생 `genre` 모드가 고를 수 있는 차트 (§8.2). 키는 차트 ID 문자열이다 —
 /// `seeds_for_mode` 가 `autoplay_genres` 를 차트 ID 로 파싱해 캐시를 읽기 때문이다.
 ///
+/// 장르는 한국·전세계·일본 세 칸으로 나뉘어 있다 (§15.2d). **셋 다 실어야 한다** —
+/// 하나라도 빠지면 그 나라 장르는 자동 재생에서 영영 못 고른다.
+///
 /// 노래방 차트도 장르처럼 고를 수 있게 같이 싣는다. 실패한 차트는 뺀다 —
 /// 고를 수는 있는데 아무 곡도 안 나오는 항목이 제일 나쁘다 (§15.2).
 fn genre_options(state: &WebState, guild_id: u64) -> Vec<Value> {
@@ -7386,7 +7389,15 @@ fn genre_options(state: &WebState, guild_id: u64) -> Vec<Value> {
         .remote
         .list_charts(guild_id)
         .iter()
-        .filter(|chart| matches!(chart.category, ChartCategory::Genre | ChartCategory::Karaoke))
+        .filter(|chart| {
+            matches!(
+                chart.category,
+                ChartCategory::KoreaGenre
+                    | ChartCategory::Genre
+                    | ChartCategory::JapanGenre
+                    | ChartCategory::Karaoke
+            )
+        })
         .filter(|chart| chart.enabled && chart.ok())
         .map(|chart| {
             json!({

@@ -133,12 +133,14 @@ const AUTOPLAY_POLICIES = [
 
 /** 차트 분류 (v3 §15.2). 관리 콘솔의 차트 목록을 이 순서로 묶는다. */
 const CHART_CATEGORIES = [
-  { key: 'ours',       icon: '⭐', label: '우리 차트',  desc: '우리가 실제로 튼 곡으로 만드는 차트예요. 주소가 없고 지울 수도 없어요.' },
-  { key: 'popular',    icon: '🔥', label: '인기',       desc: '전세계·한국·오늘 뜨는 곡이에요.' },
-  { key: 'region',     icon: '🌏', label: '나라별',     desc: '미국·일본·영국 차트예요.' },
-  { key: 'genre',      icon: '🎸', label: '장르',       desc: 'K-Pop·힙합·록 같은 장르 차트예요. 자동 재생의 "장르" 방식이 이 목록을 그대로 써요.' },
-  { key: 'karaoke',    icon: '🎤', label: '노래방',     desc: 'TJ·금영 공식 재생목록이에요.' },
-  { key: 'soundcloud', icon: '☁', label: 'SoundCloud', desc: 'SoundCloud 인기 차트예요.' },
+  { key: 'ours',        icon: '⭐', label: '우리 차트',   desc: '우리가 실제로 튼 곡으로 만드는 차트예요. 주소가 없고 지울 수도 없어요.' },
+  { key: 'popular',     icon: '🔥', label: '인기',        desc: '전세계·한국·오늘 뜨는 곡이에요.' },
+  { key: 'korea_genre', icon: '🇰🇷', label: '한국 장르',   desc: '한국 힙합·발라드·인디·트로트 차트예요. 자동 재생의 "장르" 방식이 이 목록도 같이 써요.' },
+  { key: 'genre',       icon: '🌍', label: '전세계 장르',  desc: '전세계(미국) 기준 팝·힙합·록 차트예요. 자동 재생의 "장르" 방식이 이 목록도 같이 써요.' },
+  { key: 'japan_genre', icon: '🇯🇵', label: '일본 장르',   desc: 'J-POP·애니송·시티팝 차트예요. 자동 재생의 "장르" 방식이 이 목록도 같이 써요.' },
+  { key: 'region',      icon: '🌏', label: '나라별',      desc: '미국·일본·영국 차트예요.' },
+  { key: 'karaoke',     icon: '🎤', label: '노래방',      desc: 'TJ 공식 순위예요.' },
+  { key: 'soundcloud',  icon: '☁', label: 'SoundCloud',  desc: 'SoundCloud 인기 차트예요.' },
 ];
 
 /** 차단 규칙 종류 (models.rs 의 BlacklistKind). */

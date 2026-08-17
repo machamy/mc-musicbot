@@ -653,8 +653,15 @@ pub enum ChartCategory {
     /// 우리가 실제로 튼 것으로 만드는 차트 (§15.2b). 통계 DB 에서 나온다.
     Ours,
     Popular,
-    Region,
+    /// 한국 장르 (§15.2d). 힙합·발라드·인디·트로트…
+    KoreaGenre,
+    /// **전세계** 장르. 뜻은 안 바꾸고 이름만 정확해졌다 — 원래도 미국·전세계 기준이었는데
+    /// 그냥 `장르` 라고만 적혀 있어서 "힙합" 이 한국 힙합인 줄 아는 사람이 나왔다.
+    /// 값(`"genre"`)은 그대로 둔다. 관리자가 만든 사용자 차트가 이 값을 쓰고 있다.
     Genre,
+    /// 일본 장르. 원래 `Genre` 안에 섞여 있었다.
+    JapanGenre,
+    Region,
     Karaoke,
     Soundcloud,
 }
@@ -664,8 +671,10 @@ impl ChartCategory {
         match self {
             Self::Ours => "ours",
             Self::Popular => "popular",
+            Self::KoreaGenre => "korea_genre",
             Self::Region => "region",
             Self::Genre => "genre",
+            Self::JapanGenre => "japan_genre",
             Self::Karaoke => "karaoke",
             Self::Soundcloud => "soundcloud",
         }
@@ -675,8 +684,10 @@ impl ChartCategory {
         match value {
             "ours" => Some(Self::Ours),
             "popular" => Some(Self::Popular),
+            "korea_genre" => Some(Self::KoreaGenre),
             "region" => Some(Self::Region),
             "genre" => Some(Self::Genre),
+            "japan_genre" => Some(Self::JapanGenre),
             "karaoke" => Some(Self::Karaoke),
             "soundcloud" => Some(Self::Soundcloud),
             _ => None,
@@ -687,8 +698,10 @@ impl ChartCategory {
         match self {
             Self::Ours => "우리 차트",
             Self::Popular => "인기",
+            Self::KoreaGenre => "한국 장르",
             Self::Region => "나라별",
-            Self::Genre => "장르",
+            Self::Genre => "전세계 장르",
+            Self::JapanGenre => "일본 장르",
             Self::Karaoke => "노래방",
             Self::Soundcloud => "SoundCloud",
         }
@@ -698,8 +711,10 @@ impl ChartCategory {
         match self {
             Self::Ours => "⭐",
             Self::Popular => "🔥",
+            Self::KoreaGenre => "🇰🇷",
             Self::Region => "🌏",
-            Self::Genre => "🎸",
+            Self::Genre => "🌍",
+            Self::JapanGenre => "🇯🇵",
             Self::Karaoke => "🎤",
             Self::Soundcloud => "☁",
         }
@@ -709,18 +724,26 @@ impl ChartCategory {
         match self {
             Self::Ours => "우리가 많이 튼 곡",
             Self::Popular => "지금 많이 듣는 곡",
+            Self::KoreaGenre => "힙합·발라드·인디·트로트",
             Self::Region => "미국·일본·영국",
-            Self::Genre => "K-Pop·힙합·록·R&B",
-            Self::Karaoke => "TJ·금영 장르별",
+            Self::Genre => "팝·힙합·록·EDM",
+            Self::JapanGenre => "J-POP·애니송·시티팝",
+            /* "TJ·금영" 이라고 적혀 있었는데 금영은 v4.39 에서 뺐다. 지금 여기 있는 건
+             * 전부 TJ 공식 순위다. 없는 걸 있다고 적어 두면 안 보인다고 신고가 온다. */
+            Self::Karaoke => "TJ 공식 순위",
             Self::Soundcloud => "SoundCloud 인기곡",
         }
     }
 
-    pub const ALL: [Self; 6] = [
+    /// 첫 화면 카드 순서. **지역이 먼저 보이게** 늘어놓는다 — "한국 힙합이 어디 있냐" 는
+    /// 물음이 나온 이유가 장르가 한 칸에 섞여 있어서 어느 나라 것인지 알 수 없어서였다.
+    pub const ALL: [Self; 8] = [
         Self::Ours,
         Self::Popular,
-        Self::Region,
+        Self::KoreaGenre,
         Self::Genre,
+        Self::JapanGenre,
+        Self::Region,
         Self::Karaoke,
         Self::Soundcloud,
     ];

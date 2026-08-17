@@ -934,7 +934,9 @@ pub playlist_enqueue_rule: PermissionRule,   // 기본 GuildMember
 CREATE TABLE remote_charts (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   guild_id    INTEGER,            -- NULL 이면 모든 서버 공용(기본 제공분)
-  category    TEXT NOT NULL,      -- popular | region | genre | karaoke
+  category    TEXT NOT NULL,      -- ours | popular | korea_genre | genre | japan_genre
+                                  -- | region | karaoke | soundcloud
+                                  -- (genre = 전세계. v25 에서 한국·일본을 따로 뗐다)
   name        TEXT NOT NULL,      -- "한국 인기곡"
   provider    TEXT NOT NULL,      -- YouTubeMusic | YouTube | SoundCloud
   url         TEXT NOT NULL,

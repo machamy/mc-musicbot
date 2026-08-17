@@ -146,13 +146,16 @@ const AUDIT_KINDS = {
  * 꺼짐이라, 정작 "곡이 왜 자꾸 사라지지" 를 알아야 할 사람 눈에는 안 보였다. */
 const AUDIT_DEFAULT = ['song', 'playlist', 'trouble'];
 
-/* 차트 분류 카드 (§15.3). 서버가 주는 순서를 우선하고, 이건 아이콘·설명 사전이다. */
+/* 차트 분류 카드 (§15.3). 서버가 주는 순서를 우선하고, 이건 아이콘·설명 사전이다.
+ * 여기 키는 `models.rs` 의 `ChartCategory::as_str` 과 글자까지 같아야 한다. */
 const CHART_CATEGORIES = {
   ours: { icon: '⭐', label: '우리 차트', desc: '우리가 실제로 많이 튼 곡' },
   popular: { icon: '🔥', label: '인기', desc: '지금 많이 듣는 곡' },
+  korea_genre: { icon: '🇰🇷', label: '한국 장르', desc: '힙합·발라드·인디·트로트' },
   region: { icon: '🌏', label: '나라별', desc: '미국·일본·영국' },
-  genre: { icon: '🎸', label: '장르', desc: 'K-Pop·힙합·록·R&B' },
-  karaoke: { icon: '🎤', label: '노래방', desc: 'TJ·금영 장르별' },
+  genre: { icon: '🌍', label: '전세계 장르', desc: '팝·힙합·록·EDM' },
+  japan_genre: { icon: '🇯🇵', label: '일본 장르', desc: 'J-POP·애니송·시티팝' },
+  karaoke: { icon: '🎤', label: '노래방', desc: 'TJ 공식 순위' },
   soundcloud: { icon: '☁', label: 'SoundCloud', desc: '사운드클라우드 인기곡' },
 };
 const CHART_PERIODS = [['week', '이번 주'], ['month', '이번 달'], ['all', '전체']];
@@ -3533,19 +3536,39 @@ function apGenreSection() {
   const options = autoplayState.genreOptions || [];
   // 장르 목록이 비어도 칸을 통째로 숨기지 않는다 — `🎸 장르` 를 골랐는데 아무것도 안 나오면
   // 고장인지 내가 뭘 잘못한 건지 알 수가 없다 (§23.3).
+  /* **분류별로 묶는다.** 서버는 `category` 를 같이 보내는데(`genre_options`) 여태 안 썼고,
+   * 칩에는 차트 이름만 떴다. 한국 장르가 생기면서 `힙합`·`전세계 힙합`·`TJ 힙합·랩` 이
+   * 한 줄에 섞이게 돼서, 어느 나라 것인지 이름만으로 가려야 하는 상태가 된다. */
+  const chip = (option) => {
+    const on = autoplayState.genres.includes(option.key);
+    return setLock(bindAct(h('button', {
+      class: 'seg', type: 'button', 'aria-pressed': String(on), dataset: { seg: option.key },
+      tip: `${option.label} 차트에서 곡을 골라 와요`,
+    }, option.label), () => saveAutoplay({
+      genres: on
+        ? autoplayState.genres.filter((key) => key !== option.key)
+        : autoplayState.genres.concat(option.key),
+    })), !editable, reason);
+  };
+  const groups = [];
+  options.forEach((option) => {
+    /* 모르는 분류는 버리지 않고 제 이름으로 묶는다. 관리자가 만든 차트가 여기 온다. */
+    const key = option.category || 'genre';
+    let group = groups.find((entry) => entry.key === key);
+    if (!group) {
+      const meta = CHART_CATEGORIES[key] || {};
+      groups.push(group = { key, icon: meta.icon || '🎸', label: meta.label || key, items: [] });
+    }
+    group.items.push(option);
+  });
+
   const box = options.length
-    ? h('div', { class: 'lib__seg lib__seg--wrap', style: { padding: '0' } },
-      ...options.map((option) => {
-        const on = autoplayState.genres.includes(option.key);
-        return setLock(bindAct(h('button', {
-          class: 'seg', type: 'button', 'aria-pressed': String(on), dataset: { seg: option.key },
-          tip: `${option.label} 차트에서 곡을 골라 와요`,
-        }, option.label), () => saveAutoplay({
-          genres: on
-            ? autoplayState.genres.filter((key) => key !== option.key)
-            : autoplayState.genres.concat(option.key),
-        })), !editable, reason);
-      }))
+    ? h('div', { class: 'ap__genres' },
+      ...groups.flatMap((group) => [
+        h('p', { class: 'ap__note' }, `${group.icon} ${group.label}`),
+        h('div', { class: 'lib__seg lib__seg--wrap', style: { padding: '0' } },
+          ...group.items.map(chip)),
+      ]))
     : h('p', {
       class: 'ap__note', tip: '장르 차트가 준비되면 여기에 고를 수 있는 장르가 나와요',
     }, '고를 수 있는 장르가 아직 없어요. 관리 콘솔에서 장르 차트를 켜면 여기에 나와요.');
