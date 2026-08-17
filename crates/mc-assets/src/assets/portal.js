@@ -959,6 +959,46 @@ function watchMobileTabs() {
   new ResizeObserver(syncMobileTabsHeight).observe(bar);
 }
 
+/* 탭 줄에 화살표 키를 붙인다 (WAI-ARIA tablist 규약).
+ *
+ * `role="tablist"` 는 좌우 화살표로 옮겨 다닐 수 있어야 한다. 우리 탭 네 줄(패널·좌측·
+ * 우측·모바일)은 전부 클릭만 받고 있었다. **패턴을 모르는 코드가 아니다** — 열 손잡이,
+ * 패널 분할선, 영상 크기 그립, 재생 위치 슬라이더는 화살표 키를 이미 제대로 구현했다.
+ * 탭에만 빠져 있었다.
+ *
+ * `Home`·`End` 도 같이 받는다. 규약이 요구하기도 하고, 탭이 여덟 개인 줄에서 실제로 쓴다.
+ *
+ * **활성화 방식은 "따라가기"다** — 화살표로 옮기면 포커스와 함께 그 탭이 바로 열린다.
+ * 우리 탭은 내용이 이미 만들어져 있어서(숨김만 토글) 여는 비용이 없고, 그러면
+ * 화살표 → Enter 두 번을 칠 이유가 없다. */
+function bindTablistKeys(nodes, pick) {
+  const list = () => nodes.filter((node) => node && !node.hidden && node.offsetParent !== null);
+  for (const node of nodes) {
+    if (!node) continue;
+    node.addEventListener('keydown', (event) => {
+      const items = list();
+      const at = items.indexOf(node);
+      if (at < 0) return;
+      let to = -1;
+      if (event.key === 'ArrowRight' || event.key === 'ArrowDown') to = (at + 1) % items.length;
+      else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') to = (at - 1 + items.length) % items.length;
+      else if (event.key === 'Home') to = 0;
+      else if (event.key === 'End') to = items.length - 1;
+      if (to < 0) return;
+      event.preventDefault();
+      /* **여는 것이 먼저, 포커스가 나중이다.**
+       *
+       * 탭을 열면 그 안에서 포커스를 가져가는 경우가 있다 — `setRailTab('search')` 는
+       * 검색창에 커서를 놓는다. 클릭에는 맞는 동작이지만(눌렀으니 바로 치고 싶다)
+       * 화살표로 훑는 중에는 **탭 줄 밖으로 끌려나가** 다음 화살표가 안 먹는다.
+       * 실제로 `Home` 을 눌렀을 때 그렇게 되는 것을 브라우저에서 잡았다.
+       * 뒤에 다시 포커스를 잡아 두면 훑기는 이어지고, 클릭 경로는 그대로다. */
+      pick(items[to]);
+      items[to].focus();
+    });
+  }
+}
+
 /** 지금 화면에 실제로 그려진 열 너비. 아직 안 그려졌으면 `null`. */
 function measuredWidth(key) {
   const node = key === 'rail' ? el.rail : el.side;
@@ -2046,7 +2086,9 @@ function buildDockGroup(group) {
   if (!group.__gid) group.__gid = `g${++dockGid}`;
 
   const tabs = h('div', { class: 'dk-tabs', role: 'tablist', 'aria-label': '패널 탭' });
-  for (const id of group.panels) tabs.appendChild(buildDockTab(group, id));
+  const tabNodes = group.panels.map((id) => buildDockTab(group, id));
+  for (const node of tabNodes) tabs.appendChild(node);
+  bindTablistKeys(tabNodes, (node) => activateDockPanel(group, node.dataset.panel));
 
   // 닫은 패널을 되살리는 유일한 입구다. 아이콘만 두면 패널을 닫은 사람이
   // "되돌릴 방법이 없다"고 느낀다. 라벨을 붙이고, 닫아 둔 게 있으면 개수까지 보여준다.
@@ -2484,6 +2526,7 @@ function buildRail() {
     dataset: { rail: tab.id }, tip: tab.tip,
     onClick: () => setRailTab(tab.id),
   }, h('span', { 'aria-hidden': 'true' }, tab.icon), tab.label));
+  bindTablistKeys(el.railTabs, (node) => setRailTab(node.dataset.rail));
 
   el.railPanes = {
     search: buildSearchPane(),
@@ -6662,6 +6705,7 @@ function buildSide() {
     node.__badge = badge;
     return node;
   });
+  bindTablistKeys(el.sideTabs, (node) => openSide(node.dataset.side));
 
   // 제안은 탭이 아니라 헤더 버튼 + 모달이다 (§11). 알맹이는 여기서 한 번만 만들어 두고 모달이 빌려 쓴다.
   el.suggestPane = buildSuggestPane();
@@ -7714,6 +7758,8 @@ function buildMobileTabs() {
     node.__def = def;
     return node;
   });
+  // `더보기` 는 시트를 여는 항목이라 화살표로 지나가되 열지는 않는다.
+  bindTablistKeys(el.mobileTabs, (node) => { if (node.__def.id !== 'more') node.click(); });
   el.mtabs = h('nav', { class: 'mtabs', role: 'tablist', 'aria-label': '화면 전환' }, el.mobileTabs);
   return el.mtabs;
 }
