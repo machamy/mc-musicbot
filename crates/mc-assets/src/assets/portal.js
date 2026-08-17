@@ -233,7 +233,34 @@ const PANELS = {
 
 /* 크기 조절 한계. 아무리 끌어도 화면이 깨지지 않는 선. */
 const SIZE_LIMITS = { rail: { min: 240, max: 560, def: 320 }, side: { min: 300, max: 620, def: 380 } };
-const SIDE_DEF_TWO = 390;   // 2단은 채팅이 배치의 절반이라 기본값이 조금 더 넓다
+
+/* 배치마다 다른 한계. 예전에는 `SIDE_DEF_TWO` 상수 하나를
+ * `key === 'side' && layout === 'two' ? SIDE_DEF_TWO : SIZE_LIMITS[key].def` 라는 삼항으로
+ * **네 군데에** 베껴 두고 있었다. DJ 를 하나 더 넣으려니 그 네 곳이 전부 갈라지므로 표로 모은다.
+ *
+ * DJ 의 왼쪽 대기열은 화면의 절반을 넘는 자리다(비율 1.12 : 0.88). 공용 한계(240~560)를
+ * 그대로 씌우면 지금 보이는 것보다 훨씬 좁아져 배치의 성격이 바뀌므로 따로 준다. */
+const SIZE_OVERRIDES = {
+  two: { side: { min: 300, max: 620, def: 390 } },   // 채팅이 배치의 절반이라 조금 더 넓다
+  dj: { rail: { min: 320, max: 900, def: 560 } },
+};
+
+/* 열 손잡이 두 개. **`el` 에 얹으면 안 된다** — `applyLayoutSizes()` 가 모듈 최상단에서
+ * 한 번 불리는데 그 시점의 `el` 은 아직 TDZ 라 `Cannot access 'el' before initialization`
+ * 으로 스크립트가 통째로 죽는다(실제로 브라우저에서 그렇게 잡았다). 여기 선언한다. */
+const gutters = {};
+
+function limitsFor(layout, key) {
+  return SIZE_OVERRIDES[layout]?.[key] || SIZE_LIMITS[key];
+}
+
+/* DJ 는 저장된 값이 있을 때만 고정 폭으로 돈다.
+ *
+ * 저장 전에는 CSS 가 비율(`1.12fr`)로 잡는다 — 한 번도 안 끌어 본 사람의 화면을
+ * 기본값으로 갈아 끼워 좁게 만들지 않으려는 것이다. 끌기 시작하면 그때부터 고정 폭이다. */
+function ratioSized(layout, key) {
+  return layout === 'dj' && key === 'rail' && !Number.isFinite(Number(layoutSizes().dj?.rail));
+}
 
 /* ═══════════════════════ 개인 설정 (계정 저장) ═══════════════════════
  * 우선순위: 서버 값 > localStorage 거울 > 기본값.
@@ -490,12 +517,12 @@ function layoutSizes() {
 function sizeFor(layout, key) {
   const saved = layoutSizes()[layout];
   const raw = saved && Number(saved[key]);
-  if (Number.isFinite(raw) && raw > 0) return clampSize(key, raw);
-  return key === 'side' && layout === 'two' ? SIDE_DEF_TWO : SIZE_LIMITS[key].def;
+  if (Number.isFinite(raw) && raw > 0) return clampSize(layout, key, raw);
+  return limitsFor(layout, key).def;
 }
 
-function clampSize(key, value) {
-  const limit = SIZE_LIMITS[key];
+function clampSize(layout, key, value) {
+  const limit = limitsFor(layout, key);
   if (!limit) return value;
   return Math.round(Math.min(limit.max, Math.max(limit.min, value)));
 }
@@ -511,6 +538,12 @@ function applyLayoutSizes() {
   }
   host.style.setProperty('--rail-w', `${sizeFor(layout, 'rail')}px`);
   host.style.setProperty('--side-w', `${sizeFor(layout, 'side')}px`);
+  /* DJ 레일만 **전용 변수**로 간다. `--rail-w` 는 `tokens.css` 에 320px 기본값이 있어서
+   * CSS 대체값이 영영 안 걸린다 — 한 번도 안 끌어 본 사람의 DJ 레일이 확 좁아진다.
+   * 여기서는 저장된 값이 있을 때만 박고, 없으면 지워서 비율 배치로 남긴다. */
+  if (ratioSized(layout, 'rail')) host.style.removeProperty('--rail-dj-w');
+  else if (layout === 'dj') host.style.setProperty('--rail-dj-w', `${sizeFor(layout, 'rail')}px`);
+  syncGutterRange();
   const compose = Number(layoutSizes().chat?.compose);
   if (Number.isFinite(compose) && compose > 0) host.style.setProperty('--compose-h', `${Math.round(compose)}px`);
 }
@@ -873,6 +906,30 @@ function watchViewport() {
  * 저장은 드래그가 끝난 뒤 한 번만 — 끄는 동안 서버를 두드리지 않는다.
  */
 
+/** 지금 화면에 실제로 그려진 열 너비. 아직 안 그려졌으면 `null`. */
+function measuredWidth(key) {
+  const node = key === 'rail' ? el.rail : el.side;
+  const width = node?.getBoundingClientRect().width;
+  return Number.isFinite(width) && width > 0 ? Math.round(width) : null;
+}
+
+/* 손잡이의 값 범위를 지금 배치에 맞춘다.
+ *
+ * **한 번만 세팅하면 안 된다.** 범위가 배치마다 다른데(DJ 의 레일은 320~900) 손잡이는
+ * 만들 때 한 번 그려지고 계속 산다. 스크린리더가 배치를 바꾼 뒤에도 옛 범위를 읽으면
+ * "얼마나 남았는지" 를 계속 틀리게 말한다 (§20 · role=separator 규약). */
+function syncGutterRange() {
+  const layout = effectiveLayout();
+  for (const key of ['rail', 'side']) {
+    const node = gutters[key];
+    if (!node) continue;
+    const limit = limitsFor(layout, key);
+    node.setAttribute('aria-valuemin', String(limit.min));
+    node.setAttribute('aria-valuemax', String(limit.max));
+    node.setAttribute('aria-valuenow', String(measuredWidth(key) ?? sizeFor(layout, key)));
+  }
+}
+
 function buildGutter(key, label) {
   const node = h('div', {
     class: `gutter gutter--${key}`,
@@ -883,8 +940,13 @@ function buildGutter(key, label) {
 
   const apply = (value, save) => {
     const layout = effectiveLayout();
-    const next = clampSize(key, value);
+    const next = clampSize(layout, key, value);
     document.documentElement.style.setProperty(`--${key}-w`, `${next}px`);
+    // DJ 레일은 전용 변수를 읽는다 (`applyLayoutSizes` 주석 참고). 끄는 동안에도 같이 박아야
+    // 열이 손끝을 따라온다 — 안 그러면 놓는 순간에야 움직이는 이상한 손잡이가 된다.
+    if (layout === 'dj' && key === 'rail') {
+      document.documentElement.style.setProperty('--rail-dj-w', `${next}px`);
+    }
     node.setAttribute('aria-valuenow', String(next));
     // 끄는 동안 문서 전체를 다시 재는 건 낭비다. 저장하는 순간에만 마퀴를 다시 계산한다.
     if (save) { saveSize(layout, key, next); marquee.scan(); }
@@ -898,7 +960,9 @@ function buildGutter(key, label) {
     if (event.button !== 0) return;
     dragging = true;
     startX = event.clientX;
-    startValue = sizeFor(effectiveLayout(), key);
+    /* **저장값이 아니라 지금 실제로 그려진 폭**에서 시작한다. DJ 처럼 비율로 잡히는
+     * 배치는 저장값이 없어서, 저장값으로 시작하면 잡는 순간 열이 툭 튄다. */
+    startValue = measuredWidth(key) ?? sizeFor(effectiveLayout(), key);
     node.dataset.drag = '1';
     node.setPointerCapture(event.pointerId);
     document.body.dataset.resizing = 'col';
@@ -916,7 +980,8 @@ function buildGutter(key, label) {
     delete node.dataset.drag;
     delete document.body.dataset.resizing;
     const current = parseInt(document.documentElement.style.getPropertyValue(`--${key}-w`), 10);
-    if (Number.isFinite(current)) saveSize(effectiveLayout(), key, clampSize(key, current));
+    const layout = effectiveLayout();
+    if (Number.isFinite(current)) saveSize(layout, key, clampSize(layout, key, current));
     marquee.scan();
   };
   node.addEventListener('pointerup', finish);
@@ -924,7 +989,7 @@ function buildGutter(key, label) {
 
   node.addEventListener('dblclick', () => {
     const layout = effectiveLayout();
-    const def = key === 'side' && layout === 'two' ? SIDE_DEF_TWO : SIZE_LIMITS[key].def;
+    const def = limitsFor(layout, key).def;
     apply(def, true);
     toast(`${key === 'rail' ? '왼쪽' : '오른쪽'} 열 너비를 기본값으로 되돌렸어요.`, 'ok');
   });
@@ -932,19 +997,19 @@ function buildGutter(key, label) {
   node.addEventListener('keydown', (event) => {
     const step = event.shiftKey ? 48 : 16;
     let next = null;
-    if (event.key === 'ArrowRight') next = sizeFor(effectiveLayout(), key) + (key === 'rail' ? step : -step);
-    else if (event.key === 'ArrowLeft') next = sizeFor(effectiveLayout(), key) - (key === 'rail' ? step : -step);
-    else if (event.key === 'Home') next = key === 'side' && effectiveLayout() === 'two' ? SIDE_DEF_TWO : SIZE_LIMITS[key].def;
+    const from = measuredWidth(key) ?? sizeFor(effectiveLayout(), key);
+    if (event.key === 'ArrowRight') next = from + (key === 'rail' ? step : -step);
+    else if (event.key === 'ArrowLeft') next = from - (key === 'rail' ? step : -step);
+    else if (event.key === 'Home') next = limitsFor(effectiveLayout(), key).def;
     if (next === null) return;
     event.preventDefault();
     apply(next, true);
   });
 
-  node.setAttribute('aria-valuemin', String(SIZE_LIMITS[key].min));
-  node.setAttribute('aria-valuemax', String(SIZE_LIMITS[key].max));
+  gutters[key] = node;
   // 드래그하기 전에도 지금 값을 읽을 수 있어야 한다. min/max 만 있으면 스크린리더가
   // "몇 픽셀인지"를 영영 못 말한다 (§20 · role=separator 규약).
-  node.setAttribute('aria-valuenow', String(clampSize(key, sizeFor(effectiveLayout(), key))));
+  syncGutterRange();
   return node;
 }
 
@@ -1366,8 +1431,19 @@ function syncLayoutOptions() {
   for (const node of el.layoutOpts || []) {
     node.setAttribute('aria-checked', String(node.dataset.layout === activeLayout));
   }
-  if (el.panelResetBtn) el.panelResetBtn.hidden = activeLayout !== 'panel';
-  if (el.panelSlotsBtn) el.panelSlotsBtn.hidden = activeLayout !== 'panel';
+  /* **`activeLayout` 이 아니라 `panelMode()` 로 판단한다.**
+   *
+   * 패널을 골라 둔 계정이 680px 이하로 들어오면 화면은 3단으로 강등되는데
+   * (`effectiveLayout`), 이 두 줄이 고른 값만 보고 있어서 도킹 전용 항목이 그대로
+   * 남아 있었다. 계정 설정이 기기 간에 따라다니므로 "데스크톱에서 패널을 고르고
+   * 휴대폰으로 접속" 이라는 흔한 경로에서 그대로 재현된다.
+   *
+   * 게다가 눌러도 아무 일이 없는 것이 아니라 **저장은 됐다** — `resetPanelLayout` 이
+   * `savePanelLayout()` 을 먼저 하고 `renderDock()` 만 패널일 때 부른다. 3단 화면에서
+   * 무심코 누르면 쌓아 둔 패널 배치가 조용히 날아갔다. */
+  const panel = panelMode();
+  if (el.panelResetBtn) el.panelResetBtn.hidden = !panel;
+  if (el.panelSlotsBtn) el.panelSlotsBtn.hidden = !panel;
 }
 
 function applyLayout() {
@@ -2077,9 +2153,16 @@ function openAddPanelMenu(group, anchor) {
 }
 
 function resetPanelLayout() {
+  /* 화면에 없는 도킹 트리를 **저장으로 덮어쓰지 않는다.** 메뉴에서 새는 길은 막았지만
+   * (`syncLayoutOptions`), 이 함수가 다른 경로로 불려도 같은 사고가 나면 안 된다.
+   * 되돌리기는 되돌릴 방법이 없는 조작이라 여기서 한 번 더 막는다. */
+  if (!panelMode()) {
+    toast('패널 배치일 때만 되돌릴 수 있어요.', 'warn');
+    return;
+  }
   dockTree = defaultDockTree();
   savePanelLayout();
-  if (panelMode()) renderDock();
+  renderDock();
   toast('패널 배치를 기본으로 되돌렸어요.', 'ok');
 }
 
@@ -2741,8 +2824,13 @@ function buildQueuePane() {
     class: 'btn btn--primary btn--icon', type: 'button',
     tip: '검색', 'aria-label': '대기열에서 검색',
   }, '🔎'), runQueueSearch);
+  /* **`scroll` 클래스를 달지 않는다.** 2단 배치가 레일 안의 `.scroll` 을 전부 풀어
+   * 바깥 한 줄기로 잇는데(`:root[data-layout="two"] .rail .scroll { overflow: visible }`),
+   * 그 규칙이 `.qsearch__results` 의 `overflow-y: auto` 를 이기면서 **`max-height` 만
+   * 남는다.** 짝이 깨져서 결과가 300px 상자 밖으로 흘러나와 대기열 위에 겹쳐 그려졌다.
+   * 필요한 것(`overflow-y`·`overscroll-behavior`)은 `.qsearch__results` 가 직접 선언한다. */
   el.qsResults = h('div', {
-    class: 'qsearch__results scroll', hidden: true,
+    class: 'qsearch__results', hidden: true,
     role: 'region', 'aria-label': '검색 결과',
   });
   el.qsRow = h('div', { class: 'qsearch' },
@@ -6423,8 +6511,35 @@ function highlightLyrics(position) {
     node.classList.toggle('lyrics__line--on', index === active);
     node.classList.toggle('lyrics__line--near', Math.abs(index - active) === 1);
   });
-  if (active >= 0 && !document.hidden) {
-    lyricsLines[active].scrollIntoView({ block: 'center', behavior: prefersReduced() ? 'auto' : 'smooth' });
+  if (active >= 0 && !document.hidden) scrollLyricLineIntoView(lyricsLines[active]);
+}
+
+/* 가사 한 줄을 **자기 상자 안에서만** 따라간다.
+ *
+ * 예전에는 `scrollIntoView({ block: 'center' })` 였는데, 그건 스크롤 가능한 **조상 전부**를
+ * 움직인다. 2단 배치는 `.portal__grid` 가 유일한 바깥 스크롤러라(`portal.css` 의
+ * `:root[data-layout="two"] .portal__grid { overflow-y: auto }`) 가사 한 줄이 바뀔 때마다
+ * 스테이지와 레일이 통째로 위아래로 밀렸다 — "페이지가 튄다" 가 그것이다.
+ *
+ * 그래서 **누구를 스크롤할지 코드가 정한다.** 배치마다 스크롤 주체가 달라도(3단은
+ * `.lyrics__view`, 패널은 `.dk-body`) 같은 규칙 하나로 맞는다.
+ *
+ * `.portal__grid` 에서 멈추는 것이 이 함수의 핵심이다. 거기까지 올라갔다는 것은
+ * "가사 상자가 스스로 넘치지 않는다" 는 뜻이고, 그때는 **아무것도 안 하는 것이 맞다** —
+ * 페이지를 움직여 봐야 사용자가 보고 있던 다른 것이 같이 밀릴 뿐이다. */
+function scrollLyricLineIntoView(line) {
+  const smooth = !prefersReduced();
+  for (let node = line.parentElement; node && node !== document.body; node = node.parentElement) {
+    if (node.classList.contains('portal__grid')) return;
+    // 1px 여유 — 소수점 레이아웃에서 넘치지 않는 상자가 넘친 것으로 잡히는 것을 막는다.
+    if (node.scrollHeight - node.clientHeight <= 1) continue;
+    /* `offsetTop` 을 쓰지 않는다 — 그건 `offsetParent` 기준이라 여기서 고른 상자와
+     * 다를 수 있다. 화면 좌표 차이는 누가 `position` 을 갖고 있든 항상 맞는다. */
+    const line_ = line.getBoundingClientRect();
+    const box = node.getBoundingClientRect();
+    const target = node.scrollTop + (line_.top - box.top) - (node.clientHeight - line_.height) / 2;
+    node.scrollTo({ top: Math.max(0, target), behavior: smooth ? 'smooth' : 'auto' });
+    return;
   }
 }
 
@@ -9619,6 +9734,9 @@ function tipAudit() {
   return report;
 }
 window.__machamTipAudit = tipAudit;
+/* 가사 따라가기는 **실제 배치 위에서만** 검증된다 — "누가 스크롤하는가" 가 CSS 로 갈리기
+ * 때문에 순수 함수 단언으로는 2단에서 페이지가 튀는 것을 잡을 수 없다. 그래서 노출한다. */
+window.__machamScrollLyric = scrollLyricLineIntoView;
 
 /* ── 회귀 테스트 (§0) ──
  * 여기서 고친 것들은 전부 "화면이 조용히 거짓말을 하는" 종류라 눈으로는 다시 놓치기 쉽다.
@@ -9830,6 +9948,21 @@ function selfTest() {
    * 매 틱 조용히 터지고 있었다. 여기서 실제로 불러 보면 그때 바로 걸린다. */
   eq('라이브 판정: 라이브면 참', currentIsLive({ isLive: true }), true);
   eq('라이브 판정: 평범한 곡이면 거짓', currentIsLive({ isLive: false }), false);
+
+  /* §15.4 — 열 너비 한계는 **배치마다 다르다.**
+   *
+   * 예전에는 `key === 'side' && layout === 'two' ? … : …` 삼항이 네 군데에 흩어져 있었다.
+   * DJ 를 넣으면서 표로 모았는데, 표를 도입하면서 어느 한 곳을 안 고치면 그 자리만
+   * 옛 규칙으로 남는다 — 눈으로는 절대 안 보이는 종류의 어긋남이다. */
+  eq('열 한계: DJ 레일은 따로 넓다', limitsFor('dj', 'rail'), { min: 320, max: 900, def: 560 });
+  eq('열 한계: 다른 배치의 레일은 공용값', limitsFor('three', 'rail'), SIZE_LIMITS.rail);
+  eq('열 한계: 2단 채팅은 기본값이 더 넓다', limitsFor('two', 'side').def, 390);
+  eq('열 한계: 2단이 아닌 채팅은 공용값', limitsFor('dj', 'side'), SIZE_LIMITS.side);
+  /* 한계가 배치별로 갈리면 **자르기도 같이 갈려야 한다.** 안 그러면 DJ 에서 560 을 넘겨
+   * 끌 수 없고(= 손잡이가 또 안 듣는 것처럼 보인다), 3단에서는 900 까지 늘어난다. */
+  eq('자르기: DJ 레일은 900 까지 간다', clampSize('dj', 'rail', 880), 880);
+  eq('자르기: 3단 레일은 560 에서 멈춘다', clampSize('three', 'rail', 880), 560);
+  eq('자르기: DJ 레일 하한도 배치값을 쓴다', clampSize('dj', 'rail', 100), 320);
 
   console.info(fails.length ? `[자가검사] ${fails.length}건 실패` : '[자가검사] 전부 통과', fails);
   return { fail: fails.length, fails };

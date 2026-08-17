@@ -2,6 +2,7 @@
 //! 인증: 최초 접속 시 localhost 에서 비밀번호 설정 → SHA-256 해시를 data 디렉터리에 저장.
 //! `MUSICBOT_WEB_PASSWORD` 환경변수가 있으면 그 값으로 오버라이드(설정 파일보다 우선).
 
+pub mod asset_override;
 pub mod assets;
 pub mod pages;
 pub mod remote;
@@ -265,6 +266,15 @@ pub async fn serve(app: Arc<App>) {
             "[web] 웹 비밀번호 미설정 — 호스트에서 http://localhost:8693 에 접속해 최초 비밀번호를 설정하세요."
         );
     }
+    // 자산 덮어쓰기 감시 (§43). 폴더가 없는 것이 정상이고, 그때는 아무 일도 안 한다.
+    // **웹이 뜨기 전에 시작한다** — 첫 요청이 옛 바이트를 받고 나면 그 브라우저는
+    // 다음 새로고침까지 옛 화면에 머문다.
+    asset_override::spawn_watcher(
+        app.config.data_root.clone(),
+        app.log.clone(),
+        assets::is_overridable,
+    );
+
     let (remote_events, _) = broadcast::channel(256);
     let remote_auth = remote::RemoteAuthConfig::load(&app.config.data_root);
 

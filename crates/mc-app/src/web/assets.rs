@@ -12,6 +12,7 @@
 //! 하위 디렉터리에 두면 `/music/*` 를 제어하지 못한다.
 
 use crate::assets_di::assets;
+use crate::web::asset_override;
 use axum::body::Body;
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -19,8 +20,30 @@ use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
 
 /// 자산 내용 해시. 페이지 셸이 `?v=` 에 쓴다.
-pub fn version() -> &'static str {
-    (assets().version)()
+///
+/// **`&'static str` 이 아니다.** 덮어쓰기(§43)가 켜지면 이 값이 실행 중에 바뀐다 —
+/// 안 바뀌면 브라우저가 1년 immutable 로 잡아 둔 옛 파일을 계속 쓴다.
+pub fn version() -> String {
+    asset_override::global()
+        .current()
+        .version_for((assets().version)())
+}
+
+/// 덮어쓸 수 있는 이름인가. **화이트리스트는 `mc-assets` 하나뿐이다** — 목록을 여기에
+/// 베껴 두면 자산이 하나 늘 때마다 어긋난다.
+///
+/// 서비스워커와 매니페스트는 전용 경로로 나가지만 이름으로도 덮어쓸 수 있게 둔다.
+/// 그 둘이야말로 재시작 없이 고치고 싶은 파일이다.
+pub fn is_overridable(name: &str) -> bool {
+    name == "sw.js" || (assets().get)(name).is_some()
+}
+
+/// 덮어쓴 바이트가 있으면 그것, 없으면 내장 바이트.
+fn body_for(name: &str, builtin: &[u8]) -> Vec<u8> {
+    match asset_override::global().current().get(name) {
+        Some(bytes) => bytes.as_ref().clone(),
+        None => builtin.to_vec(),
+    }
 }
 
 /// 사용자용 패치노트 원문 (§30). **원본은 `docs/CHANGELOG.md` 하나뿐이다.**
@@ -61,7 +84,7 @@ fn short_hex(bytes: &[u8]) -> String {
 /// 그래서 `?v=` 가 현재 자산 버전과 정확히 일치할 때만 immutable 을 준다.
 fn cache_policy(query_version: Option<&str>) -> &'static str {
     match query_version {
-        Some(value) if value == version() => "public, max-age=31536000, immutable",
+        Some(value) if value == version().as_str() => "public, max-age=31536000, immutable",
         // 그 외에는 매번 재검증. 본문 없는 304라 비용이 거의 없다.
         _ => "no-cache",
     }
@@ -114,8 +137,11 @@ pub async fn serve_asset(
     let cache = cache_policy(query.get("v").map(String::as_str));
     let inm = header_str(&headers, header::IF_NONE_MATCH);
     // 경로 조작 방지 — 이름은 화이트리스트 조회로만 해석한다 (`mc-assets::get`).
+    //
+    // **덮어쓰기는 이 조회를 통과한 뒤에만 본다.** 순서가 뒤집히면 덮어쓰기 폴더가
+    // 곧 파일 서버가 된다 — 이름 해석의 유일한 권위는 끝까지 화이트리스트다 (§43).
     match (assets().get)(&name) {
-        Some((body, mime)) => respond(body.to_vec(), mime, cache, inm),
+        Some((body, mime)) => respond(body_for(&name, body), mime, cache, inm),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
@@ -124,7 +150,7 @@ pub async fn serve_asset(
 pub async fn serve_service_worker(headers: HeaderMap) -> Response {
     let (body, mime) = (assets().service_worker)();
     respond(
-        body.to_vec(),
+        body_for("sw.js", body),
         mime,
         "no-cache",
         header_str(&headers, header::IF_NONE_MATCH),
@@ -135,7 +161,7 @@ pub async fn serve_service_worker(headers: HeaderMap) -> Response {
 pub async fn serve_manifest(headers: HeaderMap) -> Response {
     let (body, mime) = (assets().manifest)();
     respond(
-        body.to_vec(),
+        body_for("manifest.webmanifest", body),
         mime,
         "no-cache",
         header_str(&headers, header::IF_NONE_MATCH),
@@ -160,6 +186,18 @@ mod tests {
     use super::*;
     use crate::assets_di::install_test_assets;
     use axum::http::Request;
+
+    /// 덮어쓰기는 **프로세스 전역 하나**다(운영에서 그래야 한다). 그래서 그것을 켜는
+    /// 테스트와 자산 버전 모양을 보는 테스트가 같이 돌면 서로를 깨뜨린다 — 혼자 돌리면
+    /// 초록이고 다 같이 돌리면 빨간, 제일 나쁜 종류의 테스트가 된다. 이 자물쇠가 순서를 만든다.
+    static ASSET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const IMMUTABLE_FOR_TEST: &str = "public, max-age=31536000, immutable";
+
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        // 앞 테스트가 단언에 걸려 죽었어도 뒤 테스트는 계속 돌아야 한다.
+        ASSET_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
 
     /// 자산 이름 → 이 서버가 약속한 MIME. **화면이 이 값으로 동작이 갈린다** —
     /// `text/javascript` 가 아니면 브라우저가 ES 모듈을 아예 실행하지 않는다.
@@ -396,8 +434,10 @@ mod tests {
     /// 매번 테스트를 깨뜨리고, 결국 아무 생각 없이 갱신하는 줄이 된다.
     #[test]
     fn only_an_exact_version_query_earns_immutable() {
+        let _guard = exclusive();
         install_test_assets();
         let current = version();
+        let current = current.as_str();
         // SHA-256 앞 16자리 hex. 빈 문자열·짧은 값이면 여기서 걸린다.
         assert_eq!(current.len(), 16, "자산 버전 모양이 달라졌다: {current:?}");
         assert!(
@@ -416,10 +456,89 @@ mod tests {
         assert_eq!(cache_policy(Some(&format!("{current}x"))), "no-cache");
     }
 
+    /// **덮어쓴 바이트가 실제 HTTP 응답까지 간다** (§43).
+    ///
+    /// `asset_override` 안의 단위 테스트는 그 모듈이 파일을 잘 읽는지만 본다. 그 표를
+    /// `serve_asset` 이 안 보게 배선을 지워도 그쪽은 전부 초록이다 — 그러면 폴더에
+    /// 파일을 넣어도 화면이 안 바뀌는데 아무도 못 잡는다. 그래서 여기서 핸들러를 통과시킨다.
+    ///
+    /// 같이 못 박는 것: **버전이 같이 움직인다.** 안 움직이면 브라우저가 1년 immutable 로
+    /// 잡아 둔 옛 파일을 계속 써서, 서버는 새 바이트를 내보내는데 화면만 옛것이 된다.
+    #[tokio::test]
+    async fn an_override_reaches_the_response_and_moves_the_version() {
+        let _guard = exclusive();
+        install_test_assets();
+        let overrides = asset_override::global();
+        let dir = std::env::temp_dir().join(format!("macham-seam-{}", crate::models::uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let builtin = body_bytes(
+            serve_asset(Path("core.js".to_string()), query_of(""), HeaderMap::new()).await,
+        )
+        .await;
+        let builtin_version = version();
+
+        const PATCHED: &[u8] = "/* 덮어쓴 core.js */\nexport const x = 1;\n".as_bytes();
+        std::fs::write(dir.join("core.js"), PATCHED).unwrap();
+        overrides.refresh_once(&dir, &is_overridable);
+
+        let served = serve_asset(Path("core.js".to_string()), query_of(""), HeaderMap::new()).await;
+        assert_eq!(served.status(), StatusCode::OK);
+        // MIME 은 내장 표에서 온다 — 덮어써도 `text/javascript` 여야 모듈이 실행된다.
+        assert_eq!(
+            header_of(&served, header::CONTENT_TYPE).as_deref(),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            body_bytes(served).await,
+            PATCHED,
+            "덮어쓴 바이트가 응답까지 안 갔다 — 배선이 끊겼다"
+        );
+
+        let patched_version = version();
+        assert_ne!(
+            patched_version, builtin_version,
+            "바이트를 바꿨는데 `?v=` 가 그대로다 — 브라우저가 옛 파일에 갇힌다"
+        );
+        assert_eq!(cache_policy(Some(&patched_version)), IMMUTABLE_FOR_TEST);
+        assert_eq!(
+            cache_policy(Some(&builtin_version)),
+            "no-cache",
+            "옛 버전 질의가 아직도 영구 캐시를 받는다"
+        );
+
+        // 덮어쓰지 않은 자산은 그대로 내장 바이트다.
+        let untouched =
+            serve_asset(Path("portal.css".to_string()), query_of(""), HeaderMap::new()).await;
+        assert_eq!(untouched.status(), StatusCode::OK);
+
+        // 화이트리스트 밖 이름은 폴더에 넣어도 나가지 않는다. 여기가 뚫리면 파일 서버다.
+        std::fs::write(dir.join("secret.txt"), b"password").unwrap();
+        overrides.refresh_once(&dir, &is_overridable);
+        let leaked =
+            serve_asset(Path("secret.txt".to_string()), query_of(""), HeaderMap::new()).await;
+        assert_eq!(
+            leaked.status(),
+            StatusCode::NOT_FOUND,
+            "덮어쓰기 폴더가 파일 서버가 됐다"
+        );
+
+        // 파일을 지우면 내장 자산으로 되돌아온다 — 되돌리기가 안 되면 쓸 수 없는 기능이다.
+        std::fs::remove_file(dir.join("core.js")).unwrap();
+        overrides.refresh_once(&dir, &is_overridable);
+        let restored =
+            serve_asset(Path("core.js".to_string()), query_of(""), HeaderMap::new()).await;
+        assert_eq!(body_bytes(restored).await, builtin, "덮어쓰기를 못 되돌린다");
+        assert_eq!(version(), builtin_version);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 정책이 **응답 헤더까지** 그대로 흘러가는지. `cache_policy` 만 맞고 배선이 끊기면
     /// 단위 테스트는 초록인데 브라우저는 아무것도 캐시하지 않는다.
     #[tokio::test]
     async fn the_cache_policy_reaches_the_response() {
+        let _guard = exclusive();
         install_test_assets();
         let hit = serve_asset(
             Path("core.js".to_string()),

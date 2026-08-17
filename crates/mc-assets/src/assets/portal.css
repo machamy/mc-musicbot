@@ -207,6 +207,15 @@ body[data-dragging="tab"] { user-select: none; }
   border-radius: var(--r-md);
   box-shadow: var(--shadow-pop);
   animation: dd-in var(--t-fast) var(--ease-out);
+  /* **뷰포트 밖으로 안 나간다.** 이 메뉴는 헤더 맨 오른쪽에 `right: 0` 으로 붙는데
+     내용(배치 고르기)이 392px 를 요구해서, 360~390px 폰에서는 왼쪽 절반이 화면 밖으로
+     나가 첫 열이 통째로 안 보였다. `body { overflow: hidden }` 이라 스크롤해서 볼 수도 없었다.
+     세로도 같은 문제 — 상한이 없어 아래쪽 항목이 잘렸다. `.pop--menu` 가 이미 쓰는
+     안전장치와 같은 것을 여기에도 준다. */
+  max-width: calc(100vw - var(--sp-4));
+  max-height: calc(100dvh - 72px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .dd__menu--left { right: auto; left: 0; }
 @keyframes dd-in { from { opacity: 0; transform: translateY(-4px); } }
@@ -253,6 +262,17 @@ body[data-dragging="tab"] { user-select: none; }
 .dd__menu--wide { min-width: 392px; }
 
 .lay { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--sp-2); padding: 0 var(--sp-3) var(--sp-1); }
+
+/* **좁은 화면에서는 열을 접는다.**
+   같은 뜻의 규칙이 `.pick`(첫 진입 시트)에는 있는데 주석까지 "프로필 메뉴 그리드" 라고
+   써 놓고 정작 프로필 메뉴가 쓰는 `.lay` 에는 없었다. 그래서 폰에서 3열 392px 가
+   그대로 유지돼 첫 열이 화면 밖으로 밀렸다. 접히는 지점은 `.pick` 과 같이 맞춘다 —
+   두 화면이 다른 폭에서 접히면 같은 기기에서 다르게 보인다. */
+@media (max-width: 900px) {
+  .lay { grid-template-columns: repeat(2, 1fr); }
+  .dd__menu--wide { min-width: 0; }
+}
+@media (max-width: 640px) { .lay { grid-template-columns: 1fr; } }
 
 .lay__opt {
   display: grid;
@@ -1794,6 +1814,20 @@ body[data-dragging="tab"] { user-select: none; }
   font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
   white-space: nowrap;
+  /* **끝에 붙어 있는다.** `margin-left: auto` 는 *남는 공간*을 먹는 물건이라, 탭이 많아
+     스트립이 넘치는 순간 0으로 죽는다. 그러면 이 버튼은 "오른쪽 끝" 이 아니라 마지막 탭
+     뒤, 곧 스크롤 콘텐츠의 끝에 놓여 화면 밖으로 밀린다. 게다가 스크롤바를 숨겨 놔서
+     (`.dk-tabs`) 되찾을 방법도 없었다 — 닫은 패널을 되살리는 유일한 입구가 사라진다.
+     `sticky` 는 그 auto 마진이 죽어도 버튼을 시야에 남긴다.
+     `z-index` 는 탭 옮기기 표시(`.dk-drop`, 20)보다 낮게 둔다. */
+  position: sticky;
+  right: 0;
+  z-index: 5;
+  /* `.dk-tabs` 는 배경이 없어 `.dk-group` 의 `--surface-1` 을 물려받는다. 같은 값을 써야
+     밑으로 지나가는 탭이 비쳐 보이지 않는다. 왼쪽 그림자는 "여기 아래로 더 있다" 는 신호다
+     (스크롤바를 숨겨 놔서 그 신호가 달리 없다). */
+  background: var(--surface-1);
+  box-shadow: -8px 0 8px -8px var(--shadow-1, rgba(0, 0, 0, 0.35));
 }
 .dk-add:hover { background: var(--surface-3); border-color: var(--accent-line); color: var(--text-1); }
 /* 닫아 둔 패널이 있으면 더 눈에 띄게 — 되살릴 게 있다는 신호다 */
@@ -2355,7 +2389,17 @@ body.gate {
  * 좌측에 넓은 대기열·검색, 우측 위에 컴팩트 재생, 아래에 채팅. */
 @media (min-width: 681px) {
   :root[data-layout="dj"] .portal__grid {
-    grid-template-columns: minmax(0, 1.12fr) var(--gutter-w) minmax(320px, 0.88fr);
+    /* **끌면 실제로 폭이 바뀐다.** 예전에는 첫 트랙이 `minmax(0, 1.12fr)` 로 못 박혀 있어서,
+       레일 손잡이를 끌면 JS 가 `--rail-w` 를 성실히 갱신하고 저장까지 하는데 **아무도 그
+       변수를 안 읽었다.** 손잡이는 잡히고 커서도 바뀌는데 열은 그대로인, 제일 나쁜 종류의
+       고장이었다(더블클릭하면 "되돌렸어요" 토스트까지 떴다).
+
+       **`--rail-w` 를 그대로 쓰면 안 된다.** 그건 `tokens.css` 에 `320px` 기본값이 있어서
+       대체값(`1.12fr`)이 영영 안 걸린다 — 한 번도 안 끌어 본 사람의 DJ 레일이 780px 대에서
+       320px 로 확 좁아진다. 실제로 그렇게 만들었다가 브라우저에서 잡았다.
+       그래서 **기본값이 없는 전용 변수**를 쓴다. 저장된 값이 있을 때만 JS 가 이 변수를
+       박고(`applyLayoutSizes`), 없으면 지금까지와 똑같은 비율 배치로 남는다. */
+    grid-template-columns: minmax(320px, var(--rail-dj-w, 1.12fr)) var(--gutter-w) minmax(320px, 0.88fr);
     /* 재생 화면이 위를 다 먹으면 채팅이 눌린다. 비율로 못 박고 안쪽에서 스크롤시킨다. */
     grid-template-rows: minmax(0, 0.44fr) minmax(0, 0.56fr);
   }
@@ -2954,7 +2998,10 @@ body.gate {
  * 검토 때 이 안의 위험으로 꼽았던 것이 '좁은 패널에서 결과와 대기열이 둘 다 반쪽이 된다'
  * 였다. 그래서 결과 칸에 **높이 상한과 자기 스크롤**을 준다 — 결과가 아무리 많아도
  * 대기열이 밀려나지 않는다. 둘이 한 통에서 스크롤을 다투지도 않는다. */
-.qsearch { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4) 0; }
+/* `flex: none` 이 필요한 이유: 부모 `.tabpane` 이 세로 flex 이고 형제 `.queue__list` 는
+   `flex: 1`(= basis 0)이라 축소 배분을 거의 안 받는다. 세로가 모자라면 **줄어드는 것이
+   이 칸 혼자**여서, 세로 짧은 화면·가로 모드에서 결과 칸이 상한보다 훨씬 얇게 눌렸다. */
+.qsearch { flex: none; display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4) 0; }
 .qsearch__row { display: flex; gap: var(--sp-2); align-items: center; }
 .qsearch__row .field { flex: 1; min-width: 0; }
 .qsearch__results {
@@ -2963,7 +3010,10 @@ body.gate {
   gap: 2px;
   /* 결과는 여기까지만. 나머지는 이 칸 안에서 스크롤한다. */
   max-height: min(42vh, 300px);
+  /* `.scroll` 클래스를 안 쓰고 여기서 직접 선언한다 — 2단 배치가 레일 안의 `.scroll` 을
+     통째로 풀어 버려서 `max-height` 만 남고 결과가 밖으로 흘러나왔다(portal.js 주석 참고). */
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: var(--sp-2);
   background: var(--surface-inset);
   border: 1px solid var(--line-1);
