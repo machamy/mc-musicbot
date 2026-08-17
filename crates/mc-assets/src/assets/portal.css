@@ -1022,9 +1022,98 @@ body[data-dragging="tab"] { user-select: none; }
 .md pre code { padding: 0; background: none; }
 /* 패치노트의 `---`. 버전 사이를 가르는 선이라 여백이 선 자체보다 중요하다. */
 .md hr { margin: var(--sp-4) 0; border: 0; border-top: 1px solid var(--line-1); }
-/* 표는 줄마다 따로 그린다(파서가 좁아서). 칸 사이만 벌려 주면 읽힌다. */
-.md__t { width: 100%; border-collapse: collapse; }
-.md__t td { padding: 2px var(--sp-2); border-bottom: 1px solid var(--line-1); vertical-align: top; }
+.md__t { width: 100%; border-collapse: collapse; margin: var(--sp-2) 0; font-size: var(--fs-sm); }
+.md__t th {
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--line-2);
+  text-align: left;
+  color: var(--text-3);
+  font-weight: var(--fw-semi);
+  white-space: nowrap;
+}
+.md__t td { padding: var(--sp-1) var(--sp-2); border-bottom: 1px solid var(--line-1); vertical-align: top; }
+.md__t tr:last-child td { border-bottom: 0; }
+/* 숫자가 여러 줄에 걸치면 자릿수가 맞아야 읽힌다. */
+.md__t td, .md__t th { font-variant-numeric: tabular-nums; }
+
+/* 인용문 — 패치노트에서 "덧붙이는 말" 자리다. 본문보다 한 단계 조용하게. */
+.md blockquote {
+  margin: var(--sp-2) 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid var(--line-2);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+.md blockquote > :first-child { margin-top: 0; }
+.md blockquote > :last-child { margin-bottom: 0; }
+.md a { color: var(--accent); }
+.md em { font-style: normal; color: var(--text-1); background: var(--surface-2); padding: 0 3px; border-radius: var(--r-xs); }
+
+/* ── 패치노트 카드 (§30) ──
+ *
+ * 48개가 한 두루마리로 이어져 있으면 "지금 어느 버전을 읽는 중인지" 를 알 수 없다.
+ * 버전마다 카드로 끊고, **머리글을 스크롤에 붙여** 둔다 — 내려도 버전 이름이 위에 남는다.
+ * 그게 이 화면에서 제일 필요한 정보다. */
+.md--rel { display: flex; flex-direction: column; gap: var(--sp-3); padding-right: var(--sp-1); }
+/* **`flex: none` 이 없으면 카드 48장이 전부 눌린다.** `.md` 는 `max-height: 62vh` 인
+   스크롤 상자이고, 세로 flex 의 자식은 기본으로 수축한다 — 그래서 카드가 그 높이에
+   다 들어가려고 몇 px 짜리 줄무늬가 됐다(화면으로 잡았다). 카드는 제 높이를 갖고
+   넘치는 만큼 상자가 스크롤해야 한다. */
+.md--rel > .rel { flex: none; }
+
+.rel {
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  /* **`overflow: hidden` 을 쓰면 안 된다.** 모서리를 다듬으려고 넣었다가 아래 `sticky` 가
+     통째로 죽었다 — 조상에 overflow 가 있으면 sticky 는 그 조상 안에 갇혀서, 스크롤
+     상자가 아닌 카드 안에서 붙으려 하다가 그냥 같이 밀려 올라간다(브라우저로 확인).
+     모서리는 머리글에 직접 둥글기를 줘서 맞춘다. */
+}
+.rel__head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  border-radius: calc(var(--r-md) - 1px) calc(var(--r-md) - 1px) 0 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  /* 불투명해야 한다. 밑으로 지나가는 본문이 비치면 글자가 겹쳐 읽힌다. */
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--line-1);
+}
+.rel__ver { font-weight: var(--fw-semi); font-size: var(--fs-md); font-variant-numeric: tabular-nums; }
+.rel__date { color: var(--text-4); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.rel__now {
+  margin-left: auto;
+  padding: 1px var(--sp-2);
+  border-radius: 999px;
+  background: var(--accent-soft, var(--surface-3));
+  color: var(--accent);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+}
+.rel__body { padding: var(--sp-1) var(--sp-3) var(--sp-3); }
+.rel__body > :first-child { margin-top: var(--sp-2); }
+.rel__body > :last-child { margin-bottom: 0; }
+/* 지금 돌고 있는 버전은 한눈에 찾을 수 있어야 한다. 왼쪽 띠 하나면 충분하다. */
+.rel--here { border-color: var(--accent-line); box-shadow: inset 3px 0 0 var(--accent); }
+/* 카드 안의 소제목.
+   공용 `.md h3` 는 13px 이라 본문(14px)보다 **작아서** 제목으로 안 읽혔다.
+   패치노트는 한 버전 안에 소제목이 여럿이라 여기가 길잡이 노릇을 해야 한다. */
+.rel__body h3 {
+  margin: var(--sp-4) 0 var(--sp-1);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semi);
+  color: var(--text-1);
+}
+.rel__body h3:first-child { margin-top: var(--sp-2); }
+/* 소제목 앞에 가는 선 하나. 항목이 여럿일 때 어디서 끊기는지가 보인다. */
+.rel__body h3 + p { margin-top: 0; }
+.rel__body h4 { margin: var(--sp-3) 0 var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
 
 /* 봇이 음성에 없어서 멈춰 있는 상태 (§36). 진행바를 죽여 "안 가고 있다"를 눈으로 알린다. */
 .now--stopped .seek__fill { background: var(--text-4); }

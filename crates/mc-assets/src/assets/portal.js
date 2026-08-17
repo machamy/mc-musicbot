@@ -7876,52 +7876,181 @@ function checkVersion(state) {
  * 우리가 쓰는 문법은 제목·목록·표·코드·굵게가 전부다. **HTML 은 통째로 이스케이프**하고
  * 그 위에 우리가 아는 문법만 되살린다.
  */
-function renderMarkdown(text) {
-  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  const inline = (s) => esc(s)
+function mdEscape(s) {
+  return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+/* 한 덩이(문단·칸·항목) 안의 문법.
+ *
+ * **이스케이프가 먼저다.** 그래서 아래 정규식이 만나는 것은 이미 안전한 텍스트고,
+ * `"` 도 `<` 도 남아 있지 않다. 링크 주소에 따옴표를 넣어 속성을 깨는 길이 막힌다. */
+function mdInline(s) {
+  return mdEscape(s)
     .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    /* 링크는 `http(s)://` 로 시작할 때만 산다. `javascript:` 는 애초에 매치가 안 된다 —
+     * 스킴을 검사해서 거르는 것이 아니라 **허용된 것만 문법으로 인정**하는 쪽이다. */
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    // 굵게를 먼저 처리한 뒤라 남은 홑 `*` 만 기울임이 된다.
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+}
 
+/** 패치노트 마크다운 → HTML (§30).
+ *
+ * 원본은 `docs/CHANGELOG.md` 하나고 exe 에 같이 들어 있다. 화면용으로 옮겨 적지 않는다 —
+ * 두 벌이 되면 결국 화면 쪽이 낡는다.
+ *
+ * **줄 단위가 아니라 덩이 단위로 읽는다.** 예전 파서는 한 줄씩 처리해서
+ * `<p>` 를 줄마다 만들었는데, 우리 패치노트는 문장을 80자에서 접기 때문에
+ * **`**굵게**` 가 줄을 넘어가는 곳이 311군데**였고 그게 전부 열린 채로 남아 화면에
+ * `**` 가 그대로 찍혔다. "패치노트가 제대로 안 보인다" 의 정체가 이것이다.
+ * 이어지는 줄을 먼저 한 문단으로 합치고 나서 문법을 해석하면 자연히 풀린다.
+ *
+ * 같은 이유로 표는 **여러 줄을 한 표로** 모으고(예전엔 줄마다 `<table>` 이 하나씩
+ * 생겼다), `>` 인용문은 아예 규칙이 없어서 `&gt;` 글자로 나왔다.
+ *
+ * 범용 파서는 여전히 안 쓴다. HTML 은 통째로 이스케이프하고 우리가 쓰는 문법만 되살린다. */
+function renderMarkdown(text) {
+  const lines = String(text).split('\n').map((l) => l.replace(/\r$/, ''));
   const out = [];
-  let inCode = false;
-  let listOpen = false;
-  const closeList = () => { if (listOpen) { out.push('</ul>'); listOpen = false; } };
+  let i = 0;
 
-  for (const raw of String(text).split('\n')) {
-    const line = raw.replace(/\r$/, '');
+  const isBlank = (l) => !l.trim();
+  const isHr = (l) => /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(l);
+  const isHead = (l) => /^#{1,4}\s+/.test(l);
+  const isItem = (l) => /^\s*[-*]\s+/.test(l);
+  const isRow = (l) => l.trim().startsWith('|') && l.includes('|');
+  const isQuote = (l) => /^\s*>\s?/.test(l);
+  /* 문단이 여기서 끊긴다. 다른 덩이의 시작 줄은 문단에 딸려 들어오면 안 된다. */
+  const breaksParagraph = (l) =>
+    isBlank(l) || isHr(l) || isHead(l) || isItem(l) || isRow(l) || isQuote(l) || l.startsWith('```');
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (isBlank(line)) { i += 1; continue; }
+
     if (line.startsWith('```')) {
-      closeList();
-      out.push(inCode ? '</code></pre>' : '<pre><code>');
-      inCode = !inCode;
+      i += 1;
+      const code = [];
+      while (i < lines.length && !lines[i].startsWith('```')) { code.push(mdEscape(lines[i])); i += 1; }
+      i += 1;  // 닫는 울타리. 없으면 끝까지 코드로 본다 — 원문 그대로 보여주는 편이 안전하다.
+      out.push(`<pre><code>${code.join('\n')}</code></pre>`);
       continue;
     }
-    if (inCode) { out.push(esc(line)); continue; }
 
     const heading = line.match(/^(#{1,4})\s+(.*)$/);
-    if (heading) { closeList(); out.push(`<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`); continue; }
-    // 수평선. **목록보다 먼저 본다** — `* * *` 는 목록 규칙에도 걸리기 때문이다.
-    // 이게 없으면 `---` 가 어느 분기에도 안 걸려 맨 아래 `<p>` 로 떨어지고, 화면에 글자로 나온다.
-    if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { closeList(); out.push('<hr>'); continue; }
-    if (/^\s*[-*]\s+/.test(line)) {
-      if (!listOpen) { out.push('<ul>'); listOpen = true; }
-      out.push(`<li>${inline(line.replace(/^\s*[-*]\s+/, ''))}</li>`);
+    if (heading) {
+      out.push(`<h${heading[1].length}>${mdInline(heading[2])}</h${heading[1].length}>`);
+      i += 1;
       continue;
     }
-    // 표는 셀만 살린다. 정렬 줄(---)은 버린다.
-    if (line.includes('|') && line.trim().startsWith('|')) {
-      if (/^\s*\|[\s:|-]+\|\s*$/.test(line)) continue;
-      closeList();
-      const cells = line.split('|').slice(1, -1).map((cell) => `<td>${inline(cell.trim())}</td>`);
-      out.push(`<table class="md__t"><tr>${cells.join('')}</tr></table>`);
+
+    // 수평선을 목록보다 먼저 본다 — `* * *` 는 목록 규칙에도 걸린다.
+    if (isHr(line)) { out.push('<hr>'); i += 1; continue; }
+
+    if (isItem(line)) {
+      const items = [];
+      while (i < lines.length && isItem(lines[i])) {
+        const parts = [lines[i].replace(/^\s*[-*]\s+/, '')];
+        i += 1;
+        // 들여쓴 다음 줄은 같은 항목이 이어지는 것이다.
+        while (i < lines.length && !isBlank(lines[i]) && !breaksParagraph(lines[i])) {
+          parts.push(lines[i].trim());
+          i += 1;
+        }
+        items.push(`<li>${mdInline(parts.join(' '))}</li>`);
+      }
+      out.push(`<ul>${items.join('')}</ul>`);
       continue;
     }
-    if (!line.trim()) { closeList(); continue; }
-    closeList();
-    out.push(`<p>${inline(line)}</p>`);
+
+    if (isRow(line)) {
+      const rows = [];
+      while (i < lines.length && isRow(lines[i])) { rows.push(lines[i]); i += 1; }
+      const cells = (l) => l.split('|').slice(1, -1).map((c) => c.trim());
+      // 둘째 줄이 정렬 줄이면 첫 줄은 머리글이다.
+      const hasHead = rows.length > 1 && /^\s*\|[\s:|-]+\|\s*$/.test(rows[1]);
+      const body = rows
+        .filter((l) => !/^\s*\|[\s:|-]+\|\s*$/.test(l))
+        .map((l, index) => {
+          const tag = hasHead && index === 0 ? 'th' : 'td';
+          return `<tr>${cells(l).map((c) => `<${tag}>${mdInline(c)}</${tag}>`).join('')}</tr>`;
+        });
+      out.push(`<table class="md__t">${body.join('')}</table>`);
+      continue;
+    }
+
+    if (isQuote(line)) {
+      const inner = [];
+      while (i < lines.length && (isQuote(lines[i]) || (inner.length && !isBlank(lines[i]) && !breaksParagraph(lines[i])))) {
+        inner.push(lines[i].replace(/^\s*>\s?/, ''));
+        i += 1;
+      }
+      // 인용문 안도 같은 규칙으로 읽는다 — 목록이나 굵게가 들어 있을 수 있다.
+      out.push(`<blockquote>${renderMarkdown(inner.join('\n'))}</blockquote>`);
+      continue;
+    }
+
+    const para = [line];
+    i += 1;
+    while (i < lines.length && !breaksParagraph(lines[i])) { para.push(lines[i]); i += 1; }
+    out.push(`<p>${mdInline(para.join(' '))}</p>`);
   }
-  closeList();
-  if (inCode) out.push('</code></pre>');
+
   return out.join('\n');
+}
+
+/** `## v4.42 — 2026-08-17` 한 줄에서 버전과 날짜를 뗀다. 못 읽으면 통째로 제목이다. */
+function releaseTitle(heading) {
+  const m = heading.match(/^\s*(\S+)\s*[—–-]\s*(.+)$/);
+  return m ? { version: m[1], date: m[2].trim() } : { version: heading.trim(), date: '' };
+}
+
+/** 패치노트를 버전별 카드로 나눈다 (§30).
+ *
+ * 48개가 한 두루마리로 이어져 있으면 "지금 어느 버전을 읽고 있는지" 를 알 수 없다.
+ * `##` 를 경계로 잘라 각각을 카드로 만들고, 머리글을 스크롤에 붙여 둔다(CSS `sticky`).
+ *
+ * `---` 는 버리는 게 맞다 — 카드 경계가 그 역할을 이미 한다. 남겨 두면 카드마다
+ * 밑줄이 하나씩 더 생긴다. */
+function renderChangelog(markdown, currentBuild) {
+  const lines = String(markdown).split('\n');
+  const head = [];
+  const releases = [];
+  let cur = null;
+
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, '');
+    const m = line.match(/^##\s+(.*)$/);
+    if (m) {
+      cur = { heading: m[1], body: [] };
+      releases.push(cur);
+      continue;
+    }
+    if (!cur) { head.push(line); continue; }
+    // 카드 안의 구분선은 버린다. 카드 경계가 그 일을 한다.
+    if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) continue;
+    cur.body.push(line);
+  }
+
+  const cards = releases.map((rel) => {
+    const { version, date } = releaseTitle(rel.heading);
+    const here = currentBuild && version === currentBuild;
+    return [
+      `<section class="rel${here ? ' rel--here' : ''}">`,
+      '<header class="rel__head">',
+      `<span class="rel__ver">${mdEscape(version)}</span>`,
+      date ? `<span class="rel__date">${mdEscape(date)}</span>` : '',
+      here ? '<span class="rel__now">지금 이 버전</span>' : '',
+      '</header>',
+      `<div class="rel__body">${renderMarkdown(rel.body.join('\n'))}</div>`,
+      '</section>',
+    ].join('');
+  });
+
+  return renderMarkdown(head.join('\n')) + cards.join('');
 }
 
 let changelogCache = null;
@@ -7935,8 +8064,8 @@ async function openChangelog() {
       return;
     }
   }
-  const body = h('div', { class: 'md' });
-  body.innerHTML = renderMarkdown(changelogCache.markdown || '');
+  const body = h('div', { class: 'md md--rel' });
+  body.innerHTML = renderChangelog(changelogCache.markdown || '', ctx.buildId || '');
   // 읽었다고 표시한다. 다음 접속 때 같은 버전이면 안 띄운다.
   try { localStorage.setItem(LS.seenChangelog, ctx.buildId || ''); } catch { /* 시크릿 모드 */ }
   sheet({
@@ -10000,6 +10129,54 @@ function selfTest() {
   eq('자르기: DJ 레일은 900 까지 간다', clampSize('dj', 'rail', 880), 880);
   eq('자르기: 3단 레일은 560 에서 멈춘다', clampSize('three', 'rail', 880), 560);
   eq('자르기: DJ 레일 하한도 배치값을 쓴다', clampSize('dj', 'rail', 100), 320);
+
+  /* §30 — 패치노트 렌더러.
+   *
+   * **제일 값어치 있는 줄은 첫 번째다.** 우리 패치노트는 문장을 80자에서 접기 때문에
+   * `**굵게**` 가 줄을 넘어가는 곳이 311군데인데, 줄 단위 파서는 그걸 전부 열린 채로
+   * 남겨 화면에 `**` 를 그대로 찍었다. 그게 "패치노트가 제대로 안 보인다" 의 정체다. */
+  eq('패치노트: 굵게가 줄을 넘어가도 닫힌다',
+    renderMarkdown('앞부분 **여기서\n줄이 바뀐다** 뒷부분'),
+    '<p>앞부분 <strong>여기서 줄이 바뀐다</strong> 뒷부분</p>');
+  eq('패치노트: 이어지는 줄은 한 문단이다',
+    renderMarkdown('첫 줄\n둘째 줄'), '<p>첫 줄 둘째 줄</p>');
+  eq('패치노트: 빈 줄이 문단을 가른다',
+    renderMarkdown('첫 문단\n\n둘째 문단'), '<p>첫 문단</p>\n<p>둘째 문단</p>');
+  /* 예전에는 줄마다 `<table>` 이 하나씩 생겨서 3줄짜리 표가 표 3개가 됐다. */
+  eq('패치노트: 표는 한 덩이로 모이고 머리글이 산다',
+    renderMarkdown('| 곡 | 수 |\n|---|---|\n| 가 | 1 |\n| 나 | 2 |'),
+    '<table class="md__t"><tr><th>곡</th><th>수</th></tr>'
+    + '<tr><td>가</td><td>1</td></tr><tr><td>나</td><td>2</td></tr></table>');
+  // 인용문은 규칙이 아예 없어서 `&gt;` 글자로 나왔다.
+  eq('패치노트: 인용문이 글자가 아니라 인용문이 된다',
+    renderMarkdown('> 덧붙이는 말'), '<blockquote><p>덧붙이는 말</p></blockquote>');
+  eq('패치노트: 인용문도 여러 줄이 한 문단이다',
+    renderMarkdown('> 앞\n> 뒤'), '<blockquote><p>앞 뒤</p></blockquote>');
+
+  /* HTML 은 통째로 이스케이프한다. 이 줄이 깨지면 패치노트가 곧 XSS 통로가 된다. */
+  eq('패치노트: 태그는 글자로만 나간다',
+    renderMarkdown('<img src=x onerror=alert(1)>'),
+    '<p>&lt;img src=x onerror=alert(1)&gt;</p>');
+  eq('패치노트: 코드 안의 태그도 글자다',
+    renderMarkdown('`<script>`'), '<p><code>&lt;script&gt;</code></p>');
+  /* 링크는 `http(s)://` 만 **문법으로 인정**한다. 거르는 게 아니라 인정하지 않는 것이라
+   * `javascript:` 는 아예 매치가 안 된다. */
+  eq('패치노트: 안전한 링크는 산다',
+    renderMarkdown('[예시](https://example.test/a)'),
+    '<p><a href="https://example.test/a" target="_blank" rel="noopener noreferrer">예시</a></p>');
+  eq('패치노트: javascript 링크는 링크가 안 된다',
+    renderMarkdown('[누르지마](javascript:alert(1))'),
+    '<p>[누르지마](javascript:alert(1))</p>');
+
+  /* 버전 카드. `##` 를 경계로 잘리고, 지금 쓰는 버전에 표시가 붙는다. */
+  const cl = renderChangelog('# 패치노트\n\n## v4.42 — 2026-08-17\n\n내용\n\n---\n\n## v4.41 — 2026-08-16\n\n옛 내용', 'v4.42');
+  eq('패치노트: 버전 수만큼 카드가 생긴다', (cl.match(/<section class="rel/g) || []).length, 2);
+  eq('패치노트: 지금 버전에만 표시가 붙는다', (cl.match(/rel--here/g) || []).length, 1);
+  eq('패치노트: 지금 버전 딱지는 하나다', (cl.match(/rel__now/g) || []).length, 1);
+  // 카드 경계가 구분선 역할을 하므로 안쪽 `---` 는 버린다. 안 버리면 카드마다 줄이 하나씩 더 생긴다.
+  eq('패치노트: 카드 안의 구분선은 지운다', cl.includes('<hr>'), false);
+  eq('패치노트: 버전과 날짜를 갈라 낸다', releaseTitle('v4.42 — 2026-08-17'), { version: 'v4.42', date: '2026-08-17' });
+  eq('패치노트: 못 읽는 제목은 통째로 버전이다', releaseTitle('예전 기록'), { version: '예전 기록', date: '' });
 
   console.info(fails.length ? `[자가검사] ${fails.length}건 실패` : '[자가검사] 전부 통과', fails);
   return { fail: fails.length, fails };
