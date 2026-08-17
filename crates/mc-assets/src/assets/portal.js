@@ -466,6 +466,14 @@ function layoutHint(id) {
  * 넣으면 안 된다 — 도킹 판은 applyLayout()의 mountDock()으로만 붙는데, 첫 페인트는
  * 그 전에 일어난다. data-layout만 panel이 되고 판은 없는 빈 화면이 된다.
  * 패널형으로는 시트에서 고를 때(setLayout) 제대로 된 경로로 들어간다. */
+/* 자주 만지는 노드 참조.
+ *
+ * **선언이 여기 있는 것에 이유가 있다.** 바로 아래에서 `applyLayoutSizes()` 를 모듈
+ * 최상단에서 한 번 부르는데, 그 호출이 `el` 을 만지는 함수를 타면 아직 초기화 전이라
+ * `Cannot access 'el' before initialization` 으로 스크립트가 통째로 죽는다.
+ * 이 함정에 두 번 걸렸다(열 손잡이 · 모바일 탭바 높이). 선언을 앞으로 올려 아예 없앤다. */
+const el = {};
+
 let layoutChosen = !!LAYOUTS[prefGet('layout')];
 let activeLayout = layoutChosen ? prefGet('layout') : 'three';
 document.documentElement.dataset.layout = effectiveLayout();
@@ -531,6 +539,9 @@ function clampSize(layout, key, value) {
 function applyLayoutSizes() {
   const layout = effectiveLayout();
   const host = document.documentElement;
+  /* **조기 반환보다 먼저 잰다.** 탭바는 좁은 화면에서만 보이는데, 그 경우가 바로 아래
+   * `narrowScreen()` 분기로 빠지는 경우다 — 뒤에 두면 정작 필요할 때 한 번도 안 돈다. */
+  syncMobileTabsHeight();
   if (layout === 'panel' || narrowScreen()) {
     host.style.removeProperty('--rail-w');
     host.style.removeProperty('--side-w');
@@ -559,7 +570,6 @@ function saveSize(layout, key, value) {
 
 /* ═══════════════════════ 작은 헬퍼 ═══════════════════════ */
 
-const el = {};                 // 자주 만지는 노드 참조
 let searchResults = [];
 let searchedQuery = '';
 let searchSource = '';         // browser | server | '' — 결과가 어디서 왔는지
@@ -829,11 +839,21 @@ function skeletonRows(count) {
     h('div', null, h('div', { class: 'skel skel--t' }), h('div', { class: 'skel skel--s' })))));
 }
 
-function emptyState(icon, title, desc) {
+/* 빈 화면 한 장.
+ *
+ * **`action` 이 있는 이유**: 이 함수가 실패 화면 열 곳을 그리는데 아이콘·제목·설명뿐이라,
+ * 못 불러왔을 때 사용자에게 **다시 해 볼 방법이 하나도 없었다.** 특히 차트는 강제 새로고침
+ * 버튼이 운영자에게만 보여서(`tierOf()` 기본값이 `member`), 일반 멤버는 ← 로 나갔다 다시
+ * 들어오는 것 말고는 되살릴 길이 없는 막다른 길이었다.
+ *
+ * `action` 은 `{ label, onClick }` 이다. 안 주면 예전과 바이트가 같다. */
+function emptyState(icon, title, desc, action) {
   return h('div', { class: 'empty empty--sm' },
     h('div', { class: 'empty__icon' }, icon),
     h('div', { class: 'empty__title' }, title),
-    desc ? h('div', { class: 'empty__desc' }, desc) : null);
+    desc ? h('div', { class: 'empty__desc' }, desc) : null,
+    action ? h('div', { class: 'empty__act' },
+      bindAct(h('button', { class: 'btn btn--sm', type: 'button' }, action.label), action.onClick)) : null);
 }
 
 /* ═══════════════════════ 셸 조립 ═══════════════════════ */
@@ -905,6 +925,39 @@ function watchViewport() {
  * 열 경계에 손잡이를 둔다. 드래그·더블클릭 초기화·키보드 조절 전부 된다.
  * 저장은 드래그가 끝난 뒤 한 번만 — 끄는 동안 서버를 두드리지 않는다.
  */
+
+/* 모바일 하단 탭바의 **실제** 높이를 CSS 에 알려 준다.
+ *
+ * 토스트가 그 위에 떠야 하는데, 토스트는 클릭도 받으므로(`pointer-events: auto`) 겹치면
+ * 탭이 눌리지도 않는다. 곡을 담을 때마다 토스트가 뜨니 연달아 담는 동선에서 계속 겹쳤다.
+ *
+ * **높이를 CSS 에 상수로 적으면 안 된다.** 탭바는 테두리·안전영역까지 합쳐야 하고,
+ * 실제로 54px 로 적었다가 2px 이 겹치는 것을 브라우저에서 잡았다. 여기서 재서 넘긴다.
+ * 탭바가 안 보이는 배치에서는 변수를 지워 CSS 대체값으로 돌아가게 둔다. */
+function syncMobileTabsHeight() {
+  const host = document.documentElement;
+  const bar = document.querySelector('.mtabs');
+  const height = bar ? Math.round(bar.getBoundingClientRect().height) : 0;
+  if (height > 0) host.style.setProperty('--mtabs-h', `${height}px`);
+  else host.style.removeProperty('--mtabs-h');
+}
+
+/* 탭바 높이를 **관찰**한다.
+ *
+ * 호출 시점에 기대지 않는 것이 요점이다. `applyLayoutSizes()` 에 얹었더니 그건 모듈
+ * 최상단에서 한 번(셸 없음) 돌고 그 뒤로는 배치가 바뀔 때만 도는데, 폰은 처음부터
+ * 좁으므로 배치가 안 바뀌어 영영 안 불렸다 — 브라우저에서 두 번 확인했다.
+ * 관찰자는 탭바가 생기는 순간과 크기가 바뀌는 순간에 스스로 돈다. */
+function watchMobileTabs() {
+  syncMobileTabsHeight();
+  const bar = document.querySelector('.mtabs');
+  if (!bar || typeof ResizeObserver !== 'function') {
+    // 관찰자를 못 쓰면 창 크기 변화에만 기댄다. 없는 것보다 낫다.
+    window.addEventListener('resize', syncMobileTabsHeight);
+    return;
+  }
+  new ResizeObserver(syncMobileTabsHeight).observe(bar);
+}
 
 /** 지금 화면에 실제로 그려진 열 너비. 아직 안 그려졌으면 `null`. */
 function measuredWidth(key) {
@@ -2534,7 +2587,10 @@ async function runSearch() {
     searchedQuery = query;
     renderSearchResults();
   } catch (error) {
-    clear(el.searchResults).appendChild(emptyState('⚠', '검색하지 못했어요', error.message));
+    clear(el.searchResults).appendChild(emptyState(
+      '⚠', '검색하지 못했어요', error.message,
+      { label: '다시 시도', onClick: () => runSearch() },
+    ));
   }
   syncSearchButton();
 }
@@ -6181,7 +6237,17 @@ function renderNow(state) {
     el.nowArt.classList.add('now__art--idle');
     put(clear(el.nowEyebrow), h('span', { class: 'dot dot--offline' }), online ? '대기 중' : '봇 오프라인');
     el.nowTitle.firstElementChild.textContent = online ? '재생 중인 곡이 없어요' : '봇이 꺼져 있어요';
-    put(clear(el.nowBy), connected ? '검색해서 첫 곡을 담아 보세요.' : '봇이 음성 채널에 들어오면 재생할 수 있어요.');
+    /* **꺼져 있는데 "음성 채널에 들어오면" 이라고 하지 않는다.**
+     *
+     * 봇 프로세스가 죽으면 `voiceChannelId` 도 당연히 비므로 `connected` 가 false 가 되고,
+     * 그러면 제목은 "봇이 꺼져 있어요" 인데 밑줄은 "봇이 음성 채널에 들어오면 재생할 수
+     * 있어요" 였다 — 할 수 없는 다음 단계를 시키고, 제목과 다른 원인을 암시한다.
+     * 원인이 셋(꺼짐·안 들어옴·비었음)이니 문구도 셋이어야 한다. */
+    let idleHint;
+    if (!online) idleHint = '봇이 다시 켜지면 이어서 들을 수 있어요.';
+    else if (!connected) idleHint = '봇이 음성 채널에 들어오면 재생할 수 있어요.';
+    else idleHint = '검색해서 첫 곡을 담아 보세요.';
+    put(clear(el.nowBy), idleHint);
     el.timeNow.textContent = '0:00';
     el.timeEnd.textContent = '0:00';
     el.seekFill.style.width = '0%';
@@ -7648,7 +7714,8 @@ function buildMobileTabs() {
     node.__def = def;
     return node;
   });
-  return h('nav', { class: 'mtabs', role: 'tablist', 'aria-label': '화면 전환' }, el.mobileTabs);
+  el.mtabs = h('nav', { class: 'mtabs', role: 'tablist', 'aria-label': '화면 전환' }, el.mobileTabs);
+  return el.mtabs;
 }
 
 function syncMobileTabs() {
@@ -7889,7 +7956,11 @@ function mdInline(s) {
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     /* 링크는 `http(s)://` 로 시작할 때만 산다. `javascript:` 는 애초에 매치가 안 된다 —
      * 스킴을 검사해서 거르는 것이 아니라 **허용된 것만 문법으로 인정**하는 쪽이다. */
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    /* 링크 글자 수에 상한이 있다. `[^\]]+` 를 열어 두면 `]` 가 없는 입력에서 시작점마다
+     * 끝까지 되짚어 **길이의 제곱**으로 늘어난다(`[` 32000개에 293ms, 2000개엔 1.4ms).
+     * 패치노트는 우리가 쓰는 글이라 실제로 그럴 일은 없지만, 상한 하나로 없앨 수 있는
+     * 위험을 남겨 둘 이유가 없다. 200자 넘는 링크 글자는 어차피 링크가 아니다. */
+    .replace(/\[([^\]]{1,200})\]\((https?:\/\/[^\s)]{1,500})\)/g,
       '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     // 굵게를 먼저 처리한 뒤라 남은 홑 `*` 만 기울임이 된다.
@@ -7911,7 +7982,12 @@ function mdInline(s) {
  * 생겼다), `>` 인용문은 아예 규칙이 없어서 `&gt;` 글자로 나왔다.
  *
  * 범용 파서는 여전히 안 쓴다. HTML 은 통째로 이스케이프하고 우리가 쓰는 문법만 되살린다. */
-function renderMarkdown(text) {
+function renderMarkdown(text, depth = 0) {
+  /* 인용문은 안쪽을 다시 이 함수로 읽는다. 그래서 `> > > > …` 가 그대로 재귀 깊이가 되고,
+   * 8000겹을 넣으면 **스택이 넘쳐 패치노트가 통째로 안 뜬다**(직접 재 봤다).
+   * 우리가 쓰는 글이라 그럴 일은 없지만, 두 줄로 막을 수 있는 것을 남겨 둘 이유가 없다.
+   * 한계에 닿으면 더 파고들지 않고 남은 것을 글자 그대로 보여 준다 — 내용은 안 잃는다. */
+  const MAX_DEPTH = 4;
   const lines = String(text).split('\n').map((l) => l.replace(/\r$/, ''));
   const out = [];
   let i = 0;
@@ -7989,7 +8065,10 @@ function renderMarkdown(text) {
         i += 1;
       }
       // 인용문 안도 같은 규칙으로 읽는다 — 목록이나 굵게가 들어 있을 수 있다.
-      out.push(`<blockquote>${renderMarkdown(inner.join('\n'))}</blockquote>`);
+      const body = depth >= MAX_DEPTH
+        ? `<p>${mdInline(inner.join(' '))}</p>`
+        : renderMarkdown(inner.join('\n'), depth + 1);
+      out.push(`<blockquote>${body}</blockquote>`);
       continue;
     }
 
@@ -9515,7 +9594,11 @@ async function openChart(chart, keepLevel) {
   } catch (error) {
     // 실패 화면도 마찬가지다 — 늦게 온 실패가 지금 보고 있는 차트를 지우면 안 된다.
     if (token !== chartLoadSeq) return;
-    clear(el.chartBody).appendChild(emptyState('📈', '이 차트를 못 가져왔어요', error.message));
+    clear(el.chartBody).appendChild(emptyState(
+      '📈', '이 차트를 못 가져왔어요', error.message,
+      // 누가 눌러도 된다 — 실패에서 빠져나오는 길은 권한 문제가 아니다.
+      { label: '다시 시도', onClick: () => openChart(chart, true) },
+    ));
     return;
   }
   renderChartTracks();
@@ -9705,6 +9788,7 @@ const refetchHot = debounce(() => { loadHot().catch(() => {}); }, 400);
 async function boot() {
   paintTheme(themeChoice());
   buildShell();
+  watchMobileTabs();       // 탭바가 생긴 직후부터 높이를 따라간다 (토스트가 그 위에 뜬다)
   tooltip();
   marqueeRows();
   el.railDrawerBtn.hidden = !railDrawerActive();
@@ -10178,6 +10262,14 @@ function selfTest() {
   eq('패치노트: 버전과 날짜를 갈라 낸다', releaseTitle('v4.42 — 2026-08-17'), { version: 'v4.42', date: '2026-08-17' });
   eq('패치노트: 못 읽는 제목은 통째로 버전이다', releaseTitle('예전 기록'), { version: '예전 기록', date: '' });
 
+  /* 인용문 재귀에 바닥이 있다. 예전에는 `> ` 를 8000겹 넣으면 **스택이 넘쳐 패치노트가
+   * 통째로 안 떴다.** 우리가 쓰는 글이라 그럴 일은 없지만, 안 터진다는 것은 못 박아 둔다. */
+  let deepOk = true;
+  try { renderMarkdown('> '.repeat(200) + '바닥'); } catch { deepOk = false; }
+  eq('패치노트: 인용문을 깊게 겹쳐도 안 터진다', deepOk, true);
+  // 내용은 잃지 않는다 — 더 파고들지 않을 뿐이다.
+  eq('패치노트: 깊어도 글은 남는다', renderMarkdown('> '.repeat(200) + '바닥').includes('바닥'), true);
+
   console.info(fails.length ? `[자가검사] ${fails.length}건 실패` : '[자가검사] 전부 통과', fails);
   return { fail: fails.length, fails };
 }
@@ -10190,6 +10282,13 @@ function bindShortcuts() {
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     if (document.activeElement?.isContentEditable) return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
+    /* **시트가 떠 있으면 전역 단축키를 아예 안 받는다.**
+     *
+     * 안 막으면 "대기열을 비울까요?" 확인창에서 `n`(=no) 을 누르는 순간 **뒤에 있는 곡이
+     * 넘어간다.** `c` 는 더 나쁘다 — 배경막은 그대로 둔 채 뒤쪽 채팅 입력창으로 포커스를
+     * 옮겨 시트의 포커스 가둠을 통째로 깬다. Space 는 버튼 가드가 있어 살았지만 나머지
+     * 다섯 개는 그냥 통과하고 있었다. `core.js` 의 시트 키 핸들러는 Escape·Tab 만 본다. */
+    if (document.querySelector('.sheet-back')) return;
     // 버튼/링크에 포커스가 있을 때 Space는 그 버튼을 눌러야 한다. 가로채지 않는다.
     if (event.key === ' ' && (tag === 'BUTTON' || tag === 'A')) return;
     switch (event.key) {

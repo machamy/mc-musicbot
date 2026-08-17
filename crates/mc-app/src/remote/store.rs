@@ -3742,6 +3742,44 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                     ("시티팝", "일본 시티팝", "japan_genre", "RDCLAK5uy_nEjjAWEM3M3fk2tT4Lhb5JOr_HoD0tjnk"),
                     ("시티팝 최신", "일본 시티팝 최신", "japan_genre", "RDCLAK5uy_muPPezCrTrwoL7Ep_9a69YkIaBjsyKTg0"),
                 ];
+                /* **먼저 앞 단계가 심어 둔 같은 이름을 치운다.**
+                 *
+                 * 이게 없으면 v4.38 이하에서 올라오는 DB 가 **기동에서 패닉한다.**
+                 * 이름에는 부분 유니크 인덱스가 걸려 있는데(`idx_remote_charts_builtin_name`),
+                 * 바로 앞 `23` 팔이 `seed_builtin_charts` 로 **지금 목록**(= 새 이름)을 이미
+                 * 심어 놓기 때문이다. 그 상태에서 옛 이름을 새 이름으로 바꾸려 들면
+                 * `UNIQUE constraint failed` 가 나고, `RemoteStore::open` 은 `app.rs` 에서
+                 * `.expect` 라 그대로 프로세스가 죽는다.
+                 *
+                 * **구조적 원인**: 지나간 마이그레이션 팔이 `seed_builtin_charts` 를 부르는데
+                 * 그 함수는 `BUILTIN_CHARTS` 상수를 읽는다 — 즉 **과거 단계의 동작이 오늘 코드에
+                 * 따라 바뀐다.** 이번에 그게 처음으로 물렸다. 새 시더 호출을 지나간 팔에 넣을
+                 * 때는 매번 이 함정을 확인해야 한다.
+                 *
+                 * 지우는 쪽을 **새로 심긴 줄**로 고른 것에 이유가 있다. 옛 줄을 지우면 그 차트
+                 * ID 가 사라지는데, 자동 재생이 고른 장르는 차트 **ID** 로 저장돼 있어
+                 * (`autoplay_genres`) 쓰던 서버의 설정이 조용히 날아간다. 새로 심긴 줄은 방금
+                 * 만들어져 아무도 가리키지 않으므로 안전하다. */
+                for (old_name, new_name, _, list_id) in RETITLE {
+                    let url = format!("https://music.youtube.com/playlist?list={list_id}");
+                    tx.execute(
+                        "DELETE FROM remote_chart_cache WHERE chart_id IN (
+                             SELECT id FROM remote_charts
+                              WHERE builtin = 1 AND name = ?1 AND url = ?2
+                                AND EXISTS (SELECT 1 FROM remote_charts old
+                                             WHERE old.builtin = 1 AND old.name = ?3
+                                               AND old.url = ?2))",
+                        params![new_name, url, old_name],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM remote_charts
+                          WHERE builtin = 1 AND name = ?1 AND url = ?2
+                            AND EXISTS (SELECT 1 FROM remote_charts old
+                                         WHERE old.builtin = 1 AND old.name = ?3
+                                           AND old.url = ?2)",
+                        params![new_name, url, old_name],
+                    )?;
+                }
                 for (old_name, new_name, new_category, list_id) in RETITLE {
                     tx.execute(
                         "UPDATE remote_charts
@@ -4445,6 +4483,72 @@ mod tests {
             "정작 물어본 한국 힙합이 없다"
         );
 
+        drop(conn);
+        cleanup(store, path);
+    }
+
+    /// **v4.38 이하에서 올라오는 DB 가 기동에서 죽지 않는다.**
+    ///
+    /// 러너는 `23` 팔에서 `seed_builtin_charts` 로 **지금 목록**(새 이름)을 심고,
+    /// 곧이어 `24` 팔에서 옛 이름을 새 이름으로 `UPDATE` 한다. 그런데 이름에는 부분
+    /// 유니크 인덱스가 걸려 있어(`idx_remote_charts_builtin_name`), 옛 이름이 남아 있는
+    /// DB 에서는 **새 이름이 이미 심긴 뒤에** 같은 이름으로 바꾸려 들게 된다.
+    ///
+    /// `RemoteStore::open` 은 `app.rs` 에서 `.expect` 로 받으므로 이건 곧 **부팅 패닉**이다.
+    /// 무중단을 얻겠다는 릴리스에서 업그레이드가 봇을 못 뜨게 하는 셈이라 제일 나쁜 종류다.
+    ///
+    /// 앞 테스트(`the_genre_rename_spares_charts_touched`)는 `24` 부터 되감아서 이 경로를
+    /// 통째로 건너뛴다. 그래서 **23 부터** 태우는 이 테스트가 따로 필요하다.
+    #[test]
+    fn an_upgrade_from_before_the_rename_does_not_collide() {
+        let (store, path) = temp_store("upgrade-23");
+        // v4.38 시절 모습으로 되돌린다 — 옛 이름만 있고 한국 장르는 없다.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("DELETE FROM remote_charts WHERE builtin = 1 AND category = 'korea_genre'", [])
+                .unwrap();
+            for (old, new) in [
+                ("팝", "전세계 팝"), ("힙합", "전세계 힙합"), ("록", "전세계 록"),
+                ("하드록·메탈", "전세계 하드록·메탈"), ("댄스·일렉트로닉", "전세계 댄스·일렉트로닉"),
+                ("라틴", "전세계 라틴"), ("재즈", "전세계 재즈"), ("컨트리", "전세계 컨트리"),
+                ("J-POP", "일본 J-POP"), ("J-POP 최신", "일본 J-POP 최신"),
+                ("J-POP 봄노래", "일본 J-POP 봄노래"), ("애니송", "일본 애니송"),
+                ("시티팝", "일본 시티팝"), ("시티팝 최신", "일본 시티팝 최신"),
+            ] {
+                conn.execute(
+                    "UPDATE remote_charts SET name = ?1, category = 'genre'
+                      WHERE builtin = 1 AND name = ?2",
+                    params![old, new],
+                )
+                .unwrap();
+            }
+        }
+
+        // 여기서 죽으면 그게 곧 운영 봇의 부팅 패닉이다.
+        rewind_and_migrate(&store, 23);
+
+        let conn = store.conn.lock().unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        let builtin = "FROM remote_charts WHERE builtin = 1 AND";
+        assert_eq!(count(&format!("SELECT COUNT(*) {builtin} name = '전세계 팝'")), 1);
+        assert_eq!(count(&format!("SELECT COUNT(*) {builtin} name = '팝'")), 0, "옛 이름이 남았다");
+        assert_eq!(count(&format!("SELECT COUNT(*) {builtin} name = '일본 시티팝'")), 1);
+        // 숫자를 손으로 적지 않는다 — 차트를 하나 더 넣을 때마다 여기가 틀린다.
+        assert_eq!(
+            count(&format!("SELECT COUNT(*) {builtin} category = 'korea_genre'")),
+            BUILTIN_CHARTS
+                .iter()
+                .filter(|(category, ..)| *category == ChartCategory::KoreaGenre)
+                .count() as i64,
+        );
+        // 이름이 두 벌로 늘어나지도 않아야 한다 — 지우는 쪽을 잘못 고르면 여기서 걸린다.
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) {builtin} url = 'https://music.youtube.com/playlist?list=PL4fGSI1pDJn77aK7sAW2AT0oOzo5inWY8'"
+            )),
+            1,
+            "같은 차트가 두 줄이 됐다"
+        );
         drop(conn);
         cleanup(store, path);
     }
