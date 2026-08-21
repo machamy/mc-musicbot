@@ -18,6 +18,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// 트랙 상태를 물을 때 기다리는 한도. 드라이버가 재연결 중이면 답이 늦는다.
+const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 트랙 핸들에 상태를 물은 결과.
+///
+/// "답이 없다" 와 "없어졌다" 를 갈라야 한다 — 워치독은 없어졌으면 끝내야 하지만,
+/// 잠깐 느린 것뿐이면 다음 바퀴에 다시 물어야 한다.
+enum TrackProbe {
+    Alive(songbird::tracks::TrackState),
+    /// 핸들이 죽었다. 트랙이 끝났거나 드라이버가 사라졌다.
+    Gone,
+    /// 제한 시간 안에 답이 없다. 드라이버가 재연결 중일 수 있다.
+    Slow,
+}
+
+/// 핸들에 상태를 묻되 **영원히 기다리지 않는다.**
+///
+/// songbird 의 `get_info()` 는 드라이버 태스크에 요청을 보내고 답을 기다린다. 드라이버가
+/// 살아는 있는데 재연결 중이면 그 답이 늦거나 영영 안 온다.
+///
+/// **2026-08-20 22:53 에 실제로 그렇게 멈췄다.** 그때 이 호출이 `sessions` 락 **안에서**
+/// 일어나는 바람에, 답을 기다리는 동안 락이 안 풀려서
+///   - 그 뒤 모든 `sync_guild` 가 막혔고 → 곡을 담아도 재생이 시작되지 않았다(이틀 넘게),
+///   - 종료 정리도 같은 락을 기다리다 제한 시간을 넘겨 재생 위치를 못 저장했다.
+/// 로그에는 에러가 한 줄도 안 남았다. 조용히 멈추는 종류라 제일 나쁘다.
+///
+/// 그래서 규칙이 둘이다 — **락 밖에서 부른다**, 그리고 **기다리는 데 바닥을 둔다.**
+async fn probe_track(handle: &songbird::tracks::TrackHandle) -> TrackProbe {
+    match tokio::time::timeout(TRACK_PROBE_TIMEOUT, handle.get_info()).await {
+        Ok(Ok(info)) => TrackProbe::Alive(info),
+        Ok(Err(_)) => TrackProbe::Gone,
+        Err(_) => TrackProbe::Slow,
+    }
+}
+
 pub struct Session {
     pub handle: TrackHandle,
     pub item_id: String,
@@ -351,14 +386,20 @@ impl Coordinator {
 
     /// 현재 곡의 재생 위치 (시작 오프셋 포함). /현재곡 진행바용.
     pub async fn current_position(&self, guild_id: u64) -> Option<Duration> {
-        {
+        // 핸들만 꺼내고 락을 놓은 뒤에 묻는다 (`probe_track` 주석 참고).
+        let session = {
             let sessions = self.sessions.lock().await;
-            if let Some(s) = sessions.get(&guild_id) {
-                // **물리 계산은 그대로 둔다.** `started_utc` 를 보지 않고 핸들 위치를 쓴다 —
-                // 둘을 통일하려 들면 기존 진행바가 틀어진다.
-                let info = s.handle.get_info().await.ok()?;
-                return Some(s.start_offset + info.position);
-            }
+            sessions
+                .get(&guild_id)
+                .map(|s| (s.handle.clone(), s.start_offset))
+        };
+        if let Some((handle, start_offset)) = session {
+            // **물리 계산은 그대로 둔다.** `started_utc` 를 보지 않고 핸들 위치를 쓴다 —
+            // 둘을 통일하려 들면 기존 진행바가 틀어진다.
+            let TrackProbe::Alive(info) = probe_track(&handle).await else {
+                return None;
+            };
+            return Some(start_offset + info.position);
         }
         let virtuals = self.virtual_sessions.lock().await;
         virtuals.get(&guild_id).map(|v| v.position())
@@ -860,19 +901,24 @@ impl Coordinator {
 
             // 같은 곡이 이미 재생 중이면 볼륨/일시정지만 동기화.
             {
-                let sessions = self.sessions.lock().await;
-                if let Some(s) = sessions.get(&guild_id) {
-                    if s.item_id == current.id {
-                        if let Ok(info) = s.handle.get_info().await {
-                            use songbird::tracks::PlayMode;
-                            let playing =
-                                matches!(info.playing, PlayMode::Play | PlayMode::Pause);
-                            if playing {
-                                drop(sessions);
-                                self.apply_volume(guild_id, state.effective_volume).await;
-                                self.apply_pause(guild_id, state.is_paused).await;
-                                return;
-                            }
+                // 핸들만 꺼내고 **락을 놓은 뒤에** 묻는다. 예전에는 락을 쥔 채 기다렸고,
+                // 답이 안 오는 순간 이 길드의 재생이 통째로 멈췄다 (`probe_track` 주석).
+                let same_track = {
+                    let sessions = self.sessions.lock().await;
+                    sessions
+                        .get(&guild_id)
+                        .filter(|s| s.item_id == current.id)
+                        .map(|s| s.handle.clone())
+                };
+                if let Some(handle) = same_track {
+                    // 답이 늦으면(`Slow`) 아래로 내려가 다시 튼다. 예전 `Err` 갈래와 같은
+                    // 처리다 — 모르는 채로 손 놓고 있는 것보다 다시 트는 편이 낫다.
+                    if let TrackProbe::Alive(info) = probe_track(&handle).await {
+                        use songbird::tracks::PlayMode;
+                        if matches!(info.playing, PlayMode::Play | PlayMode::Pause) {
+                            self.apply_volume(guild_id, state.effective_volume).await;
+                            self.apply_pause(guild_id, state.is_paused).await;
+                            return;
                         }
                     }
                 }
@@ -1152,16 +1198,23 @@ impl Coordinator {
             let mut stalled_for = 0u32;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                let info = {
+                let handle = {
                     let sessions = coordinator.sessions.lock().await;
                     match sessions.get(&guild_id) {
                         // 세대 번호로 식별 — seek/replay 로 같은 곡을 다시 시작한 경우
                         // 옛 워치독이 새 세션을 감시하는 중복을 막는다.
-                        Some(s) if s.generation == generation => s.handle.get_info().await.ok(),
+                        Some(s) if s.generation == generation => s.handle.clone(),
                         _ => return, // 다른 곡/새 세션으로 넘어감 — 워치독 종료.
                     }
                 };
-                let Some(info) = info else { return }; // 트랙 종료됨.
+                // 락을 놓고 묻는다. 여기서 락을 쥔 채 기다리면 재생 전체가 멈춘다.
+                let info = match probe_track(&handle).await {
+                    TrackProbe::Alive(info) => info,
+                    TrackProbe::Gone => return, // 트랙 종료됨.
+                    // 잠깐 늦은 것뿐이다. 끝내지 않고 다음 바퀴에 다시 묻는다 —
+                    // 여기서 return 하면 재연결 한 번에 워치독이 사라진다.
+                    TrackProbe::Slow => continue,
+                };
                 use songbird::tracks::PlayMode;
                 match info.playing {
                     PlayMode::Pause => {
@@ -1419,5 +1472,69 @@ impl VoiceEventHandler for TrackErrorHandler {
             )
             .await;
         None
+    }
+}
+
+#[cfg(test)]
+mod lock_discipline_tests {
+    //! **세션 락을 쥔 채로 드라이버에 물으면 안 된다.**
+    //!
+    //! 2026-08-20 22:53 에 그 하나로 재생이 이틀 넘게 멈췄다. `sessions` 락 안에서
+    //! `get_info()` 를 기다렸는데 드라이버가 재연결 중이라 답이 안 왔고, 그러면
+    //!   - 이후 모든 `sync_guild` 가 그 락에서 막혀 곡을 담아도 재생이 시작되지 않고,
+    //!   - 종료 정리도 같은 락을 기다리다 제한 시간을 넘겨 재생 위치를 못 저장한다.
+    //!
+    //! **에러가 한 줄도 안 남는다.** 그래서 사람 눈으로는 다시 놓치기 쉽고,
+    //! 실행으로도 못 잡는다(교착은 재현 조건이 타이밍이다). 소스를 직접 읽는 이유다.
+
+    /// 락 가드가 살아 있는 동안 `get_info()` 를 기다리는 자리를 찾는다.
+    ///
+    /// 완벽한 파서가 아니다 — 중괄호 깊이만 센다. 그래도 이 파일에서 실제로 난 사고를
+    /// 잡기에는 충분하고, 새 코드가 같은 모양을 만들면 걸린다.
+    #[test]
+    fn no_driver_call_while_holding_the_session_lock() {
+        const SOURCE: &str = include_str!("coordinator.rs");
+        let lines: Vec<&str> = SOURCE.lines().collect();
+        let mut bad = Vec::new();
+
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains("sessions.lock().await") {
+                continue;
+            }
+            // 그 줄에서 바로 값을 꺼내 쓰는 형태(`...lock().await.keys()`)는 가드가 안 남는다.
+            if line.trim_end().ends_with(';') && !line.contains("let ") {
+                continue;
+            }
+            let mut depth = 0i32;
+            for (offset, probe) in lines.iter().enumerate().skip(index) {
+                if offset > index {
+                    // 가드를 명시적으로 놓았으면 거기서 끝.
+                    if probe.contains("drop(sessions)") || probe.contains("drop(virtuals)") {
+                        break;
+                    }
+                    if probe.contains(".get_info()") {
+                        bad.push(format!("{}행: {}", offset + 1, probe.trim()));
+                        break;
+                    }
+                }
+                depth += probe.matches('{').count() as i32;
+                depth -= probe.matches('}').count() as i32;
+                /* 가드를 만든 블록이 닫혔다.
+                 *
+                 * `< 0` 이지 `<= 0` 이 아니다. 락을 잡는 줄에서 깊이는 **이미 0**이다
+                 * (가드를 감싼 중괄호는 그 앞에서 열렸다). `<= 0` 으로 두면 바로 다음 줄에서
+                 * 멈춰 아무것도 못 본다 — 실제로 그렇게 썼다가 반증 검사에서 걸렸다. */
+                if offset > index && depth < 0 {
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            bad.is_empty(),
+            "세션 락을 쥔 채 드라이버에 묻고 있다 — 답이 늦으면 이 길드의 재생이 통째로 멈춘다.\n\
+             핸들을 복제해 락을 놓은 뒤 `probe_track` 으로 물어라.\n  {}",
+            bad.join("\n  ")
+        );
     }
 }
