@@ -571,6 +571,20 @@ pub fn broadcast_restarting(state: &Arc<WebState>) {
 }
 
 /// 한 사람에게만 보낸다. 개인화된 payload(내 표·내 보관함)는 전체로 뿌리면 안 된다.
+
+/// 이 투표 변화가 개인 보관함의 `👍 좋아요` 목록을 바꾸는가.
+///
+/// `store.set_vote` 가 좋아요·슈퍼일 때 `Liked` 행을 넣고 그 밖이면 지우므로, 목록에
+/// 드나드는 경계는 "좋아요 계열이었나 → 좋아요 계열인가" 하나뿐이다.
+///
+/// **좋아요 ↔ 슈퍼 전환은 바뀌지 않는다.** 둘 다 목록에 있는 상태라, 여기서 참을 주면
+/// 화면이 `/state/cold`(멤버 전수 순회 + 쿼리 여러 개)를 헛되이 다시 돌린다.
+fn liked_membership_changed(previous: Option<QueueVoteKind>, next: Option<QueueVoteKind>) -> bool {
+    let in_library =
+        |vote: Option<QueueVoteKind>| matches!(vote, Some(QueueVoteKind::Like | QueueVoteKind::SuperLike));
+    in_library(previous) != in_library(next)
+}
+
 fn emit_to(state: &WebState, guild_id: u64, user_id: u64, topic: &str, data: Value) {
     let _ = state.remote_events.send(RemoteEvent {
         guild_id,
@@ -5731,6 +5745,26 @@ async fn api_vote(
         );
     } else if was_super && !is_super {
         state.app.remote.refund_super_like(guild_id, ctx.user_id());
+    }
+
+    /* 좋아요는 개인 보관함(`👍 좋아요`)도 바꾼다 — **그 사실을 화면에 알려야 한다.**
+     *
+     * `store.set_vote` 는 좋아요/슈퍼일 때 `remote_user_tracks` 에 `Liked` 행을 같이 넣고
+     * 뗄 때 지운다. 그러니까 **저장은 원래부터 잘 되고 있었다.** 그런데 화면의 보관함은
+     * `/state/cold` 의 `liked` 로만 채워지고, 그걸 다시 받아오는 신호는 `library` 이벤트
+     * 하나뿐이다(`portal.js`: `what === 'library' → refetchCold()`).
+     *
+     * 투표 핸들러는 `queue`·`playback` 만 쏘고 `library` 는 한 번도 안 쐈다. 그래서
+     * **좋아요를 눌러도 새로고침하기 전까지는 보관함에 안 나타났다.** DB 에는 들어가 있는데
+     * 화면만 모르는, 눈으로는 "등록이 안 된다" 로 보이는 상태다.
+     *
+     * 개인 보관함이라 본인에게만 보낸다 (`/library` 와 같은 규칙 — 전체로 뿌리면 좋아요
+     * 한 번에 접속자 전원이 `/state/cold` 를 다시 돌린다).
+     *
+     * 목록에 드나든 경우에만 보낸다. 좋아요 → 슈퍼처럼 둘 다 `Liked` 인 전환은 목록이
+     * 안 바뀌므로 헛되이 `/state/cold` 를 돌릴 이유가 없다. */
+    if liked_membership_changed(previous, kind) {
+        emit_bare_to(&state, guild_id, ctx.user_id(), "library");
     }
 
     // §22.3 투표 통계 — 누른 것(`*_give`)과 받은 것(`*_recv`)을 같이 센다.
@@ -12986,6 +13020,32 @@ mod tests {
     // ══════════════ V3 §10.2 — 투표 종류 ══════════════
 
     #[test]
+    /// 좋아요를 눌렀는데 보관함이 안 바뀌던 것 (§12.2).
+    ///
+    /// 저장은 원래부터 잘 됐다 — `store.set_vote` 가 `Liked` 행을 같이 넣는다. 문제는
+    /// **화면에 알리지 않은 것**이었다. 보관함 목록은 `/state/cold` 로만 오고 그걸 다시
+    /// 받아오는 신호는 `library` 이벤트뿐인데, 투표 핸들러는 그걸 한 번도 안 보냈다.
+    /// 그래서 새로고침하기 전까지 "눌러도 등록이 안 된다" 로 보였다.
+    #[test]
+    fn a_vote_tells_the_library_only_when_the_list_actually_changes() {
+        use QueueVoteKind::{Dislike, Like, SuperLike};
+        // 목록에 들어가고 나가는 전환 — 알려야 한다.
+        assert!(liked_membership_changed(None, Some(Like)));
+        assert!(liked_membership_changed(None, Some(SuperLike)));
+        assert!(liked_membership_changed(Some(Like), None));
+        assert!(liked_membership_changed(Some(SuperLike), None));
+        assert!(liked_membership_changed(Some(Dislike), Some(Like)));
+        assert!(liked_membership_changed(Some(Like), Some(Dislike)));
+
+        // 목록이 그대로인 전환 — 헛되이 `/state/cold` 를 돌리지 않는다.
+        assert!(!liked_membership_changed(Some(Like), Some(SuperLike)));
+        assert!(!liked_membership_changed(Some(SuperLike), Some(Like)));
+        assert!(!liked_membership_changed(None, Some(Dislike)));
+        assert!(!liked_membership_changed(Some(Dislike), None));
+        assert!(!liked_membership_changed(None, None));
+        assert!(!liked_membership_changed(Some(Like), Some(Like)));
+    }
+
     fn vote_kinds_round_trip_through_the_api_key() {
         for kind in [
             QueueVoteKind::Like,
