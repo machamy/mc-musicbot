@@ -2629,6 +2629,8 @@ async function runSearch() {
     searchSource = found.source;
     searchedQuery = query;
     renderSearchResults();
+    // 결과를 먼저 그리고 나서 묻는다 — 물어보는 동안에도 곡 하나는 이미 담을 수 있다.
+    await offerPlaylist(found.playlist);
   } catch (error) {
     clear(el.searchResults).appendChild(emptyState(
       '⚠', '검색하지 못했어요', error.message,
@@ -2653,8 +2655,41 @@ async function searchTracks(query, provider) {
   return {
     results: data?.results || [],
     note: data?.note || '',
+    // `watch?v=..&list=..` 처럼 재생목록이 딸려 온 링크면 서버가 곡 수까지 세어 준다.
+    playlist: data?.playlist || null,
     source: browserSearchReady(query) ? 'fallback' : 'server',
   };
+}
+
+/* 링크에 재생목록이 딸려 있으면 통째로 담을지 물어본다 (§15.4).
+ *
+ * 예전에는 `watch?v=..&list=..` 를 붙여넣으면 **그 영상 한 곡만** 담기고 재생목록은
+ * 조용히 버려졌다. 그런 게 있다는 사실조차 화면에 안 나타나서, 통째로 담고 싶으면
+ * 재생목록 주소를 따로 구해 와야 했다.
+ *
+ * **묻기만 하고 기본은 안 바꾼다** — 취소하면 예전처럼 그 곡 하나만 담는 화면이 그대로다. */
+async function offerPlaylist(playlist) {
+    if (!playlist || !playlist.url || !(playlist.total > 1)) return;
+    if (!can('bulkEnqueue')) return;          // 권한이 없으면 물어봐야 헛일이다
+    const ok = await confirmSheet({
+      title: `재생목록도 담을까요`,
+      desc: `이 링크에는 ${playlist.total}곡짜리 재생목록이 같이 들어 있어요. `
+        + '전부 담으면 순서대로 대기열에 들어가요. 한 번에 담는 양에는 상한이 있어요.',
+      confirmText: `${playlist.total}곡 전부 담기`,
+      cancelText: '이 곡만',
+    });
+    if (!ok) return;
+    // 담긴 결과는 서버가 `broadcast_queue` 로 바로 밀어 준다 — 여기서 다시 받아올 게 없다.
+    //
+    // **몇 곡이 담겼는지 정확히 말한다.** 상한·중복·차단으로 일부만 들어가는 일이 흔한데
+    // "담았어요" 로만 끝내면 15곡을 눌렀는데 5곡만 들어온 것을 고장으로 읽는다.
+    // 차트 전부 담기와 같은 문구 규칙을 쓴다.
+    const result = await call(() => api('/queue/collection', { body: { url: playlist.url } }));
+    if (!result) return;
+    const added = result.added ?? 0;
+    if (result.limited) toast(`대기열 한도까지 ${added}곡만 담았어요.`, 'warn');
+    else if (result.skipped) toast(`${added}곡을 담았어요. ${result.skipped}곡은 이미 있거나 담을 수 없어요.`, 'ok');
+    else toast(`${added}곡을 담았어요.`, 'ok');
 }
 
 /* ── 대기열 안에서 바로 찾기 (C안) ── */

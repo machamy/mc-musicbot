@@ -657,6 +657,11 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/api/guilds/{guild_id}/queue",
             get(api_queue_page).post(api_enqueue),
         )
+        // 링크에 딸려 온 재생목록 통째로 담기 (§15.4)
+        .route(
+            "/music/api/guilds/{guild_id}/queue/collection",
+            post(api_enqueue_collection),
+        )
         // 통계 (V3 §22.6) · 사람 카드 (V3 §24.2)
         .route("/music/api/guilds/{guild_id}/stats/me", get(api_stats_me))
         .route(
@@ -4523,6 +4528,8 @@ async fn api_search(
         Some("YouTubeMusic") => ProviderKind::YouTubeMusic,
         _ => ProviderKind::YouTube,
     };
+    // `watch?v=..&list=..` 처럼 곡과 재생목록이 같이 온 링크의 `(목록 주소, 곡 수)`.
+    let mut playlist_hint: Option<(String, usize)> = None;
     let results = if crate::media::resolver::can_resolve(input) {
         match crate::media::resolver::resolve(input) {
             Ok(crate::media::resolver::Resolved::Collection(collection)) => state
@@ -4533,13 +4540,34 @@ async fn api_search(
                 .into_iter()
                 .take(50)
                 .collect(),
-            Ok(crate::media::resolver::Resolved::Track(track)) => state
-                .app
-                .ytdlp()
-                .inspect_track(&track.source_url, track.provider)
-                .await
-                .into_iter()
-                .collect(),
+            Ok(crate::media::resolver::Resolved::Track(track)) => {
+                /* 곡 조회와 재생목록 세기를 **같이** 돌린다.
+                 *
+                 * 순서대로 하면 둘을 더한 만큼 기다린다 — 실측 8.3초였다. 링크를 붙여넣고
+                 * 8초를 기다리는 건 "먹통인가?" 로 읽힌다. 겹쳐 돌리면 느린 쪽 하나로 준다.
+                 *
+                 * 재생목록이 없는 링크(대부분)는 두 번째 미래가 아예 안 만들어지므로
+                 * 예전과 완전히 같은 비용이다. */
+                let list_url = track
+                    .playlist_id
+                    .as_ref()
+                    .map(|id| format!("https://www.youtube.com/playlist?list={id}"));
+                // `ytdlp()` 가 만드는 임시값을 미래보다 오래 살려 둔다.
+                let ytdlp = state.app.ytdlp();
+                let inspect = ytdlp.inspect_track(&track.source_url, track.provider);
+                match list_url {
+                    Some(url) => {
+                        let expand = ytdlp.expand_collection(&url, ProviderKind::YouTube);
+                        let (found, listed) = tokio::join!(inspect, expand);
+                        // 한 곡짜리는 물어볼 값이 없다. 그 곡은 이미 결과에 있다.
+                        if listed.len() > 1 {
+                            playlist_hint = Some((url, listed.len()));
+                        }
+                        found.into_iter().collect()
+                    }
+                    None => inspect.await.into_iter().collect(),
+                }
+            }
             Err(_) => Vec::new(),
         }
     } else {
@@ -4563,7 +4591,17 @@ async fn api_search(
     } else {
         Value::Null
     };
-    json_ok(json!({ "results": values, "note": note }))
+    /* 재생목록이 딸려 온 링크면 **곡 수까지 세어** 같이 준다.
+     *
+     * 예전에는 `list` 를 조용히 버려서 그런 게 있다는 사실조차 화면에 안 나타났다.
+     * 세는 데 몇 초 걸리지만(yt-dlp 한 번), "총 몇 곡인지" 를 모르면 물어볼 수가 없다.
+     * 세다 실패하면 조용히 없던 일로 한다 — 곡 하나는 이미 담을 수 있으니 막을 이유가 없다. */
+    let playlist = match playlist_hint {
+        // 곡을 하나도 못 읽었으면 물어봐야 헛일이다 — 화면에 담을 것 자체가 없다.
+        Some((url, total)) if !values.is_empty() => json!({ "url": url, "total": total }),
+        _ => Value::Null,
+    };
+    json_ok(json!({ "results": values, "note": note, "playlist": playlist }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -10227,6 +10265,20 @@ impl Drop for ChartFetchGuard {
 /// 한 장만 하는 게 핵심이다. 40장을 한 번에 돌리면 프리페치가 yt-dlp 를 몇 분씩
 /// 붙들어서 정작 사람이 검색할 때 밀린다. 10분마다 한 장이면 6시간 캐시 수명 안에
 /// 자주 보는 차트는 늘 따뜻하게 유지된다.
+
+/// 이번 tick 에 미리 받을 차트를 고른다 — **한 번도 못 받은 것 먼저, 그다음 오래 식은 것부터.**
+///
+/// 예전에는 목록 **순서상** 첫 번째 식은 차트를 골랐다. 그러면 앞쪽 차트만 계속 새로 받고
+/// 뒤쪽은 영영 밀린다. 실제로 61장 중 55장이 TTL(30시간)을 넘겼고 제일 오래된 것은
+/// 82시간, SoundCloud 한 장은 377시간이었다.
+///
+/// 시각은 `now_iso()` 가 만든 같은 모양의 UTC 문자열이라 사전순 비교가 곧 시간순이다.
+/// `None`(한 번도 못 받음)은 `Option` 정렬 규칙상 어떤 시각보다도 앞에 온다 — 의도한 순서다.
+fn pick_prefetch_targets<T>(mut stale: Vec<(Option<String>, T)>, limit: usize) -> Vec<T> {
+    stale.sort_by(|a, b| a.0.cmp(&b.0));
+    stale.into_iter().take(limit).map(|(_, item)| item).collect()
+}
+
 pub fn spawn_chart_prefetch(state: &Arc<WebState>) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -10251,32 +10303,60 @@ pub fn spawn_chart_prefetch(state: &Arc<WebState>) {
             {
                 continue;
             }
-            let charts = state.app.remote.list_charts(guild_id);
-            let stale = charts.into_iter().find(|chart| {
-                chart.enabled
-                    && !chart.is_internal()
-                    && state
-                        .app
-                        .remote
-                        .chart_cache(chart.id)
-                        .is_none_or(|snapshot| snapshot.stale)
-            });
-            let Some(chart) = stale else { continue };
-            match fetch_chart_tracks(&state, guild_id, &chart, false).await {
-                Ok(snapshot) => state.app.log.info(
-                    "Chart",
-                    &format!(
-                        "미리 받아 뒀어요: '{}' {}곡 (아무도 안 쓸 때)",
-                        chart.name,
-                        snapshot.tracks.len()
-                    ),
-                ),
-                Err(reason) => state
-                    .app
-                    .log
-                    .info("Chart", &format!("'{}' 미리 받기 실패: {reason}", chart.name)),
+            /* 식은 것부터, 한 tick 에 여러 장.
+             *
+             * 예전에는 목록 **순서상 첫 번째** 식은 차트 한 장만 받았다. 차트가 61장이라
+             * 한 바퀴에 열 시간이 넘게 걸리는데, 그동안 누가 한 번이라도 음악을 틀면 위
+             * `active_guild_ids` 검사에서 통째로 건너뛴다. 실사용 중에는 사실상 못 따라잡는다.
+             *
+             * 실제로 그렇게 밀렸다 — 61장 중 55장이 30시간(TTL)을 넘겼고 제일 오래된 것은
+             * 82시간이었다. (그 직접적 계기는 v4.46 에서 고친 세션 락 교착이다. 위
+             * `active_guild_ids()` 가 바로 그 락을 잡는 함수라 프리페치가 이틀 넘게
+             * 첫 줄에서 멈춰 있었다.)
+             *
+             * 그래서 둘을 바꾼다 — **제일 오래 식은 것부터** 고르고, 유휴일 때 몇 장을
+             * 이어서 받는다. 한 장 받을 때마다 재생이 시작됐는지 다시 보고, 시작했으면
+             * 즉시 물러난다. 사람이 듣기 시작하면 yt-dlp 를 다투지 않는다는 원칙은 그대로다. */
+            const PREFETCH_BATCH: usize = 3;
+
+            let mut stale: Vec<(Option<String>, crate::remote::models::ChartDef)> = state
+                .app
+                .remote
+                .list_charts(guild_id)
+                .into_iter()
+                .filter(|chart| chart.enabled && !chart.is_internal())
+                .filter_map(|chart| match state.app.remote.chart_cache(chart.id) {
+                    // 한 번도 못 받은 것이 제일 급하다 — `None` 이 정렬에서 맨 앞으로 간다.
+                    None => Some((None, chart)),
+                    Some(snapshot) if snapshot.stale => Some((Some(snapshot.fetched_utc), chart)),
+                    Some(_) => None,
+                })
+                .collect();
+            if stale.is_empty() {
+                continue;
             }
-            return; // 한 tick 에 한 장만.
+
+            for chart in pick_prefetch_targets(stale, PREFETCH_BATCH) {
+                // 받는 사이에 누가 틀었으면 거기서 그만둔다.
+                if !state.app.coordinator.active_guild_ids().await.is_empty() {
+                    return;
+                }
+                match fetch_chart_tracks(&state, guild_id, &chart, false).await {
+                    Ok(snapshot) => state.app.log.info(
+                        "Chart",
+                        &format!(
+                            "미리 받아 뒀어요: '{}' {}곡 (아무도 안 쓸 때)",
+                            chart.name,
+                            snapshot.tracks.len()
+                        ),
+                    ),
+                    Err(reason) => state
+                        .app
+                        .log
+                        .info("Chart", &format!("'{}' 미리 받기 실패: {reason}", chart.name)),
+                }
+            }
+            return; // 한 tick 에 한 서버만.
         }
     });
 }
@@ -10830,6 +10910,85 @@ async fn fetch_chart_tracks(
 }
 
 /// `POST .../charts/{id}/enqueue` — 전부 담기. `bulkEnqueue` 권한 (V3 §15.4).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionEnqueueRequest {
+    url: String,
+}
+
+/// `POST .../queue/collection` — 링크에 딸려 온 재생목록을 통째로 담는다 (§15.4).
+///
+/// `watch?v=..&list=..` 를 붙여넣으면 예전에는 그 영상 한 곡만 담기고 `list` 는 조용히
+/// 버려졌다. 이제 검색 응답이 `playlist: { url, total }` 을 같이 주고, 사람이 "전체 넣기" 를
+/// 고르면 여기로 온다.
+///
+/// **권한·상한·중복 걸러내기는 차트 전부 담기와 똑같이 간다** — `bulk_enqueue` 를 그대로
+/// 쓴다. 여기서 규칙을 새로 만들면 두 경로가 갈라져서 한쪽만 상한이 새는 일이 생긴다.
+async fn api_enqueue_collection(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<CollectionEnqueueRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = ctx.require(
+        "bulkEnqueue",
+        ctx.settings.bulk_enqueue_rule,
+        "재생목록을 통째로 담을 권한이 없어요.",
+    ) {
+        return response;
+    }
+    if let Err(response) = ctx.require_not_suspended(SuspensionScope::Queue) {
+        return response;
+    }
+    // **주소는 우리가 다시 푼다.** 클라이언트가 준 문자열을 그대로 yt-dlp 에 넘기면
+    // 그게 곧 임의 주소 실행이다. 재생목록으로 해석되는 주소만 통과시킨다.
+    let collection = match crate::media::resolver::resolve(request.url.trim()) {
+        Ok(crate::media::resolver::Resolved::Collection(collection)) => collection,
+        _ => return json_error(StatusCode::BAD_REQUEST, "재생목록 주소가 아니에요."),
+    };
+    let tracks = state
+        .app
+        .ytdlp()
+        .expand_collection(&collection.source_url, collection.provider)
+        .await;
+    if tracks.is_empty() {
+        return json_error(StatusCode::BAD_GATEWAY, "재생목록에서 곡을 못 읽었어요.");
+    }
+
+    let player = state.app.player.get_state(guild_id).await;
+    let existing: HashSet<String> = player
+        .current_item
+        .iter()
+        .chain(player.upcoming.iter())
+        .map(|item| item.track.cache_key())
+        .collect();
+    let outcome = bulk_enqueue(&state, &ctx, &tracks, &existing, &player, "재생목록").await;
+    if outcome.added > 0 {
+        let titles: Vec<String> = tracks
+            .iter()
+            .take(200)
+            .map(|track| track.display_title().to_string())
+            .collect();
+        let _ = state.app.remote.add_audit_bulk(
+            guild_id,
+            ctx.user_id(),
+            &ctx.session.display_name,
+            "playlist.enqueue",
+            Some(&collection.collection_id),
+            outcome.added as u32,
+            &titles,
+        );
+        emit_bare(&state, guild_id, "audit");
+        broadcast_queue(&state, guild_id).await;
+    }
+    json_ok(outcome.to_json())
+}
+
 async fn api_chart_enqueue(
     State(state): State<Arc<WebState>>,
     cookies: Cookies,
@@ -13027,6 +13186,34 @@ mod tests {
     /// 받아오는 신호는 `library` 이벤트뿐인데, 투표 핸들러는 그걸 한 번도 안 보냈다.
     /// 그래서 새로고침하기 전까지 "눌러도 등록이 안 된다" 로 보였다.
     #[test]
+    /// 프리페치는 **제일 오래 식은 것부터** 집는다.
+    ///
+    /// 순서상 앞의 것만 계속 집으면 뒤쪽 차트가 영영 안 갱신된다. 실제로 그렇게 밀려서
+    /// 61장 중 55장이 TTL 을 넘겼고, 한 장은 377시간(15일) 전 것이었다.
+    #[test]
+    fn prefetch_takes_the_stalest_first() {
+        let at = |s: &str| Some(s.to_string());
+        let rows = vec![
+            (at("2026-08-22T10:00:00+00:00"), "어제것"),
+            (None, "한번도못받음"),
+            (at("2026-08-01T10:00:00+00:00"), "제일오래됨"),
+            (at("2026-08-23T10:00:00+00:00"), "방금"),
+        ];
+        assert_eq!(
+            pick_prefetch_targets(rows, 3),
+            vec!["한번도못받음", "제일오래됨", "어제것"],
+        );
+    }
+
+    /// 상한을 넘겨 달라고 해도 있는 만큼만 준다. 빈 목록도 안 터진다.
+    #[test]
+    fn prefetch_never_asks_for_more_than_there_is() {
+        let rows: Vec<(Option<String>, &str)> = vec![(None, "하나")];
+        assert_eq!(pick_prefetch_targets(rows, 5), vec!["하나"]);
+        let empty: Vec<(Option<String>, &str)> = Vec::new();
+        assert!(pick_prefetch_targets(empty, 3).is_empty());
+    }
+
     fn a_vote_tells_the_library_only_when_the_list_actually_changes() {
         use QueueVoteKind::{Dislike, Like, SuperLike};
         // 목록에 들어가고 나가는 전환 — 알려야 한다.

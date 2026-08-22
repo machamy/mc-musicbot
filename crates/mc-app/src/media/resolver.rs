@@ -10,6 +10,16 @@ pub struct ResolvedTrack {
     pub provider: ProviderKind,
     pub content_id: String,
     pub source_url: String,
+    /// 같은 URL 에 딸려 온 재생목록 id (`watch?v=..&list=..`).
+    ///
+    /// **기본 동작은 안 바꾼다** — 이런 링크는 예전처럼 그 영상 한 곡으로 푼다.
+    /// 다만 예전에는 `list` 를 **조용히 버려서**, 재생목록을 통째로 담고 싶어도 그런 게
+    /// 있다는 사실조차 화면에 안 나타났다. 여기에 실어 두면 호출부가
+    /// "이 재생목록도 담을까요?" 를 물어볼 수 있다.
+    ///
+    /// `RD`(자동 생성 믹스/라디오)는 담지 않는다 — 사람이 만든 목록이 아니라
+    /// 그 곡에서 파생된 무한 스트림이라 "총 몇 곡" 이라는 말이 성립하지 않는다.
+    pub playlist_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +159,7 @@ pub fn resolve(input: &str) -> Result<Resolved, String> {
             provider: ProviderKind::YouTube,
             content_id: id.clone(),
             source_url: format!("https://www.youtube.com/watch?v={id}"),
+            playlist_id: None,
         }));
     }
     if is_youtube_host(&url.host) {
@@ -179,6 +190,9 @@ pub fn resolve(input: &str) -> Result<Resolved, String> {
                 provider,
                 content_id: id.clone(),
                 source_url: format!("{base}{id}"),
+                // `RD…` 는 유튜브가 그 곡에서 만들어 내는 무한 라디오다. 목록이 아니라
+                // 스트림이라 "총 몇 곡" 이 없으므로 물어볼 것도 없다.
+                playlist_id: list.filter(|id| !id.starts_with("RD")),
             }));
         }
         if url.path.starts_with("/shorts/") || url.path.starts_with("/embed/") {
@@ -195,6 +209,7 @@ pub fn resolve(input: &str) -> Result<Resolved, String> {
                     provider: ProviderKind::YouTube,
                     content_id: id.clone(),
                     source_url: format!("https://www.youtube.com/watch?v={id}"),
+                    playlist_id: None,
                 }));
             }
         }
@@ -221,6 +236,7 @@ pub fn resolve(input: &str) -> Result<Resolved, String> {
             // C# 과 동일하게 슬래시 보존 — cache_key 호환 (파일명 정제는 cache.rs 몫).
             content_id: slug.clone(),
             source_url,
+                playlist_id: None,
         }));
     }
     Err(format!("지원하지 않는 공급자입니다: {}", url.host))
@@ -332,5 +348,36 @@ mod tests {
             "YXIz7U42pgk"
         );
         assert!(can_resolve("https://youtu.be/YXIz7U42pgk?si=abc"));
+    }
+
+    /// `watch?v=..&list=..` 는 **곡 하나로 풀되 재생목록도 알려 준다** (§15.4).
+    ///
+    /// 예전에는 `list` 를 조용히 버려서, 통째로 담고 싶어도 그런 게 있다는 사실조차
+    /// 화면에 안 나타났다. 기본 동작(곡 하나)은 그대로 두고 힌트만 얹는다.
+    #[test]
+    fn a_watch_link_with_a_list_keeps_the_track_and_reports_the_playlist() {
+        let got = resolve("https://www.youtube.com/watch?v=dHXC_ahjtEE&list=PL7FnNjteHBFj8uJ70ILqOyfquDw-ewkSW")
+            .expect("풀려야 한다");
+        let Resolved::Track(track) = got else { panic!("곡 하나로 풀려야 한다") };
+        assert_eq!(track.content_id, "dHXC_ahjtEE");
+        assert_eq!(track.playlist_id.as_deref(), Some("PL7FnNjteHBFj8uJ70ILqOyfquDw-ewkSW"));
+    }
+
+    /// **`RD…` 는 물어보지 않는다.** 유튜브가 그 곡에서 만들어 내는 무한 라디오라
+    /// "총 몇 곡" 이 없다. 여기서 걸러 두지 않으면 화면이 있지도 않은 수를 말하게 된다.
+    #[test]
+    fn an_auto_generated_mix_is_not_offered_as_a_playlist() {
+        let got = resolve("https://www.youtube.com/watch?v=abc12345678&list=RDabc12345678")
+            .expect("풀려야 한다");
+        let Resolved::Track(track) = got else { panic!("곡 하나로 풀려야 한다") };
+        assert_eq!(track.playlist_id, None);
+    }
+
+    /// 재생목록 **페이지** 주소는 예전처럼 통째로(Collection) 푼다. 이건 안 바뀐다.
+    #[test]
+    fn a_playlist_page_is_still_a_collection() {
+        let got = resolve("https://www.youtube.com/playlist?list=PL7FnNjteHBFj8uJ70ILqOyfquDw-ewkSW")
+            .expect("풀려야 한다");
+        assert!(matches!(got, Resolved::Collection(_)));
     }
 }
