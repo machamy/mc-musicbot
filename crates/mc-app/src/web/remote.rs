@@ -2858,34 +2858,40 @@ fn autoplay_options_json(
 ) -> Value {
     // **길드 id 를 인자로 받는다.** `player.guild_id` 에 기대면 그 필드가 비는 경로가
     // 하나라도 생겼을 때 후보가 조용히 사라진다 — 호출부는 진짜 id 를 이미 알고 있다.
+    let quiet = json!({ "resolving": false, "items": [] });
     if !player.autoplay_enabled || !player.upcoming.is_empty() {
-        return json!([]);
+        return quiet;
     }
-    let picked = player.autoplay_preview.as_ref().map(|item| item.id.clone());
-    /* **이미 지나간 곡은 후보에서 뺀다.**
-     *
-     * 미리보기가 소비되어 지금 곡이 되고 나면, 새 후보가 뽑히기 전까지 잠깐 옛 묶음이
-     * 남는다. 그대로 보여 주면 **지금 나오는 곡이 후보 맨 위에 뜬다** — 화면으로 확인했다.
-     * 그건 "이걸 고르면 다음에 나온다" 는 말과 정면으로 어긋난다. */
+
     let played: HashSet<String> = player
         .current_item
         .iter()
         .chain(player.upcoming.iter())
         .map(|item| item.track.cache_key())
         .collect();
-    let options: Vec<_> = state
-        .app
-        .player
-        .preview_options(guild_id)
-        .into_iter()
-        .filter(|item| !played.contains(&item.track.cache_key()))
-        .collect();
+    let options = state.app.player.preview_options(guild_id);
+
+    /* **지난 판의 잔여는 통째로 안 보여준다.**
+     *
+     * 곡이 넘어가면 후보 중 하나가 그 곡이 된다. 그때 나머지 둘만 남겨 두면 **고를 수
+     * 있는 것처럼 보이다가** 새 추천이 오는 순간 셋이 통째로 바뀐다. 눌러 봐야 곧
+     * 덮어써지니 고를 수 있다는 말 자체가 거짓이다.
+     *
+     * 하나라도 이미 나갔으면 그 묶음은 지난 판의 것이다 — 낱개로 거르지 않고 통째로 접는다.
+     * 대신 **비워 두지 않고 "고르는 중" 이라고 말한다.** 셋이 사라졌다 나타나면 고장으로
+     * 읽히고, 회색으로만 두면 왜 못 누르는지 알 수 없다 (§23.3). */
+    let stale = options
+        .iter()
+        .any(|item| played.contains(&item.track.cache_key()));
+    let resolving = stale || state.app.player.is_preview_resolving(guild_id);
+    if resolving {
+        return json!({ "resolving": true, "items": [] });
+    }
     if options.len() < 2 {
-        /* 하나뿐이면 고를 것이 없다 — 예전처럼 `next` 한 줄만 보여 주면 된다.
+        /* 고를 게 없다 — 예전처럼 `next` 한 줄만 보여 주면 된다.
          *
          * **왜 비었는지 한 번은 말한다.** 후보가 안 보이는데 화면에도 로그에도 아무
-         * 흔적이 없으면 원인을 찾을 길이 없다(실제로 그렇게 한참 헤맸다).
-         * 미리보기는 잡혀 있는데 후보만 없는 경우가 이상한 상태이므로 그때만 남긴다. */
+         * 흔적이 없으면 원인을 찾을 길이 없다(실제로 그렇게 한참 헤맸다). */
         if player.autoplay_preview.is_some() {
             state.app.log.info(
                 "Autoplay",
@@ -2895,26 +2901,26 @@ fn autoplay_options_json(
                 ),
             );
         }
-        return json!([]);
+        return quiet;
     }
-    Value::Array(
-        options
-            .iter()
-            .enumerate()
-            .map(|(at, item)| {
-                let mut row = next_item_json(item);
-                /* 표시가 **반드시 하나는** 있어야 한다. 고른 것이 걸러져 나갔으면 실제로
-                 * 나갈 곡은 첫 번째이므로 거기에 표시한다 — 셋 다 `○` 인 화면은
-                 * "안 고르면 뭐가 나오지?" 를 답하지 못한다(실제로 그렇게 나갔다). */
-                let is_picked = match picked.as_deref() {
-                    Some(id) if options.iter().any(|o| o.id == id) => id == item.id,
-                    _ => at == 0,
-                };
-                row["picked"] = json!(is_picked);
-                row
-            })
-            .collect(),
-    )
+
+    let picked = player.autoplay_preview.as_ref().map(|item| item.id.clone());
+    let items: Vec<Value> = options
+        .iter()
+        .enumerate()
+        .map(|(at, item)| {
+            let mut row = next_item_json(item);
+            /* 표시가 **반드시 하나는** 있어야 한다. 셋 다 `○` 인 화면은
+             * "안 고르면 뭐가 나오지?" 를 답하지 못한다(실제로 그렇게 나갔다). */
+            let is_picked = match picked.as_deref() {
+                Some(id) if options.iter().any(|o| o.id == id) => id == item.id,
+                _ => at == 0,
+            };
+            row["picked"] = json!(is_picked);
+            row
+        })
+        .collect();
+    json!({ "resolving": false, "items": items })
 }
 
 fn next_item_json(item: &QueueItem) -> Value {
@@ -13372,6 +13378,26 @@ mod tests {
     ///
     /// 실행으로는 못 잡는다(각 프레임을 다 띄워 봐야 한다). 소스를 읽는다.
     #[test]
+    /// **지난 판의 잔여를 고를 수 있는 것처럼 보여 주지 않는다** (§8.6).
+    ///
+    /// 곡이 넘어가면 후보 중 하나가 그 곡이 된다. 그때 나머지 둘만 남기면 고를 수 있는
+    /// 것처럼 보이다가 새 추천이 오는 순간 셋이 통째로 바뀐다 — 눌러 봐야 곧 덮어써지니
+    /// "고를 수 있다" 는 말 자체가 거짓이다. 하나라도 이미 나갔으면 그 묶음은 접는다.
+    #[test]
+    fn a_leftover_option_set_is_folded_not_trimmed() {
+        // 규칙 자체를 여기서 못 박는다 — 서버 상태를 통째로 만들지 않고 조건만 본다.
+        let already_played = |keys: &[&str], options: &[&str]| -> bool {
+            let played: std::collections::HashSet<&str> = keys.iter().copied().collect();
+            options.iter().any(|key| played.contains(key))
+        };
+        // 후보 하나가 지금 나오는 곡이 됐다 → 지난 판이다.
+        assert!(already_played(&["a"], &["a", "b", "c"]));
+        // 아무도 안 나갔다 → 이번 판이다.
+        assert!(!already_played(&["z"], &["a", "b", "c"]));
+        // 대기열에 담긴 곡이 후보에 있어도 지난 판으로 본다 — 어차피 그 곡은 곧 나간다.
+        assert!(already_played(&["z", "c"], &["a", "b", "c"]));
+    }
+
     fn every_frame_that_carries_next_also_carries_the_options() {
         const SOURCE: &str = include_str!("remote.rs");
         let mut missing = Vec::new();

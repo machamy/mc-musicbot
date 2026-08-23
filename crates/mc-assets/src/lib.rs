@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn version_hash_is_pinned() {
-        assert_eq!(version(), "21de184c485508ef");
+        assert_eq!(version(), "d6458460e61bb606");
     }
 
     /// 이름과 바이트가 서로 **뒤바뀌어도** 버전 해시는 그대로다(같은 것을 다 더하므로).
@@ -301,7 +301,7 @@ mod tests {
             ),
             (
                 "portal.css",
-                "6636a737856d13526345a4d831b53732b975c75e7349cf7f2e5c8d4869f31112",
+                "d56e96e387085419aaa1f05c6d9165a7dd873f7f664e2ba962ec93aa2a67aac6",
             ),
             (
                 "console.css",
@@ -317,7 +317,7 @@ mod tests {
             ),
             (
                 "portal.js",
-                "1dd70e4c6fc97c5f66e10038587203116bf0a0a3cd71fc7e89d8a5e30818463e",
+                "9bf550e21abfb7702bc3173587443cadd79045a774dd3d392e34e2d3508474c6",
             ),
             (
                 "console.js",

@@ -4984,7 +4984,11 @@ function renderSkipButton(offline, offlineReason) {
  *
  * 아무나 고를 수 있다. 마지막에 누른 사람의 선택이 남고 누가 골랐는지는 활동 기록에 남는다. */
 function renderNextOptions(state) {
-  const options = state.nextOptions || [];
+  /* 서버가 `{ resolving, items }` 로 준다. 곡이 막 넘어가 다음 판을 고르는 중이면
+   * `resolving` 이 참이고 `items` 는 비어 있다 — 지난 판의 잔여를 고를 수 있는 것처럼
+   * 보여 주지 않기 위해서다. */
+  const payload = state.nextOptions || {};
+  const options = payload.items || [];
   /* **권한 키로 잠그지 않는다.** 서버는 뷰어·정지자만 막고 나머지는 아무나 고를 수 있게
    * 열어 두었으니(§8.6) 화면도 같은 규칙이어야 한다.
    *
@@ -4994,7 +4998,16 @@ function renderNextOptions(state) {
   const blocked = tierOf() === 'viewer'
     || state.conn === 'down'
     || (state.suspension && (state.suspension.scope === 'all' || state.suspension.scope === 'queue'));
-  if (options.length < 2 || blocked) { el.nextOptions.hidden = true; return; }
+  if (blocked) { el.nextOptions.hidden = true; return; }
+  if (payload.resolving) {
+    /* **비워 두지 않고 말한다.** 후보 셋이 사라졌다 나타나면 고장으로 읽힌다.
+     * 자리를 지키고 무슨 일이 일어나는 중인지 한 줄로 알려 준다 (§23.3). */
+    el.nextOptions.hidden = false;
+    clear(el.nextOptions);
+    put(el.nextOptions, h('span', { class: 'nextopts__tag' }, '다음 곡 후보를 고르는 중이에요…'));
+    return;
+  }
+  if (options.length < 2) { el.nextOptions.hidden = true; return; }
   el.nextOptions.hidden = false;
   clear(el.nextOptions);
   put(el.nextOptions, h('span', { class: 'nextopts__tag' }, '하나 고르면 그걸로 가요'));
@@ -9869,7 +9882,7 @@ async function loadHot() {
     sortedAt: data.sortedAt || null,
     nextSortAt: data.nextSortAt || null,
     next: data.next || null,
-    nextOptions: data.nextOptions || [],
+    nextOptions: data.nextOptions || {},
     skipVote: data.skipVote || null,
     presence: data.presence || store.get().presence,
     hotAt: Date.now(),

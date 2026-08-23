@@ -1959,11 +1959,21 @@ body[data-dragging="tab"] { user-select: none; }
 .dk-body > .lyrics { display: flex; flex-direction: column; }
 .dk-body > .lyrics .lyrics__view { max-height: none; flex: 1; }
 .dk-body > .now { overflow-y: auto; }
-/* **채팅은 자기 안에서 스크롤한다.** 위의 `.dk-body > *` 규칙(`flex: 1 0 auto`)을 그대로 두면
- * 로그가 내용 높이만큼 늘어나 `.chat__log` 에 오버플로가 생기지 않는다. 그 상태에서도
- * `.chat__log` 는 `overflow-y: auto` + `overscroll-behavior: contain` 이라 휠을 자기가 삼키고
- * 부모(`.dk-body`)로 넘기지도 않는다 — 패널 배치에서만 휠 스크롤이 죽던 이유가 이것이다. */
-.dk-body > .chat { flex: 1 1 0; min-height: 0; }
+/* **자기 안에서 스크롤하는 패널은 늘어나면 안 된다.**
+ *
+ * 위의 `.dk-body > *`(`flex: 1 0 auto; min-height: min-content`)를 그대로 두면 패널이
+ * 내용 높이만큼 늘어나 안쪽 `.scroll` 에 오버플로가 **안 생긴다.** 그 상태에서도
+ * `.scroll` 은 `overflow-y: auto` + `overscroll-behavior: contain` 이라 휠을 자기가
+ * 삼키고 부모(`.dk-body`)로 넘기지도 않는다. 결과는 **휠이 아무 데도 안 먹는 것**이다.
+ *
+ * 예전에는 이 예외가 `.chat` 하나에만 걸려 있었다. 그런데 `.tabpane` 은 **열 개 패널이
+ * 전부 쓰는 껍데기**다(로그·보관함·최근·멤버·대기열·검색·차트…). 채팅만 고쳐 두면
+ * 나머지 아홉에서 같은 증상이 그대로 난다 — 실제로 로그·보관함에서 휠이 죽어 있었다.
+ * 터치도 같다: 늘어난 패널은 관성 스크롤이 걸릴 데가 없다.
+ *
+ * `.tabpane` 은 이미 `flex: 1; min-height: 0` 을 갖고 있으니 여기서는 그 뜻을
+ * `.dk-body` 안에서도 잃지 않게 다시 못 박는 것뿐이다. */
+.dk-body > .tabpane { flex: 1 1 0; min-height: 0; }
 
 /* 드롭 하이라이트 — 어디에 붙을지 끌기 중에 반드시 보여야 한다 */
 .dk-drop {
@@ -3172,7 +3182,11 @@ body.gate {
 }
 /* `다음` 줄 바로 밑에 붙을 때는 그 줄이 이미 위 여백과 테두리를 갖고 있다. */
 .nextrow + .nextopts { margin-top: 0; }
+/* 태그 줄은 설명이다 — 누르는 것이 아니다. 후보가 없을 때는 이 줄만 남는다. */
 .nextopts__tag { color: var(--text-4); font-size: var(--fs-xs); padding: 0 0 2px; }
+/* 후보를 고르는 중이라 줄이 하나뿐일 때 높이가 툭 줄지 않게 최소 높이를 준다 —
+   재생 카드가 곡 넘어갈 때마다 위아래로 흔들리면 그게 더 거슬린다. */
+.nextopts:not(:has(.nextopt)) { min-height: 44px; display: flex; align-items: center; }
 .nextopt {
   display: flex; align-items: center; gap: var(--sp-2);
   min-width: 0;
