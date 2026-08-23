@@ -2824,6 +2824,8 @@ fn playback_payload(
         "botOnline": bot_in_guild(state, player.guild_id),
         // 곡이 바뀌면 다음 곡도 같이 바뀐다 — 같은 프레임에 실어야 화면이 한 번만 움직인다 (V3 §14).
         "next": next_up_json(player),
+        // 다음 곡이 바뀌면 후보의 `●` 자리도 같이 바뀐다. 한 프레임에 실어야 어긋나지 않는다.
+        "nextOptions": autoplay_options_json(state_ref, player.guild_id, player),
     })
 }
 
@@ -2978,6 +2980,12 @@ async fn broadcast_queue(state: &Arc<WebState>, guild_id: u64) {
             // 카운트다운이 0이 되는 순간과 다음 곡 줄이 한 번에 움직여 인과가 보인다.
             // 이게 없으면 길드 감시 태스크가 최대 2초 뒤에 `playback` 으로 따라잡는다.
             "next": next_up_json(&player),
+            /* **후보도 같은 프레임에 실어야 한다.**
+             *
+             * 예전에는 `next` 만 실었다. 그래서 누가 후보를 고르면 다음 곡 줄은 바뀌는데
+             * `●` 표시는 옛 자리에 그대로 남았다 — 후보 목록이 `/state/hot` 에서만 오니까
+             * 새로고침 전까지 갱신될 길이 없었다. 화면으로 확인한 증상이다. */
+            "nextOptions": autoplay_options_json(state, guild_id, &player),
         }),
     );
 }
@@ -4278,6 +4286,7 @@ async fn api_state(
         "queue": queue,
         "queueTotal": player.upcoming.len(),
         "next": next_up_json(&player),
+        "nextOptions": autoplay_options_json(&state, guild_id, &player),
         "settings": ctx.settings,
         "permissions": permissions_json(&state, &ctx),
         "serverTimeUtc": sampled_at,
@@ -13353,6 +13362,42 @@ mod tests {
         assert_eq!(pick_prefetch_targets(rows, 5), vec!["하나"]);
         let empty: Vec<(Option<String>, &str)> = Vec::new();
         assert!(pick_prefetch_targets(empty, 3).is_empty());
+    }
+
+    /// **`next` 를 싣는 프레임은 후보도 같이 실어야 한다** (§8.6).
+    ///
+    /// 후보 목록은 `/state/hot` 에서만 오고 브로드캐스트에는 없었다. 그래서 누가 후보를
+    /// 고르면 다음 곡 줄은 바뀌는데 `●` 표시는 옛 자리에 남았다 — 새로고침 전까지
+    /// 갱신될 길이 없었다. 둘이 **같은 값의 두 얼굴**이라 한 프레임에 있어야 한다.
+    ///
+    /// 실행으로는 못 잡는다(각 프레임을 다 띄워 봐야 한다). 소스를 읽는다.
+    #[test]
+    fn every_frame_that_carries_next_also_carries_the_options() {
+        const SOURCE: &str = include_str!("remote.rs");
+        let mut missing = Vec::new();
+        for (index, line) in SOURCE.lines().enumerate() {
+            if !line.contains("\"next\": next_up_json(") {
+                continue;
+            }
+            // 같은 JSON 리터럴 안(뒤쪽 몇 줄)에 후보가 같이 있어야 한다.
+            let near: String = SOURCE
+                .lines()
+                .skip(index)
+                .take(12)
+                .collect::<Vec<_>>()
+                .join("
+");
+            if !near.contains("\"nextOptions\"") {
+                missing.push(format!("{}행: {}", index + 1, line.trim()));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "`next` 만 싣고 후보를 빠뜨린 프레임이 있다 — 고르면 다음 곡은 바뀌는데              화면의 `●` 는 안 따라간다.
+  {}",
+            missing.join("
+  ")
+        );
     }
 
     fn a_vote_tells_the_library_only_when_the_list_actually_changes() {
