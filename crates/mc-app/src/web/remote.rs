@@ -775,10 +775,15 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/api/guilds/{guild_id}/autoplay/blocked/remove",
             post(api_autoplay_blocked_remove),
         )
-        // `📻 이 곡 말고` (V3 §8.5-3 · §14.3) — 잡혀 있는 다음 추천곡을 7일간 막고 다시 뽑는다.
+        // `🚫 이 곡은 그만` (V3 §8.5-3 · §14.3) — 잡혀 있는 다음 추천곡을 7일간 막고 다시 뽑는다.
         .route(
             "/music/api/guilds/{guild_id}/autoplay/reroll",
             post(api_autoplay_reroll),
+        )
+        // `🎲 후보 다시 뽑기` (§8.6) — 후보 세 곡을 통째로 새로 고른다. **아무것도 안 막는다.**
+        .route(
+            "/music/api/guilds/{guild_id}/autoplay/refresh",
+            post(api_autoplay_refresh),
         )
         // 추천 바구니 비우기 (V3 §8.7). 기준 곡 권한과 같은 규칙 — 기본값은 모든 멤버.
         .route(
@@ -7929,6 +7934,97 @@ async fn api_autoplay_seeds_reorder(
         }
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
+}
+
+/// `POST .../autoplay/refresh` — `🎲 후보 다시 뽑기` (§8.6).
+///
+/// 후보 세 곡을 **통째로** 새로 고른다. `reroll` 과 갈라 놓은 이유는 하나다 —
+/// **이건 아무것도 막지 않는다.** "지금 이 세 곡이 다 안 당긴다" 와 "이 곡은 앞으로도
+/// 싫다" 는 다른 말인데, 버튼 하나로 두 가지를 같이 하고 있었다. 마음에 안 드는 후보를
+/// 넘길 때마다 7일 차단 목록이 조용히 불어나서, 나중에는 왜 그 곡이 안 나오는지
+/// 아무도 설명할 수 없게 된다.
+async fn api_autoplay_refresh(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = autoplay_gate(&ctx) {
+        return response;
+    }
+    /* **기다리지 않는다.** `refresh_preview` 는 `resolve_preview` 를 통해 yt-dlp 추천을
+     * 통째로 돌린다. 추천은 직렬화돼 있어 10~20초씩 걸리고, 그걸 요청 안에서 await 하면
+     * 버튼이 그동안 계속 도는 것으로 보인다. 설정 저장 경로가 이미 같은 이유로 떼어
+     * 던지고 있다(아래 `api_settings_save`).
+     *
+     * 떼어 던져도 화면이 비지 않는다 — 후보 목록을 **먼저 비우고** 그 상태로 한 프레임을
+     * 보내면 리모컨이 `다음 곡 후보를 고르는 중이에요…` 를 띄우고(§8.6), 추천이 끝나면
+     * `resolve_preview` 가 `on_queue_sorted` 훅으로 스스로 다시 알린다. */
+    /* **다시 뽑았다는 사실 자체를 입력에 섞는다.**
+     *
+     * 추천 RNG 는 10분 슬롯으로 돈다(`DeterministicRng::now`). 그래서 그냥 비우고 다시
+     * 뽑으면 입력이 하나도 안 바뀌어 **똑같은 세 곡**이 그대로 돌아온다 — 눌러도 아무
+     * 일이 안 일어나는 것처럼 보인다. 옛 `이 곡 말고` 가 7일 차단을 해야만 했던 이유가
+     * 이것이었다. 차단 말고 소금으로 푼다. */
+    state.app.player.bump_reroll_salt(guild_id);
+    state.app.player.clear_preview(guild_id);
+    {
+        /* **이미 추천이 돌고 있으면 그게 끝나기를 기다렸다 다시 뽑는다.**
+         *
+         * 곡이 시작되면 그 훅이 추천을 하나 띄운다. 그 10~20초 안에 사람이 🎲 를 누르면
+         * `try_begin_preview_resolve` 가 막아서 **조용히 아무 일도 안 일어나고**, 심지어
+         * 먼저 돌던 추천이 방금 지운 그 세 곡을 그대로 다시 채운다. 눌렀는데 같은 곡이
+         * 돌아오는 게 그 경로다. 앞의 것이 끝나기를 짧게 기다렸다가 새 소금으로 다시 뽑는다. */
+        let app = state.app.clone();
+        tokio::spawn(async move {
+            for _ in 0..60 {
+                if !app.player.is_preview_resolving(guild_id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            // 먼저 돌던 추천이 옛 소금으로 채워 놓았을 수 있다. 그것부터 버린다.
+            app.player.clear_preview(guild_id);
+            crate::player::side_effects::resolve_preview(app, guild_id).await;
+        });
+    }
+    audit_ok(
+        &state,
+        guild_id,
+        &ctx.session,
+        "autoplay.refresh",
+        None,
+        Some("refreshed"),
+    );
+    // `next` 와 `nextOptions` 는 `playback` 프레임에만 실린다 — 비운 상태가 바로 보여야 한다 (§14.4).
+    let player = state.app.player.get_state(guild_id).await;
+    let position = state
+        .app
+        .coordinator
+        .current_position(guild_id)
+        .await
+        .map(|value| value.as_secs_f64())
+        .unwrap_or(0.0);
+    /* `resolving` 을 **직접 적는다.**
+     *
+     * `autoplay_options_json` 은 그 값을 `is_preview_resolving` 에서 읽는데, 그 표시를
+     * 세우는 것은 방금 떼어 던진 태스크다. 여기까지 오는 길에 `await` 가 있긴 하지만
+     * 전부 경합이 없으면 즉시 끝나는 것들이라 **양보가 보장되지 않는다.** 그러면
+     * 이 프레임이 "고르는 중" 이 아니라 **"후보 없음"** 으로 나가고, 화면에서는 후보
+     * 셋이 그냥 사라진 것으로 보인다. 간헐적으로만 재현되는 종류의 결함이다. */
+    let mut payload = playback_payload(&state, &player, position, &now_utc(), None, state.app.coordinator.schedule(guild_id).await);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "nextOptions".into(),
+            json!({ "resolving": true, "items": [] }),
+        );
+    }
+    emit(&state, guild_id, "playback", payload);
+    json_ok(json!({ "ok": true }))
 }
 
 /// `POST .../autoplay/reroll` — `📻 이 곡 말고` (V3 §8.5-3 · §14.3).

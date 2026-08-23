@@ -1568,7 +1568,8 @@ pub fn audit_text(
          * 없으면 맨 아래 폴백으로 떨어져서 활동 기록에
          * `민수님이 autoplay.reroll 을 했어요` 같은 기계 문자열이 그대로 나갔다.
          * 화면은 사람이 읽는 곳이라 그러면 안 된다. */
-        "autoplay.reroll" => format!("{actor}님이 자동 추천을 다시 뽑았어요"),
+        "autoplay.reroll" => format!("{actor}님이 추천곡 하나를 한동안 빼 뒀어요"),
+        "autoplay.refresh" => format!("{actor}님이 추천 후보를 새로 골랐어요"),
         "autoplay.reset" => format!("{actor}님이 자동 재생 기준을 초기화했어요"),
         "autoplay.config" => format!("{actor}님이 자동 재생 설정을 바꿨어요"),
         "autoplay.recent.remove" => match item {

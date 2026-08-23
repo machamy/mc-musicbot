@@ -34,6 +34,8 @@ pub struct PlayerManager {
     /// 자동 재생이 같이 뽑아 둔 **다른 후보들** (§8.6). 첫 번째가 `previews` 와 같은 곡이다.
     /// 사람이 하나를 고르면 그게 `previews` 로 올라간다.
     preview_options: StdMutex<HashMap<u64, Vec<QueueItem>>>,
+    /// 길드별 `🎲 후보 다시 뽑기` 횟수 (`bump_reroll_salt`).
+    reroll_salt: StdMutex<HashMap<u64, u64>>,
     preview_inflight: StdMutex<HashSet<u64>>,
     /// 길드별 리모컨 설정 캐시. 정렬은 5초마다·모든 상태 변경마다 돌기 때문에
     /// 매번 설정 JSON을 읽으면 유휴 상태에서도 쿼리가 계속 나간다(사양서 §5.2 H).
@@ -85,6 +87,7 @@ impl PlayerManager {
             gate: Mutex::new(()),
             previews: StdMutex::new(HashMap::new()),
             preview_options: StdMutex::new(HashMap::new()),
+            reroll_salt: StdMutex::new(HashMap::new()),
             preview_inflight: StdMutex::new(HashSet::new()),
             settings: StdMutex::new(HashMap::new()),
             shuffle_seeds: StdMutex::new(HashMap::new()),
@@ -838,6 +841,23 @@ impl PlayerManager {
         drop(options);
         self.previews.lock().unwrap().insert(guild_id, found);
         true
+    }
+
+    /// `🎲 후보 다시 뽑기` 를 누른 횟수. 추천 RNG 는 **10분 슬롯**으로 도는지라
+    /// 그 안에서는 입력이 하나도 안 바뀌어 같은 세 곡이 그대로 나온다. 눌렀다는 사실
+    /// 자체를 입력에 섞어야 다른 답이 나온다 (`DeterministicRng::now_salted`).
+    ///
+    /// **저장하지 않는다.** 재시작하면 0으로 돌아가는데, 그래도 된다 — 이건 취향이
+    /// 아니라 "방금 이 사람이 다시 눌렀다" 는 순간의 사실이다.
+    pub fn bump_reroll_salt(&self, guild_id: u64) -> u64 {
+        let mut map = self.reroll_salt.lock().unwrap();
+        let slot = map.entry(guild_id).or_insert(0);
+        *slot = slot.wrapping_add(1);
+        *slot
+    }
+
+    pub fn reroll_salt(&self, guild_id: u64) -> u64 {
+        self.reroll_salt.lock().unwrap().get(&guild_id).copied().unwrap_or(0)
     }
 
     pub fn clear_preview(&self, guild_id: u64) {

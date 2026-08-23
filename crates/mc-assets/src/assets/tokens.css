@@ -570,6 +570,22 @@ select.field { cursor: pointer; }
 .mq[data-over="1"][data-run="1"] .mq__i {
   animation: mq-run var(--marquee-dur, 8s) linear infinite;
 }
+/* **손가락으로 쓰는 기기에는 hover 가 없다.**
+ *
+ * 흐르는 조건이 hover(또는 포커스)뿐이라, 터치에서는 긴 제목을 **끝까지 읽을 방법이
+ * 아예 없었다.** 잘라 놨으니 밀어서 볼 수도 없다. 그쪽에서는 넘치면 그냥 흐른다. */
+@media (hover: none) {
+  /* **다는 아니다.** 목록의 서른 줄이 한꺼번에 흐르면 읽기는커녕 눈을 둘 데가 없다.
+     지금 곡과 다음 곡 — 한 번에 하나뿐이고 제목이 제일 중요한 두 자리만 흐른다.
+     목록에서는 길게 눌러 `📋 복사 ▸ 제목 복사` 로 전체를 가져갈 수 있다. */
+  .now .mq[data-over="1"] .mq__i,
+  .nextrow .mq[data-over="1"] .mq__i { animation: mq-run var(--marquee-dur, 8s) linear infinite; }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* 움직임을 줄여 달라고 한 사람에게는 흐르지 않는다. 대신 잘린 끝을 흐리게 두어
+     "더 있다" 는 것만 알린다(`.mq[data-over="1"]` 의 마스크). */
+  .mq .mq__i { animation: none !important; }
+}
 @keyframes mq-run {
   0%, 8%    { transform: translateX(0); }
   92%, 100% { transform: translateX(var(--marquee-shift, 0px)); }

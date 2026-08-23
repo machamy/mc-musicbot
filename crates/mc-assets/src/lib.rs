@@ -285,9 +285,42 @@ mod tests {
         );
     }
 
+    /// **검색한 곳은 재생목록도 물어봐야 한다.**
+    ///
+    /// `searchTracks` 는 검색 패널과 대기열 안 검색이 같이 쓰는데, 재생목록이 딸려 왔는지
+    /// 물어보는 `offerPlaylist` 는 검색 패널에만 붙어 있었다. 그래서 같은 링크를 붙여넣어도
+    /// **어느 칸에 넣었느냐에 따라** 재생목록이 통째로 담기기도 하고 조용히 버려지기도 했다.
+    ///
+    /// 이 결함은 파일 하나만 봐서는 안 보인다. 두 호출부가 서로 멀리 떨어져 있고 각각은
+    /// 그 자체로 멀쩡하기 때문이다. 그래서 "쌍으로 다녀야 하는 것"을 여기서 못 박는다.
+    #[test]
+    fn every_search_call_site_also_offers_the_playlist() {
+        let mut missing = Vec::new();
+        // 함수 단위로 자른다 — 호출부가 어느 함수 안에 있는지가 판정 기준이다.
+        for chunk in PORTAL_JS.split("
+async function ") {
+            let name = chunk.split('(').next().unwrap_or("").trim();
+            // 정의 자체(`async function searchTracks(`)는 건너뛴다.
+            if name == "searchTracks" {
+                continue;
+            }
+            let body = chunk.split("
+async function ").next().unwrap_or(chunk);
+            if body.contains("searchTracks(") && !body.contains("offerPlaylist(") {
+                missing.push(name.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "검색은 하는데 재생목록은 안 물어보는 곳이 있다 — 같은 링크가 어느 칸에                         들어가느냐에 따라 다르게 동작한다:
+  {}",
+            missing.join(", ")
+        );
+    }
+
     #[test]
     fn version_hash_is_pinned() {
-        assert_eq!(version(), "d6458460e61bb606");
+        assert_eq!(version(), "f68aacc5d5668ba4");
     }
 
     /// 이름과 바이트가 서로 **뒤바뀌어도** 버전 해시는 그대로다(같은 것을 다 더하므로).
@@ -297,11 +330,11 @@ mod tests {
         let expected: [(&str, &str); 13] = [
             (
                 "tokens.css",
-                "6b36dc813ea0d48ae2af9428049071bdb04cd61415d7f170b6e7daf50717dcc8",
+                "7883eae6b3bd112a19864801180421a9f3fc41bb66acdd8a0d485025c611f761",
             ),
             (
                 "portal.css",
-                "d56e96e387085419aaa1f05c6d9165a7dd873f7f664e2ba962ec93aa2a67aac6",
+                "8b5467c94e726e3cd9b7f8e04e97dea58d9e8087b752eb9fc183bf10889a3e88",
             ),
             (
                 "console.css",
@@ -313,11 +346,11 @@ mod tests {
             ),
             (
                 "core.js",
-                "c714aa14c463699ad30dd27092b3d779d74461e4129d86ce639c1080a358a8f0",
+                "28be9c9d3ef97b4edf309837d0923c7830d17154088ff63458afd0f929c336fe",
             ),
             (
                 "portal.js",
-                "9bf550e21abfb7702bc3173587443cadd79045a774dd3d392e34e2d3508474c6",
+                "fc86591a990fc8a09ed000752d94534c6df8aa78b12104f17c4af1775248528d",
             ),
             (
                 "console.js",

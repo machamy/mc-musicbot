@@ -345,6 +345,14 @@ body[data-dragging="tab"] { user-select: none; }
 }
 .mq[data-over="1"]:hover,
 .mq[data-over="1"][data-run="1"] { -webkit-mask-image: none; mask-image: none; }
+/* **흐르는데 끝은 계속 흐리면 반쪽짜리다.** 터치 기기에서는 호버가 없어 마스크를 걷을
+   조건이 영영 안 맞는다. 그러면 글자가 지나가는데도 오른쪽 끝에 닿는 순간 흐려져서,
+   정작 읽으려던 뒷부분만 못 읽는다. 흐르는 그 두 자리는 마스크도 같이 걷는다
+   (짝은 `tokens.css` 의 `@media (hover: none)` 규칙). */
+@media (hover: none) {
+  .now .mq[data-over="1"],
+  .nextrow .mq[data-over="1"] { -webkit-mask-image: none; mask-image: none; }
+}
 
 /* 앵커에 붙는 작은 팝오버 (이모지 고르기 등). .dd__menu와 달리 전역 닫기 로직을 안 탄다. */
 .pop {

@@ -90,6 +90,8 @@ struct AutoplayPlan {
     recent_ages: HashMap<String, f64>,
     recent_artists: Vec<String>,
     tuning: AutoplayTuning,
+    /// `🎲 후보 다시 뽑기` 횟수 (`PlayerManager::reroll_salt`).
+    salt: u64,
 }
 
 impl AutoplayPlan {
@@ -100,6 +102,7 @@ impl AutoplayPlan {
             recent_ages: &self.recent_ages,
             recent_artists: &self.recent_artists,
             tuning: self.tuning,
+            salt: self.salt,
         }
     }
 
@@ -173,6 +176,7 @@ fn build_autoplay_plan(app: &Arc<App>, guild_id: u64, state: &GuildPlayerState) 
             artist_cooldown: settings.autoplay_artist_cooldown,
             recent_decay_hours: settings.autoplay_recent_decay_hours,
         },
+        salt: app.player.reroll_salt(guild_id),
     }
 }
 
@@ -475,7 +479,12 @@ pub async fn reject_preview(app: Arc<App>, guild_id: u64, reason: &str) -> bool 
 /// 정책·기준 곡이 바뀌었을 때 다음 추천곡만 다시 뽑는다 (§8.5 UI).
 /// 이미 잡혀 있던 후보는 **차단하지 않는다** — 사용자가 싫다고 한 게 아니라 규칙이 바뀐 것뿐이다.
 pub async fn refresh_preview(app: Arc<App>, guild_id: u64) {
-    app.player.take_preview(guild_id);
+    /* **후보 목록까지 같이 버린다.**
+     *
+     * `take_preview` 만 하면 "안 고르면 나갈 곡" 한 자리만 비고, 옆에 놓인 나머지
+     * 후보는 옛것 그대로 남는다. 다시 뽑았다고 했는데 화면에는 방금 본 곡이 그대로
+     * 앉아 있고, 심지어 고를 수도 있는 상태다. */
+    app.player.clear_preview(guild_id);
     resolve_preview(app, guild_id).await;
 }
 

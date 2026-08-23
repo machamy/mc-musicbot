@@ -2710,6 +2710,13 @@ async function runQueueSearch() {
     qsNote = found.note;
     qsQuery = query;
     renderQueueSearch();
+    /* **대기열 안 검색에도 똑같이 물어본다.**
+     *
+     * `searchTracks` 는 둘이 같이 쓰는데 물어보는 쪽은 검색 패널에만 붙어 있었다.
+     * 그래서 대기열에서 `watch?v=..&list=..` 를 붙여넣으면 재생목록이 딸려 있다는
+     * 사실조차 안 나타나고 그 곡 하나만 담겼다. 같은 링크가 어느 칸에 들어가느냐에
+     * 따라 다르게 동작하면 안 된다. */
+    await offerPlaylist(found.playlist);
   } catch (error) {
     clear(el.qsResults).append(qsMetaRow('검색 실패'), emptyState('⚠', '검색하지 못했어요', error.message));
   }
@@ -3842,7 +3849,7 @@ function apBlockedSection() {
     count: `${blocked.length}곡`,
     action: apWipe('blocked', '빼 둔 곡', blocked.length,
       '빼 둔 곡을 전부 풀까요?\n다시 추천에 나올 수 있어요.'),
-    desc: '`📻 이 곡 말고` 로 뺐거나 재생에 실패한 곡이에요. 한동안 다시 안 뽑아요.',
+    desc: '`🚫 이 곡은 당분간 그만` 으로 뺐거나 재생에 실패한 곡이에요. 7일이 지나면 스스로 사라져요.',
     children: [
       rows.length ? h('div', { class: 'ap__rows' }, ...rows) : h('p', { class: 'ap__note' }, '빼 둔 곡이 없어요.'),
       blocked.length > 12 ? h('p', { class: 'ap__note' }, `외 ${blocked.length - 12}곡`) : null,
@@ -4998,17 +5005,27 @@ function renderNextOptions(state) {
   const blocked = tierOf() === 'viewer'
     || state.conn === 'down'
     || (state.suspension && (state.suspension.scope === 'all' || state.suspension.scope === 'queue'));
-  if (blocked) { el.nextOptions.hidden = true; return; }
+  if (blocked) { el.nextOptions.hidden = true; el.nextOptions.__key = ''; return; }
   if (payload.resolving) {
     /* **비워 두지 않고 말한다.** 후보 셋이 사라졌다 나타나면 고장으로 읽힌다.
      * 자리를 지키고 무슨 일이 일어나는 중인지 한 줄로 알려 준다 (§23.3). */
     el.nextOptions.hidden = false;
+    if (el.nextOptions.__key === 'resolving') return;
+    el.nextOptions.__key = 'resolving';
     clear(el.nextOptions);
     put(el.nextOptions, h('span', { class: 'nextopts__tag' }, '다음 곡 후보를 고르는 중이에요…'));
     return;
   }
-  if (options.length < 2) { el.nextOptions.hidden = true; return; }
+  if (options.length < 2) { el.nextOptions.hidden = true; el.nextOptions.__key = ''; return; }
   el.nextOptions.hidden = false;
+  /* **바뀐 게 없으면 다시 그리지 않는다.**
+   *
+   * 이 함수는 실시간 프레임마다 도는데(초당 여러 번) 그때마다 후보 셋을 통째로 헐고
+   * 다시 지었다. 눈에 보이는 변화는 없으면서 노드만 계속 버려져서, 흐름 관찰자가
+   * 그 버려진 노드를 붙들면 그대로 누수가 된다. `다음` 줄이 이미 쓰고 있는 방식이다. */
+  const key = options.map((o) => `${o.item?.id ?? o.id}:${o.picked ? 1 : 0}`).join('|');
+  if (el.nextOptions.__key === key) return;
+  el.nextOptions.__key = key;
   clear(el.nextOptions);
   put(el.nextOptions, h('span', { class: 'nextopts__tag' }, '하나 고르면 그걸로 가요'));
   for (const option of options) {
@@ -5062,16 +5079,26 @@ function renderNextRow(state) {
     ? '자동 재생이 골라 둔 후보예요. 누가 곡을 담으면 밀려요'
     : `다음에 나갈 곡이에요 · ${next.item.requestedByDisplay || '알 수 없음'}님이 담았어요`);
 
-  bindContextTarget(el.nextRow, () => trackMenu(track, { source: 'next' }));
+  /* `source: 'next'` 만으로는 부족하다 — 이 줄은 **자동 추천일 때도 있고 누가 담은 곡일 때도**
+   * 있다. `🚫 이 곡은 당분간 그만` 은 자동 추천에만 뜻이 있어서, 안 갈라 두면 사람이 담은
+   * 곡에도 그 줄이 뜨고 눌러 봐야 `지금은 다시 뽑을 추천곡이 없어요` 만 돌아온다. */
+  bindContextTarget(el.nextRow, () => trackMenu(track, { source: fromAutoplay ? 'next' : 'queued' }));
   if (changed) flashNode(el.nextRow);
   marquee.scan(el.nextRow);
 }
 
 function nextRowActions(track) {
+  /* **`📻 이 곡 말고` 였다.**
+   *
+   * 후보를 셋 보여 주게 된 뒤로 그 이름이 맞지 않는다. 누르면 세 곡이 다 바뀌는데
+   * 문구는 한 곡만 가리키고 있었고, 게다가 조용히 7일 차단 목록에 적었다. "이번 셋은
+   * 다 별로다" 가 "이 곡은 앞으로도 싫다" 로 기록되니, 나중에 왜 그 곡이 안 나오는지
+   * 아무도 설명하지 못한다. 이제 버튼은 **다시 뽑기만** 하고, 한 곡을 찍어서 그만
+   * 보는 것은 그 줄 우클릭 메뉴로 옮겼다. */
   const reroll = bindAct(h('button', {
     class: 'btn btn--sm btn--ghost', type: 'button',
-    tip: '이 후보를 빼고 다시 골라요',
-  }, '📻 이 곡 말고'), rerollAutoplay);
+    tip: '추천 후보 세 곡을 전부 새로 골라요. 차단하지는 않아요',
+  }, '🎲 후보 다시 뽑기'), refreshAutoplayOptions);
   setLock(reroll, !canAutoplay(), lockReason('autoplay'));
 
   const add = bindAct(h('button', {
@@ -5089,10 +5116,18 @@ function canAutoplay() {
   return can('autoplaySeed');
 }
 
-async function rerollAutoplay() {
+/** 후보 세 곡을 통째로 새로 뽑는다. **아무것도 차단하지 않는다.** */
+async function refreshAutoplayOptions() {
+  const result = await call(() => api('/autoplay/refresh', { body: {} }),
+    '후보를 새로 골랐어요.');
+  if (result) refetchHot();
+}
+
+/** 지금 잡혀 있는 후보 한 곡을 7일간 안 뽑히게 하고 그 자리를 다시 채운다. */
+async function rejectPreviewTrack() {
   const key = trackKey(store.get().next?.item?.track);
   const result = await call(() => api('/autoplay/reroll', { body: { cacheKey: key } }),
-    '다른 곡으로 다시 골랐어요.');
+    '한동안 이 곡은 안 뽑을게요.');
   if (result) refetchHot();
 }
 
@@ -8548,11 +8583,17 @@ function openWhoSheet() {
  * 규칙
  *  - Ctrl / Alt / Shift + 우클릭이면 브라우저 기본 메뉴를 그대로 띄운다(preventDefault 안 한다).
  *  - 모바일은 롱프레스 500ms.
- *  - 항목은 6개 이하. 넘으면 하위 메뉴(▸)로 접는다.
- *  - 권한 없는 항목은 숨기지 않고 비활성 + 이유. 뭐가 있는지는 알아야 한다.
+ *  - 항목은 7개 이하. 넘으면 하위 메뉴(▸)로 접는다.
+ *  - **지금은 못 하지만 언젠가 될 일**은 숨기지 않고 비활성 + 이유. 뭐가 있는지는 알아야 한다.
+ *    (예: `내가 신청한 곡이라 투표 불가` — 곡이 바뀌면 풀린다)
+ *  - **등급 때문에 영영 안 될 일**은 아예 안 그린다. 잠긴 채로 자리만 차지하면 소음이다.
+ *    (예: 일반 멤버에게 `차단 목록에 넣기`) 서버도 같은 등급에서 막는다.
+ *    단 `viewer` 는 역할이 아니라 **정지 상태**라 여기 해당하지 않는다 — 잠긴 채로 보여 준다.
  */
 
-const MENU_MAX = 6;
+/* 자동 접기는 **마지막 안전장치**다. 어느 줄을 접을지는 메뉴를 만드는 쪽이 직접 정한다
+ * (`trackMenu` 참고) — 길이만 보고 자르면 자주 쓰는 것과 안 쓰는 것이 뒤섞여 잘린다. */
+const MENU_MAX = 7;
 let openMenu = null;
 
 function closeContextMenu() {
@@ -8573,9 +8614,15 @@ function openContextMenu(items, where) {
   closeContextMenu();
   if (!items || !items.length) return;
 
-  const rows = items.length > MENU_MAX
-    ? items.slice(0, MENU_MAX - 1).concat([{ icon: '⋯', label: '더 보기', children: items.slice(MENU_MAX - 1) }])
-    : items;
+  let rows = items;
+  if (items.length > MENU_MAX) {
+    /* 넘치는 줄을 `더 보기` 로 접는다. **접히는 것 안에 이미 `더 보기` 가 있으면 펴서 합친다** —
+     * 안 그러면 `더 보기 ▸ 더 보기 ▸ 항목` 이 되어, 두 번 들어가야 나오는 줄이 생긴다. */
+    const rest = items.slice(MENU_MAX - 1).flatMap((item) => (
+      item.children && item.label === '더 보기' ? item.children : [item]
+    ));
+    rows = items.slice(0, MENU_MAX - 1).concat([{ icon: '⋯', label: '더 보기', children: rest }]);
+  }
 
   const node = h('div', { class: 'pop pop--menu ctxmenu', role: 'menu' });
   for (const item of rows) node.appendChild(menuRow(item, node));
@@ -8722,39 +8769,63 @@ function bindContextTarget(node, build) {
 
 /* ── 대상별 메뉴 ── */
 
+/* 우클릭 메뉴 (§24.1).
+ *
+ * **열한 줄짜리 목록이었다.** `MENU_MAX` 가 여섯 줄에서 잘라 나머지를 `더 보기` 로
+ * 접어 주긴 했는데, 자르는 자리가 **배열 순서**라 자주 쓰는 것과 안 쓰는 것이
+ * 뒤섞인 채로 잘렸다. 그래서 두 가지를 바꾼다.
+ *
+ * ① **묶는다.** 복사류는 `📋 복사` 밑으로, 어쩌다 한 번 쓰는 것은 `⋯ 더 보기` 밑으로
+ *    내가 직접 내린다. 접히는 자리를 길이가 정하게 두지 않는다.
+ * ② **등급 때문에 영영 못 누르는 줄은 아예 안 그린다.** 잠금 표시는 "지금은 안 되지만
+ *    이유를 알면 될 수도 있는 것"에만 값어치가 있다. 일반 멤버에게 `차단 목록에 넣기` 는
+ *    영원히 안 되는 일이라, 잠긴 채로 자리만 차지하면 그냥 소음이다. 반대로
+ *    `내가 신청한 곡에는 투표 불가` 같은 건 곡이 바뀌면 풀리므로 잠긴 채로 남긴다.
+ */
 function trackMenu(track, opts = {}) {
   if (!track) return null;
-  const state = store.get();
   const itemId = opts.itemId;
   const item = opts.item;
   const mine = !!item?.isMine;
   const voteReason = mine ? '내가 신청한 곡에는 투표할 수 없어요' : lockReason('vote');
   const url = trackUrl(track);
+  const title = String(track.title || '').trim();
+  const artist = String(track.artist || '').trim();
+  /* **`viewer` 를 `member` 와 같이 묶으면 안 된다.**
+   *
+   * `viewer` 는 역할이 아니라 상태다 — 전체 정지를 당하면 누구든 여기로 내려온다.
+   * 풀리면 원래대로 돌아오므로 "영영 안 될 일" 이 아니고, 그래서 이유와 함께 잠긴 채로
+   * 보여 줘야 왜 안 되는지 배울 수 있다. 반면 일반 멤버에게 관리자 항목은 **역할이
+   * 바뀌지 않는 한 영영 안 되는 일**이라 잠긴 줄로 남기면 소음일 뿐이다. */
+  const memberOnly = tierOf() === 'member';
 
   const items = [
     { icon: '＋', label: '대기열에 담기', disabled: !can('search'), reason: lockReason('search'), onPick: () => enqueue(track) },
     { icon: '🔖', label: '보관함에 담기', disabled: !can('library'), reason: lockReason('library'), onPick: () => toggleSaved(track, true) },
-    { icon: '📃', label: '재생목록에 추가', onPick: () => openPlaylistPicker(track, null) },
-    {
-      icon: '👍',
-      label: '투표',
-      children: [
-        { icon: '👍', label: '좋아요', disabled: !itemId || !can('vote') || mine, reason: voteReason, onPick: () => vote(itemId, 'like') },
-        { icon: '⭐', label: '슈퍼 좋아요', disabled: !itemId || !can('vote') || mine, reason: voteReason, onPick: () => vote(itemId, 'superLike') },
-        { icon: '👎', label: '싫어요', disabled: !itemId || !can('vote') || mine, reason: voteReason, onPick: () => vote(itemId, 'dislike') },
-      ],
-    },
   ];
 
+  // 지금 이 자리에서만 뜻이 있는 것을 위쪽에 둔다 — 여기까지가 "자주 쓰는 것"이다.
   if (opts.source === 'now') {
     items.push({ icon: '⏭', label: '스킵', disabled: !canSkipNow(), reason: lockReason('skip'), onPick: doSkip });
     items.push({ icon: '🎤', label: '가사 보기', onPick: () => { if (!lyricsOpen) toggleLyrics(); } });
-  } else if (itemId) {
+  } else if (opts.source === 'next' && !itemId) {
+    /* 자동 재생이 골라 둔 후보줄. `🎲 후보 다시 뽑기` 는 버튼으로 밖에 나와 있고,
+     * **이 곡 하나만 찍어서 그만 보는 것**은 여기에 둔다. 둘은 다른 일이다 —
+     * 하나는 취향을 남기지 않고, 하나는 7일짜리 기록을 남긴다. */
     items.push({
-      icon: '📌', label: '맨 앞으로 올리기',
-      disabled: !can('queueEdit') || tierOf() === 'member', reason: lockReason('queueEdit'),
-      onPick: () => call(() => api('/queue/action', { body: { action: 'togglePin', itemId } })),
+      icon: '🚫', label: '이 곡은 당분간 그만',
+      tip: '7일 동안 자동 재생에서 안 뽑아요',
+      disabled: !canAutoplay(), reason: lockReason('autoplay'),
+      onPick: rejectPreviewTrack,
     });
+  } else if (itemId) {
+    if (!memberOnly) {
+      items.push({
+        icon: '📌', label: '맨 앞으로 올리기',
+        disabled: !can('queueEdit'), reason: lockReason('queueEdit'),
+        onPick: () => call(() => api('/queue/action', { body: { action: 'togglePin', itemId } })),
+      });
+    }
     items.push({
       icon: '✕', label: '대기열에서 빼기', danger: true,
       disabled: !(mine ? can('queueEdit') || can('search') : can('queueEdit')), reason: lockReason('queueEdit'),
@@ -8763,20 +8834,49 @@ function trackMenu(track, opts = {}) {
   }
 
   items.push({
-    icon: '📻', label: '자동 재생 기준으로 삼기',
-    disabled: !seedState || !canAutoplay(), reason: lockReason('autoplay'),
-    onPick: () => addSeed(track),
+    icon: '👍',
+    label: '투표',
+    children: [
+      { icon: '👍', label: '좋아요', disabled: !itemId || !can('vote') || mine, reason: voteReason, onPick: () => vote(itemId, 'like') },
+      { icon: '⭐', label: '슈퍼 좋아요', disabled: !itemId || !can('vote') || mine, reason: voteReason, onPick: () => vote(itemId, 'superLike') },
+      { icon: '👎', label: '싫어요', disabled: !itemId || !can('vote') || mine, reason: voteReason, onPick: () => vote(itemId, 'dislike') },
+    ],
   });
-  items.push({
-    icon: '🚫', label: '차단 목록에 넣기',
-    disabled: tierOf() === 'member' || tierOf() === 'viewer', reason: '서버 관리자만 차단할 수 있어요',
-    onPick: () => openBlacklistSheet(track),
-  });
-  if (url) {
-    items.push({ icon: '🔗', label: '링크 복사', onPick: () => copyText(url, '링크를 복사했어요.') });
-    items.push({ icon: '↗', label: '원본에서 열기', onPick: () => window.open(url, '_blank', 'noreferrer') });
+
+  /* **제목을 복사할 방법이 없었다.** 링크만 복사할 수 있어서, 곡 이름을 다른 데
+   * 옮겨 적으려면 화면을 보고 손으로 다시 쳐야 했다 — 게다가 긴 제목은 잘려 있어서
+   * 그대로 옮겨 적는 것조차 안 됐다. */
+  // 제목이 없으면 줄에는 `trackTitle()` 이 대신 그려 주는 것을 복사한다 — 화면에
+  // 보이는 글자와 복사되는 글자가 어긋나면 안 된다.
+  const copyTitle = title || trackTitle(track);
+  const copy = copyTitle
+    ? [{ icon: '🅣', label: '제목 복사', onPick: () => copyText(copyTitle, '제목을 복사했어요.') }]
+    : [];
+  if (artist) copy.push({ icon: '🅐', label: '아티스트 복사', onPick: () => copyText(artist, '아티스트를 복사했어요.') });
+  if (copyTitle && artist) copy.push({ icon: '📝', label: '제목 + 아티스트 복사', onPick: () => copyText(`${artist} - ${copyTitle}`, '복사했어요.') });
+  if (url) copy.push({ icon: '🔗', label: '링크 복사', onPick: () => copyText(url, '링크를 복사했어요.') });
+  // 복사할 게 하나도 없으면 묶음 자체를 안 만든다 — 열어 보니 빈 서랍이면 안 된다.
+  if (copy.length) items.push({ icon: '📋', label: '복사', children: copy });
+
+  const more = [
+    { icon: '📃', label: '재생목록에 추가', onPick: () => openPlaylistPicker(track, null) },
+    {
+      icon: '📻', label: '자동 재생 기준으로 삼기',
+      disabled: !seedState || !canAutoplay(), reason: lockReason('autoplay'),
+      onPick: () => addSeed(track),
+    },
+  ];
+  if (url) more.push({ icon: '↗', label: '원본에서 열기', onPick: () => window.open(url, '_blank', 'noreferrer') });
+  // 등급이 안 되면 영영 못 누른다 — 잠긴 줄로 남기지 않고 뺀다 (위 ②).
+  if (!memberOnly) {
+    more.push({
+      icon: '🚫', label: '차단 목록에 넣기', danger: true,
+      disabled: tierOf() === 'viewer', reason: lockReason('queueEdit'),
+      onPick: () => openBlacklistSheet(track),
+    });
   }
-  if (state.tier === 'viewer') return items;
+  items.push({ icon: '⋯', label: '더 보기', children: more });
+
   return items;
 }
 

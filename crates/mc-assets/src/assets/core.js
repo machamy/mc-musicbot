@@ -653,18 +653,79 @@ export function marquee(el) {
     el.dataset.over = '1';
     el.style.setProperty('--marquee-shift', `${-Math.ceil(overflow + 8)}px`);
     // 초당 약 42px. 짧은 넘침도 너무 빨라 보이지 않게 하한 6초.
-    el.style.setProperty('--marquee-dur', `${Math.max(6, Math.round((overflow + 8) / 42 * 2))}s`);
+    /* **너무 느려서 안 움직이는 것처럼 보였다.**
+     *
+     * 옛 식은 630px 넘침에 30초를 줬다. `mq-run` 은 앞뒤로 8% 씩 멈춰 있으므로 실제로
+     * 미는 시간은 그중 84% — 초당 25px 이다. 글자 하나가 1초에 한 칸 갈까 말까 해서,
+     * 보고 있으면 멈춰 있는 것과 구별이 안 된다. 읽으면서 따라갈 수 있는 속도는
+     * 초당 70~90px 쯤이다. 그 속도가 나오도록 거꾸로 계산한다. */
+    const move = (overflow + 8) / 80;          // 초당 80px 로 미는 데 걸리는 시간
+    /* 하한 3초는 **짧게 넘칠 때 휙 지나가지 않게** 하는 것이다. 그 구간(넘침 약 194px
+     * 미만)에서는 초당 80px 보다 느리게 가는데, 거리가 짧아 눈으로 따라가는 데는
+     * 문제가 없다. 앞뒤 정지 구간도 너무 짧아지면 시작 글자를 읽을 새가 없다. */
+    el.style.setProperty('--marquee-dur', `${Math.max(3, Math.round(move / 0.84))}s`);
   } else {
     el.dataset.over = '0';
     el.style.removeProperty('--marquee-shift');
   }
 }
 
+/* 크기·내용이 바뀌면 **스스로 다시 잰다.**
+ *
+ * `scan()` 만으로는 부족했다. 렌더 직후에 재면 그 시점의 폭이 아직 확정 전이거나(글꼴
+ * 로딩·배치 전환) 제목이 나중에 바뀌어서, 넘치는데도 `data-over="0"` 인 채로 굳는다.
+ * 그러면 흐르지도 않고 "더 있다" 는 표시도 안 뜬다 — 실측으로 넘침 612px 인 제목이
+ * `data-over="0"` 이었다.
+ *
+ * 관찰자를 붙이면 시점을 따질 필요가 없다. 폭이 정해지는 순간, 제목이 바뀌는 순간
+ * 자동으로 다시 잰다. 모바일 탭바 높이 때와 같은 방식이다. */
+/* 무엇을 보고 있는지 **직접 들고 있어야 한다.**
+ *
+ * `ResizeObserver` 는 관찰 대상을 강하게 붙든다. `WeakSet` 으로 기억해 봐야 관찰자가
+ * 붙들고 있으니 아무것도 회수되지 않는다. 그런데 이 화면에는 실시간 프레임마다
+ * `.mq` 를 통째로 새로 만드는 곳이 있어서(후보 셋), 놔두면 떨어져 나간 노드가
+ * **무한히 쌓인다.** 몇 시간 열어 두면 수만 개다.
+ *
+ * 그래서 목록을 들고 있다가 다시 잴 때 화면에서 떨어진 것을 놓아 준다. 떨어진 노드는
+ * 크기가 안 바뀌어 관찰자 콜백이 영영 안 오므로, 정리는 여기서밖에 못 한다. */
+const mqWatched = new Set();
+let mqObserver = null;
+function mqWatch(el) {
+  if (mqWatched.has(el) || typeof ResizeObserver !== 'function') return;
+  if (!mqObserver) {
+    mqObserver = new ResizeObserver((entries) => {
+      // 같은 `.mq` 가 바깥·안쪽 두 항목으로 들어올 수 있다. 한 번만 잰다.
+      const seen = new Set();
+      for (const entry of entries) {
+        const host = entry.target.closest?.('.mq') || entry.target;
+        if (seen.has(host)) continue;
+        seen.add(host);
+        marquee(host);
+      }
+    });
+  }
+  mqWatched.add(el);
+  mqObserver.observe(el);
+  // 안쪽도 본다 — 글자가 바뀌면 바깥 폭은 그대로여도 넘침이 달라진다.
+  if (el.firstElementChild) mqObserver.observe(el.firstElementChild);
+}
+
+function mqPrune() {
+  if (!mqObserver) return;
+  for (const el of mqWatched) {
+    if (el.isConnected) continue;
+    mqObserver.unobserve(el);
+    if (el.firstElementChild) mqObserver.unobserve(el.firstElementChild);
+    mqWatched.delete(el);
+  }
+}
+
 /** 루트 안의 모든 .mq를 다시 잰다. 렌더 직후에 호출한다. */
 marquee.scan = (root) => {
   if (document.hidden) return;
+  mqPrune();
   const scope = root || document;
-  for (const el of scope.querySelectorAll('.mq')) marquee(el);
+  for (const el of scope.querySelectorAll('.mq')) { marquee(el); mqWatch(el); }
 };
 
 let mqInstalled = false;

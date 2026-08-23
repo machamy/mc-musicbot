@@ -91,18 +91,19 @@ fn pick_seed(
 #[derive(Debug, Clone)]
 pub struct DeterministicRng(u64);
 
+/// FNV-1a 로 문자열까지 한 값에 접는다.
+fn fold(hash: u64, bytes: &[u8]) -> u64 {
+    let mut hash = hash;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
 impl DeterministicRng {
     /// `(guild_id, 시드 캐시키, 후보 수, 시각/10분)` 을 섞은 해시로 시작한다.
     pub fn new(guild_id: u64, seed_key: &str, candidates: usize, slot: i64) -> Self {
-        // FNV-1a 로 문자열까지 한 값에 접는다.
-        fn fold(hash: u64, bytes: &[u8]) -> u64 {
-            let mut hash = hash;
-            for byte in bytes {
-                hash ^= *byte as u64;
-                hash = hash.wrapping_mul(0x1000_0000_01b3);
-            }
-            hash
-        }
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         hash = fold(hash, &guild_id.to_le_bytes());
         hash = fold(hash, seed_key.as_bytes());
@@ -113,12 +114,26 @@ impl DeterministicRng {
 
     /// 지금 시각으로 만든 PRNG. 10분 안에는 같은 답이 나온다.
     pub fn now(guild_id: u64, seed_key: &str, candidates: usize) -> Self {
-        Self::new(
+        Self::now_salted(guild_id, seed_key, candidates, 0)
+    }
+
+    /// 같은 10분 안에서도 **일부러 다른 답**을 뽑고 싶을 때 쓴다.
+    ///
+    /// 시간 슬롯이 10분이라, 사람이 `🎲 후보 다시 뽑기` 를 눌러도 그 안에서는 입력이
+    /// 하나도 안 바뀌어 **똑같은 세 곡**이 그대로 나온다. 눌렀는데 아무것도 안 변하는
+    /// 것처럼 보이는 게 그 이유다. 소금을 한 겹 섞어 그 사람이 다시 뽑았다는 사실
+    /// 자체를 입력으로 만든다. 소금이 그대로면 결과도 그대로다 — 결정성은 안 깨진다.
+    pub fn now_salted(guild_id: u64, seed_key: &str, candidates: usize, salt: u64) -> Self {
+        let mut rng = Self::new(
             guild_id,
             seed_key,
             candidates,
             chrono::Utc::now().timestamp() / RNG_SLOT_SECS,
-        )
+        );
+        if salt != 0 {
+            rng.0 = fold(rng.0, &salt.to_le_bytes());
+        }
+        rng
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -170,6 +185,9 @@ pub struct AutoplayContext<'a> {
     /// 최근 재생 아티스트 (최신순, 소문자). 앞에서 `artist_cooldown`개만 본다 (§8.5-1).
     pub recent_artists: &'a [String],
     pub tuning: AutoplayTuning,
+    /// `🎲 후보 다시 뽑기` 를 누른 횟수. 같은 10분 안에서도 다른 답이 나오게 하는
+    /// 유일한 입력이다 (`DeterministicRng::now_salted`).
+    pub salt: u64,
 }
 
 impl<'a> AutoplayContext<'a> {
@@ -183,6 +201,7 @@ impl<'a> AutoplayContext<'a> {
             recent_ages: EMPTY_AGES.get_or_init(HashMap::new),
             recent_artists: &[],
             tuning: AutoplayTuning::default(),
+            salt: 0,
         }
     }
 }
@@ -311,7 +330,8 @@ impl AutoplayEngine {
             if weighted.is_empty() {
                 continue;
             }
-            let mut rng = DeterministicRng::now(guild_id, &seed.cache_key(), weighted.len());
+            let mut rng =
+                DeterministicRng::now_salted(guild_id, &seed.cache_key(), weighted.len(), ctx.salt);
             let picks: Vec<TrackRef> = weighted_pick_many(&mut weighted, &mut rng, want)
                 .into_iter()
                 .map(|at| candidates[at].clone())
@@ -904,6 +924,7 @@ mod tests {
                 artist_cooldown: 2,
                 ..AutoplayTuning::default()
             },
+            salt: 0,
         };
         let survivors = |ctx: &AutoplayContext<'_>, relax| -> Vec<usize> {
             engine
@@ -933,4 +954,30 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// **소금이 바뀌면 답도 바뀌어야 한다.**
+    ///
+    /// 추천 RNG 는 10분 슬롯으로 돈다. 그래서 `🎲 후보 다시 뽑기` 를 눌러도 그 안에서는
+    /// 입력이 하나도 안 바뀌어 같은 곡이 그대로 나온다 — 버튼이 아무 일도 안 하는 것처럼
+    /// 보이는 게 그 경로다. 소금이 그걸 깨는 유일한 수단이라, 실제로 깨는지 못 박는다.
+    #[test]
+    fn a_different_salt_gives_a_different_answer_inside_the_same_time_slot() {
+        let draw = |salt: u64| {
+            let mut rng = DeterministicRng::now_salted(7, "seed-key", 40, salt);
+            (0..8).map(|_| rng.next_u64() % 40).collect::<Vec<_>>()
+        };
+        // 같은 소금이면 같은 답 — 결정성은 그대로다.
+        assert_eq!(draw(0), draw(0));
+        assert_eq!(draw(3), draw(3));
+        // 소금이 다르면 답이 달라진다. 하나라도 같으면 다시 뽑기가 헛돈다.
+        assert_ne!(draw(0), draw(1));
+        assert_ne!(draw(1), draw(2));
+        // `now()` 는 소금 0 과 같아야 한다 — 기존 경로의 동작이 바뀌면 안 된다.
+        let plain = {
+            let mut rng = DeterministicRng::now(7, "seed-key", 40);
+            (0..8).map(|_| rng.next_u64() % 40).collect::<Vec<_>>()
+        };
+        assert_eq!(plain, draw(0));
+    }
+
 }
