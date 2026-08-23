@@ -2849,22 +2849,66 @@ fn next_up_json(player: &crate::models::GuildPlayerState) -> Value {
 /// 첫 번째가 "안 고르면 나갈 곡" 이고, `picked` 가 지금 올라와 있는 것이다.
 /// 대기열에 곡이 있으면 자동 재생이 나갈 차례가 아니므로 빈 목록을 준다 — 그때 후보를
 /// 보여 주면 "이걸 고르면 다음에 나오나?" 라는 거짓말이 된다.
-fn autoplay_options_json(state: &WebState, player: &crate::models::GuildPlayerState) -> Value {
+fn autoplay_options_json(
+    state: &WebState,
+    guild_id: u64,
+    player: &crate::models::GuildPlayerState,
+) -> Value {
+    // **길드 id 를 인자로 받는다.** `player.guild_id` 에 기대면 그 필드가 비는 경로가
+    // 하나라도 생겼을 때 후보가 조용히 사라진다 — 호출부는 진짜 id 를 이미 알고 있다.
     if !player.autoplay_enabled || !player.upcoming.is_empty() {
         return json!([]);
     }
     let picked = player.autoplay_preview.as_ref().map(|item| item.id.clone());
-    let options = state.app.player.preview_options(player.guild_id);
+    /* **이미 지나간 곡은 후보에서 뺀다.**
+     *
+     * 미리보기가 소비되어 지금 곡이 되고 나면, 새 후보가 뽑히기 전까지 잠깐 옛 묶음이
+     * 남는다. 그대로 보여 주면 **지금 나오는 곡이 후보 맨 위에 뜬다** — 화면으로 확인했다.
+     * 그건 "이걸 고르면 다음에 나온다" 는 말과 정면으로 어긋난다. */
+    let played: HashSet<String> = player
+        .current_item
+        .iter()
+        .chain(player.upcoming.iter())
+        .map(|item| item.track.cache_key())
+        .collect();
+    let options: Vec<_> = state
+        .app
+        .player
+        .preview_options(guild_id)
+        .into_iter()
+        .filter(|item| !played.contains(&item.track.cache_key()))
+        .collect();
     if options.len() < 2 {
-        // 하나뿐이면 고를 것이 없다. 예전처럼 `next` 한 줄만 보여 주면 된다.
+        /* 하나뿐이면 고를 것이 없다 — 예전처럼 `next` 한 줄만 보여 주면 된다.
+         *
+         * **왜 비었는지 한 번은 말한다.** 후보가 안 보이는데 화면에도 로그에도 아무
+         * 흔적이 없으면 원인을 찾을 길이 없다(실제로 그렇게 한참 헤맸다).
+         * 미리보기는 잡혀 있는데 후보만 없는 경우가 이상한 상태이므로 그때만 남긴다. */
+        if player.autoplay_preview.is_some() {
+            state.app.log.info(
+                "Autoplay",
+                &format!(
+                    "후보 줄을 못 그려요 (guild {guild_id}): 미리보기는 있는데 후보가 {}개예요.",
+                    options.len()
+                ),
+            );
+        }
         return json!([]);
     }
     Value::Array(
         options
             .iter()
-            .map(|item| {
+            .enumerate()
+            .map(|(at, item)| {
                 let mut row = next_item_json(item);
-                row["picked"] = json!(picked.as_deref() == Some(item.id.as_str()));
+                /* 표시가 **반드시 하나는** 있어야 한다. 고른 것이 걸러져 나갔으면 실제로
+                 * 나갈 곡은 첫 번째이므로 거기에 표시한다 — 셋 다 `○` 인 화면은
+                 * "안 고르면 뭐가 나오지?" 를 답하지 못한다(실제로 그렇게 나갔다). */
+                let is_picked = match picked.as_deref() {
+                    Some(id) if options.iter().any(|o| o.id == id) => id == item.id,
+                    _ => at == 0,
+                };
+                row["picked"] = json!(is_picked);
                 row
             })
             .collect(),
@@ -3614,7 +3658,7 @@ async fn api_state_hot(
         // 다음 곡 (V3 §14) — 이미 메모리에 있는 값을 그대로 싣는다.
         "next": next_up_json(&player),
         // 다음 곡 후보들 (§8.6). 고를 게 없으면 빈 배열이라 화면이 예전처럼 한 줄만 그린다.
-        "nextOptions": autoplay_options_json(&state, &player),
+        "nextOptions": autoplay_options_json(&state, guild_id, &player),
         // 투표 스킵 현황 (V3 §10.5). 진행 중이 아니면 null 이다.
         "skipVote": skip_vote_json(&state, &ctx, &player),
         "presence": build_presence(&state, guild_id).await,
