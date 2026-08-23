@@ -4985,7 +4985,16 @@ function renderSkipButton(offline, offlineReason) {
  * 아무나 고를 수 있다. 마지막에 누른 사람의 선택이 남고 누가 골랐는지는 활동 기록에 남는다. */
 function renderNextOptions(state) {
   const options = state.nextOptions || [];
-  if (options.length < 2 || !can('queue')) { el.nextOptions.hidden = true; return; }
+  /* **권한 키로 잠그지 않는다.** 서버는 뷰어·정지자만 막고 나머지는 아무나 고를 수 있게
+   * 열어 두었으니(§8.6) 화면도 같은 규칙이어야 한다.
+   *
+   * 처음에 없는 권한 키(`queue`)로 잠갔다가 후보 줄이 아무에게도 안 보였다 — 그 키는
+   * **존재하지 않는 권한 키**라 `permissions.can['queue']` 가 늘 `undefined` 였다.
+   * `can()` 은 모르는 키를 조용히 거짓으로 돌려주므로 화면에는 아무 흔적도 안 남는다. */
+  const blocked = tierOf() === 'viewer'
+    || state.conn === 'down'
+    || (state.suspension && (state.suspension.scope === 'all' || state.suspension.scope === 'queue'));
+  if (options.length < 2 || blocked) { el.nextOptions.hidden = true; return; }
   el.nextOptions.hidden = false;
   clear(el.nextOptions);
   put(el.nextOptions, h('span', { class: 'nextopts__tag' }, '하나 고르면 그걸로 가요'));
@@ -4994,13 +5003,13 @@ function renderNextOptions(state) {
     if (!track) continue;
     const id = option.item?.id ?? option.id;
     const picked = !!option.picked;
-    put(el.nextOptions, setLock(bindAct(h('button', {
+    put(el.nextOptions, bindAct(h('button', {
       class: 'nextopt', type: 'button', 'aria-pressed': String(picked),
       tip: picked ? '지금 이 곡이 다음에 나가요' : '이 곡을 다음에 틀어요',
     },
       h('span', { class: 'nextopt__dot', 'aria-hidden': 'true' }, picked ? '●' : '○'),
       mqText(trackTitle(track), 'nextopt__title'),
-    ), () => pickNextOption(id)), !can('queue'), lockReason('queue')));
+    ), () => pickNextOption(id)));
   }
   marquee.scan(el.nextOptions);
 }

@@ -222,9 +222,72 @@ mod tests {
     /// 자산을 일부러 고쳤으면 이 값을 같이 갱신한다 — 그 갱신이 곧
     /// "자산이 바뀌었다" 는 명시적 선언이다. 의도 없이 바뀌면 여기서 먼저 걸린다.
     /// (워크스페이스 이사 때는 `d44ff894b8ef9398` 이 그대로 유지되는 것으로 무변경을 증명했다.)
+
+    /// **화면이 없는 권한 키를 쓰고 있지 않은지.**
+    ///
+    /// `portal.js` 의 `can(key)` 는 모르는 키를 조용히 `false` 로 돌려준다. 그래서 오타나
+    /// 존재하지 않는 키를 쓰면 **그 기능이 아무에게도 안 보이는데 화면에도 콘솔에도
+    /// 아무 흔적이 안 남는다.**
+    ///
+    /// 실제로 그렇게 당했다 — 다음 곡 후보 줄을 `can('queue')` 로 잠갔는데 `queue` 라는
+    /// 권한 키는 없어서(진짜는 `queueEdit`) 후보가 통째로 안 보였다. 서버 로그에는 후보가
+    /// 셋 잘 뽑혔다고 찍혀 있어서 원인을 찾기도 어려웠다.
+    ///
+    /// 실행으로는 못 잡는다(조용히 거짓이라 예외도 안 난다). 소스를 직접 읽는 이유다.
+    ///
+    /// **주석 안의 예시도 똑같이 걸린다.** 문자열만 훑는 단순한 검사라 그렇다 —
+    /// 그게 싫으면 주석에 `can(` 을 그대로 쓰지 말고 키 이름만 적으면 된다.
+    /// 파서를 정교하게 만드는 것보다 이 규칙이 싸다.
+    #[test]
+    fn the_portal_never_asks_for_a_permission_key_that_does_not_exist() {
+        // `PERM_LABELS = { ... }` 블록에서 키를 긁는다.
+        let start = PORTAL_JS
+            .find("const PERM_LABELS = {")
+            .expect("PERM_LABELS 를 못 찾았다 — 이름이 바뀌었으면 이 테스트도 같이 고친다");
+        let end = PORTAL_JS[start..]
+            .find("
+};")
+            .expect("PERM_LABELS 블록이 안 닫혔다")
+            + start;
+        let known: Vec<&str> = PORTAL_JS[start..end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let name = line.split(':').next()?.trim();
+                (!name.is_empty()
+                    && !name.starts_with('/')
+                    && !name.starts_with('*')
+                    && name.chars().all(|c| c.is_ascii_alphanumeric()))
+                .then_some(name)
+            })
+            .collect();
+        assert!(known.len() > 8, "권한 키를 제대로 못 긁었다: {known:?}");
+
+        // `can('...')` 로 쓰이는 키를 전부 모은다.
+        let mut unknown = Vec::new();
+        let mut rest = PORTAL_JS;
+        while let Some(at) = rest.find("can('") {
+            rest = &rest[at + 5..];
+            if let Some(close) = rest.find("'") {
+                let key = &rest[..close];
+                if !key.is_empty() && !known.contains(&key) {
+                    unknown.push(key.to_string());
+                }
+            }
+        }
+        unknown.sort();
+        unknown.dedup();
+        assert!(
+            unknown.is_empty(),
+            "화면이 없는 권한 키를 쓰고 있다 — `can()` 이 조용히 false 를 돌려줘서 그 기능이              아무에게도 안 보인다. PERM_LABELS 에 있는 이름만 써라.
+  {}",
+            unknown.join(", ")
+        );
+    }
+
     #[test]
     fn version_hash_is_pinned() {
-        assert_eq!(version(), "1157b239cf3ddbd6");
+        assert_eq!(version(), "1434c8d7137fa346");
     }
 
     /// 이름과 바이트가 서로 **뒤바뀌어도** 버전 해시는 그대로다(같은 것을 다 더하므로).
@@ -254,7 +317,7 @@ mod tests {
             ),
             (
                 "portal.js",
-                "626f049b5b0cb53258a5ef87fa3e72443d6e68faabe655c85d5a85623ca4c921",
+                "1dd70e4c6fc97c5f66e10038587203116bf0a0a3cd71fc7e89d8a5e30818463e",
             ),
             (
                 "console.js",
