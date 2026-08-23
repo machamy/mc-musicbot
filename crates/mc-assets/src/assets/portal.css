@@ -3151,3 +3151,36 @@ body.gate {
 @media (max-height: 720px) {
   .qsearch__results { max-height: 34vh; }
 }
+
+/* ── 다음 곡 후보 (§8.6) ──
+ *
+ * 자동 재생이 하나만 정해 주는 대신 셋을 보여 주고 고르게 한다. 재생 카드 아래
+ * `다음` 줄에 이어 붙는다 — 같은 이야기의 연속이라 자리를 따로 만들지 않는다.
+ * 고를 게 없으면 JS 가 통째로 숨기므로 예전 화면과 완전히 같아진다. */
+.nextopts {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: var(--sp-1) 0 0;
+  padding: var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.nextopts__tag { color: var(--text-4); font-size: var(--fs-xs); padding: 0 var(--sp-1) 2px; }
+.nextopt {
+  display: flex; align-items: center; gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  text-align: left;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.nextopt:hover { background: var(--surface-3); color: var(--text-1); }
+/* 지금 나갈 곡. **색만으로 알리지 않는다** — 앞의 ●/○ 글리프가 같은 뜻을 글자로 말한다. */
+.nextopt[aria-pressed="true"] { background: var(--accent-soft); color: var(--text-1); }
+.nextopt__dot { flex: none; color: var(--accent); }
+.nextopt__title { flex: 1 1 auto; min-width: 0; }
+/* 손가락으로 쓸 때는 줄을 키운다 (v4.44 와 같은 규칙). */
+@media (pointer: coarse) { .nextopt { padding: var(--sp-2); } }

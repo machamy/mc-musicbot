@@ -4,6 +4,10 @@
 use crate::app::App;
 use crate::models::*;
 use crate::player::autoplay::{AutoplayContext, AutoplayTuning};
+
+/// 다음 곡 후보를 몇 개 보여 줄지 (§8.6). 하나만 정해 주는 대신 고르게 한다.
+/// 모바일 세로에서 세 줄이 적당하고, 후보를 더 뽑는 비용은 0이다(라디오는 이미 긁었다).
+const AUTOPLAY_OPTION_COUNT: usize = 3;
 use crate::player::coordinator::Coordinator;
 use crate::player::manager::PlayerManager;
 use crate::remote::AutoplayMode;
@@ -275,19 +279,25 @@ pub async fn resolve_preview(app: Arc<App>, guild_id: u64) {
     let result = async {
         let plan = build_autoplay_plan(&app, guild_id, &state);
         if plan.is_empty() {
-            return None;
+            return Vec::new();
         }
+        /* 후보를 **셋** 받아 둔다 (§8.6).
+         *
+         * 라디오를 긁는 일은 이미 한 번이라 추가 비용이 없다 — 같은 목록에서 두 개를
+         * 더 뽑을 뿐이다. 첫 번째가 예전과 똑같이 "안 고르면 나갈 곡" 이고,
+         * 나머지는 사람이 고를 수 있게 화면에 같이 보낸다. */
         app.autoplay
-            .recommend_with_context(
+            .recommend_many_with_context(
                 guild_id,
                 plan.fallback.as_ref(),
                 &plan.seeds,
                 &plan.context(),
+                AUTOPLAY_OPTION_COUNT,
             )
             .await
     }
     .await;
-    if let Some(track) = result {
+    if let Some(track) = result.first().cloned() {
         // 도중에 사용자가 곡을 추가했을 수 있으니 재검사.
         let fresh = app.player.get_state(guild_id).await;
         let same_seed_item =
@@ -300,8 +310,12 @@ pub async fn resolve_preview(app: Arc<App>, guild_id: u64) {
             app.player.should_fill_preview(&fresh) && (same_seed_item || fresh.current_item.is_none());
         if usable {
             let title = track.display_title().to_string();
-            app.player
-                .set_preview(guild_id, QueueItem::new_autoplay(track));
+            let options: Vec<QueueItem> = result
+                .iter()
+                .cloned()
+                .map(QueueItem::new_autoplay)
+                .collect();
+            app.player.set_preview_options(guild_id, options);
             app.log.info(
                 "Autoplay",
                 &format!("AutoplayPreview 채움 guild={guild_id} title={title}"),

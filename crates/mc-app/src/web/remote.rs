@@ -657,6 +657,11 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/api/guilds/{guild_id}/queue",
             get(api_queue_page).post(api_enqueue),
         )
+        // 다음 곡 후보 고르기 (§8.6)
+        .route(
+            "/music/api/guilds/{guild_id}/autoplay/pick",
+            post(api_autoplay_pick),
+        )
         // 링크에 딸려 온 재생목록 통째로 담기 (§15.4)
         .route(
             "/music/api/guilds/{guild_id}/queue/collection",
@@ -2839,6 +2844,33 @@ fn next_up_json(player: &crate::models::GuildPlayerState) -> Value {
     }
 }
 
+/// 자동 재생이 같이 뽑아 둔 후보들 (§8.6).
+///
+/// 첫 번째가 "안 고르면 나갈 곡" 이고, `picked` 가 지금 올라와 있는 것이다.
+/// 대기열에 곡이 있으면 자동 재생이 나갈 차례가 아니므로 빈 목록을 준다 — 그때 후보를
+/// 보여 주면 "이걸 고르면 다음에 나오나?" 라는 거짓말이 된다.
+fn autoplay_options_json(state: &WebState, player: &crate::models::GuildPlayerState) -> Value {
+    if !player.autoplay_enabled || !player.upcoming.is_empty() {
+        return json!([]);
+    }
+    let picked = player.autoplay_preview.as_ref().map(|item| item.id.clone());
+    let options = state.app.player.preview_options(player.guild_id);
+    if options.len() < 2 {
+        // 하나뿐이면 고를 것이 없다. 예전처럼 `next` 한 줄만 보여 주면 된다.
+        return json!([]);
+    }
+    Value::Array(
+        options
+            .iter()
+            .map(|item| {
+                let mut row = next_item_json(item);
+                row["picked"] = json!(picked.as_deref() == Some(item.id.as_str()));
+                row
+            })
+            .collect(),
+    )
+}
+
 fn next_item_json(item: &QueueItem) -> Value {
     json!({
         "id": item.id,
@@ -3581,6 +3613,8 @@ async fn api_state_hot(
         "votePoints": points,
         // 다음 곡 (V3 §14) — 이미 메모리에 있는 값을 그대로 싣는다.
         "next": next_up_json(&player),
+        // 다음 곡 후보들 (§8.6). 고를 게 없으면 빈 배열이라 화면이 예전처럼 한 줄만 그린다.
+        "nextOptions": autoplay_options_json(&state, &player),
         // 투표 스킵 현황 (V3 §10.5). 진행 중이 아니면 null 이다.
         "skipVote": skip_vote_json(&state, &ctx, &player),
         "presence": build_presence(&state, guild_id).await,
@@ -10924,6 +10958,69 @@ struct CollectionEnqueueRequest {
 ///
 /// **권한·상한·중복 걸러내기는 차트 전부 담기와 똑같이 간다** — `bulk_enqueue` 를 그대로
 /// 쓴다. 여기서 규칙을 새로 만들면 두 경로가 갈라져서 한쪽만 상한이 새는 일이 생긴다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoplayPickRequest {
+    item_id: String,
+}
+
+/// `POST .../autoplay/pick` — 다음에 나갈 자동 재생 후보를 고른다 (§8.6).
+///
+/// **아무나 고를 수 있다.** 방에서 같이 듣는 기능이라 곡 조작 권한으로 잠그면
+/// 정작 듣는 사람들이 못 쓴다. 마지막에 누른 사람의 선택이 남고, 누가 골랐는지는
+/// 활동 기록에 남는다 — 그게 실랑이를 줄이는 방식이고 대기열 신청자 표시와 같은 규칙이다.
+///
+/// **후보 목록은 안 지운다** — 마음이 바뀌면 다시 고를 수 있어야 한다.
+async fn api_autoplay_pick(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<AutoplayPickRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    // 읽기 전용·정지 중인 사람은 방의 다음 곡을 바꿀 수 없다.
+    if let Err(response) = ctx.require_not_suspended(SuspensionScope::Queue) {
+        return response;
+    }
+    if ctx.tier <= AccessTier::Viewer {
+        return json_error(StatusCode::FORBIDDEN, "읽기 전용이라 고를 수 없어요.");
+    }
+    if rate_limited(
+        &state,
+        guild_id,
+        ctx.user_id(),
+        "autoplayPick",
+        Duration::from_millis(400),
+    ) {
+        return json_error(StatusCode::TOO_MANY_REQUESTS, "너무 빨라요. 잠깐만 쉬었다 해요.");
+    }
+    if !state.app.player.pick_preview(guild_id, &request.item_id) {
+        return json_error(StatusCode::NOT_FOUND, "그 후보는 이미 지나갔어요.");
+    }
+    let title = state
+        .app
+        .player
+        .get_preview(guild_id)
+        .map(|item| item.track.display_title().to_string())
+        .unwrap_or_default();
+    audit_ok(
+        &state,
+        guild_id,
+        &ctx.session,
+        "autoplay.pick",
+        Some(&title),
+        None,
+    );
+    emit_bare(&state, guild_id, "audit");
+    // 모두의 화면에서 다음 곡 줄이 같이 바뀌어야 한다.
+    broadcast_queue(&state, guild_id).await;
+    json_ok(json!({ "picked": title }))
+}
+
 async fn api_enqueue_collection(
     State(state): State<Arc<WebState>>,
     cookies: Cookies,

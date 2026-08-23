@@ -284,27 +284,58 @@ impl AutoplayEngine {
         ctx: &AutoplayContext<'_>,
         policy: AutoplayPolicy,
     ) -> Option<TrackRef> {
+        self.choose_many(guild_id, seed, candidates, ctx, policy, 1)
+            .into_iter()
+            .next()
+    }
+
+    /// 같은 후보 목록에서 **서로 다른 곡을 여러 개** 뽑는다 (§8.6).
+    ///
+    /// 다음 곡을 하나만 정해 주는 대신 몇 개를 보여 주고 고르게 하려는 것이다.
+    /// **추가 비용이 없다** — 후보를 모으는 일(라디오 424곡 긁기)은 이미 끝났고,
+    /// 여기서는 그 목록에서 뽑기만 더 한다.
+    ///
+    /// 뽑은 것을 목록에서 빼고 다시 뽑는다(비복원). 그래야 같은 곡이 두 번 안 나온다.
+    /// 첫 번째가 곧 "안 고르면 나갈 곡" 이라 예전 동작과 정확히 같다.
+    fn choose_many(
+        &self,
+        guild_id: u64,
+        seed: &TrackRef,
+        candidates: &[TrackRef],
+        ctx: &AutoplayContext<'_>,
+        policy: AutoplayPolicy,
+        want: usize,
+    ) -> Vec<TrackRef> {
         for relax in [Relax::None, Relax::NoArtistCooldown, Relax::Everything] {
-            let weighted = self.weigh(guild_id, candidates, ctx, policy, relax);
+            let mut weighted = self.weigh(guild_id, candidates, ctx, policy, relax);
             if weighted.is_empty() {
                 continue;
             }
             let mut rng = DeterministicRng::now(guild_id, &seed.cache_key(), weighted.len());
-            let picked = weighted_pick(&weighted, &mut rng)?;
-            let track = candidates[picked].clone();
+            let picks: Vec<TrackRef> = weighted_pick_many(&mut weighted, &mut rng, want)
+                .into_iter()
+                .map(|at| candidates[at].clone())
+                .collect();
+            if picks.is_empty() {
+                continue;
+            }
             self.log.info(
                 "Autoplay",
                 &format!(
-                    "정책 {}({} 후보 {}곡)에서 '{}'를 골랐어요.",
+                    "정책 {}({} 후보 {}곡)에서 골랐어요: {}",
                     policy.as_str(),
                     relax.label(),
-                    weighted.len(),
-                    track.display_title()
+                    weighted.len() + picks.len(),
+                    picks
+                        .iter()
+                        .map(|t| t.display_title().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
                 ),
             );
-            return Some(track);
+            return picks;
         }
-        None
+        Vec::new()
     }
 
     /// 살아남은 후보의 `(원본 인덱스, 가중치)`. 가중치가 클수록 잘 뽑힌다.
@@ -417,12 +448,31 @@ impl AutoplayEngine {
         seeds: &[TrackRef],
         ctx: &AutoplayContext<'_>,
     ) -> Option<TrackRef> {
+        self.recommend_many_with_context(guild_id, fallback_seed, seeds, ctx, 1)
+            .await
+            .into_iter()
+            .next()
+    }
+
+    /// 추천을 **여러 개** 받는다 (§8.6). 첫 번째가 "안 고르면 나갈 곡" 이다.
+    ///
+    /// `want == 1` 이면 예전 경로와 완전히 같다 — 후보를 모으는 일도, 고르는 규칙도,
+    /// 시드를 갈아타는 규칙도 그대로다. 달라지는 것은 같은 후보 목록에서 몇 개를 더
+    /// 뽑느냐뿐이라 **라디오를 다시 긁지 않는다.**
+    pub async fn recommend_many_with_context(
+        &self,
+        guild_id: u64,
+        fallback_seed: Option<&TrackRef>,
+        seeds: &[TrackRef],
+        ctx: &AutoplayContext<'_>,
+        want: usize,
+    ) -> Vec<TrackRef> {
         let Some((mut picked, mut seed)) = pick_seed(guild_id, fallback_seed, seeds) else {
             self.log.info(
                 "Autoplay",
                 "기준 곡도 없고 참고할 최근 곡도 없어서 이번 추천은 건너뛰어요.",
             );
-            return None;
+            return Vec::new();
         };
         if let Some(index) = picked {
             self.log.info(
@@ -449,7 +499,8 @@ impl AutoplayEngine {
                 ),
             );
             let candidates = self.gather_candidates(&seed).await;
-            if let Some(next) = self.choose(guild_id, &seed, &candidates, ctx, policy) {
+            let picks = self.choose_many(guild_id, &seed, &candidates, ctx, policy, want);
+            if let Some(next) = picks.first().cloned() {
                 let dur_txt = next
                     .duration
                     .map(|d| format!("{:.0}초", d.as_secs_f64()))
@@ -465,7 +516,7 @@ impl AutoplayEngine {
                         policy.as_str()
                     ),
                 );
-                return Some(next);
+                return picks;
             }
 
             // 아직 안 써 본 기준 곡이 남아 있으면 다음 곡으로 넘어가면서 정책을 한 단계 푼다.
@@ -473,7 +524,7 @@ impl AutoplayEngine {
                 rotations += 1;
                 let previous = seed.display_title().to_string();
                 let Some(rotated) = pick_seed(guild_id, fallback_seed, seeds) else {
-                    return None;
+                    return Vec::new();
                 };
                 (picked, seed) = rotated;
                 let loosened = policy.loosened();
@@ -513,7 +564,7 @@ impl AutoplayEngine {
                     seed.provider
                 ),
             );
-            return None;
+            return Vec::new();
         }
         self.log.warn(
             "Autoplay",
@@ -521,7 +572,7 @@ impl AutoplayEngine {
                 "차단 규칙과 길이 제한 때문에 {MAX_ATTEMPTS}번 안에 쓸 만한 추천을 못 찾았어요."
             ),
         );
-        None
+        Vec::new()
     }
 }
 
@@ -580,6 +631,29 @@ fn weighted_pick(weighted: &[(usize, f64)], rng: &mut DeterministicRng) -> Optio
         }
     }
     weighted.last().map(|(index, _)| *index)
+}
+
+/// 가중 목록에서 **서로 다른** 항목을 최대 `want` 개 뽑는다 (비복원).
+///
+/// 뽑은 것을 목록에서 빼고 다시 뽑는다. 그래야 같은 곡이 두 번 안 나온다.
+/// **`weighted_pick` 이 주는 값은 원본 후보 인덱스**이지 목록 위치가 아니다 —
+/// 지울 때 위치로 착각해 지우면 엉뚱한 후보가 사라진다. 그래서 값으로 찾아 지운다.
+///
+/// `want == 1` 이면 한 번만 돌아 예전 동작과 정확히 같다.
+fn weighted_pick_many(
+    weighted: &mut Vec<(usize, f64)>,
+    rng: &mut DeterministicRng,
+    want: usize,
+) -> Vec<usize> {
+    let mut picks = Vec::new();
+    while picks.len() < want && !weighted.is_empty() {
+        let Some(at) = weighted_pick(weighted, rng) else { break };
+        if let Some(pos) = weighted.iter().position(|(index, _)| *index == at) {
+            weighted.remove(pos);
+        }
+        picks.push(at);
+    }
+    picks
 }
 
 #[cfg(test)]
@@ -751,6 +825,44 @@ mod tests {
     }
 
     /// 가중 무작위가 가중치를 실제로 따르는지. 0 가중치는 절대 안 뽑혀야 한다.
+    /// 후보 여러 개를 뽑을 때 **같은 곡이 두 번 안 나온다** (§8.6).
+    ///
+    /// 뽑은 것을 목록에서 안 빼면 같은 곡이 세 줄 다 차지해서 고를 것이 없어진다.
+    /// 그리고 `weighted_pick` 이 주는 값은 원본 후보 인덱스라, 지울 때 위치로 착각하면
+    /// 엉뚱한 후보가 사라진다 — 그 둘을 여기서 못 박는다.
+    #[test]
+    fn picking_several_never_repeats_a_candidate() {
+        // 인덱스를 일부러 위치와 다르게 준다. 위치로 지우는 구현이면 여기서 걸린다.
+        let mut weighted = vec![(10usize, 1.0), (20, 1.0), (30, 1.0), (40, 1.0)];
+        let mut rng = DeterministicRng::new(7, "seed", weighted.len(), 0);
+        let picks = weighted_pick_many(&mut weighted, &mut rng, 3);
+        assert_eq!(picks.len(), 3, "셋을 달라고 했으면 셋이어야 한다");
+        let mut sorted = picks.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "같은 후보가 두 번 나왔다: {picks:?}");
+        for at in &picks {
+            assert!([10, 20, 30, 40].contains(at), "없는 후보를 뽑았다: {at}");
+        }
+        assert_eq!(weighted.len(), 1, "뽑은 만큼 목록에서 빠져야 한다");
+    }
+
+    /// 후보가 모자라면 있는 만큼만 준다. 하나만 달라면 예전과 같이 하나다.
+    #[test]
+    fn picking_several_stops_when_the_pool_runs_out() {
+        let mut two = vec![(0usize, 1.0), (1, 1.0)];
+        let mut rng = DeterministicRng::new(7, "seed", 2, 0);
+        assert_eq!(weighted_pick_many(&mut two, &mut rng, 5).len(), 2);
+
+        let mut one = vec![(3usize, 1.0), (4, 1.0), (5, 1.0)];
+        let mut rng = DeterministicRng::new(7, "seed", 3, 0);
+        assert_eq!(weighted_pick_many(&mut one, &mut rng, 1).len(), 1);
+
+        let mut none: Vec<(usize, f64)> = Vec::new();
+        let mut rng = DeterministicRng::new(7, "seed", 1, 0);
+        assert!(weighted_pick_many(&mut none, &mut rng, 3).is_empty());
+    }
+
     #[test]
     fn weighted_pick_respects_the_weights() {
         let weighted = vec![(0usize, 0.0), (1, 1.0)];

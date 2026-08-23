@@ -1123,7 +1123,7 @@ pub fn audit_kind_for(action: &str) -> AuditKind {
             }
         }
         _ if action.starts_with("queue.") => AuditKind::Song,
-        "playlist.enqueue" | "chart.enqueue" => AuditKind::Song,
+        "playlist.enqueue" | "chart.enqueue" | "autoplay.pick" => AuditKind::Song,
         _ if action.starts_with("vote.") => AuditKind::Vote,
         // 못 튼 것은 '재생 조작' 이 아니라 '문제' 다. 아래 `playback.` 접두보다 먼저 본다 —
         // 순서가 뒤집히면 실패가 재생으로 분류돼 기본 필터에서 사라진다.
@@ -1456,6 +1456,12 @@ pub fn audit_text(
         "chart.enqueue" => match item {
             Some(name) => format!("{actor}님이 차트 **{name}** 에서 {count}곡을 담았어요"),
             None => format!("{actor}님이 차트에서 {count}곡을 담았어요"),
+        },
+        // 다음 곡 후보 고르기 (§8.6). 아무나 고를 수 있으니 **누가 골랐는지**가 중요하다 —
+        // 그게 실랑이를 줄이는 방식이라 문장에 이름을 앞세운다.
+        "autoplay.pick" => match item {
+            Some(name) => format!("{actor}님이 다음 곡으로 **{name}** 을 골랐어요"),
+            None => format!("{actor}님이 다음 곡을 골랐어요"),
         },
         "vote.like" | "vote.superlike" | "vote.dislike" => {
             let what = match action {

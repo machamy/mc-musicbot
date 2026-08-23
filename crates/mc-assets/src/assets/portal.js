@@ -4870,6 +4870,8 @@ function buildStage() {
 
   // 다음 곡 한 줄 (§14.3). 카드를 하나 더 만들면 화면만 무거워진다.
   el.nextRow = h('div', { class: 'nextrow', hidden: true, dataset: { mqRow: '1' } });
+  // 다음 곡 후보 (§8.6). 고를 게 없으면 통째로 숨는다 — 예전 화면과 같아진다.
+  el.nextOptions = h('div', { class: 'nextopts', hidden: true, role: 'group', 'aria-label': '다음 곡 후보' });
 
   el.nowCard = h('section', { class: 'now', 'data-testid': 'now-playing', dataset: { mqRow: '1' } },
     (el.nowArtWrap = h('div', { class: 'now__artwrap' }, el.nowArt)),
@@ -4888,7 +4890,8 @@ function buildStage() {
         el.videoBtn,
         el.webBtn),
       h('div', { class: 'vols' }, el.volumeWrap, el.webVolWrap, el.webSync, el.webNote)),
-    el.nextRow);
+    el.nextRow,
+    el.nextOptions);
 
   bindSeek();
   bindContextTarget(el.nowCard, () => {
@@ -4974,6 +4977,41 @@ function renderSkipButton(offline, offlineReason) {
 }
 
 /* ── 다음 곡 (§14.3) ── */
+/* 다음 곡 후보 (§8.6).
+ *
+ * 자동 재생이 하나만 정해 주는 대신 셋을 보여 주고 고르게 한다. **안 고르면 예전과
+ * 똑같이** 첫 번째가 나간다 — 이 줄은 순전히 덤이라, 후보가 둘 미만이면 아예 안 그린다.
+ *
+ * 아무나 고를 수 있다. 마지막에 누른 사람의 선택이 남고 누가 골랐는지는 활동 기록에 남는다. */
+function renderNextOptions(state) {
+  const options = state.nextOptions || [];
+  if (options.length < 2 || !can('queue')) { el.nextOptions.hidden = true; return; }
+  el.nextOptions.hidden = false;
+  clear(el.nextOptions);
+  put(el.nextOptions, h('span', { class: 'nextopts__tag' }, '하나 고르면 그걸로 가요'));
+  for (const option of options) {
+    const track = option.item?.track || option.track;
+    if (!track) continue;
+    const id = option.item?.id ?? option.id;
+    const picked = !!option.picked;
+    put(el.nextOptions, setLock(bindAct(h('button', {
+      class: 'nextopt', type: 'button', 'aria-pressed': String(picked),
+      tip: picked ? '지금 이 곡이 다음에 나가요' : '이 곡을 다음에 틀어요',
+    },
+      h('span', { class: 'nextopt__dot', 'aria-hidden': 'true' }, picked ? '●' : '○'),
+      mqText(trackTitle(track), 'nextopt__title'),
+    ), () => pickNextOption(id)), !can('queue'), lockReason('queue')));
+  }
+  marquee.scan(el.nextOptions);
+}
+
+async function pickNextOption(itemId) {
+  if (!itemId) return;
+  // 서버가 `queue.set` 을 다시 쏘므로 모두의 화면이 같이 바뀐다. 여기서 낙관적으로
+  // 칠하지 않는다 — 남이 고른 것과 뒤섞이면 무엇이 진짜인지 알 수 없게 된다.
+  await call(() => api('/autoplay/pick', { body: { itemId } }));
+}
+
 function renderNextRow(state) {
   const next = state.next;
   if (!next || !next.item || !next.item.track) { el.nextRow.hidden = true; return; }
@@ -6444,6 +6482,7 @@ function renderNow(state) {
   }
   renderSkipButton(offline, offlineReason);
   renderNextRow(state);
+  renderNextOptions(state);
   /* 잠기는 이유가 셋인데 메시지를 하나로 뭉치면 안 된다. 권한은 멀쩡한데 길이를 모르는 곡이면
    * `lockReason` 이 마지막 분기까지 내려가 "이 서버의 멤버여야 눌러요" 라는 엉뚱한 말을 한다
    * (일시정지는 되는데 위치 이동만 안 되는 것처럼 보여서 두 배로 헷갈린다). 사유별로 갈라 준다. */
@@ -9821,6 +9860,7 @@ async function loadHot() {
     sortedAt: data.sortedAt || null,
     nextSortAt: data.nextSortAt || null,
     next: data.next || null,
+    nextOptions: data.nextOptions || [],
     skipVote: data.skipVote || null,
     presence: data.presence || store.get().presence,
     hotAt: Date.now(),
@@ -9887,7 +9927,7 @@ async function boot() {
   // `watch` 도 본다 — 같이보기 표가 붙고 떨어지려면 명단이 바뀔 때 다시 그려야 한다.
   store.subscribe(['presence', 'members', 'intentStatus', 'watch'], renderMembers);
   store.subscribe(['queue', 'queueMode', 'permissions', 'suspension', 'tier', 'conn', 'hotAt', 'settings', 'superLike'], renderQueue);
-  store.subscribe(['current', 'player', 'permissions', 'suspension', 'tier', 'settings', 'conn', 'next', 'skipVote'], renderNow);
+  store.subscribe(['current', 'player', 'permissions', 'suspension', 'tier', 'settings', 'conn', 'next', 'nextOptions', 'skipVote'], renderNow);
   store.subscribe(['chat', 'chatDelta', 'permissions', 'suspension', 'tier', 'conn', 'settings', 'coldAt'], renderChat);
   store.subscribe(['liked', 'saved', 'playlists', 'permissions', 'suspension', 'tier'], renderLibrary);
   store.subscribe(['recent', 'permissions', 'suspension', 'tier'], renderRecent);
@@ -10012,12 +10052,14 @@ async function boot() {
           queue: mergeQueueFrame(store.get().queue),
           nextSortAt: data.nextSortAt || null,
           next: data.next !== undefined ? data.next : store.get().next,
+          nextOptions: data.nextOptions !== undefined ? data.nextOptions : store.get().nextOptions,
         });
       }
       if (type === 'playback' && data) {
         noteServerTime(data.sampledAtUtc);
         // 곡이 바뀌면 다음 곡도 같이 바뀌고, 스킵 투표는 리셋된다 (§10.5·§14.2)
         if (data.next !== undefined) store.patch({ next: data.next });
+        if (data.nextOptions !== undefined) store.patch({ nextOptions: data.nextOptions });
         if (data.currentId !== undefined && data.currentId !== store.get().current?.id) store.patch({ skipVote: null });
       }
     },

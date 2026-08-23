@@ -31,6 +31,9 @@ pub struct PlayerManager {
     log: Arc<LogService>,
     gate: Mutex<()>,
     previews: StdMutex<HashMap<u64, QueueItem>>,
+    /// 자동 재생이 같이 뽑아 둔 **다른 후보들** (§8.6). 첫 번째가 `previews` 와 같은 곡이다.
+    /// 사람이 하나를 고르면 그게 `previews` 로 올라간다.
+    preview_options: StdMutex<HashMap<u64, Vec<QueueItem>>>,
     preview_inflight: StdMutex<HashSet<u64>>,
     /// 길드별 리모컨 설정 캐시. 정렬은 5초마다·모든 상태 변경마다 돌기 때문에
     /// 매번 설정 JSON을 읽으면 유휴 상태에서도 쿼리가 계속 나간다(사양서 §5.2 H).
@@ -81,6 +84,7 @@ impl PlayerManager {
             log,
             gate: Mutex::new(()),
             previews: StdMutex::new(HashMap::new()),
+            preview_options: StdMutex::new(HashMap::new()),
             preview_inflight: StdMutex::new(HashSet::new()),
             settings: StdMutex::new(HashMap::new()),
             shuffle_seeds: StdMutex::new(HashMap::new()),
@@ -799,7 +803,45 @@ impl PlayerManager {
         self.previews.lock().unwrap().insert(guild_id, item);
     }
 
+    /// 후보 묶음을 통째로 갈아 끼운다. 첫 번째가 곧 "안 고르면 나갈 곡" 이다.
+    pub fn set_preview_options(&self, guild_id: u64, items: Vec<QueueItem>) {
+        if let Some(first) = items.first().cloned() {
+            self.previews.lock().unwrap().insert(guild_id, first);
+        }
+        self.preview_options
+            .lock()
+            .unwrap()
+            .insert(guild_id, items);
+    }
+
+    pub fn preview_options(&self, guild_id: u64) -> Vec<QueueItem> {
+        self.preview_options
+            .lock()
+            .unwrap()
+            .get(&guild_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 후보 중 하나를 "다음 곡" 으로 올린다. 없는 id 면 `false`.
+    ///
+    /// **후보 목록 자체는 그대로 둔다** — 마음이 바뀌면 다시 고를 수 있어야 한다.
+    pub fn pick_preview(&self, guild_id: u64, item_id: &str) -> bool {
+        let options = self.preview_options.lock().unwrap();
+        let Some(found) = options
+            .get(&guild_id)
+            .and_then(|list| list.iter().find(|item| item.id == item_id))
+            .cloned()
+        else {
+            return false;
+        };
+        drop(options);
+        self.previews.lock().unwrap().insert(guild_id, found);
+        true
+    }
+
     pub fn clear_preview(&self, guild_id: u64) {
+        self.preview_options.lock().unwrap().remove(&guild_id);
         self.previews.lock().unwrap().remove(&guild_id);
     }
 
