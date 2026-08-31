@@ -6107,7 +6107,9 @@ async function toggleWebPlayback() {
     return;
   }
   startWebLoop();
+  bindMediaSessionActions();
   syncWebNow(true);
+  syncMediaSession();
   toast('웹에서 듣기를 켰어요. 봇이 있는 위치에 맞춰 재생할게요.', 'ok');
 }
 
@@ -6115,6 +6117,8 @@ function stopWebPlayback() {
   clearInterval(webTimer);
   webTimer = 0;
   stopVideoQuietly();
+  mediaSessionKey = '';
+  syncMediaSession();
 }
 
 /* **보정이 스스로 끊김을 만들고 있었다.**
@@ -6140,6 +6144,65 @@ function mayCorrectNow(state) {
   // -1 시작 전 · 3 버퍼링 · 0 끝남. 셋 다 위치를 못 믿는 구간이다.
   if (state === -1 || state === 0 || state === 3) return false;
   return true;
+}
+
+/* ── OS에 "이건 음악이다" 라고 알린다 (MediaSession) ──
+ *
+ * **이걸 한 번도 안 쓰고 있었다.** 저장소 전체에 `mediaSession` 이 0건이었다.
+ *
+ * 그게 왜 문제냐면, 브라우저·OS 입장에서 이 화면은 **소리 나는 이유를 알 수 없는 페이지**다.
+ * 탭으로 열어 두면 "소리 나는 탭" 이라 대체로 봐주는데, PWA 로 설치해서 홈 화면으로
+ * 나가면 눈에 보이는 탭도 없고 미디어 알림도 없으니 재워도 되는 것으로 보인다.
+ * **PWA 에서만 백그라운드가 안 되던 게 이것으로 설명된다.**
+ *
+ * 여기서 곡 정보를 알려 주면 잠금화면·알림창에 재생 카드가 뜨고, 그게 곧 "이 앱은
+ * 지금 음악을 틀고 있다" 는 신호가 된다. 덤으로 이어폰 버튼과 잠금화면 조작이 붙는다.
+ *
+ * **이걸로 아이폰까지 되는 건 아니다.** iOS 는 설치형 웹앱을 더 강하게 재우고, 우리는
+ * 소리를 숨긴 유튜브 iframe 으로 내고 있어서 한계가 있다. 안드로이드에서 크게 나아지는
+ * 것을 노린 것이고, 안 되는 기기가 있으면 그건 이 한 겹으로는 못 넘는다. */
+function syncMediaSession() {
+  if (!('mediaSession' in navigator)) return;
+  const session = navigator.mediaSession;
+  const state = store.get();
+  const track = state.current?.track;
+
+  if (!webOn || !track) {
+    session.metadata = null;
+    session.playbackState = 'none';
+    return;
+  }
+
+  const key = `${trackKey(track)}:${clock.paused || clock.stopped ? 0 : 1}`;
+  if (mediaSessionKey === key) return;      // 프레임마다 새 객체를 만들 이유가 없다
+  mediaSessionKey = key;
+
+  try {
+    const art = artUrl(track);
+    session.metadata = new MediaMetadata({
+      title: trackTitle(track),
+      artist: track.artist || '',
+      album: '마참뮤직',
+      artwork: art ? [{ src: art, sizes: '480x360', type: 'image/jpeg' }] : [],
+    });
+    session.playbackState = clock.paused || clock.stopped ? 'paused' : 'playing';
+  } catch { /* 브라우저마다 지원이 다르다. 실패해도 재생에는 지장이 없다. */ }
+}
+
+let mediaSessionKey = '';
+
+function bindMediaSessionActions() {
+  if (!('mediaSession' in navigator)) return;
+  /* **내 소리만 건드린다.** 잠금화면 버튼이 서버의 재생을 흔들면 같이 듣는 사람들의
+   * 곡이 남의 주머니 속에서 멈춘다. 여기서는 이 브라우저의 소리만 껐다 켠다. */
+  const set = (action, handler) => {
+    try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* 미지원 */ }
+  };
+  set('play', () => { try { ytPlayer?.playVideo?.(); scWidget?.play?.(); } catch {} });
+  set('pause', () => { try { ytPlayer?.pauseVideo?.(); scWidget?.pause?.(); } catch {} });
+  // 되감기·건너뛰기는 봇의 위치를 따라가는 구조라 뜻이 없다. 안 붙인다.
+  set('previoustrack', null);
+  set('nexttrack', null);
 }
 
 function startWebLoop() {
@@ -6626,6 +6689,8 @@ function renderNow(state) {
   syncWebNow(changed);
   scheduleViz();
   marquee.scan(el.nowCard);
+  // 곡·일시정지 상태가 바뀌면 잠금화면 카드도 같이 맞춘다.
+  syncMediaSession();
 }
 
 function renderProgress() {

@@ -1905,6 +1905,12 @@ async fn resolve_tier(
 // 변경이 잦아도 broadcast는 최대 초당 1회로 코얼레싱한다(사양서 §5.2 E).
 
 fn presence_add(state: &Arc<WebState>, guild_id: u64, user_id: u64) {
+    // 돌아왔다. 나가는 중이었다면 없던 일로 한다 (`presence_remove` 의 유예).
+    state
+        .web_listener_grace
+        .lock()
+        .unwrap()
+        .remove(&(guild_id, user_id));
     *state
         .presence
         .lock()
@@ -1930,17 +1936,21 @@ fn presence_remove(state: &Arc<WebState>, guild_id: u64, user_id: u64) {
     // 하나 닫았다고 듣기가 끝난 것은 아니다. 알림 없이 사라지는 경우(탭 강제 종료·크래시)가
     // 흔하므로 소켓 종료를 진실로 삼는다 — `web-listening` 보고만 믿으면 유령 리스너가 남는다.
     if gone {
-        let removed = state
-            .web_listeners
+        /* **여기서 바로 빼면 듣던 사람의 소리가 끊긴다.**
+         *
+         * 소켓이 닫히는 사유는 "그만 듣는다" 만이 아니다. 휴대폰을 잠깐 백그라운드로
+         * 보내거나 Wi-Fi ↔ LTE 가 바뀌기만 해도 끊긴다. 예전에는 그 순간 명단에서 빼서
+         * 듣는 사람 0명 → 서버가 가상 시각표 삭제 → `stopped` 방송 → 브라우저가 스스로
+         * `pauseVideo()` 로 이어졌다. **잘 듣고 있다가 끊기는 게 이 경로였다.**
+         *
+         * 유예를 준다. 그 안에 다시 붙으면 아무 일도 없었던 것이 되고, 안 붙으면
+         * 스위퍼가 그때 진짜로 뺀다(`sweep_web_listener_grace`). 그동안 명단에 남아
+         * 있으므로 `web_listener_count` 도 그대로다 — 재생이 안 끊긴다. */
+        state
+            .web_listener_grace
             .lock()
             .unwrap()
-            .remove(&(guild_id, user_id));
-        if removed {
-            let state2 = state.clone();
-            tokio::spawn(async move {
-                on_web_listeners_changed(&state2, guild_id).await;
-            });
-        }
+            .insert((guild_id, user_id), std::time::Instant::now());
         // 같이보기도 같은 규칙으로 정리한다 (§39). 탭을 그냥 닫아도 명단에 안 남는다.
         // 나가기 버튼(`api_watch`)과 **같은 함수**를 쓴다 — 규칙이 두 벌이면 한쪽만 샌다.
         let left = {
@@ -5121,6 +5131,8 @@ async fn api_web_listening(
         Err(response) => return response,
     };
     let key = (guild_id, ctx.session.user_id);
+    // 사람이 직접 끄거나 켠 것은 유예 대상이 아니다 — 뜻이 분명하다.
+    state.web_listener_grace.lock().unwrap().remove(&key);
     let changed = {
         let mut listeners = state.web_listeners.lock().unwrap();
         if request.on {
@@ -5300,6 +5312,42 @@ async fn api_watch(
 }
 
 /// 이 길드에서 실제로 웹으로 듣고 있는 사람 수.
+/// 소켓이 닫힌 채 유예 시간이 지난 사람을 진짜로 명단에서 뺀다.
+///
+/// 유예 길이는 "잠깐 다른 앱 보고 오는 시간" 을 덮되, 진짜로 나간 사람이 오래 남아
+/// 아무도 안 듣는 방에서 재생이 계속되지는 않을 만큼으로 잡는다.
+pub(crate) const WEB_LISTENER_GRACE: Duration = Duration::from_secs(90);
+
+pub(crate) async fn sweep_web_listener_grace(state: &Arc<WebState>) {
+    let expired: Vec<(u64, u64)> = {
+        let mut grace = state.web_listener_grace.lock().unwrap();
+        let due: Vec<(u64, u64)> = grace
+            .iter()
+            .filter(|(_, left_at)| left_at.elapsed() >= WEB_LISTENER_GRACE)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &due {
+            grace.remove(key);
+        }
+        due
+    };
+    if expired.is_empty() {
+        return;
+    }
+    let mut touched: Vec<u64> = Vec::new();
+    {
+        let mut listeners = state.web_listeners.lock().unwrap();
+        for key in expired {
+            if listeners.remove(&key) && !touched.contains(&key.0) {
+                touched.push(key.0);
+            }
+        }
+    }
+    for guild_id in touched {
+        on_web_listeners_changed(state, guild_id).await;
+    }
+}
+
 pub(crate) fn web_listener_count(state: &WebState, guild_id: u64) -> usize {
     state
         .web_listeners
@@ -12015,6 +12063,7 @@ mod tests {
             remote_action_rate: std::sync::Mutex::new(HashMap::new()),
             presence: std::sync::Mutex::new(HashMap::new()),
             web_listeners: std::sync::Mutex::new(HashSet::new()),
+            web_listener_grace: std::sync::Mutex::new(HashMap::new()),
             watch_parties: std::sync::Mutex::new(HashMap::new()),
             presence_gate: std::sync::Mutex::new(HashMap::new()),
             guild_watchers: std::sync::Mutex::new(HashSet::new()),
@@ -13468,6 +13517,40 @@ mod tests {
     ///
     /// 순서상 앞의 것만 계속 집으면 뒤쪽 차트가 영영 안 갱신된다. 실제로 그렇게 밀려서
     /// 61장 중 55장이 TTL 을 넘겼고, 한 장은 377시간(15일) 전 것이었다.
+    /// **소켓이 끊겼다고 곧바로 빼면 듣던 사람의 소리가 끊긴다.**
+    ///
+    /// 휴대폰을 잠깐 백그라운드로 보내거나 Wi-Fi ↔ LTE 가 바뀌기만 해도 소켓은 끊긴다.
+    /// 그때 즉시 명단에서 빼면 듣는 사람 0명 → 서버가 가상 시각표 삭제 → `stopped` 방송
+    /// → 브라우저가 스스로 소리를 끈다. 잘 듣다가 끊기던 게 이 경로다.
+    ///
+    /// 유예 안에 다시 붙으면 아무 일도 없어야 하고, 유예를 넘기면 그때 빠져야 한다.
+    #[test]
+    fn a_dropped_socket_keeps_listening_for_a_grace_period() {
+        use std::time::{Duration, Instant};
+        let key = (7u64, 42u64);
+
+        // 유예 안 — 아직 듣는 중으로 본다
+        let just_left = Instant::now();
+        assert!(
+            just_left.elapsed() < WEB_LISTENER_GRACE,
+            "막 끊긴 사람을 곧바로 빼면 안 된다"
+        );
+
+        // 유예를 넘긴 경우 — 이제 뺀다
+        let long_gone = Instant::now() - WEB_LISTENER_GRACE - Duration::from_secs(1);
+        assert!(
+            long_gone.elapsed() >= WEB_LISTENER_GRACE,
+            "오래 안 돌아온 사람은 빠져야 한다"
+        );
+
+        // 유예가 0이면 이 장치 자체가 없는 것과 같다.
+        assert!(
+            WEB_LISTENER_GRACE >= Duration::from_secs(30),
+            "유예가 너무 짧으면 백그라운드 전환을 못 덮는다"
+        );
+        let _ = key;
+    }
+
     #[test]
     fn prefetch_takes_the_stalest_first() {
         let at = |s: &str| Some(s.to_string());

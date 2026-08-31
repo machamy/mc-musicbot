@@ -195,6 +195,16 @@ pub struct WebState {
     /// 새로고침하면 브라우저의 실제 재생 상태(`webOn`)는 항상 false 로 시작해 사용자가
     /// 다시 눌러야 한다. 그래서 **브라우저가 실제로 소리를 내기 시작한 순간** 알려 준다.
     pub web_listeners: Mutex<HashSet<(u64, u64)>>,
+    /* **소켓이 닫혔다고 곧바로 빼지 않는다.**
+     *
+     * "듣는 중" 명단은 WebSocket 수명에 묶여 있는데, 휴대폰을 잠깐 백그라운드로 보내거나
+     * Wi-Fi ↔ LTE 가 바뀌기만 해도 소켓은 끊긴다. 그때 즉시 빼면 듣는 사람이 0명이 되고,
+     * 서버가 가상 시각표를 지우고, 그 `stopped` 를 받은 브라우저가 스스로 소리를 끈다.
+     * **듣고 있는 도중에 끊기는 게 이 경로다.**
+     *
+     * 그래서 나간 시각만 적어 두고 유예를 준다. 그 안에 다시 붙으면 아무 일도 없었던
+     * 것이 되고, 안 붙으면 그때 진짜로 뺀다. 값은 "언제 마지막 소켓이 닫혔나". */
+    pub web_listener_grace: Mutex<HashMap<(u64, u64), std::time::Instant>>,
     /// **지금 이 방에서 도는 같이보기 한 판** (§39).
     ///
     /// `web_listeners` 와 같은 이유로 **DB를 쓰지 않는다.** 접속해 있는 동안에만 뜻이 있는
@@ -304,6 +314,7 @@ pub async fn serve(app: Arc<App>) {
         remote_action_rate: Mutex::new(HashMap::new()),
         presence: Mutex::new(HashMap::new()),
         web_listeners: Mutex::new(HashSet::new()),
+        web_listener_grace: Mutex::new(HashMap::new()),
         watch_parties: Mutex::new(HashMap::new()),
         presence_gate: Mutex::new(HashMap::new()),
         guild_watchers: Mutex::new(HashSet::new()),
@@ -313,6 +324,20 @@ pub async fn serve(app: Arc<App>) {
     });
 
     spawn_sweeper(state.clone());
+    /* **듣는 중 명단은 따로, 자주 걷는다.**
+     *
+     * 위 스위퍼는 5분마다 도는데 그건 로그인 흔적·역할 캐시용 주기다. 듣는 사람이
+     * 진짜로 나갔는지는 그보다 촘촘히 봐야 한다 — 유예가 90초인데 5분마다 걷으면
+     * 아무도 없는 방에서 몇 분을 더 튼다. */
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                remote::sweep_web_listener_grace(&state).await;
+            }
+        });
+    }
 
     // 5초 재정렬 루프가 순서를 바꾸면 그 결과를 WS로 밀어 준다.
     // 이 훅을 안 걸면 대기열이 조용히 재정렬되기만 하고 화면은 안 움직인다.
