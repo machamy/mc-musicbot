@@ -5241,7 +5241,14 @@ function webTargetPosition() {
   const raw = startedAt && !clock.paused && !clock.stopped
     ? (Date.now() - startedAt) / 1000
     : clock.position();
-  return Math.max(0, raw - syncOffsetSeconds());
+  const target = Math.max(0, raw - syncOffsetSeconds());
+  /* **곡 길이를 넘어가지 않게 붙든다.**
+   *
+   * 목표 시각은 벽시계로 흐르는데 곡이 바뀐 사실은 서버가 알려 줘야 안다(최대 2초 늦다).
+   * 그 사이 목표는 곡 끝을 지나 계속 커지고 재생은 끝에 멈춰 있으니 어긋남이 폭발한다 —
+   * 그러면 곡이 넘어갈 때마다 `끝 너머로 seek + 재생` 이 걸리고, 끝난 플레이어에
+   * 재생을 걸면 **처음부터 다시 튼다.** `clock.position()` 은 이미 같은 이유로 붙들고 있다. */
+  return clock.duration > 0 ? Math.min(target, clock.duration) : target;
 }
 
 function buildWebPlayback() {
@@ -5362,7 +5369,21 @@ function buildWebPlayback() {
   document.body.appendChild(el.videoChrome);
   bindVideoChromeIdle();
 
+  /* **떠날 때 끄되, 돌아오면 되살린다.**
+   *
+   * `pagehide` 에서 소리와 **동기화 루프를 같이** 껐는데 되살리는 짝이 없었다. 화면을
+   * 껐다 켜면 소리는 렌더가 다시 물어 살아나지만 `webTimer` 는 영영 안 돌아온다 —
+   * 그때부터 위치 보정도, 다음 곡 준비도, `멈춤` 감시도 죽은 채로 남는다.
+   * `startWebLoop` 를 부르는 곳이 켜기 토글 안뿐이라 그랬다. */
   window.addEventListener('pagehide', stopWebPlayback);
+  const resumeWebIfNeeded = () => {
+    if (!webOn || document.hidden) return;
+    if (!webTimer) startWebLoop();
+    reportWebListening(true);   // 그동안 소켓이 끊겼다면 명단에서 빠져 있다
+    syncWebNow(true);
+  };
+  window.addEventListener('pageshow', resumeWebIfNeeded);
+  document.addEventListener('visibilitychange', resumeWebIfNeeded);
 }
 
 /* ═══════════════════════ 같이보기 · 영상 오버레이 (§39) ═══════════════════════
@@ -6096,7 +6117,33 @@ function stopWebPlayback() {
   stopVideoQuietly();
 }
 
+/* **보정이 스스로 끊김을 만들고 있었다.**
+ *
+ * 루프가 1.5초마다 도는데, 어긋남이 2초를 넘으면 `seekTo(위치, true)` 를 건다. 그 `true`
+ * 는 "버퍼 밖이면 새로 받아와라" 라는 뜻이라 **보정 한 번이 새 버퍼링 한 번**이다. 그런데
+ * 버퍼링 동안 재생은 멈추고 목표 시각은 벽시계로 계속 흐르므로, 보정하고 나면 오히려 더
+ * 뒤처진다. 그래서 1.5초 뒤에 또 걸리고, 또 끊긴다 — 되먹임이다. 신고된 "1~3초마다
+ * 끊긴다" 가 이 주기(1.5초, 한 틱 걸러 3.0초)와 그대로 맞는다.
+ *
+ * 두 가지를 막는다. **버퍼링·시작 전·끝남 상태에서는 손대지 않고**(그때 `getCurrentTime`
+ * 은 아직 못 믿을 값이다), 한 번 보정했으면 **자리 잡을 시간을 준다.** 진짜로 어긋난
+ * 경우에는 이 시간 뒤에 어차피 다시 걸리므로 맞춰지는 건 늦어질 뿐 안 되는 게 아니다. */
+const WEB_SEEK_COOLDOWN_MS = 6000;
+let webLastSeekAt = 0;
+
+function ytPlayerState() {
+  try { return Number(ytPlayer?.getPlayerState?.()); } catch { return null; }
+}
+
+function mayCorrectNow(state) {
+  if (Date.now() - webLastSeekAt < WEB_SEEK_COOLDOWN_MS) return false;
+  // -1 시작 전 · 3 버퍼링 · 0 끝남. 셋 다 위치를 못 믿는 구간이다.
+  if (state === -1 || state === 0 || state === 3) return false;
+  return true;
+}
+
 function startWebLoop() {
+  webLastSeekAt = 0;
   clearInterval(webTimer);
   webTimer = setInterval(webTick, 1500);
 }
@@ -6218,8 +6265,14 @@ function seekWebTo(seconds) {
  * 유튜브 플레이어는 `loadVideoById` 로 갈아 끼우는데, 그 사이 몇 초가 무음이다.
  * 곡이 실제로 끝난 **뒤에** 서버 이벤트를 받고 나서야 로드하면 그 공백이 그대로 들린다.
  *
- * 그래서 다음 곡을 미리 **cue** 해 둔다. `cueVideoById` 는 버퍼만 채우고 소리는 안 낸다.
- * 서버가 알려 준 다음 곡 시작 시각이 되면 이미 준비된 것을 재생만 시작하면 된다.
+ * **아직 안 된다.** 이 함수는 다음 곡 키를 적어 두기만 하고 실제로 미리 받아 두지 않는다.
+ * 주석에 적혀 있던 `cueVideoById` 호출은 저장소 어디에도 없다 — 즉 곡 사이 공백을
+ * 막는다는 이 설명은 지금까지 거짓이었다.
+ *
+ * 그리고 그 방법으로는 못 고친다. 유튜브 플레이어가 **하나뿐**이라, 거기에 다음 곡을
+ * cue 하는 순간 지금 곡이 내려간다. 진짜로 하려면 숨은 플레이어를 하나 더 두고
+ * 곡이 바뀔 때 둘을 바꿔 끼워야 한다(이중 버퍼). 그건 별도 작업이라 여기서는
+ * **사실만 바로잡아 둔다** — 다음 사람이 이 주석을 믿고 고쳤다고 생각하면 안 된다.
  */
 let webPreloaded = null;   // 미리 준비해 둔 다음 곡 키
 
@@ -6259,8 +6312,9 @@ function webTick() {
     try { here = Number(ytPlayer.getCurrentTime()) || 0; } catch { return; }
     // 라이브는 맞출 기준이 없다. 되감으면 오히려 방송에서 멀어진다 (§40).
     if (currentIsLive()) return;
-    if (Math.abs(there - here) > WEB_SYNC_GAP) {
+    if (Math.abs(there - here) > WEB_SYNC_GAP && mayCorrectNow(ytPlayerState())) {
       try { ytPlayer.seekTo(there, true); ytPlayer.playVideo(); } catch { /* 무시 */ }
+      webLastSeekAt = Date.now();
     }
     return;
   }
@@ -6272,8 +6326,9 @@ function webTick() {
       if (!Number.isFinite(here)) return;
       // 라이브는 맞출 기준이 없다. 되감으면 오히려 방송에서 멀어진다 (§40).
       if (currentIsLive()) return;
-      if (Math.abs(there - here) > WEB_SYNC_GAP) {
+      if (Math.abs(there - here) > WEB_SYNC_GAP && mayCorrectNow(null)) {
         try { scWidget.seekTo(there * 1000); scWidget.play(); } catch { /* 무시 */ }
+        webLastSeekAt = Date.now();
       }
     });
   } catch { /* 무시 */ }
@@ -7703,11 +7758,31 @@ function renderRecent(state) {
  * 문장(text)은 서버가 완성해서 내려준다 — 클라이언트가 액션명을 문장으로 바꾸는 로직을 갖지 않는다.
  */
 
+/* **이 설정은 한 번도 저장된 적이 없었다.**
+ *
+ * 화면은 `["song","playlist"]` 같은 JSON 배열을 보냈는데 서버는 `song,playlist` 처럼
+ * 콤마로 이은 값만 받는다. 그래서 칩을 누를 때마다 저장이 400 으로 튕겼다. 운영 DB 에
+ * 이 키의 행이 **0개**인 것으로 확인했다. 더 나쁜 건, 이 API 는 키 하나가 틀리면
+ * **묶음 전체를 거절**하는데 화면은 여러 설정을 0.3초 동안 모아 한 번에 보낸다 —
+ * 로그 필터를 만지는 동안 같이 실려 간 다른 설정까지 함께 날아갔다.
+ *
+ * 서버 형식에 맞춘다. 저장된 적이 없으니 옮겨야 할 옛 값도 없다. 다만 예전 형식이
+ * 어딘가 남아 있어도 조용히 읽히도록 둘 다 받아 준다. */
+function parseAuditFilter(raw) {
+  if (!raw || raw === 'none') return null;
+  // 저장된 적은 없지만, 어딘가 남아 있어도 조용히 읽히게 옛 형식도 받는다.
+  if (raw.startsWith('[')) {
+    try { const p = JSON.parse(raw); return Array.isArray(p) ? p : null; } catch { return null; }
+  }
+  return raw.split(',').map((k) => k.trim()).filter(Boolean);
+}
+
 function auditKinds() {
-  const raw = prefGet('auditFilter');
-  let parsed = null;
-  try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = null; }
-  const list_ = Array.isArray(parsed) ? parsed.filter((key) => AUDIT_KINDS[key]) : null;
+  const parsed = parseAuditFilter(prefGet('auditFilter'));
+  const list_ = parsed ? parsed.filter((key) => AUDIT_KINDS[key]) : null;
+  /* 하나도 안 남으면 기본값으로 돌아간다. **보이는 동작은 예전 그대로다** — 이번에 고친
+   * 것은 저장이 되느냐뿐이다. 빈 목록을 그대로 서버에 넘기면 `kinds=` 가 빈 값이 되는데,
+   * 서버는 그걸 "분류를 안 골랐다" 로 읽어 오히려 전부 보여 준다. 뜻이 뒤집힌다. */
   return list_ && list_.length ? list_ : AUDIT_DEFAULT.slice();
 }
 
@@ -7715,7 +7790,8 @@ function toggleAuditKind(key) {
   const current = new Set(auditKinds());
   if (current.has(key)) current.delete(key); else current.add(key);
   const next = [...current];
-  prefSet('auditFilter', JSON.stringify(next.length ? next : AUDIT_DEFAULT));
+  // 서버가 받는 형식(콤마로 이은 분류 이름)으로 보낸다.
+  prefSet('auditFilter', (next.length ? next : AUDIT_DEFAULT).join(','));
   store.patch({ audit: [] });
   syncAuditChips();
   loadAudit(true);
@@ -7738,7 +7814,7 @@ function buildAuditPane() {
     class: 'audit__more', type: 'button', hidden: true,
     tip: '켜지 않은 분류에 몇 줄이 숨어 있는지 알려드려요',
     onClick: () => {
-      prefSet('auditFilter', JSON.stringify(Object.keys(AUDIT_KINDS)));
+      prefSet('auditFilter', Object.keys(AUDIT_KINDS).join(','));
       store.patch({ audit: [] });
       syncAuditChips();
       loadAudit(true);
@@ -10113,7 +10189,22 @@ async function boot() {
   if (!layoutChosen) openLayoutSheet();
 
   connect(ctx.guildId, {
-    onResync: () => { loadHot().catch(() => {}); loadCold().catch(() => {}); loadSeeds(); },
+    onResync: () => {
+      loadHot().catch(() => {});
+      loadCold().catch(() => {});
+      loadSeeds();
+      /* **다시 붙었으면 듣고 있다고 다시 말해야 한다.**
+       *
+       * 서버의 "듣는 중" 명단은 WebSocket 수명에 묶여 있다. 소켓이 한 번 끊기면 그 사람을
+       * 명단에서 빼는데, 다시 붙어도 아무도 넣어 주지 않아 **0명에 고정**됐다. 그러면
+       * 서버가 "아무도 안 듣는다" 고 보고 가상 시각표를 지우고, 그 `stopped` 를 받은
+       * 브라우저가 스스로 소리를 끈다. 살리려면 토글을 껐다 켜야 했다.
+       *
+       * 휴대폰을 백그라운드로 보내면 소켓이 끊기니 이게 "화면 끄면 노래가 멈춘다" 로
+       * 나타났는데, 원인은 백그라운드가 아니라 **끊겼다 붙는 것 전부**다 —
+       * Wi-Fi ↔ LTE 전환도, 서버 재시작도 똑같이 터진다. */
+      if (webOn) reportWebListening(true);
+    },
     onRefetch: (what) => {
       if (what === 'library' || what === 'settings' || what === 'permissions') refetchCold();
       // 모달을 열어 둔 채라면 이미 보고 있는 것이다. 점을 다시 켜지 않고 목록만 갱신한다 (§11).

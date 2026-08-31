@@ -9,6 +9,7 @@ use super::{
     Suspension, SuspensionScope, UserTrack, UserTrackKind, as_limit_u32, audit_kind_for,
     audit_text, is_mergeable_action, truncate_title,
 };
+use crate::remote::ReactionOutcome;
 use crate::models::{QueueItem, TrackRef};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::types::Value as SqlValue;
@@ -1410,13 +1411,22 @@ impl RemoteStore {
         .map(|id| id as u64)
     }
 
+    /// 반응 하나를 켜거나 끈다.
+    ///
+    /// **`bool` 하나로는 이 일을 표현할 수 없다.** 예전에는 메시지가 없을 때도 `false` 를
+    /// 돌려줬는데, 그건 "반응을 뗐다" 와 글자가 같다. 그래서 라우트가 그걸 성공으로 읽고
+    /// `200 OK` 를 돌려줬고, 화면에서는 **눌러도 아무 일이 안 일어나면서 오류도 안 뜨는**
+    /// 상태가 됐다. 채팅에는 보존 기간이 있어서(`chat_retention_days`) 오래된 메시지가
+    /// DB 에서 지워지는데 열어 둔 화면에는 그대로 남아 있으니, 스크롤을 올려 남의 옛
+    /// 메시지에 반응하면 조용히 실패했다. 옆의 `report_chat_message` 는 같은 상황을
+    /// 404 로 돌려주고 있었다 — 여기만 어긋나 있었다.
     pub fn toggle_chat_reaction(
         &self,
         guild_id: u64,
         message_id: i64,
         user_id: u64,
         emoji: &str,
-    ) -> rusqlite::Result<bool> {
+    ) -> rusqlite::Result<ReactionOutcome> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let belongs: bool = tx.query_row(
@@ -1424,23 +1434,23 @@ impl RemoteStore {
             params![guild_id as i64, message_id], |row| row.get(0),
         )?;
         if !belongs {
-            return Ok(false);
+            return Ok(ReactionOutcome::MessageGone);
         }
         let removed = tx.execute(
             "DELETE FROM remote_chat_reactions WHERE message_id = ?1 AND user_id = ?2 AND emoji = ?3",
             params![message_id, user_id as i64, emoji],
         )?;
-        let active = if removed > 0 {
-            false
+        let outcome = if removed > 0 {
+            ReactionOutcome::Removed
         } else {
             tx.execute(
                 "INSERT INTO remote_chat_reactions(message_id, user_id, emoji, created_utc) VALUES(?1, ?2, ?3, ?4)",
                 params![message_id, user_id as i64, emoji, Self::now_iso()],
             )?;
-            true
+            ReactionOutcome::Added
         };
         tx.commit()?;
-        Ok(active)
+        Ok(outcome)
     }
 
     /// 최신 `limit`건을 오래된 순으로 돌려준다. `before_id`가 있으면 그보다 과거만 본다.
@@ -4675,16 +4685,53 @@ mod tests {
         let message = store
             .add_chat_message(1, 10, "tester", None, "hello", None)
             .unwrap();
-        assert!(store.toggle_chat_reaction(1, message, 10, "👍").unwrap());
+        assert_eq!(
+            store.toggle_chat_reaction(1, message, 10, "👍").unwrap(),
+            ReactionOutcome::Added
+        );
         assert_eq!(
             store.list_chat_messages(1, 10, 10, None)[0].reactions[0].count,
             1
         );
-        assert!(!store.toggle_chat_reaction(1, message, 10, "👍").unwrap());
+        assert_eq!(
+            store.toggle_chat_reaction(1, message, 10, "👍").unwrap(),
+            ReactionOutcome::Removed
+        );
         assert!(
             store.list_chat_messages(1, 10, 10, None)[0]
                 .reactions
                 .is_empty()
+        );
+        cleanup(store, path);
+    }
+
+    /// **없는 메시지는 "뗐다" 가 아니다.**
+    ///
+    /// 채팅에는 보존 기간이 있어 오래된 메시지가 지워지는데, 열어 둔 화면에는 남아 있다.
+    /// 그 상태로 반응을 누르면 예전에는 `false`(=뗐다)가 나왔고 라우트가 그걸 성공으로
+    /// 읽어 `200 OK` 를 돌려줬다 — 화면에서는 아무 일도 안 일어나고 오류도 안 떴다.
+    /// 둘을 도로 뭉뚱그리면 이 테스트가 깨진다.
+    #[test]
+    fn reacting_to_a_message_that_is_gone_is_not_the_same_as_removing() {
+        let (store, path) = temp_store("chat-gone");
+        let message = store
+            .add_chat_message(1, 10, "tester", None, "hello", None)
+            .unwrap();
+        // 지워진 메시지
+        store.delete_chat_message(1, message).unwrap();
+        assert_eq!(
+            store.toggle_chat_reaction(1, message, 10, "👍").unwrap(),
+            ReactionOutcome::MessageGone
+        );
+        // 애초에 존재한 적 없는 id
+        assert_eq!(
+            store.toggle_chat_reaction(1, 999_999, 10, "👍").unwrap(),
+            ReactionOutcome::MessageGone
+        );
+        // 다른 길드의 메시지도 남의 것이 아니라 "없는 것" 으로 본다
+        assert_eq!(
+            store.toggle_chat_reaction(2, message, 10, "👍").unwrap(),
+            ReactionOutcome::MessageGone
         );
         cleanup(store, path);
     }

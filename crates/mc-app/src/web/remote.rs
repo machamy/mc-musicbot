@@ -6806,7 +6806,7 @@ fn chat_gate(ctx: &AuthContext) -> Result<(), Response> {
     if !ctx.settings.chat_enabled {
         return Err(json_error(
             StatusCode::FORBIDDEN,
-            "관리자가 채팅을 꺼 뒀어요.",
+            "이 서버는 채팅을 꺼 뒀어요. 쓰기도 반응도 다 막혀요. 서버 관리자가 관리 콘솔에서 켤 수 있어요.",
         ));
     }
     ctx.require("chat", ctx.settings.chat_rule, "채팅할 권한이 없어요.")?;
@@ -6925,6 +6925,13 @@ struct ChatReactionRequest {
     emoji: String,
 }
 
+/// 반응 하나에 쓸 수 있는 기호 개수 상한.
+///
+/// 예전 상한은 8이었는데 그건 **실제 이모지보다 짧다.** 사람 둘이 나오는 뽀뽀 이모지는
+/// 피부색까지 붙으면 기호가 10개다. 저장 용량을 묶어 두려는 값이지 이모지를 걸러내려는
+/// 값이 아니므로, 표준 이모지가 다 통과하는 선까지 올린다.
+const REACTION_EMOJI_MAX: usize = 16;
+
 async fn api_chat_reaction(
     State(state): State<Arc<WebState>>,
     cookies: Cookies,
@@ -6939,8 +6946,19 @@ async fn api_chat_reaction(
     if let Err(response) = chat_gate(&ctx) {
         return response;
     }
-    if request.emoji.is_empty() || request.emoji.chars().count() > 8 {
-        return json_error(StatusCode::BAD_REQUEST, "이모지가 올바르지 않아요.");
+    /* **왜 안 되는지 말한다.** 예전에는 두 가지 다른 사정을 `이모지가 올바르지 않아요`
+     * 한 줄로 뭉뚱그렸다. 그 말을 듣고 사람이 할 수 있는 게 아무것도 없다. */
+    if request.emoji.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "고른 이모지가 비어 있어요. 다시 골라 주세요.");
+    }
+    let emoji_len = request.emoji.chars().count();
+    if emoji_len > REACTION_EMOJI_MAX {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "이 이모지는 기호 {emoji_len}개가 합쳐진 것이라 반응으로 쓸 수 없어요(최대 {REACTION_EMOJI_MAX}개). 가족·직업·국기처럼 여러 기호를 이어 붙인 이모지가 여기 걸려요. 단순한 이모지로 골라 주세요."
+            ),
+        );
     }
     match state.app.remote.toggle_chat_reaction(
         guild_id,
@@ -6948,7 +6966,15 @@ async fn api_chat_reaction(
         ctx.user_id(),
         &request.emoji,
     ) {
-        Ok(active) => {
+        /* **없는 메시지를 성공으로 답하면 안 된다.** 채팅에는 보존 기간이 있어서
+         * 오래된 메시지가 지워지는데 열어 둔 화면에는 남아 있다. 그래서 스크롤을 올려
+         * 남의 옛 메시지에 반응하면 아무 일도 안 일어나면서 오류도 안 떴다. */
+        Ok(crate::remote::ReactionOutcome::MessageGone) => json_error(
+            StatusCode::NOT_FOUND,
+            "이 메시지는 이제 없어요. 지워졌거나, 채팅 보존 기간이 지나 사라졌어요. 새로고침하면 화면에서도 없어져요.",
+        ),
+        Ok(outcome) => {
+            let active = outcome == crate::remote::ReactionOutcome::Added;
             // 해당 메시지 노드만 갱신된다.
             emit(
                 &state,

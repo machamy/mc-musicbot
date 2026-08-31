@@ -318,9 +318,41 @@ async function ").next().unwrap_or(chunk);
         );
     }
 
+    /// **개인 설정은 서버가 받는 형식으로 보내야 한다.**
+    ///
+    /// 로그 필터가 `JSON.stringify(배열)` 로 나가는데 서버는 콤마로 이은 값만 받아서,
+    /// 칩을 누를 때마다 저장이 400 으로 튕겼다. 운영 DB 에 이 키의 행이 0개였다 —
+    /// **한 번도 저장된 적이 없다.** 게다가 이 API 는 키 하나가 틀리면 묶음 전체를
+    /// 거절하는데 화면은 여러 설정을 모아 한 번에 보내므로, 같이 실린 다른 설정까지
+    /// 함께 날아갔다.
+    ///
+    /// 이 검사는 그 재발을 막는다. `prefSet('auditFilter', …)` 에 `JSON.stringify` 를
+    /// 넘기면 여기서 걸린다.
+    #[test]
+    fn the_log_filter_pref_is_not_sent_as_json() {
+        let mut offenders = Vec::new();
+        let mut rest = PORTAL_JS;
+        while let Some(at) = rest.find("prefSet('auditFilter'") {
+            rest = &rest[at..];
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let line = &rest[..line_end];
+            if line.contains("JSON.stringify") {
+                offenders.push(line.trim().to_string());
+            }
+            rest = &rest[line_end..];
+        }
+        assert!(
+            offenders.is_empty(),
+            "로그 필터를 JSON 으로 보내고 있다 — 서버는 콤마로 이은 값만 받아서 저장이                         통째로 튕긴다(같은 묶음의 다른 설정까지):
+  {}",
+            offenders.join("
+  ")
+        );
+    }
+
     #[test]
     fn version_hash_is_pinned() {
-        assert_eq!(version(), "f68aacc5d5668ba4");
+        assert_eq!(version(), "b4b02e09ea3aa9d7");
     }
 
     /// 이름과 바이트가 서로 **뒤바뀌어도** 버전 해시는 그대로다(같은 것을 다 더하므로).
@@ -334,7 +366,7 @@ async function ").next().unwrap_or(chunk);
             ),
             (
                 "portal.css",
-                "8b5467c94e726e3cd9b7f8e04e97dea58d9e8087b752eb9fc183bf10889a3e88",
+                "2a2fb625268d0b975ded986ed14eeb6651c5bf4ce61c91f0cbaf6ca92bacbb81",
             ),
             (
                 "console.css",
@@ -350,7 +382,7 @@ async function ").next().unwrap_or(chunk);
             ),
             (
                 "portal.js",
-                "fc86591a990fc8a09ed000752d94534c6df8aa78b12104f17c4af1775248528d",
+                "8e2721b16c12201379bc71b464edc6d194997bcf1e6b2b0831b86dbbf3b7a016",
             ),
             (
                 "console.js",

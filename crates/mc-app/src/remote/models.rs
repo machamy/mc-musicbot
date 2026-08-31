@@ -3455,3 +3455,17 @@ mod voice_audit_tests {
         assert!(unknown.contains("음성 채널에서 나갔어요"), "{unknown}");
     }
 }
+
+/// 채팅 반응 토글의 결과 (`RemoteStore::toggle_chat_reaction`).
+///
+/// **`MessageGone` 이 이 타입이 존재하는 이유다.** 이 경우를 `Removed` 와 같은 값으로
+/// 뭉뚱그리면 서버가 "성공" 이라고 답하면서 아무 일도 안 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactionOutcome {
+    /// 반응을 새로 달았다.
+    Added,
+    /// 이미 달려 있던 반응을 뗐다.
+    Removed,
+    /// 그 메시지가 없다 — 지워졌거나 보존 기간이 지나 사라졌다.
+    MessageGone,
+}
