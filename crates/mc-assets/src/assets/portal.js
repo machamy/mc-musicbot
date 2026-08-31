@@ -6161,6 +6161,12 @@ function mayCorrectNow(state) {
  * **이걸로 아이폰까지 되는 건 아니다.** iOS 는 설치형 웹앱을 더 강하게 재우고, 우리는
  * 소리를 숨긴 유튜브 iframe 으로 내고 있어서 한계가 있다. 안드로이드에서 크게 나아지는
  * 것을 노린 것이고, 안 되는 기기가 있으면 그건 이 한 겹으로는 못 넘는다. */
+/* **선언을 쓰는 곳보다 먼저 둔다.** `let` 은 끌어올려지지 않으므로, 이 파일이 위에서
+ * 아래로 실행되는 도중에 `syncMediaSession()` 이 불리면 선언 줄을 아직 안 지나
+ * `ReferenceError` 가 난다. 지금 호출부는 전부 아래에 있어 우연히 무사하지만,
+ * 이 저장소에서 같은 함정을 이미 두 번 밟았다. 순서로 막아 둔다. */
+let mediaSessionKey = '';
+
 function syncMediaSession() {
   if (!('mediaSession' in navigator)) return;
   const session = navigator.mediaSession;
@@ -6189,7 +6195,6 @@ function syncMediaSession() {
   } catch { /* 브라우저마다 지원이 다르다. 실패해도 재생에는 지장이 없다. */ }
 }
 
-let mediaSessionKey = '';
 
 function bindMediaSessionActions() {
   if (!('mediaSession' in navigator)) return;
