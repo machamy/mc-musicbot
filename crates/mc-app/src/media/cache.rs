@@ -14,6 +14,8 @@ pub struct CacheManager {
     pub dir: PathBuf,
     db: Arc<Db>,
     log: Arc<LogService>,
+    /// 지금 받고 있는 곡 → 그 곡 전용 잠금 (`prepare` 참고).
+    inflight: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 fn sanitize_file_name(value: &str) -> String {
@@ -27,7 +29,12 @@ fn sanitize_file_name(value: &str) -> String {
 impl CacheManager {
     pub fn new(dir: PathBuf, db: Arc<Db>, log: Arc<LogService>) -> CacheManager {
         let _ = std::fs::create_dir_all(&dir);
-        CacheManager { dir, db, log }
+        CacheManager {
+            dir,
+            db,
+            log,
+            inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// 캐시 적중 검사 — 메타와 실제 파일 둘 다 있어야 한다. 적중 시 LRU 갱신.
@@ -75,6 +82,15 @@ impl CacheManager {
     }
 
     /// 트랙을 재생 가능한 로컬 파일로 준비한다 (캐시 미스 시 yt-dlp 다운로드).
+    ///
+    /// **같은 곡은 한 번만 받는다.** 예전에는 이걸 막는 게 아무것도 없어서, 미리 받아 두는
+    /// 쪽과 실제 재생 쪽이 같은 곡에 겹치면 **서로를 망가뜨렸다.** 뒤에 온 쪽이 아직 등록
+    /// 전이라 캐시 미스로 판정하고, 아래 잔재 정리에서 **앞선 다운로드가 쓰고 있던 중간
+    /// 파일을 지운 뒤** 같은 이름으로 yt-dlp 를 하나 더 띄웠다. 미리 받아 둔 보람이 사라질
+    /// 뿐 아니라 처음부터 다시 받게 된다 — 곡을 빨리 넘겼을 때 유독 오래 걸리던 게 이것이다.
+    ///
+    /// 이제 곡별 잠금을 잡고, 잠금을 얻은 뒤 **캐시를 한 번 더 본다.** 기다리는 동안 앞선
+    /// 쪽이 끝냈으면 그 결과를 그대로 쓴다.
     pub async fn prepare(
         &self,
         track: &TrackRef,
@@ -82,15 +98,63 @@ impl CacheManager {
         cache_limit_gb: i32,
         remove_segments: bool,
     ) -> Result<(String, bool), String> {
-        if let Some(hit) = self.get(&track.cache_key()) {
+        let cache_key = track.cache_key();
+        if let Some(hit) = self.get(&cache_key) {
             return Ok((hit.file_path, true));
         }
+
+        let gate = {
+            let mut map = self.inflight.lock().unwrap();
+            map.entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = gate.lock().await;
+        // 기다리는 동안 앞선 쪽이 끝냈을 수 있다. 그러면 받지 않는다.
+        if let Some(hit) = self.get(&cache_key) {
+            self.release_inflight(&cache_key, &gate);
+            return Ok((hit.file_path, true));
+        }
+        let outcome = self
+            .download_uncached(track, ytdlp, cache_limit_gb, remove_segments)
+            .await;
+        self.release_inflight(&cache_key, &gate);
+        outcome
+    }
+
+    /// 잠금을 놓은 뒤 지도에서도 치운다. 기다리는 사람이 남아 있으면 그대로 둔다 —
+    /// 지워 버리면 그 사람들이 서로 다른 잠금을 잡게 되어 중복 방지가 무너진다.
+    fn release_inflight(&self, cache_key: &str, gate: &Arc<tokio::sync::Mutex<()>>) {
+        let mut map = self.inflight.lock().unwrap();
+        // 나(1) + 지도(1) 뿐이면 아무도 안 기다리는 것이다.
+        if Arc::strong_count(gate) <= 2 {
+            map.remove(cache_key);
+        }
+    }
+
+    async fn download_uncached(
+        &self,
+        track: &TrackRef,
+        ytdlp: &YtDlp,
+        cache_limit_gb: i32,
+        remove_segments: bool,
+    ) -> Result<(String, bool), String> {
         let base = sanitize_file_name(&track.cache_key());
         // 같은 base 의 이전 잔재 제거 (부분 다운로드 등).
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with(&base) {
+                /* **접두사만 맞으면 지우던 것을 고쳤다.**
+                 *
+                 * `soundcloud_artist_song` 을 받으려는데 이미 캐시돼 있던
+                 * `soundcloud_artist_song-remix.opus` 가 같이 지워졌다. 유튜브 ID 는 길이가
+                 * 고정이라 안 겪지만 사운드클라우드는 슬러그라 길이가 제각각이다.
+                 * 그래서 분명히 예전에 튼 곡인데 매번 다시 받는 일이 생긴다.
+                 * 내 잔재는 `base` 바로 뒤가 반드시 `.` 다 (`{base}.%(ext)s`). */
+                let mine = name
+                    .strip_prefix(&base)
+                    .is_some_and(|rest| rest.starts_with('.'));
+                if mine {
                     let _ = std::fs::remove_file(e.path());
                 }
             }
@@ -274,5 +338,46 @@ impl CacheManager {
             }
         }
         (ok, failed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_file_name;
+
+    /// 잔재를 지우는 규칙을 여기 한 번 더 적어 둔다. `prepare` 는 `{base}.%(ext)s` 로
+    /// 받으므로 **내 파일은 `base` 바로 뒤가 반드시 `.`** 다.
+    fn is_my_residue(name: &str, base: &str) -> bool {
+        name.strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('.'))
+    }
+
+    /// **접두사만 맞으면 지우던 것을 막는다.**
+    ///
+    /// 사운드클라우드 키는 길이가 제각각인 슬러그라, `.../song` 을 받으면서
+    /// 이미 캐시된 `.../song-remix` 를 같이 지웠다. 그러면 분명히 예전에 튼 곡인데
+    /// 매번 다시 받게 된다 — 이 봇은 통째로 받아야 소리가 나므로 그대로 지연이다.
+    #[test]
+    fn residue_cleanup_does_not_eat_a_longer_neighbour() {
+        let base = sanitize_file_name("soundcloud:artist/song");
+
+        // 내 것 — 지워야 한다
+        assert!(is_my_residue(&format!("{base}.opus"), &base));
+        assert!(is_my_residue(&format!("{base}.part"), &base));
+        assert!(is_my_residue(&format!("{base}.webm.part"), &base));
+
+        // 남의 것 — 건드리면 안 된다
+        assert!(!is_my_residue(&format!("{base}-remix.opus"), &base));
+        assert!(!is_my_residue(&format!("{base}2.opus"), &base));
+        assert!(!is_my_residue(&format!("{base}_live.opus"), &base));
+    }
+
+    /// 키에 든 경로 구분자가 파일 이름으로 새 나가면 안 된다.
+    #[test]
+    fn cache_keys_never_become_paths() {
+        let name = sanitize_file_name("soundcloud:artist/song");
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains(':'), "{name}");
+        assert!(!name.contains('\\'), "{name}");
     }
 }

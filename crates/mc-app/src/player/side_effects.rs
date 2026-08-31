@@ -340,26 +340,62 @@ pub async fn resolve_preview(app: Arc<App>, guild_id: u64) {
     // inflight 해제는 _inflight 가드의 Drop 이 담당 (패닉 시에도 보장).
 }
 
-/// 다음에 재생될 곡(큐 첫 항목 또는 preview)을 미리 캐시에 받아 둔다.
+/// 미리 받아 둘 곡 수. **이 봇은 곡을 통째로 받은 뒤에야 소리를 낸다**(`media/cache.rs`).
+/// 그래서 미리 받히지 못한 곡은 사용자가 그 다운로드 시간을 그대로 기다린다.
+///
+/// 한 곡만 받아 두면 연달아 넘길 때 바로 뚫린다 — 두 번째 곡은 첫 곡이 실제로 시작해야
+/// 대상이 되기 때문이다. 짧은 곡이 이어져도 마찬가지다. 캐시가 맞으면 즉시 반환이라
+/// 여벌로 받아 두는 비용은 처음 한 번뿐이다.
+const PREFETCH_DEPTH: usize = 2;
+
+/// 다음에 재생될 곡들을 미리 캐시에 받아 둔다.
 pub async fn prefetch_next(app: Arc<App>, _coordinator: Arc<Coordinator>, guild_id: u64) {
     let state = app.player.get_state(guild_id).await;
-    let next = state
+    let mut targets: Vec<_> = state
         .upcoming
-        .first()
+        .iter()
+        .take(PREFETCH_DEPTH)
         .map(|i| i.track.clone())
-        .or_else(|| state.autoplay_preview.as_ref().map(|p| p.track.clone()));
-    let Some(track) = next else { return };
+        .collect();
+    // 큐가 모자라면 자동 재생이 잡아 둔 후보로 채운다 — 대기열이 비면 그게 다음 곡이다.
+    if targets.len() < PREFETCH_DEPTH {
+        if let Some(preview) = state.autoplay_preview.as_ref() {
+            let key = preview.track.cache_key();
+            if !targets.iter().any(|t| t.cache_key() == key) {
+                targets.push(preview.track.clone());
+            }
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
     let global = app.db.load_global_settings();
     let ytdlp = app.ytdlp();
-    let _ = app
-        .cache
-        .prepare(
-            &track,
-            &ytdlp,
-            global.cache_limit_gb,
-            global.sponsorblock_remove,
-        )
-        .await;
+    for track in targets {
+        /* **실패를 삼키지 않는다.**
+         *
+         * 예전에는 `let _ =` 로 결과를 버렸고, `prepare` 는 성공했을 때만 로그를 남긴다.
+         * 그래서 미리 받기가 실패하면 **어디에도 흔적이 없었다** — 운영자 눈에는 "가끔
+         * 곡이 늦게 시작한다" 만 보이고 왜인지 알 방법이 없었다. */
+        if let Err(error) = app
+            .cache
+            .prepare(
+                &track,
+                &ytdlp,
+                global.cache_limit_gb,
+                global.sponsorblock_remove,
+            )
+            .await
+        {
+            app.log.warn(
+                "Download",
+                &format!(
+                    "'{}' 를 미리 받지 못했어요. 그 곡을 틀 때 기다리게 돼요: {error}",
+                    track.display_title()
+                ),
+            );
+        }
+    }
 }
 
 /// 곡 종료/스킵 후 autoplay 후보를 큐에 채운다 (C# EnsureAutoplayCandidateAsync).

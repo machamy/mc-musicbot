@@ -21,6 +21,13 @@ use tokio::sync::Mutex;
 /// 트랙 상태를 물을 때 기다리는 한도. 드라이버가 재연결 중이면 답이 늦는다.
 const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// 곡 하나를 받는 데 허용하는 최대 시간.
+///
+/// 안쪽(`YtDlp::download`)은 인증 창구마다 10분씩, 재시도까지 겹쳐 최악 두 시간이다.
+/// 그 시간 동안 그 서버는 아무 곡도 못 튼다. 넉넉하되 유한하게 끊어서, 안 되는 곡은
+/// 실패로 처리하고 **다음 곡으로 넘어가게** 한다.
+const DOWNLOAD_BUDGET: Duration = Duration::from_secs(180);
+
 /// 트랙 핸들에 상태를 물은 결과.
 ///
 /// "답이 없다" 와 "없어졌다" 를 갈라야 한다 — 워치독은 없어졌으면 끝내야 하지만,
@@ -852,6 +859,25 @@ impl Coordinator {
     /// 재생 실패(다운로드 403/삭제된 영상/ffmpeg 등) 시 다음 곡으로 넘어가며 재시도한다.
     /// 큐 전체가 재생 불가면 연속 실패 상한에서 멈춰 무한 스킵을 막는다.
     pub async fn sync_guild(self: &Arc<Self>, app: &Arc<App>, guild_id: u64) {
+        /* **다음 곡을 미리 받아 둔다 — 여기 한 곳에서.**
+         *
+         * 이 봇은 곡을 통째로 받은 뒤에야 소리를 낸다. 그래서 미리 받아 두지 못한 곡은
+         * 사용자가 그 다운로드 시간을 그대로 기다린다.
+         *
+         * 그런데 미리 받는 일이 **곡 시작과 스킵 때만** 걸려 있었다. 곡을 담는 경로에는
+         * 웹이든 디스코드든 하나도 없었고, 하필 사용자가 곡을 담으면 자동 재생이 잡아
+         * 둔 후보를 버린다(`PlayerManager::enqueue_inner`). 즉 **이미 받아 둔 곡을
+         * 버리고 한 번도 안 받아 본 곡을 다음 자리에 앉히는** 셈이라 손해가 두 배였다.
+         *
+         * 담기·빼기·순서 바꾸기가 전부 여기를 지나므로, 열 군데에 흩어 놓는 대신 이 목에
+         * 한 번 건다. 이미 받아 둔 곡이면 `prepare` 가 즉시 돌아오므로 헛돌아도 싸다. */
+        {
+            let app2 = app.clone();
+            let coordinator = self.clone();
+            tokio::spawn(async move {
+                crate::player::side_effects::prefetch_next(app2, coordinator, guild_id).await;
+            });
+        }
         // 준비가 끝날 때마다 곡이 또 바뀌어 있는 상황이 이어질 수 있다. 무한히 쫓아가지
         // 않도록 몇 바퀴만 돈다 — 어차피 다음 `sync_guild` 가 다시 맞춘다.
         let mut stale_rounds = 0u32;
@@ -1009,17 +1035,48 @@ impl Coordinator {
         let manager = app.songbird.get().ok_or("songbird not ready")?.clone();
         let global = app.db.load_global_settings();
 
+        /* **끝나지 않는 방송은 받을 수 없다.**
+         *
+         * 이 봇은 곡을 통째로 받아서 트는데, 라이브는 끝이 없으니 받기가 끝나지 않는다.
+         * 그러면 인증 창구마다 10분 타임아웃을 꽉 채우고, 그 타임아웃 문구가 하필
+         * "일시적 오류" 로 분류돼 재시도까지 돈다 — 최악 두 시간을 매달린다. 그동안 그
+         * 서버는 아무 곡도 못 튼다. 웹 재생기 경로에는 이미 라이브 가드가 있는데
+         * 디스코드 경로에만 없었다. */
+        if item.track.is_live {
+            return Err(format!(
+                "'{}' 는 생방송이라 디스코드로는 틀 수 없어요. 리모컨의 `웹에서 듣기` 로 들어 주세요.",
+                item.track.display_title()
+            ));
+        }
+
         // 1) 파일 준비 (캐시 미스 시 다운로드).
         let ytdlp = app.ytdlp();
-        let (file_path, from_cache) = app
-            .cache
-            .prepare(
+        /* **한 곡을 받는 데 상한을 둔다.**
+         *
+         * `prepare` 안쪽은 인증 창구 × 재시도로 최악 두 시간까지 간다. 그런데 이 호출에는
+         * 아무 상한도 없어서, 곡 하나가 그 서버의 재생을 통째로 붙들 수 있었다. 바로 위
+         * `probe_track` 에는 2초 상한을 달아 뒀으면서 정작 제일 오래 걸리는 자리가 비어
+         * 있었다. 여기서 끊으면 실패로 처리돼 **다음 곡으로 넘어간다** — 침묵보다 낫다. */
+        let (file_path, from_cache) = match tokio::time::timeout(
+            DOWNLOAD_BUDGET,
+            app.cache.prepare(
                 &item.track,
                 &ytdlp,
                 global.cache_limit_gb,
                 global.sponsorblock_remove,
-            )
-            .await?;
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(format!(
+                    "'{}' 를 {}초 안에 받지 못했어요. 다음 곡으로 넘어갈게요.",
+                    item.track.display_title(),
+                    DOWNLOAD_BUDGET.as_secs()
+                ));
+            }
+        };
         if !from_cache {
             app.log.info(
                 "Download",
