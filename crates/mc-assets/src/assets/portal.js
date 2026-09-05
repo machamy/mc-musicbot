@@ -3849,7 +3849,7 @@ function apBlockedSection() {
     count: `${blocked.length}곡`,
     action: apWipe('blocked', '빼 둔 곡', blocked.length,
       '빼 둔 곡을 전부 풀까요?\n다시 추천에 나올 수 있어요.'),
-    desc: '`🚫 이 곡은 당분간 그만` 으로 뺐거나 재생에 실패한 곡이에요. 7일이 지나면 스스로 사라져요.',
+    desc: '`🚫 이 곡은 당분간 그만` 으로 뺀 곡이에요. 7일이 지나면 스스로 사라져요.',
     children: [
       rows.length ? h('div', { class: 'ap__rows' }, ...rows) : h('p', { class: 'ap__note' }, '빼 둔 곡이 없어요.'),
       blocked.length > 12 ? h('p', { class: 'ap__note' }, `외 ${blocked.length - 12}곡`) : null,
@@ -7989,12 +7989,26 @@ function auditLine(entry, merged) {
     ? text.slice(entry.actorName.length)
     : text;
 
-  if (merged <= 1 || !(entry.items || []).length) {
-    return h('div', { class: 'logrow__text' }, actor, h('span', null, ...markdownBold(bodyText)));
+  /* **못 튼 곡은 이유를 같이 말한다.**
+   *
+   * 예전에는 제목만 나갔다. 그래서 듣던 사람에게는 곡이 아무 이유 없이 사라지는 것으로
+   * 보였고, '문제' 칩을 눌러도 볼 것이 없었다. 서버가 사람 말 한 문장으로 접어서 주므로
+   * (`AuditEntry::feed_item`) 그대로 붙이면 된다 — 원문은 관리 콘솔이 따로 본다.
+   */
+  const reason = entry.failureReason
+    ? h('span', { class: 'logrow__why' }, ` — ${entry.failureReason}`)
+    : null;
+
+  /* 합쳐진 줄의 항목은 서버가 `mergedItems` 라는 이름으로, **문자열 배열**로 준다
+   * (`AuditFeedItem.merged_items`). 예전에는 `entry.items` 를 읽고 각 항목을 객체 취급했다 —
+   * 이름도 모양도 어긋나서 **펼치기가 한 번도 뜬 적이 없다.** */
+  const merges = entry.mergedItems || [];
+  if (merged <= 1 || !merges.length) {
+    return h('div', { class: 'logrow__text' }, actor, h('span', null, ...markdownBold(bodyText)), reason);
   }
 
   const items = h('div', { class: 'logrow__items', hidden: true },
-    ...entry.items.map((row) => h('div', { class: 'row__sub' }, `· ${row.title || trackTitle(row.track)}`)));
+    ...merges.map((row) => h('div', { class: 'row__sub' }, `· ${row}`)));
   const toggle = h('button', {
     class: 'logrow__toggle', type: 'button', 'aria-expanded': 'false',
     tip: '무엇이 담겼는지 펼쳐 봐요',
@@ -8005,7 +8019,7 @@ function auditLine(entry, merged) {
     },
   }, `▸ ${merged}곡 보기`);
 
-  return h('div', { class: 'logrow__text' }, actor, h('span', null, ...markdownBold(bodyText)), toggle, items);
+  return h('div', { class: 'logrow__text' }, actor, h('span', null, ...markdownBold(bodyText)), reason, toggle, items);
 }
 
 /* ═══════════════════════ 모바일 하단 탭바 ═══════════════════════ */

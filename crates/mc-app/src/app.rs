@@ -217,6 +217,7 @@ impl App {
             exe: config.yt_dlp_path.clone(),
             browser_profile: global.preferred_browser_profile.clone(),
             cookie_file: global.cookie_file_path.clone(),
+            retry_rounds: crate::media::ytdlp::retry_rounds(0),
         };
         let autoplay = Arc::new(AutoplayEngine {
             ytdlp: ytdlp.clone(),
@@ -350,6 +351,8 @@ impl App {
             exe: self.config.yt_dlp_path.clone(),
             browser_profile: global.preferred_browser_profile,
             cookie_file: global.cookie_file_path,
+            // 기본은 예전과 같은 3바퀴. 줄이는 것은 부르는 쪽이 정한다.
+            retry_rounds: crate::media::ytdlp::retry_rounds(0),
         }
     }
 }

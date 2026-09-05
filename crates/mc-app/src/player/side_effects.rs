@@ -84,7 +84,7 @@ struct AutoplayPlan {
     fallback: Option<TrackRef>,
     /// 지금 재생 중·대기열에 있는 곡. 무조건 제외.
     excluded: HashSet<String>,
-    /// `📻 이 곡 말고`로 뺐거나 재생에 실패한 곡 (§8.5-3).
+    /// `📻 이 곡 말고`로 뺀 곡 (§8.5-3). 재생 실패는 여기 안 들어간다.
     blocked: HashSet<String>,
     /// `cache_key → 마지막 재생 후 지난 시간`. **최근 목록에 있다고 영원히 빼지 않는다** (§8.5-2).
     recent_ages: HashMap<String, f64>,
@@ -370,7 +370,12 @@ pub async fn prefetch_next(app: Arc<App>, _coordinator: Arc<Coordinator>, guild_
         return;
     }
     let global = app.db.load_global_settings();
-    let ytdlp = app.ytdlp();
+    /* **미리 받기는 사다리를 안 돈다.**
+     *
+     * 미리 받아 두지 못해도 그 곡을 실제로 틀 때 `prepare` 가 다시 불린다. 그때 제대로
+     * 다시 해 본다. 백그라운드에서 30초씩 재시도를 도는 것은 사용자에게 아무것도 돌려주지
+     * 않으면서 yt-dlp 프로세스만 배로 띄운다 — 그게 유튜브 쪽 속도 제한을 부른다. */
+    let ytdlp = app.ytdlp().with_retry_rounds(1);
     for track in targets {
         /* **실패를 삼키지 않는다.**
          *
@@ -754,6 +759,44 @@ mod skip_settlement_tests {
         assert!(
             code.contains("refill_after_skip("),
             "skip 갈래의 **코드**에서 보충을 불러야 한다 (주석만으로는 안 된다)"
+        );
+    }
+    /* **재생에 실패한 곡을 자동으로 7일 차단하지 않는다.**
+     *
+     * 스펙 §8.5-3 과 주석 세 곳이 6개월간 "재생 실패한 곡도 넣는다" 고 말했지만 그런 코드는
+     * 처음부터 없었다. 그리고 없는 편이 맞다 — 403 처럼 곡 잘못이 아닌 실패가 한 번
+     * 몰아치면(2026-08-31) 멀쩡한 곡 수백 개가 일주일간 후보에서 사라진다. 이 목록은
+     * 감쇠가 아니라 하드 제외라 자동재생 풀이 그대로 마르고, 그러면 "자동재생이 이유 없이
+     * 멈춘 것처럼" 보인다 — `build_autoplay_plan` 주석이 제일 나쁘다고 적어 둔 그 상태다.
+     *
+     * 되살리려거든 이 테스트를 먼저 지우고 위 주석을 읽어라.
+     */
+    #[test]
+    fn only_a_person_saying_no_blocks_a_candidate() {
+        // **테스트 자신을 세지 않는다.** 아래 두 줄에도 같은 이름이 나온다.
+        let src = include_str!("side_effects.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("제품 코드 부분");
+        let calls = src
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with("//") && !line.starts_with('*'))
+            .filter(|line| line.contains("block_autoplay_candidate("))
+            .count();
+        assert_eq!(
+            calls, 1,
+            "차단 호출이 늘었어요. 재생 실패로 곡을 막고 있지 않은지 확인하세요"
+        );
+
+        // 그 하나는 사람이 `이 곡 말고` 를 누른 갈래여야 한다.
+        let arm = src
+            .split("pub async fn reject_preview")
+            .nth(1)
+            .expect("reject_preview 가 있어야 한다");
+        assert!(
+            arm[..arm.len().min(900)].contains("block_autoplay_candidate("),
+            "차단은 사람이 뺀 갈래에서만 일어나야 해요"
         );
     }
 }

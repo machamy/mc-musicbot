@@ -417,7 +417,7 @@ pub enum AutoplayPolicy { Similar, Balanced, Explore, Popular }   // 기본 Bala
 2. **재생 이력 감쇠** — `remote_recent_tracks` 에 있는 곡은 무조건 제외가 아니라
    **최근일수록 강하게 회피**해요. 하루 지난 곡은 다시 나와도 괜찮아요.
    지금은 최근 목록에 있으면 영원히 안 나와서 풀이 계속 좁아져요.
-3. **막힌 후보 기억** — `📻 이 곡 말고`(§14.3)로 뺀 곡과 재생 실패한 곡은
+3. **막힌 후보 기억** — `📻 이 곡 말고`(§14.3)로 뺀 곡은
    `remote_autoplay_blocked(guild_id, cache_key, until_utc)` 에 7일간 넣어 다시 안 뽑아요.
 4. **후보 부족 시 시드 회전** — 지금도 `MAX_ATTEMPTS` 로 시드를 갈아타는데,
    갈아탈 때마다 **정책을 한 단계 느슨하게** 해요 (`similar` → `balanced` → `explore`).

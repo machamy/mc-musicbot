@@ -12,6 +12,56 @@ pub struct YtDlp {
     pub exe: String,
     pub browser_profile: String,
     pub cookie_file: Option<String>,
+    /// 다운로드 재시도를 몇 바퀴 돌까 (`download` 참고). 기본은 3 — 예전과 같다.
+    /// 연속 실패 중이거나 미리 받는 중이면 부르는 쪽이 1로 줄인다.
+    pub retry_rounds: usize,
+}
+
+/// 연속 실패 횟수에 따라 사다리를 몇 바퀴 돌지.
+///
+/// **첫 실패는 반드시 3이다.** 여기가 1로 바뀌면 v4.14 가 잡은 "들쭉날쭉한 403 하나에
+/// 멀쩡한 곡이 줄줄이 스킵되는" 버그가 되살아난다.
+pub fn retry_rounds(consecutive_fails: u32) -> usize {
+    if consecutive_fails == 0 {
+        3
+    } else {
+        1
+    }
+}
+
+impl YtDlp {
+    /// 이 한 번의 내려받기에만 다른 사다리 길이를 쓴다. 값 타입이라 복제해서 넘긴다.
+    pub fn with_retry_rounds(mut self, rounds: usize) -> Self {
+        self.retry_rounds = rounds;
+        self
+    }
+}
+
+#[cfg(test)]
+mod retry_budget_tests {
+    use super::retry_rounds;
+
+    /// 처음 튕긴 곡은 원래대로 다 해 본다 — 이게 v4.14 의 존재 이유다.
+    #[test]
+    fn a_first_failure_still_gets_the_full_ladder() {
+        assert_eq!(retry_rounds(0), 3);
+    }
+
+    /// 앞 곡이 이미 사다리를 다 돌고 실패했다. 같은 실험을 또 하지 않는다.
+    #[test]
+    fn a_streak_collapses_the_ladder() {
+        for n in 1..=4 {
+            assert_eq!(retry_rounds(n), 1, "연속 {n}회째인데 사다리를 또 돌아요");
+        }
+    }
+
+    /// 라운드는 0이 될 수 없다 — 0이면 곡을 아예 시도조차 안 한다.
+    #[test]
+    fn rounds_never_reach_zero() {
+        for n in 0..100 {
+            assert!(retry_rounds(n) >= 1);
+        }
+    }
 }
 
 /* ── JS 런타임 (§EJS) ──────────────────────────────────────────────
@@ -129,7 +179,7 @@ mod cookie_source_tests {
 pub(crate) fn is_transient(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     // 다시 해도 소용없는 것들. 이것들이 먼저다.
-    const HOPELESS: [&str; 7] = [
+    const HOPELESS: [&str; 9] = [
         "video unavailable",
         "private video",
         "members-only",
@@ -137,6 +187,19 @@ pub(crate) fn is_transient(error: &str) -> bool {
         "account associated with this video has been terminated",
         "is not a valid url",
         "unsupported url",
+        /* **끝난 방송과 아직 처리 중인 영상.**
+         *
+         * 재생 직전의 라이브 가드(`coordinator`)는 `is_live` 를 보는데, 끝난 방송은
+         * `live_status` 가 `was_live` 라 그 값이 false 다 — 가드를 그냥 통과한다.
+         * 여기서 안 잡으면 사다리를 30초 넘게 헛돈다.
+         *
+         * "일시적" 의 기준은 절대 시간이 아니라 **우리 백오프 창(11초) 안에 풀리는가** 다.
+         * "나중에 다시 오라" 고 말하는 상태가 11초 만에 풀릴 리 없다.
+         *
+         * `we're` 의 아포스트로피는 일부러 뺐다 — 유튜브가 `'` 와 `’` 를 둘 다 쓴다.
+         * 한쪽만 맞추면 나머지 절반을 **조용히** 놓친다. */
+        "live stream recording is not available",
+        "processing this video",
     ];
     if HOPELESS.iter().any(|needle| lower.contains(needle)) {
         return false;
@@ -155,6 +218,288 @@ pub(crate) fn is_transient(error: &str) -> bool {
         "실행 실패",
     ];
     TRANSIENT.iter().any(|needle| lower.contains(needle))
+}
+
+/* ── yt-dlp 가 하는 말을 흘려듣지 않는다 ──────────────────────────
+ *
+ * yt-dlp 는 스스로 두 가지를 stderr 에 적어 보낸다. **낡았다** 는 잔소리와, 유튜브 서명을
+ * **어떤 런타임으로 풀고 있는지**(`[youtube] [jsc:deno] ...`). 둘 다 우리가 제일 알고 싶던 것이다.
+ *
+ * 그런데 그 버퍼를 매번 버리고 있었다 — 다운로드가 성공하면 stderr 를 읽지도 않았고,
+ * 실패해도 `rev().take(3)` 으로 마지막 3줄만 남겼다. 낡았다는 경고는 두 줄짜리라 그 3칸
+ * 중 2칸을 차지하면서도 정작 머리줄("You are using an outdated version…")은 잘려 나갔다.
+ * 그래서 로그에는 "업데이트하라" 는 꼬리만 남고 **왜 그 꼬리가 붙었는지는 알 수 없었다.**
+ *
+ * 프로세스를 새로 띄울 필요가 없다. 이미 손에 있는 것을 지나가면서 한 번 훑기만 하면 된다.
+ * 관찰만 하고 판단은 안 한다 — 무엇을 경고할지는 `tools.rs` 가 정한다.
+ */
+static OBSERVED_OUTDATED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static OBSERVED_JSC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// yt-dlp 가 남긴 stderr 를 지나가며 훑는다. 처음 본 것만 기억한다.
+pub(crate) fn observe_stderr(stderr: &str) {
+    let lower = stderr.to_ascii_lowercase();
+    // 판마다 문구가 조금씩 다르다. 여러 개를 보되 하나만 걸려도 낡은 것으로 친다.
+    const OUTDATED: [&str; 4] = [
+        "you are using an outdated version",
+        "yt-dlp is out of date",
+        "--update-to",
+        r#"run "yt-dlp --update""#,
+    ];
+    if OUTDATED.iter().any(|n| lower.contains(n)) {
+        let _ = OBSERVED_OUTDATED.set(());
+    }
+    /* `[youtube] [jsc:deno] Solving JS challenges using deno` 에서 런타임 이름만 꺼낸다.
+     * **이게 있으면 서명이 실제로 풀리고 있다는 뜻이다** — 우리가 경로를 못 박아 주지
+     * 못했어도 yt-dlp 가 스스로 찾아 쓰고 있는 것이다. */
+    if OBSERVED_JSC.get().is_none() {
+        let name = stderr
+            .split("[jsc:")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .map(str::trim)
+            // 런타임 이름은 짧다. 길면 `[jsc:` 를 우연히 품은 다른 줄을 주운 것이다.
+            .filter(|name| !name.is_empty() && name.len() <= 16);
+        if let Some(name) = name {
+            let _ = OBSERVED_JSC.set(name.to_string());
+        }
+    }
+}
+
+/// yt-dlp 가 스스로 "낡았다" 고 말한 적이 있는가.
+pub fn observed_outdated() -> bool {
+    OBSERVED_OUTDATED.get().is_some()
+}
+
+/// yt-dlp 가 실제로 쓰고 있는 JS 런타임 이름. 아직 한 곡도 안 받았으면 `None`.
+pub fn observed_jsc() -> Option<String> {
+    OBSERVED_JSC.get().cloned()
+}
+
+/// 처음 한 번만 `Some` 을 돌려준다 — 기동 로그의 "다시 적힙니다" 를 실제로 지키는 자리다.
+/// 곡마다 같은 줄을 쏟아 내면 그건 그것대로 소음이라 한 번으로 끊는다.
+pub fn take_jsc_notice() -> Option<String> {
+    static TOLD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let name = OBSERVED_JSC.get()?;
+    TOLD.set(()).ok()?;
+    Some(name.clone())
+}
+
+#[cfg(test)]
+mod observe_tests {
+    use super::*;
+
+    /// 8/31 로그에 실제로 남아 있던 꼬리. **이걸 못 알아보면 6개월 묵은 도구가 또 조용히 지난다.**
+    #[test]
+    fn the_update_nag_we_actually_saw_is_recognised() {
+        // 정적에 기록하므로 앞선 상태를 전제하지 않는다 — 테스트 순서에 기대면 흔들린다.
+        observe_stderr(
+            "         Run \"yt-dlp --update\" or \"yt-dlp -U\" to update.\n\
+             ERROR: unable to download video data: HTTP Error 403: Forbidden",
+        );
+        assert!(observed_outdated());
+    }
+
+    /// **런타임을 쓰고 있다는 사실은 stderr 에만 있다.** 이걸 놓치면 기동 로그가
+    /// "못 찾았다" 고 단정하는 것을 바로잡을 근거가 없어진다.
+    #[test]
+    fn the_jsc_line_tells_us_which_runtime_is_actually_used() {
+        observe_stderr("[youtube] [jsc:deno] Solving JS challenges using deno");
+        assert_eq!(observed_jsc().as_deref(), Some("deno"));
+    }
+
+    /// 평범한 출력에서 아무것이나 주워 담지 않는다.
+    #[test]
+    fn ordinary_output_teaches_us_nothing() {
+        observe_stderr("[download] 100% of 3.63MiB in 00:00:01");
+        // 위 두 테스트가 이미 채웠을 수 있으므로 값 자체가 아니라 **오염**만 본다.
+        assert_ne!(observed_jsc().as_deref(), Some("download"));
+    }
+}
+
+/* ── 실패 사유를 사람 말로 (§10.8) ────────────────────────────────
+ *
+ * **곡이 왜 사라졌는지 아무 데도 안 적혀 있었다.** 채널에는 제목만 나가고
+ * (`⚠️ 재생에 실패해서 다음 곡으로 넘어가요: {제목}`), 활동 기록에는 사유 자리에
+ * 아예 `None` 이 들어갔다. 그래서 듣던 사람도, 나중에 들여다보는 운영자도
+ * "그냥 곡이 없어졌다" 는 것 말고는 알 방법이 없었다.
+ *
+ * 두 군데가 필요로 하는 길이가 다르다. 채널은 흐르는 대화라 괄호 한 조각이면 되고,
+ * 리모컨은 사후에 들여다보는 원장이라 한 문장이 낫다. 그래서 **한 함수가 둘 다** 낸다 —
+ * 갈라 놓으면 한쪽만 고쳐져서 서로 다른 말을 하게 된다.
+ *
+ * 원문은 어디에도 버리지 않는다. 활동 기록에는 이 요약과 별개로 원문이 그대로 실린다.
+ */
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FailCode {
+    /// 채널 괄호 안에 들어갈 짧은 말.
+    pub short: &'static str,
+    /// 리모컨에 보일 한 문장.
+    pub long: &'static str,
+}
+
+/// 오류 원문을 사람이 읽는 짧은 말로 접는다.
+///
+/// **판정 순서가 규칙이다.** 위에서부터 먼저 걸리는 것이 이긴다. 한 응답에 여러 낱말이
+/// 같이 나오는 일이 실제로 있어서(`403 ... Video unavailable`), 결과가 뻔한 쪽을 위에 둔다.
+pub fn fail_code(error: &str) -> FailCode {
+    let lower = error.to_ascii_lowercase();
+    // (판정 낱말, 짧은 말, 한 문장). 위가 이긴다.
+    const TABLE: [(&str, &str, &str); 17] = [
+        ("live stream recording is not available",
+         "다시보기 없음", "끝난 생방송이라 다시보기가 남아 있지 않아요."),
+        ("processing this video",
+         "처리 중", "유튜브가 아직 이 영상을 처리하고 있어요. 나중에는 될 수도 있어요."),
+        ("video unavailable",
+         "영상 없음", "유튜브에서 볼 수 없는 영상이에요."),
+        ("private video",
+         "비공개", "비공개 영상이라 받을 수 없어요."),
+        ("members-only",
+         "멤버 전용", "채널 멤버에게만 열린 영상이에요."),
+        /* 아래 셋은 **실서버 로그에서 실제로 나온** 것들이다(2026-08-18~09-05 40건).
+         * 처음 표를 만들 때 로컬 dev 로그만 보고 짜서 이 셋이 빠져 있었고,
+         * 그러면 정작 사람들이 제일 자주 보는 실패가 `알 수 없음` 으로 나갔다. */
+        ("only available to music premium",
+         "프리미엄 전용", "유튜브 뮤직 프리미엄에서만 들을 수 있는 곡이에요."),
+        ("confirm your age",
+         "연령 확인", "성인 인증이 필요한 영상이라 받을 수 없어요."),
+        ("removed for violating",
+         "약관 위반 삭제", "유튜브 약관 위반으로 지워진 영상이에요."),
+        ("removed by the uploader",
+         "올린이 삭제", "올린 사람이 지운 영상이에요."),
+        ("account associated with this video has been terminated",
+         "계정 정지", "영상을 올린 계정이 정지됐어요."),
+        ("requested format is not available",
+         "형식 없음", "받을 수 있는 소리 형식이 없어요. yt-dlp 가 낡으면 이렇게 나오기도 해요."),
+        ("429",
+         "요청 과다", "유튜브가 요청이 너무 잦다고 잠시 막았어요."),
+        ("too many requests",
+         "요청 과다", "유튜브가 요청이 너무 잦다고 잠시 막았어요."),
+        // 403 은 429 보다 아래다 — 둘이 같이 나오면 속도 제한 쪽이 더 쓸모 있는 말이다.
+        ("403",
+         "403", "유튜브가 거절했어요(403). yt-dlp 가 낡았을 때 가장 흔해요."),
+        ("forbidden",
+         "403", "유튜브가 거절했어요(403). yt-dlp 가 낡았을 때 가장 흔해요."),
+        ("초과해 중단",
+         "시간 초과", "정해진 시간 안에 다 받지 못했어요."),
+        /* 웹 재생기 갈래는 도구가 준 오류가 없다 — 우리가 우리말로 적어 보낸다.
+         * 그 문장도 여기를 지나야 리모컨이 같은 말을 한다. */
+        ("길이를 알 수 없",
+         "길이 모름", "곡 길이를 알 수 없어 웹 재생기가 틀 수 없었어요."),
+    ];
+    for (needle, short, long) in TABLE {
+        if lower.contains(needle) {
+            return FailCode { short, long };
+        }
+    }
+    /* **빈 문자열이 실제로 올라온다.** `download_once` 의 `last_err` 은 인증 창구를 다
+     * 돌고도 아무 stderr 를 못 받으면 빈 채로 남는다. 그때 `()` 만 덩그러니 붙으면
+     * 오히려 더 헷갈리니 말로 적는다. */
+    if error.trim().is_empty() {
+        return FailCode {
+            short: "사유 없음",
+            long: "왜 실패했는지 도구가 아무 말도 남기지 않았어요.",
+        };
+    }
+    FailCode {
+        short: "알 수 없음",
+        long: "분류되지 않은 오류예요. 자세한 내용은 원문을 보세요.",
+    }
+}
+
+#[cfg(test)]
+mod fail_code_tests {
+    use super::{fail_code, is_transient};
+
+    /// **끝난 방송의 다시보기는 다시 물어봐도 안 준다.**
+    /// 재생 직전의 `is_live` 가드는 "방송 중" 만 막는다 — 끝난 방송은 `is_live=false` 라
+    /// 그 가드를 통과하고, 여기서 안 잡으면 사다리를 30초 넘게 헛돈다.
+    #[test]
+    fn a_finished_live_archive_is_not_worth_waiting_for() {
+        assert!(!is_transient(
+            "ERROR: [youtube] xxxx: This live stream recording is not available."
+        ));
+        assert!(!is_transient(
+            "ERROR: [youtube] xxxx: We're processing this video. Check back later."
+        ));
+    }
+
+    /// **아포스트로피를 믿지 않는다.** 유튜브는 `'` 와 `’` 를 둘 다 쓴다.
+    /// 한쪽만 맞추면 나머지 절반이 **조용히** 예전처럼 사다리를 돈다 — 제일 나쁜 종류의 버그다.
+    #[test]
+    fn the_processing_notice_matches_either_apostrophe() {
+        assert!(!is_transient("We're processing this video. Check back later."));
+        assert!(!is_transient("We\u{2019}re processing this video. Check back later."));
+    }
+
+    /// 403 과 같이 나와도 결과가 뻔한 쪽이 이긴다 (기존 불변식의 확장).
+    #[test]
+    fn a_live_archive_beats_a_403_in_the_same_tail() {
+        assert!(!is_transient(
+            "HTTP Error 403: Forbidden | This live stream recording is not available."
+        ));
+    }
+
+    /// 로그에 실제로 남아 있던 문구들이 전부 사람 말이 된다.
+    /// **여기가 `알 수 없음` 으로 떨어지면** 사용자는 또 이유를 못 본다.
+    ///
+    /// 아래 목록은 지어낸 것이 아니라 **실서버 로그 19일치(2026-08-18~09-05, 실패 40건)와
+    /// 로컬 dev 로그에서 그대로 꺼낸 원문**이다. 새 문구를 만나면 여기 추가한다.
+    #[test]
+    fn the_errors_we_actually_saw_all_get_a_name() {
+        for (raw, want) in [
+            // ── 실서버에서 실제로 난 것 (많은 순) ──
+            ("ERROR: [youtube] xgQHpTdw6Kg: Video unavailable", "영상 없음"),
+            ("ERROR: [youtube] s29lt0E27Mc: Private video", "비공개"),
+            ("ERROR: [youtube] 7Ia6meT4fKU: This video is only available to Music Premium members", "프리미엄 전용"),
+            ("ERROR: [youtube] L4rJPHUCu_4: Sign in to confirm your age. Use --cookies-from-browser or --cookies for the authentication.", "연령 확인"),
+            ("ERROR: [youtube] 2ctTxnkRbIo: This video has been removed for violating YouTube's Terms of Service", "약관 위반 삭제"),
+            // ── 로컬 dev 에서 난 것 ──
+            ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "403"),
+            ("ERROR: [youtube] jfKfPfyJRdk: This live stream recording is not available.", "다시보기 없음"),
+            ("ERROR: [youtube] DWcJFNfaw9c: We're processing this video. Check back later.", "처리 중"),
+            ("ERROR: [youtube] 7NOSDKb0HlU: Requested format is not available.", "형식 없음"),
+            ("yt-dlp 다운로드가 10분을 초과해 중단했습니다.", "시간 초과"),
+        ] {
+            assert_eq!(fail_code(raw).short, want, "이 오류를 못 알아봤어요: {raw}");
+        }
+    }
+
+    /// 실서버 실패는 전부 **다시 해도 소용없는** 것들이다. 사다리를 돌면 안 된다 —
+    /// 죽은 영상 하나에 30초씩 매달리면 그 서버는 그동안 아무 소리도 못 낸다.
+    #[test]
+    fn the_real_world_failures_never_spin_the_ladder() {
+        for raw in [
+            "ERROR: [youtube] xgQHpTdw6Kg: Video unavailable",
+            "ERROR: [youtube] s29lt0E27Mc: Private video",
+            "ERROR: [youtube] 7Ia6meT4fKU: This video is only available to Music Premium members",
+            "ERROR: [youtube] L4rJPHUCu_4: Sign in to confirm your age.",
+            "ERROR: [youtube] 2ctTxnkRbIo: This video has been removed for violating YouTube's Terms of Service",
+        ] {
+            assert!(!is_transient(raw), "죽은 영상을 붙잡고 재시도해요: {raw}");
+        }
+    }
+
+    /// **속도 제한이 403 보다 먼저다.** 둘이 같이 나오는 응답이 있는데,
+    /// "요청이 잦다" 가 "거절당했다" 보다 사람에게 쓸모 있는 말이다.
+    #[test]
+    fn rate_limiting_wins_over_a_bare_403() {
+        assert_eq!(fail_code("HTTP Error 429: Too Many Requests (403)").short, "요청 과다");
+    }
+
+    /// **빈 오류가 실제로 올라온다.** `()` 만 덩그러니 붙으면 더 헷갈린다.
+    #[test]
+    fn an_empty_error_still_says_something() {
+        assert_eq!(fail_code("").short, "사유 없음");
+        assert_eq!(fail_code("   ").short, "사유 없음");
+    }
+
+    /// 모르는 오류도 반드시 무언가를 돌려준다 — 빈 괄호가 나가면 안 된다.
+    #[test]
+    fn an_unknown_error_never_yields_an_empty_label() {
+        let c = fail_code("무언가 새로운 오류");
+        assert!(!c.short.is_empty() && !c.long.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -482,10 +827,23 @@ impl YtDlp {
         output_template: &str,
         remove_segments: bool,
     ) -> Result<(String, &'static str), String> {
-        // 쉬는 시간을 늘려 가며 시도한다. 바로 다시 하면 같은 이유로 또 튕긴다.
+        /* 쉬는 시간을 늘려 가며 시도한다. 바로 다시 하면 같은 이유로 또 튕긴다.
+         *
+         * **다만 앞 곡이 이미 이 사다리를 다 돌고 실패했다면 이야기가 다르다.** 그건 사다리가
+         * 지금 안 듣는다는 것을 이미 한 번 측정한 것이다. 같은 실험을 곡마다 반복하면
+         * 한 곡당 30초씩 쌓이고, 그동안 그 서버는 아무 소리도 못 낸다. 게다가 우리가 띄우는
+         * yt-dlp 가 배로 늘어 유튜브 쪽 속도 제한(429)을 부르는데, 그 429 는 다시 "다시 해 볼
+         * 실패" 로 분류돼 사다리를 또 돌린다 — 스스로를 먹여 키우는 고리다.
+         *
+         * 그래서 **첫 실패는 원래대로 다 해 보고**(v4.14 가 잡은 들쭉날쭉 403 복구력),
+         * 연속 실패 중이면 한 번만 해 본다. `retry_rounds` 를 부르는 쪽이 그것을 정한다.
+         *
+         * 인증 창구 순회(`download_once` 안쪽)는 **줄이지 않는다.** 그건 시간이 아니라
+         * 다양성이라, 줄이면 쿠키가 살아 있는 창구를 못 만나 본 채로 포기하게 된다. */
         const BACKOFF_SECS: [u64; 2] = [3, 8];
+        let rounds = self.retry_rounds.clamp(1, BACKOFF_SECS.len() + 1);
         let mut last = String::new();
-        for (round, wait) in BACKOFF_SECS.iter().enumerate() {
+        for (round, wait) in BACKOFF_SECS.iter().enumerate().take(rounds - 1) {
             match self
                 .download_once(source_url, output_template, remove_segments)
                 .await
@@ -561,6 +919,12 @@ impl YtDlp {
                 }
             };
 
+            // **답을 손에 쥐었다가 버리고 있었다.** 성공하면 stderr 를 읽지도 않고 버렸고,
+            // 실패해도 마지막 3줄만 남겼다. 그 앞쪽에 yt-dlp 가 "나 낡았다" 고 적어 보내는
+            // 줄과 어떤 JS 런타임을 쓰는지가 있다. 버리기 전에 한 번 훑는다.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            observe_stderr(&stderr);
+
             if out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 if let Some(path) = stdout
@@ -574,7 +938,6 @@ impl YtDlp {
                 }
                 last_err = "yt-dlp 가 출력 파일 경로를 알려주지 않았습니다.".into();
             } else {
-                let stderr = String::from_utf8_lossy(&out.stderr);
                 let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
                 last_err = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
                 // 쿠키를 아예 못 읽는 창구면 접어 둔다 (곡을 못 받은 것과는 다르다).

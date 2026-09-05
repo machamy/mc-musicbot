@@ -1666,6 +1666,13 @@ pub struct AuditFeedItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_title: Option<String>,
     pub created_utc: String,
+    /* **왜 못 틀었는지는 사람 말로 한 문장만 싣는다.**
+     *
+     * 원문(`yt-dlp` stderr 꼬리 같은 것)은 여기 오지 않는다 — 그건 관리 콘솔이 쓰고,
+     * 사람 화면에 나가면 위 주석이 말한 "못 읽는 화면" 이 된다. 대신 아무것도 안 실으면
+     * 곡이 이유 없이 사라진 것으로 보였다. 그래서 접어서 한 문장만 낸다. */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_count: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1683,6 +1690,10 @@ impl AuditEntry {
             text: self.text.clone(),
             track_title: self.target.clone(),
             created_utc: self.created_utc.clone(),
+            // 원문을 그대로 넘기지 않는다. 사람 말 한 문장으로 접어서 낸다.
+            failure_reason: self.failure_reason.as_deref().map(|raw| {
+                crate::media::ytdlp::fail_code(raw).long.to_string()
+            }),
             merged_count: (self.merged_count > 1).then_some(self.merged_count),
             merged_items: self.merged_items.clone(),
         }
@@ -1690,8 +1701,15 @@ impl AuditEntry {
 
     /// 자동 재생이 넣은 곡은 사람 피드에 안 남긴다 (§13.3).
     /// 사람이 한 일이 아니고, 계속 쌓이면 피드가 자동재생 로그가 된다.
+    ///
+    /// **못 튼 것은 예외다.** 위 규칙은 "자동재생이 곡을 담았다" 는 잔소리를 막으려는
+    /// 것이지, 듣던 곡이 사라진 사실까지 감추려는 것이 아니었다. 그런데 봇이 남기는 행은
+    /// `user_id` 가 0이라 **실패도 같이 걸러져** 나갔다. 그래서 리모컨만 보는 사람에게는
+    /// 곡이 아무 이유 없이 줄줄이 없어지는 것으로 보였다 — '문제' 칩이 있는데도 늘 비어 있었다.
+    ///
+    /// `Trouble` 은 `playback.failed` 계열에만 붙고 그건 봇만 쓴다. 잔소리로 불어날 일이 없다.
     pub fn is_human_visible(&self) -> bool {
-        self.user_id != 0 && self.success
+        (self.user_id != 0 && self.success) || self.kind == AuditKind::Trouble
     }
 }
 

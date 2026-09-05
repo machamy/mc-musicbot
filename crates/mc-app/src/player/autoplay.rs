@@ -178,7 +178,8 @@ impl Default for AutoplayTuning {
 pub struct AutoplayContext<'a> {
     /// 지금 재생 중·대기열에 있는 곡. **무조건 제외**다.
     pub excluded: &'a HashSet<String>,
-    /// `📻 이 곡 말고`로 뺐거나 재생에 실패한 곡 (§8.5-3). 무조건 제외다.
+    /// `📻 이 곡 말고`로 뺀 곡 (§8.5-3). 무조건 제외다.
+    /// 재생에 실패한 곡은 여기 안 들어간다 — 이유는 `block_autoplay_candidate` 주석에.
     pub blocked: &'a HashSet<String>,
     /// `cache_key → 마지막 재생 후 지난 시간(시간)`. 최근일수록 강하게 회피한다 (§8.5-2).
     pub recent_ages: &'a HashMap<String, f64>,
@@ -717,6 +718,7 @@ mod tests {
                 exe: "yt-dlp".into(),
                 browser_profile: String::new(),
                 cookie_file: None,
+                retry_rounds: 1,
             },
             blacklist: Arc::new(Blacklist::new(db)),
             log: Arc::new(LogService::new(root.join("logs"))),

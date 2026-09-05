@@ -2746,7 +2746,14 @@ impl RemoteStore {
 
     // ───────── 자동재생 차단 후보 (§8.5-3) ─────────
 
-    /// `📻 이 곡 말고`로 뺀 곡과 재생에 실패한 곡을 7일간 기억한다.
+    /// `📻 이 곡 말고`로 뺀 곡을 7일간 기억한다.
+    ///
+    /// **재생에 실패한 곡은 여기 넣지 않는다.** 스펙(§8.5-3)은 넣으라고 적혀 있었고 주석도
+    /// 6개월간 그렇게 말했지만, 부르는 곳은 처음부터 `이 곡 말고` 하나뿐이었다. 그리고
+    /// 넣지 않는 편이 맞다 — 403 처럼 곡 잘못이 아닌 실패가 한 번 몰아치면 멀쩡한 곡
+    /// 수백 개가 일주일간 후보에서 사라진다. 이 목록은 감쇠가 아니라 **하드 제외**라
+    /// 자동재생 풀이 그대로 마른다. 7일이라는 기간도 사람이 의사표시한 곡에 맞춘 것이지
+    /// 인프라 사고에 맞춘 것이 아니다.
     /// 후보 하나를 한동안 안 뽑게 막는다.
     ///
     /// **트랙을 통째로 같이 남긴다.** 예전에는 `cache_key` 만 저장해서, 화면이 빼 둔 곡을
@@ -5529,7 +5536,43 @@ mod tests {
         let feed = admin.feed_item();
         let json = serde_json::to_string(&feed).unwrap();
         assert!(!json.contains("beforeValue"));
+        // 사유가 없는 항목에는 사유 자리도 안 생긴다.
         assert!(!json.contains("failureReason"));
+    }
+
+    /* **못 튼 곡은 리모컨에도, 이유와 함께 보인다.**
+     *
+     * 예전에는 두 겹으로 막혀 있었다. `is_human_visible()` 이 `user_id != 0` 을 요구해서
+     * 봇이 남긴 실패 행이 통째로 걸러졌고(그래서 '문제' 칩이 늘 비어 있었다), 투영에는
+     * 사유 자리조차 없었다. 그래서 듣던 사람은 곡이 이유 없이 사라지는 것만 봤다.
+     *
+     * 그렇다고 원문을 그대로 내보내면 §13.2 가 막으려던 "못 읽는 화면" 이 된다.
+     * 그래서 **접어서 한 문장만** 낸다.
+     */
+    #[test]
+    fn a_playback_failure_reaches_the_human_feed_with_a_readable_reason() {
+        let (store, path) = temp_store("audit-failure-feed");
+        let raw = "ERROR: unable to download video data: HTTP Error 403: Forbidden";
+        store
+            .add_audit(1, 0, "봇", "playback.failed", Some("어떤 곡"), None, None, false, Some(raw))
+            .unwrap();
+
+        let entry = store.list_audit(1, 50, None).into_iter().next().unwrap();
+        assert_eq!(entry.kind, AuditKind::Trouble);
+        assert!(
+            entry.is_human_visible(),
+            "봇이 남긴 실패가 사람 피드에서 걸러지면 '문제' 칩이 다시 텅 빈다"
+        );
+
+        let json = serde_json::to_string(&entry.feed_item()).unwrap();
+        assert!(json.contains("failureReason"), "이유 없이 곡만 사라져 보인다");
+        // 사람 말로 접힌 것이지 원문이 새어 나간 게 아니다.
+        assert!(!json.contains("unable to download"), "원문이 그대로 나갔어요");
+        assert!(!json.contains("HTTP Error"), "원문이 그대로 나갔어요");
+
+        // 관리 콘솔은 원문을 그대로 본다 — 접는 건 사람 화면뿐이다.
+        assert_eq!(entry.failure_reason.as_deref(), Some(raw));
+        let _ = path;
         assert!(json.contains("actorName"));
         cleanup(store, path);
     }

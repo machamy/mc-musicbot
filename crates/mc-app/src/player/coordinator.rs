@@ -28,6 +28,157 @@ const TRACK_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// 실패로 처리하고 **다음 곡으로 넘어가게** 한다.
 const DOWNLOAD_BUDGET: Duration = Duration::from_secs(180);
 
+/* ── 연속 실패를 채널에 어떻게 알릴까 ─────────────────────────────
+ *
+ * 예전에는 실패 1건마다 한 줄씩 나갔다. 상한이 5라 한 번 무너지면 **여섯 줄**이 33초
+ * 간격으로 채널을 덮었고, 사람이 다시 `/재생` 을 누르면 카운터가 초기화돼 또 여섯 줄이
+ * 나갔다. 같은 말을 반복하는 것은 알림이 아니라 소음이다.
+ *
+ * 그렇다고 그냥 줄이면 **곡이 왜 사라졌는지 모르게 된다.** 그래서 지우는 게 아니라 접는다:
+ * 첫 줄은 반드시 말하고, 가운데는 접고, 멈출 때 접어 둔 것을 한꺼번에 갚는다.
+ * 중간에 되살아났을 때도 갚는다 — 안 그러면 3연속 실패 후 회복한 사람은 사라진 두 곡을
+ * 영영 모른다.
+ *
+ * 활동 기록은 접지 않는다. 그쪽은 사후에 뒤져 보는 원장이라 **실패 1건 = 1행** 그대로다.
+ */
+#[derive(Default)]
+struct FailStreak {
+    /// 연속 실패 횟수. `MAX_CONSECUTIVE_PLAY_FAILS` 판정은 예전과 똑같이 이 값으로 한다.
+    count: u32,
+    /// 첫 줄 이후로 채널에 안 알린 곡 제목. 너무 길어지지 않게 상한을 둔다 —
+    /// 디스코드 2000자를 넘기면 안내가 **통째로 사라진다**(`announce_text` 는 결과를 버린다).
+    folded: Vec<String>,
+}
+
+/// 접어 둔 곡 목록을 사람이 읽는 한 조각으로. 상한을 넘으면 "외 n곡" 으로 줄인다.
+fn folded_summary(folded: &[String]) -> String {
+    const SHOW: usize = 3;
+    if folded.len() <= SHOW {
+        return folded.join(", ");
+    }
+    format!("{}, 외 {}곡", folded[..SHOW].join(", "), folded.len() - SHOW)
+}
+
+/// 이번 실패를 채널에 알릴까, 접을까. **판단만 하는 함수라 디스코드 없이도 검사할 수 있다.**
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum FailNotice {
+    /// 첫 줄 — 반드시 말한다.
+    Announce,
+    /// 가운데 — 접는다. 활동 기록에는 그대로 남는다.
+    Fold,
+    /// 상한 — 멈추면서 접어 둔 것까지 갚는다.
+    Stop,
+}
+
+fn fail_notice(count: u32) -> FailNotice {
+    if count >= MAX_CONSECUTIVE_PLAY_FAILS {
+        FailNotice::Stop
+    } else if count <= 1 {
+        FailNotice::Announce
+    } else {
+        FailNotice::Fold
+    }
+}
+
+#[cfg(test)]
+mod fail_notice_tests {
+    use super::*;
+
+    /// **첫 실패는 반드시 알린다.** 이게 접히면 사용자는 곡이 왜 사라졌는지 알 방법이 없다.
+    #[test]
+    fn the_first_failure_always_speaks() {
+        assert_eq!(fail_notice(1), FailNotice::Announce);
+    }
+
+    /// 가운데는 접는다 — 33초마다 같은 말이 다섯 번 나오던 게 이 항목의 출발점이다.
+    #[test]
+    fn the_middle_of_a_streak_is_folded() {
+        for n in 2..MAX_CONSECUTIVE_PLAY_FAILS {
+            assert_eq!(fail_notice(n), FailNotice::Fold, "{n}번째가 안 접혀요");
+        }
+    }
+
+    /// 상한에 닿으면 멈추고 알린다. **여기가 Fold 로 바뀌면 봇이 조용히 죽는다.**
+    #[test]
+    fn the_stop_always_speaks() {
+        assert_eq!(fail_notice(MAX_CONSECUTIVE_PLAY_FAILS), FailNotice::Stop);
+        assert_eq!(fail_notice(MAX_CONSECUTIVE_PLAY_FAILS + 1), FailNotice::Stop);
+    }
+
+    /// **한 번도 침묵으로 끝나지 않는다.** 어떤 길이의 연속 실패든 최소 한 줄은 나간다.
+    #[test]
+    fn no_streak_ends_in_silence() {
+        for len in 1..=20u32 {
+            assert!(
+                (1..=len).any(|n| fail_notice(n) != FailNotice::Fold),
+                "{len}연속 실패가 통째로 조용히 지나가요"
+            );
+        }
+    }
+
+    /// 접어 둔 목록은 길어져도 한 조각으로 줄어든다 — 디스코드 2000자를 넘기면
+    /// 안내가 통째로 사라지기 때문이다.
+    #[test]
+    fn a_long_fold_is_summarised_not_dumped() {
+        let many: Vec<String> = (0..40).map(|i| format!("아주 긴 곡 제목 {i}")).collect();
+        let text = folded_summary(&many);
+        assert!(text.contains("외 37곡"), "{text}");
+        assert!(text.len() < 200, "너무 길어요: {}", text.len());
+    }
+
+    /// 세 곡까지는 그대로 보여 준다 — 줄이는 것이 목적이 아니라 읽히는 것이 목적이다.
+    #[test]
+    fn a_short_fold_is_shown_in_full() {
+        assert_eq!(folded_summary(&["가".into(), "나".into()]), "가, 나");
+    }
+
+    /* **이 변경의 진짜 불변식: 곡을 잃지도, 두 번 말하지도 않는다.**
+     *
+     * 알림을 줄이는 것이 목적이지 감추는 것이 목적이 아니다. 어떤 길이의 연속 실패든
+     * 사라진 곡은 전부 어딘가에서 한 번씩 언급돼야 한다 — 첫 줄이거나, 접힌 목록이거나,
+     * 마지막 줄의 "마지막 실패" 거나. `sync_guild` 의 실패 갈래가 하는 일을 그대로 흉내 낸다.
+     */
+    fn walk(fail_count: u32) -> (Vec<String>, Vec<String>) {
+        let mut folded: Vec<String> = Vec::new();
+        let mut spoken: Vec<String> = Vec::new();
+        for n in 1..=fail_count {
+            let title = format!("곡{n}");
+            match fail_notice(n) {
+                FailNotice::Announce => spoken.push(title),
+                FailNotice::Fold => folded.push(title),
+                FailNotice::Stop => {
+                    // 멈출 때 접어 둔 것과 마지막 곡을 함께 말한다.
+                    spoken.extend(folded.drain(..));
+                    spoken.push(title);
+                }
+            }
+        }
+        // 상한 전에 되살아났다면 접어 둔 것을 회복 요약으로 갚는다.
+        spoken.extend(folded.drain(..));
+        (spoken, folded)
+    }
+
+    #[test]
+    fn every_skipped_song_is_named_exactly_once() {
+        for len in 1..=MAX_CONSECUTIVE_PLAY_FAILS {
+            let (spoken, leftover) = walk(len);
+            assert!(leftover.is_empty(), "{len}연속에서 못 갚은 곡이 남았어요");
+            let want: Vec<String> = (1..=len).map(|n| format!("곡{n}")).collect();
+            assert_eq!(spoken, want, "{len}연속에서 곡이 새거나 겹쳤어요");
+        }
+    }
+
+    /// 그러면서도 채널에 나가는 **줄 수**는 두 줄을 넘지 않는다.
+    /// 예전에는 5연속이면 여섯 줄이 33초 간격으로 채널을 덮었다.
+    #[test]
+    fn a_full_streak_costs_at_most_two_messages() {
+        let lines = (1..=MAX_CONSECUTIVE_PLAY_FAILS)
+            .filter(|n| fail_notice(*n) != FailNotice::Fold)
+            .count();
+        assert_eq!(lines, 2, "채널에 {lines}줄이 나가요");
+    }
+}
+
 /// 트랙 핸들에 상태를 물은 결과.
 ///
 /// "답이 없다" 와 "없어졌다" 를 갈라야 한다 — 워치독은 없어졌으면 끝내야 하지만,
@@ -128,8 +279,9 @@ pub struct Coordinator {
     played_counted: Mutex<HashMap<u64, String>>,
     /// 단조 증가 세대 카운터 (play_track 마다 +1).
     gen_counter: AtomicU64,
-    /// 길드별 연속 재생 실패 횟수. 다운로드/ffmpeg 실패가 반복될 때 무한 스킵을 막는다.
-    play_fail: Mutex<HashMap<u64, u32>>,
+    /// 길드별 연속 재생 실패. 다운로드/ffmpeg 실패가 반복될 때 무한 스킵을 막고,
+    /// **채널에 같은 말을 반복하지 않도록** 그 사이에 접어 둔 곡들을 들고 있는다.
+    play_fail: Mutex<HashMap<u64, FailStreak>>,
     /// 지금 가상 재생 중인 길드. `PlayerManager` 와 같은 손잡이를 나눠 갖는다 —
     /// 통계가 재생을 `plays_virtual` 로 가를 때 이 값을 읽는다.
     virtual_guilds: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
@@ -502,8 +654,24 @@ impl Coordinator {
      * 예전에는 디스코드 채널에만 알렸다. 그래서 리모컨만 보는 사람에게는 곡이 아무 이유
      * 없이 줄줄이 사라지는 것으로 보였고, 활동 기록에는 아무것도 없으니 원인을 찾을
      * 실마리가 없었다. 사람이 넘긴 것과 문구를 다르게 해서 서로 의심하지 않게 한다.
+     *
+     * **원문을 통째로 남긴다.** 채널에는 `(403)` 같은 조각만 나가지만 여기는 사후에
+     * 뒤져 보는 원장이라 자를 이유가 없다. 예전에는 이 자리에 `None` 이 들어가서
+     * 무엇이 왜 실패했는지가 **어디에도** 안 남았다.
+     *
+     * `success` 도 `false` 로 바로잡는다. 예전에는 `true` 였는데, 관리 콘솔이
+     * `success === false` 일 때만 사유를 그리기 때문에 사유를 채워도 화면에 안 떴다.
+     * 사람 피드 노출은 이 값과 무관하다 — `is_human_visible()` 이 `user_id != 0` 도
+     * 함께 요구하는데 봇이 남기는 행은 `user_id` 가 0이라 어차피 걸리지 않는다.
      */
-    fn record_playback_failure(&self, app: &Arc<App>, guild_id: u64, action: &str, title: &str) {
+    fn record_playback_failure(
+        &self,
+        app: &Arc<App>,
+        guild_id: u64,
+        action: &str,
+        title: &str,
+        reason: &str,
+    ) {
         let _ = app.remote.add_audit(
             guild_id,
             0,
@@ -512,8 +680,8 @@ impl Coordinator {
             Some(title),
             None,
             None,
-            true,
-            None,
+            false,
+            Some(reason),
         );
     }
 
@@ -714,11 +882,15 @@ impl Coordinator {
                                 current.track.display_title()
                             ),
                         );
+                        /* 이 갈래에는 도구가 준 오류 문자열이 없다 — 길이를 못 읽었다는
+                         * 우리 판단이 전부다. 그래도 사유 자리를 비워 두지는 않는다.
+                         * 비워 두면 활동 기록에서 "왜 사라졌는지 모름" 이 되어 버린다. */
                         self.record_playback_failure(
                             app,
                             guild_id,
                             "playback.failed",
                             current.track.display_title(),
+                            "곡 길이를 알 수 없어 웹 재생기가 틀 수 없었어요.",
                         );
                         self.virtual_sessions.lock().await.remove(&guild_id);
                         // **여기서 멈추면 안 된다.** 대기열을 한 칸 밀고 다시 맞춘다.
@@ -956,7 +1128,28 @@ impl Coordinator {
                 .await
             {
                 Ok(PlayOutcome::Started) => {
-                    self.play_fail.lock().await.remove(&guild_id);
+                    /* **접어 둔 것을 여기서 갚는다.**
+                     *
+                     * 예전에는 성공하면 카운터를 조용히 지웠다. 그래서 3연속 실패 뒤
+                     * 되살아난 경우, 사용자는 첫 줄 하나만 보고 나머지 두 곡이 왜 사라졌는지
+                     * 영영 몰랐다. 알림을 줄이는 대신 원인을 지워 버린 셈이 된다.
+                     *
+                     * 한 번 실패하고 바로 회복한 경우는 이미 그 한 줄을 말했으니 아무 말도 안 한다. */
+                    let folded = self.play_fail.lock().await.remove(&guild_id);
+                    if let Some(streak) = folded {
+                        if !streak.folded.is_empty() {
+                            crate::player::side_effects::announce_text(
+                                app,
+                                guild_id,
+                                &format!(
+                                    "▶️ 다시 정상이에요. 그 사이 {n}곡을 건너뛰었어요: {list}",
+                                    n = streak.folded.len(),
+                                    list = folded_summary(&streak.folded)
+                                ),
+                            )
+                            .await;
+                        }
+                    }
                     return;
                 }
                 // 준비하는 사이에 곡이 바뀌었다. 실패가 아니므로 실패 수를 세지 않고,
@@ -979,34 +1172,68 @@ impl Coordinator {
                         "Playback",
                         &format!("Playback failed for guild {guild_id}: {e}"),
                     );
-                    let fails = {
-                        let mut map = self.play_fail.lock().await;
-                        let c = map.entry(guild_id).or_insert(0);
-                        *c += 1;
-                        *c
-                    };
                     let title = current.track.display_title().to_string();
-                    if fails >= MAX_CONSECUTIVE_PLAY_FAILS {
-                        self.play_fail.lock().await.remove(&guild_id);
-                        self.cancel_current(guild_id).await;
-                        self.record_playback_failure(app, guild_id, "playback.failed.stop", &title);
-                        crate::player::side_effects::announce_text(
-                            app,
-                            guild_id,
-                            &format!(
-                                "⚠️ 재생이 연속 {fails}번 실패해서 멈췄어요. 잠시 뒤에 `/재생` 으로 다시 시도해 주세요. (마지막 실패: {title})"
-                            ),
-                        )
-                        .await;
-                        return;
+                    let (fails, folded) = {
+                        let mut map = self.play_fail.lock().await;
+                        let streak = map.entry(guild_id).or_default();
+                        streak.count += 1;
+                        // 첫 줄로 말할 곡은 접어 둔 목록에 넣지 않는다 — 두 번 말하게 된다.
+                        if fail_notice(streak.count) == FailNotice::Fold {
+                            streak.folded.push(title.clone());
+                        }
+                        (streak.count, streak.folded.clone())
+                    };
+                    /* **왜 사라졌는지 같이 말한다.**
+                     *
+                     * 예전에는 제목만 나갔다. 듣던 사람에게는 곡이 아무 이유 없이 사라지는
+                     * 것으로 보였고, 나중에 들여다보는 운영자도 활동 기록에서 사유를 찾을 수
+                     * 없었다(그 자리에 `None` 이 들어가고 있었다).
+                     *
+                     * 채널에는 괄호 한 조각만, 활동 기록에는 원문까지. 흐르는 대화와 사후에
+                     * 뒤져 보는 원장은 필요로 하는 길이가 다르다. */
+                    let code = crate::media::ytdlp::fail_code(&e);
+                    // **활동 기록은 접지 않는다** — 실패 1건 = 1행. 접는 것은 채널뿐이다.
+                    let action = if fails >= MAX_CONSECUTIVE_PLAY_FAILS {
+                        "playback.failed.stop"
+                    } else {
+                        "playback.failed"
+                    };
+                    self.record_playback_failure(app, guild_id, action, &title, &e);
+
+                    match fail_notice(fails) {
+                        FailNotice::Announce => {
+                            crate::player::side_effects::announce_text(
+                                app,
+                                guild_id,
+                                &format!(
+                                    "⚠️ 재생에 실패해서 다음 곡으로 넘어가요: {title} ({short})",
+                                    short = code.short
+                                ),
+                            )
+                            .await;
+                        }
+                        // 가운데는 채널에 말하지 않는다. 멈추거나 되살아날 때 한꺼번에 갚는다.
+                        FailNotice::Fold => {}
+                        FailNotice::Stop => {
+                            self.play_fail.lock().await.remove(&guild_id);
+                            self.cancel_current(guild_id).await;
+                            let skipped = if folded.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" 건너뛴 곡: {}.", folded_summary(&folded))
+                            };
+                            crate::player::side_effects::announce_text(
+                                app,
+                                guild_id,
+                                &format!(
+                                    "⚠️ 재생이 연속 {fails}번 실패해서 멈췄어요.{skipped} 잠시 뒤에 `/재생` 으로 다시 시도해 주세요. (마지막 실패: {title} — {short})",
+                                    short = code.short
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
                     }
-                    self.record_playback_failure(app, guild_id, "playback.failed", &title);
-                    crate::player::side_effects::announce_text(
-                        app,
-                        guild_id,
-                        &format!("⚠️ 재생에 실패해서 다음 곡으로 넘어가요: {title}"),
-                    )
-                    .await;
                     // 망가진 곡을 강제로 지나친다(Track 반복이어도 같은 곡 재착석 방지).
                     app.player.skip(guild_id).await;
                     // 큐가 비었으면 자동추천을 시드해 자연종료 경로와 동일하게 이어지게 한다
@@ -1049,8 +1276,20 @@ impl Coordinator {
             ));
         }
 
-        // 1) 파일 준비 (캐시 미스 시 다운로드).
-        let ytdlp = app.ytdlp();
+        /* 1) 파일 준비 (캐시 미스 시 다운로드).
+         *
+         * 앞 곡이 이미 재시도 사다리를 다 돌고 실패했다면 이 곡에서 같은 실험을 반복하지
+         * 않는다. 첫 실패는 그대로 다 해 본다 (`retry_rounds` 주석 참고). */
+        let fails_so_far = self
+            .play_fail
+            .lock()
+            .await
+            .get(&guild_id)
+            .map(|s| s.count)
+            .unwrap_or(0);
+        let ytdlp = app
+            .ytdlp()
+            .with_retry_rounds(crate::media::ytdlp::retry_rounds(fails_so_far));
         /* **한 곡을 받는 데 상한을 둔다.**
          *
          * `prepare` 안쪽은 인증 창구 × 재시도로 최악 두 시간까지 간다. 그런데 이 호출에는

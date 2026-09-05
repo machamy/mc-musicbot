@@ -1176,6 +1176,19 @@ pub async fn tools_page(State(state): Ctx, cookies: Cookies) -> Response {
     }
     let app = &state.app;
     let yt_ver = tool_version(&app.config.yt_dlp_path, "--version").await;
+    /* **얼마나 묵었는지 여기서 바로 보이게 한다.**
+     *
+     * 6개월 된 yt-dlp 가 곡을 403 으로 떨어뜨리는 동안, 이 화면은 버전 문자열만
+     * 무표정하게 보여 주고 있었다. 날짜를 읽을 수 있으니 며칠인지도 같이 적는다.
+     * 프로세스를 새로 띄우지 않는다 — 위에서 이미 `--version` 을 받아 왔다. */
+    let yt_age = crate::media::tools::version_age_note(&yt_ver);
+    /* 무엇으로 유튜브 서명을 푸는지. 곡을 한 곡이라도 받아 봐야 알 수 있다
+     * (yt-dlp 가 stderr 로 알려 준다). **'없음' 이라고 단정하지 않는다** — 우리가
+     * 못 박지 못한 것과 yt-dlp 가 못 찾은 것은 다르고, 없어도 곡은 받아진다. */
+    let jsc = match crate::media::ytdlp::observed_jsc() {
+        Some(name) => format!("{name} (yt-dlp 자체 탐색)"),
+        None => "아직 모름 — 곡을 하나 틀면 여기 적힙니다".to_string(),
+    };
     let ff_ver = tool_version(&app.config.ffmpeg_path, "-version").await;
     let yt_ok = !yt_ver.starts_with("실행 실패");
     let ff_ok = !ff_ver.starts_with("실행 실패");
@@ -1217,8 +1230,9 @@ pub async fn tools_page(State(state): Ctx, cookies: Cookies) -> Response {
 <div class="grid2">
 <div class="card">
 <h2>도구 상태</h2>
-<p>yt-dlp: {yt_pill} <span class="kv">{yt_ver}</span></p>
+<p>yt-dlp: {yt_pill} <span class="kv">{yt_ver}</span> {yt_age}</p>
 <p class="kv">경로: {yt_path}</p>
+<p class="kv">JS 런타임: {jsc}</p>
 <p>ffmpeg: {ff_pill} <span class="kv">{ff_ver}</span></p>
 <p class="kv">경로: {ff_path}</p>
 <h2 style="margin-top:18px">링크 검사</h2>
@@ -1243,6 +1257,8 @@ pub async fn tools_page(State(state): Ctx, cookies: Cookies) -> Response {
         yt_pill = pill(yt_ok),
         ff_pill = pill(ff_ok),
         yt_ver = html_escape(&yt_ver),
+        yt_age = yt_age,
+        jsc = html_escape(&jsc),
         ff_ver = html_escape(&ff_ver),
         yt_path = html_escape(&app.config.yt_dlp_path),
         ff_path = html_escape(&app.config.ffmpeg_path),

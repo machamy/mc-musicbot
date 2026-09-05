@@ -175,6 +175,15 @@ impl CacheManager {
             "Download",
             &format!("Prepared {} using auth mode '{mode}'.", track.cache_key()),
         );
+        /* 기동 때는 "우리가 못 박지 못했다" 까지만 말할 수 있다. 무엇이 실제로 쓰이는지는
+         * 곡을 한 곡 받아 봐야 yt-dlp 가 stderr 로 알려 준다. 그 답을 여기서 한 번만 적는다.
+         * 이 줄이 뜨면 운영자는 JS 런타임 쪽을 지우고 다른 데를 볼 수 있다. */
+        if let Some(runtime) = crate::media::ytdlp::take_jsc_notice() {
+            self.log.info(
+                "Tools",
+                &format!("yt-dlp 가 유튜브 서명을 {runtime} 로 풀고 있어요 (yt-dlp 자체 탐색)."),
+            );
+        }
         self.prune_to_limit((cache_limit_gb as i64) * 1024 * 1024 * 1024);
         Ok((path, false))
     }

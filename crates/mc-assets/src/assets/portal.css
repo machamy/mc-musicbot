@@ -1767,6 +1767,10 @@ body[data-dragging="tab"] { user-select: none; }
 .logrow b { color: var(--text-1); font-weight: var(--fw-medium); }
 .logrow p { color: var(--text-3); overflow-wrap: anywhere; }
 .logrow--fail b { color: var(--danger); }
+/* 못 튼 이유. 제목 뒤에 이어 붙는 한 문장이라 좁은 화면에서도 접혀 내려가게 둔다 —
+   자르면 이유를 되찾을 방법이 없다. */
+.logrow__why { color: var(--text-4); overflow-wrap: anywhere; }
+.logrow--fail .logrow__why { color: var(--danger); }
 
 .filterbar { flex: none; padding: var(--sp-3) var(--sp-3) var(--sp-2); }
 
