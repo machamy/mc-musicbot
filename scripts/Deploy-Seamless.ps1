@@ -60,6 +60,36 @@ function Invoke-Remote([string]$Script) {
 }
 
 if (-not (Test-Path $LocalExe)) { throw "빌드 결과가 없어요: $LocalExe" }
+
+# ── 패치노트가 **exe 안에도** 들어 있는지 본다 ─────────────────────────────
+#
+# 위 검사는 디스크의 `docs/CHANGELOG.md` 를 본다. 그런데 화면이 보여 주는 것은
+# `include_str!` 로 **exe 에 박힌 사본**이다(`mc-assets/src/lib.rs`). 패치노트를 쓰기
+# 전에 빌드하면 이 둘이 어긋나는데, 예전에는 아무도 안 잡았다 — 배포는 통과하고
+# 화면의 패치노트만 옛날 것으로 남았다(v4.61 에서 실제로 그랬다).
+#
+# 바이너리에서 `## <버전>` 을 직접 찾는다. 못 찾으면 **빌드를 다시 하라는 뜻**이다.
+$needle = [Text.Encoding]::UTF8.GetBytes("## $Version")
+$bytes = [IO.File]::ReadAllBytes((Resolve-Path $LocalExe))
+$found = $false
+$limit = $bytes.Length - $needle.Length
+for ($i = 0; $i -le $limit; $i++) {
+    if ($bytes[$i] -ne $needle[0]) { continue }
+    $ok = $true
+    for ($j = 1; $j -lt $needle.Length; $j++) {
+        if ($bytes[$i + $j] -ne $needle[$j]) { $ok = $false; break }
+    }
+    if ($ok) { $found = $true; break }
+}
+if (-not $found) {
+    throw @"
+빌드된 exe 안에 '## $Version' 패치노트가 없어요.
+docs/CHANGELOG.md 를 먼저 쓰고 **그다음에** 빌드하세요 — exe 는 빌드 시점의
+패치노트를 통째로 품고 나가고, 화면은 그걸 읽습니다.
+    cargo build --release
+"@
+}
+Write-Host '[deploy] exe 안의 패치노트도 확인됨'
 $localHash = (Get-FileHash $LocalExe -Algorithm SHA256).Hash
 Write-Host "[deploy] 로컬 SHA256 $localHash"
 

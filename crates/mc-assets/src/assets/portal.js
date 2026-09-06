@@ -579,6 +579,9 @@ let lastReadId = 0;
 let unread = 0;
 let libraryTab = 'liked';      // liked | saved | playlists
 let auditQuery = '';
+/* 볼륨 슬라이더에 손이 닿아 있는 동안만 참. 서버가 보내오는 값이 끌고 있는
+   손잡이를 빼앗지 않게 한다 — 자세한 사정은 아래 볼륨 갱신 자리에 적어 뒀다. */
+let volumeDragging = false;
 let libraryQuery = '';
 let lastCurrentId = null;
 let acState = null;            // 자동완성 { kind, from, to, items, index }
@@ -4846,8 +4849,16 @@ function buildStage() {
   el.volume = h('input', {
     class: 'vol__range', type: 'range', 'data-testid': 'volume', min: '0', max: '200', value: '100',
     'aria-label': '서버 볼륨 (모두에게 적용돼요)',
+    // 손이 닿아 있는 동안에는 서버 값이 슬라이더를 뺏지 않게 표시해 둔다.
+    onPointerDown: () => { volumeDragging = true; },
+    onKeyDown: () => { volumeDragging = true; },
     onInput: () => { el.volumeLabel.textContent = `${el.volume.value}%`; },
-    onChange: () => control('volume', Number(el.volume.value)),
+    onChange: () => { volumeDragging = false; control('volume', Number(el.volume.value)); },
+    // 끌다가 창 밖에서 손을 떼거나 포커스를 잃어도 반드시 풀린다 — 안 풀면 그 사람
+    // 화면만 영영 서버 값을 안 따라간다.
+    onPointerUp: () => { volumeDragging = false; },
+    onPointerCancel: () => { volumeDragging = false; },
+    onBlur: () => { volumeDragging = false; },
   });
   el.volumeLabel = h('span', { class: 'vol__label' }, '100%');
   el.volumeWrap = h('div', {
@@ -6632,7 +6643,16 @@ function renderNow(state) {
   el.repeatBtn.setAttribute('aria-label', repeatWord);
   el.shuffleBtn.setAttribute('aria-pressed', String(!!player.shuffleEnabled));
 
-  if (Number.isFinite(player.effectiveVolume) && document.activeElement !== el.volume) {
+  /* **끌고 있는 동안만 손을 뗀다 — 포커스가 남아 있다고 계속 손을 떼면 안 된다.**
+   *
+   * 예전 조건은 `document.activeElement !== el.volume` 이었다. 그런데 슬라이더는 한 번
+   * 누르면 **놓은 뒤에도 포커스가 남는다.** 그래서 볼륨을 한 번 만진 사람의 화면은
+   * 그때부터 서버 값을 영영 안 따라갔다 — 남이 볼륨을 바꿔도, 서버가 상·하한으로
+   * 잘라도 숫자가 옛날 값에 멈춰 있었다. 처음 들어왔을 때 값이 아직 안 온 경우에도
+   * 만들 때 박아 둔 `100%` 가 그대로 남았다.
+   *
+   * 실제로 손이 닿아 있는 동안(`volumeDragging`)만 비켜 준다. */
+  if (Number.isFinite(player.effectiveVolume) && !volumeDragging) {
     el.volume.min = String(player.minVolume ?? state.settings?.minVolume ?? 0);
     el.volume.max = String(player.maxVolume ?? state.settings?.maxVolume ?? 200);
     el.volume.value = String(player.effectiveVolume);

@@ -194,6 +194,7 @@ impl App {
             config.cache_dir(),
             db.clone(),
             log.clone(),
+            config.ffmpeg_path.clone(),
         ));
         let remote = Arc::new(
             RemoteStore::open(&config.db_path()).expect("마참뮤직 SQLite 테이블 준비 실패"),

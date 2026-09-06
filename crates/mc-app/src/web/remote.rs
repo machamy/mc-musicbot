@@ -2915,8 +2915,21 @@ fn autoplay_options_json(
                     options.len()
                 ),
             );
+            return quiet;
         }
-        return quiet;
+        /* **여기서 화면이 통째로 침묵했다.**
+         *
+         * 자동 재생이 켜져 있고 대기열도 비었는데 아직 고른 곡이 없으면, `next` 는
+         * `null`(`next_up_json` — 대기열도 미리보기도 없으니)이고 후보 줄도 조용히
+         * 빈 채로 나갔다. 그래서 **다음 곡 줄도, "고르는 중" 도 둘 다 안 보였다.**
+         *
+         * 짧은 창이 아니다. 라디오를 긁는 데 실측 1분쯤 걸리고(운영 로그), 곡이 그 사이
+         * 바뀌면 도착한 추천이 폐기되고 처음부터 다시 돈다. 그 내내 화면은 아무 말도
+         * 안 했다.
+         *
+         * 자동 재생이 켜져 있는 한 다음 곡은 **이 봇이 내놓기로 한 것**이다. 아직 없으면
+         * 없다고 말한다 — 비워 두면 고장으로 읽힌다 (§23.3). */
+        return json!({ "resolving": true, "items": [] });
     }
 
     let picked = player.autoplay_preview.as_ref().map(|item| item.id.clone());

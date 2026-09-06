@@ -686,6 +686,55 @@ impl PlayerManager {
         .await
     }
 
+    /* **뒤늦게 알아낸 곡 길이를 상태에 적어 넣는다.**
+     *
+     * 검색(`--flat-playlist`)으로 담은 곡은 길이가 안 온다. 그 상태로 두면 화면 총 시간이
+     * `0:00` 이고, 웹 재생기는 **길이를 모른다는 이유로 그 곡을 건너뛴다.**
+     *
+     * 그런데 곡을 실제로 받고 나면 파일에서 길이를 읽을 수 있다(`cache::probe_duration`).
+     * 그 값을 여기 한 번 써 넣으면 화면으로 나가는 18곳이 전부 알아서 맞아떨어진다 —
+     * 내보내는 자리마다 캐시를 뒤지게 하면 그 18곳을 앞으로도 계속 맞춰야 한다.
+     *
+     * **이미 아는 길이는 덮지 않는다.** 우리가 잰 값보다 제공자가 준 값이 낫다.
+     */
+    pub async fn fill_missing_duration(
+        &self,
+        guild_id: u64,
+        cache_key: &str,
+        duration: CsTimeSpan,
+    ) -> bool {
+        let key = cache_key.to_string();
+        let mut touched = false;
+        {
+            // 바꿀 게 없으면 저장도 방송도 하지 않는다 — 곡마다 헛프레임이 나간다.
+            let state = self.get_state(guild_id).await;
+            let needs = |item: &QueueItem| item.track.duration.is_none() && item.track.cache_key() == key;
+            touched = state.current_item.as_ref().is_some_and(needs)
+                || state.upcoming.iter().any(needs)
+                || state.autoplay_preview.as_ref().is_some_and(needs);
+        }
+        if !touched {
+            return false;
+        }
+        self.mutate(
+            guild_id,
+            "Playback",
+            &format!("곡 길이를 뒤늦게 채웠어요 ({key}, {}초).", duration.as_secs_f64() as i64),
+            |s| {
+                let patch = |item: &mut QueueItem| {
+                    if item.track.duration.is_none() && item.track.cache_key() == key {
+                        item.track.duration = Some(duration);
+                    }
+                };
+                if let Some(item) = s.current_item.as_mut() { patch(item); }
+                for item in s.upcoming.iter_mut() { patch(item); }
+                if let Some(item) = s.autoplay_preview.as_mut() { patch(item); }
+            },
+        )
+        .await;
+        true
+    }
+
     pub async fn set_autoplay(&self, guild_id: u64, enabled: bool) -> GuildPlayerState {
         if !enabled {
             self.clear_preview(guild_id);

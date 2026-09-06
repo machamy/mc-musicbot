@@ -14,6 +14,8 @@ pub struct CacheManager {
     pub dir: PathBuf,
     db: Arc<Db>,
     log: Arc<LogService>,
+    /// 받아 놓은 파일에서 길이를 읽을 때 쓴다 (`probe_duration`).
+    ffmpeg: String,
     /// 지금 받고 있는 곡 → 그 곡 전용 잠금 (`prepare` 참고).
     inflight: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -27,12 +29,13 @@ fn sanitize_file_name(value: &str) -> String {
 }
 
 impl CacheManager {
-    pub fn new(dir: PathBuf, db: Arc<Db>, log: Arc<LogService>) -> CacheManager {
+    pub fn new(dir: PathBuf, db: Arc<Db>, log: Arc<LogService>, ffmpeg: String) -> CacheManager {
         let _ = std::fs::create_dir_all(&dir);
         CacheManager {
             dir,
             db,
             log,
+            ffmpeg,
             inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -49,13 +52,24 @@ impl CacheManager {
     }
 
     pub fn register(&self, track: &TrackRef, file_path: &str, size_bytes: i64) {
+        self.register_with_duration(track, file_path, size_bytes, track.duration);
+    }
+
+    /// 길이를 따로 알아냈을 때 쓰는 등록 (`probe_duration` 참고).
+    pub fn register_with_duration(
+        &self,
+        track: &TrackRef,
+        file_path: &str,
+        size_bytes: i64,
+        duration: Option<crate::models::CsTimeSpan>,
+    ) {
         let entry = CacheEntry {
             cache_key: track.cache_key(),
             provider: track.provider,
             content_id: track.content_id.clone(),
             source_url: track.source_url.clone(),
             title: track.title.clone(),
-            duration: track.duration,
+            duration,
             file_path: file_path.to_string(),
             size_bytes,
             loudness_profile: None,
@@ -170,7 +184,19 @@ impl CacheManager {
         let size = std::fs::metadata(&path)
             .map(|m| m.len() as i64)
             .unwrap_or(0);
-        self.register(track, &path, size);
+        /* **여기서 곡 길이를 확정한다.**
+         *
+         * 검색(`--flat-playlist`)으로 담은 곡은 길이가 안 온다. 그러면 화면의 총 시간이
+         * `0:00` 으로 나오고(실측: 최근 50곡 중 4곡), 웹 재생기는 아예 **길이를 모른다는
+         * 이유로 그 곡을 건너뛴다**(`coordinator` 의 가상 재생 갈래).
+         *
+         * 그런데 여기까지 왔으면 파일이 손에 있다. 받아 놓고도 안 물어본 셈이었다.
+         * 실패해도 예전과 같을 뿐이라 잃을 게 없다. */
+        let duration = match track.duration {
+            Some(d) => Some(d),
+            None => probe_duration(&self.ffmpeg, &path).await,
+        };
+        self.register_with_duration(track, &path, size, duration);
         self.log.info(
             "Download",
             &format!("Prepared {} using auth mode '{mode}'.", track.cache_key()),
@@ -388,5 +414,82 @@ mod tests {
         assert!(!name.contains('/'), "{name}");
         assert!(!name.contains(':'), "{name}");
         assert!(!name.contains('\\'), "{name}");
+    }
+}
+
+/* ── 받아 놓은 파일에서 길이를 읽는다 ────────────────────────────
+ *
+ * 검색(`--flat-playlist`)으로 담은 곡은 메타에 길이가 없다. 그러면 화면 총 시간이
+ * `0:00` 이 되고, 웹 재생기는 그 곡을 **길이를 모른다는 이유로 건너뛴다.**
+ *
+ * `ffprobe` 는 배포본에 없다(실서버 `tools\` 에 `ffmpeg.exe` 하나뿐). 그런데 `ffmpeg -i`
+ * 는 입력만 읽고 `Duration: 00:03:24.15` 를 stderr 에 적어 준다 — 출력이 없다고 실패
+ * 코드로 끝나지만 그 줄은 이미 나온 뒤다. 그래서 종료 코드를 안 보고 stderr 만 읽는다.
+ */
+async fn probe_duration(ffmpeg: &str, path: &str) -> Option<crate::models::CsTimeSpan> {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-i", path]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::process::Command::from(cmd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    parse_ffmpeg_duration(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// `ffmpeg -i` 의 stderr 에서 `Duration: HH:MM:SS.ss` 를 뽑는다.
+/// **순수 함수라 ffmpeg 없이도 검사할 수 있다.**
+fn parse_ffmpeg_duration(stderr: &str) -> Option<crate::models::CsTimeSpan> {
+    let rest = stderr.split("Duration:").nth(1)?;
+    let head = rest.split(',').next()?.trim();
+    // `N/A` 는 길이를 모른다는 뜻이다 — 0으로 적어 두면 아는 척이 된다.
+    if head.starts_with("N/A") {
+        return None;
+    }
+    let mut secs = 0f64;
+    for part in head.split(':') {
+        let v: f64 = part.trim().parse().ok()?;
+        secs = secs * 60.0 + v;
+    }
+    (secs > 0.0).then(|| crate::models::CsTimeSpan::from_secs_f64(secs))
+}
+
+#[cfg(test)]
+mod duration_probe_tests {
+    use super::parse_ffmpeg_duration;
+
+    /// ffmpeg 이 실제로 뱉는 줄. **여기가 깨지면 길이 없는 곡이 다시 `0:00` 이 된다.**
+    #[test]
+    fn a_real_ffmpeg_line_is_read() {
+        let out = "  Duration: 00:03:24.15, start: 0.000000, bitrate: 128 kb/s\n";
+        let d = parse_ffmpeg_duration(out).expect("길이를 못 읽었어요");
+        assert!((d.as_secs_f64() - 204.15).abs() < 0.01, "{}", d.as_secs_f64());
+    }
+
+    /// 한 시간이 넘는 것도 자릿수 그대로 읽는다.
+    #[test]
+    fn an_hour_long_file_is_read() {
+        let d = parse_ffmpeg_duration("Duration: 01:02:03.00, bitrate: 1 kb/s").unwrap();
+        assert!((d.as_secs_f64() - 3723.0).abs() < 0.01);
+    }
+
+    /// **모르면 모른다고 한다.** 0으로 적어 두면 아는 척이 되어 화면이 `0:00` 을 확신한다.
+    #[test]
+    fn unknown_stays_unknown() {
+        assert!(parse_ffmpeg_duration("Duration: N/A, bitrate: N/A").is_none());
+        assert!(parse_ffmpeg_duration("아무 상관 없는 출력").is_none());
+        assert!(parse_ffmpeg_duration("Duration: 00:00:00.00, x").is_none());
     }
 }

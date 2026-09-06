@@ -1290,6 +1290,10 @@ impl Coordinator {
         let ytdlp = app
             .ytdlp()
             .with_retry_rounds(crate::media::ytdlp::retry_rounds(fails_so_far));
+        /* 받고 나면 파일에서 길이를 읽을 수 있다. 검색으로 담은 곡은 길이가 안 와서
+         * 화면 총 시간이 `0:00` 이고 웹 재생기는 그 곡을 통째로 건너뛴다 — 아래
+         * `prepare` 가 끝난 뒤 캐시에 적힌 값을 상태로 옮긴다. */
+        let needs_duration = item.track.duration.is_none();
         /* **한 곡을 받는 데 상한을 둔다.**
          *
          * `prepare` 안쪽은 인증 창구 × 재시도로 최악 두 시간까지 간다. 그런데 이 호출에는
@@ -1324,6 +1328,21 @@ impl Coordinator {
                     item.track.cache_key()
                 ),
             );
+        }
+        /* 길이를 몰랐던 곡이면 여기서 채운다. 캐시가 파일에서 읽어 적어 뒀다
+         * (`cache::probe_duration`). 상태에 한 번 써 넣으면 화면으로 나가는 모든 자리가
+         * 알아서 맞는다 — 총 시간이 `0:00` 으로 나오던 것도, 웹 재생기가 길이를 모른다고
+         * 곡을 건너뛰던 것도 같이 풀린다. */
+        if needs_duration {
+            if let Some(found) = app
+                .cache
+                .get(&item.track.cache_key())
+                .and_then(|entry| entry.duration)
+            {
+                app.player
+                    .fill_missing_duration(guild_id, &item.track.cache_key(), found)
+                    .await;
+            }
         }
 
         // 2) 음성 채널 합류. **봇이 이미 어떤 채널에 연결돼 있으면 절대 다른 채널로 옮기지 않는다.**
