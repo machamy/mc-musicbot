@@ -4653,14 +4653,25 @@ async fn api_search(
     let mut playlist_hint: Option<(String, usize)> = None;
     let results = if crate::media::resolver::can_resolve(input) {
         match crate::media::resolver::resolve(input) {
-            Ok(crate::media::resolver::Resolved::Collection(collection)) => state
-                .app
-                .ytdlp()
-                .expand_collection(&collection.source_url, collection.provider)
-                .await
-                .into_iter()
-                .take(50)
-                .collect(),
+            Ok(crate::media::resolver::Resolved::Collection(collection)) => {
+                /* **재생목록 링크에도 "전부 담기" 를 물어본다.**
+                 *
+                 * 예전에는 곡 50개를 검색 결과처럼 늘어놓기만 했다. `watch?v=..&list=..`
+                 * 에는 아래 갈래가 물어보는데 정작 **재생목록 주소 자체**로 들어오면
+                 * 안 물어봤다 — 281곡짜리를 붙여넣고도 한 곡씩 눌러 담아야 했다.
+                 *
+                 * 세는 수는 **자르기 전**이다. 화면에 50곡만 보인다고 `50곡 전부 담기`
+                 * 라고 말하면 거짓말이 된다. */
+                let listed = state
+                    .app
+                    .ytdlp()
+                    .expand_collection(&collection.source_url, collection.provider)
+                    .await;
+                if listed.len() > 1 {
+                    playlist_hint = Some((collection.source_url.clone(), listed.len()));
+                }
+                listed.into_iter().take(50).collect()
+            }
             Ok(crate::media::resolver::Resolved::Track(track)) => {
                 /* 곡 조회와 재생목록 세기를 **같이** 돌린다.
                  *
@@ -6653,6 +6664,38 @@ async fn api_playlist_action(
                 );
             }
             format!("{id}:{name}")
+        }
+        /* 공개 범위 바꾸기 (§12.2). `내 재생목록 ↔ 서버 재생목록`.
+         *
+         * **양쪽 다 관리자 권한이다.** 서버 목록으로 올리는 것은 서버 사람 모두가 보게
+         * 만드는 일이고, 내리는 것은 서버가 같이 쓰던 것을 한 사람 것으로 가져가는
+         * 일이다. 위쪽 블록이 이미 서버 목록에 대한 관리자 검사를 하지만, **개인 목록을
+         * 올리는 경우는 그 검사에 안 걸린다** — 대상이 아직 개인 것이라서다. 여기서 막는다. */
+        "setScope" => {
+            let Some(playlist) = target else {
+                return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
+            };
+            let to_guild = request
+                .scope
+                .as_deref()
+                .is_some_and(|scope| scope.eq_ignore_ascii_case("guild"));
+            if let Err(response) = ctx.require_manager() {
+                return response;
+            }
+            let (scope, owner) = if to_guild {
+                (PlaylistScope::Guild, session.user_id)
+            } else {
+                (PlaylistScope::User, session.user_id)
+            };
+            let target_guild = to_guild.then_some(guild_id);
+            if !state
+                .app
+                .db
+                .set_playlist_scope(playlist.id, scope, target_guild, owner)
+            {
+                return json_error(StatusCode::CONFLICT, "공개 범위를 바꾸지 못했어요.");
+            }
+            format!("{}:{}", playlist.id, playlist.name)
         }
         "rename" => {
             let Some(playlist) = target else {

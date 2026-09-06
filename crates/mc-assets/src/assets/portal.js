@@ -2637,7 +2637,7 @@ async function runSearch() {
     searchedQuery = query;
     renderSearchResults();
     // 결과를 먼저 그리고 나서 묻는다 — 물어보는 동안에도 곡 하나는 이미 담을 수 있다.
-    await offerPlaylist(found.playlist);
+    await offerPlaylist(found.playlist, (found.results || []).length);
   } catch (error) {
     clear(el.searchResults).appendChild(emptyState(
       '⚠', '검색하지 못했어요', error.message,
@@ -2675,15 +2675,24 @@ async function searchTracks(query, provider) {
  * 재생목록 주소를 따로 구해 와야 했다.
  *
  * **묻기만 하고 기본은 안 바꾼다** — 취소하면 예전처럼 그 곡 하나만 담는 화면이 그대로다. */
-async function offerPlaylist(playlist) {
+async function offerPlaylist(playlist, resultCount) {
     if (!playlist || !playlist.url || !(playlist.total > 1)) return;
     if (!can('bulkEnqueue')) return;          // 권한이 없으면 물어봐야 헛일이다
+    /* **묻는 말이 두 가지다.**
+     *
+     * `watch?v=..&list=..` 는 곡 하나가 정해진 채로 들어온 것이라 `이 곡만` 이 뜻이 있다.
+     * 반면 재생목록 주소 자체로 들어오면 정해진 곡이 없다 — 그때 `이 곡만` 은 무슨 곡을
+     * 말하는지 알 수 없는 말이 된다. 목록을 늘어놓아 뒀으니 `골라서 담기` 가 맞다. */
+    const single = resultCount === 1;
     const ok = await confirmSheet({
-      title: `재생목록도 담을까요`,
-      desc: `이 링크에는 ${playlist.total}곡짜리 재생목록이 같이 들어 있어요. `
-        + '전부 담으면 순서대로 대기열에 들어가요. 한 번에 담는 양에는 상한이 있어요.',
+      title: single ? '재생목록도 담을까요' : '재생목록을 전부 담을까요',
+      desc: single
+        ? `이 링크에는 ${playlist.total}곡짜리 재생목록이 같이 들어 있어요. `
+          + '전부 담으면 순서대로 대기열에 들어가요. 한 번에 담는 양에는 상한이 있어요.'
+        : `${playlist.total}곡짜리 재생목록이에요. 전부 담으면 순서대로 대기열에 들어가요. `
+          + '한 번에 담는 양에는 상한이 있어요. 골라서 담고 싶으면 아래 목록에서 누르세요.',
       confirmText: `${playlist.total}곡 전부 담기`,
-      cancelText: '이 곡만',
+      cancelText: single ? '이 곡만' : '골라서 담기',
     });
     if (!ok) return;
     // 담긴 결과는 서버가 `broadcast_queue` 로 바로 밀어 준다 — 여기서 다시 받아올 게 없다.
@@ -2723,7 +2732,7 @@ async function runQueueSearch() {
      * 그래서 대기열에서 `watch?v=..&list=..` 를 붙여넣으면 재생목록이 딸려 있다는
      * 사실조차 안 나타나고 그 곡 하나만 담겼다. 같은 링크가 어느 칸에 들어가느냐에
      * 따라 다르게 동작하면 안 된다. */
-    await offerPlaylist(found.playlist);
+    await offerPlaylist(found.playlist, (found.results || []).length);
   } catch (error) {
     clear(el.qsResults).append(qsMetaRow('검색 실패'), emptyState('⚠', '검색하지 못했어요', error.message));
   }

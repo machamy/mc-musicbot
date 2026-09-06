@@ -579,6 +579,38 @@ impl Db {
         .unwrap_or(false)
     }
 
+    /* 재생목록의 공개 범위를 바꾼다 (§12.2).
+     *
+     * **`guild_id` 도 같이 옮겨야 한다.** 개인 목록은 길드에 안 묶여 있고(어느 서버에서든
+     * 보인다) 서버 목록은 그 길드 것이다. 범위만 바꾸고 `guild_id` 를 그대로 두면
+     * "서버 목록인데 어느 서버 것인지 모르는" 행이 남아 목록에서 조용히 사라진다.
+     *
+     * 개인으로 되돌릴 때는 **지금 누르는 사람이 주인이 된다.** 서버 목록에는 주인이
+     * 없는 것이나 마찬가지라(관리자 아무나 고친다) 원래 만든 사람에게 돌려주면
+     * 그 사람이 이미 서버를 떠났을 때 아무도 못 건드리는 목록이 된다.
+     */
+    pub fn set_playlist_scope(
+        &self,
+        id: i64,
+        scope: PlaylistScope,
+        guild_id: Option<u64>,
+        owner_user_id: u64,
+    ) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE playlists SET scope = ?2, guild_id = ?3, owner_user_id = ?4, updated_utc = ?5              WHERE id = ?1",
+            params![
+                id,
+                scope.as_str(),
+                guild_id.map(|g| g as i64),
+                owner_user_id as i64,
+                Self::now_iso()
+            ],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
     pub fn add_playlist_entry(&self, playlist_id: i64, entry: &PlaylistEntry) {
         if let Ok(j) = serde_json::to_string(entry) {
             let conn = self.conn.lock().unwrap();

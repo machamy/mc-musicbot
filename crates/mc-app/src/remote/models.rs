@@ -1540,6 +1540,20 @@ pub fn audit_text(
             }
             _ => format!("{actor}님이 재생목록 이름을 바꿨어요"),
         },
+        /* 공개 범위 바꾸기. **어느 쪽으로 갔는지가 이 기록의 핵심이다** — 서버 사람
+         * 모두가 보게 됐는지, 한 사람 것으로 내려갔는지는 전혀 다른 일이다. 그런데
+         * 대상 문자열에는 `id:이름` 뿐이라 방향이 안 들어 있어서 전후값에서 읽는다. */
+        "playlist.setScope" => {
+            let to_guild = after.is_some_and(|v| v.contains("guild"));
+            match playlist_name(item) {
+                Some(name) if to_guild => {
+                    format!("{actor}님이 재생목록 **{name}** 을 서버 전체에 공개했어요")
+                }
+                Some(name) => format!("{actor}님이 재생목록 **{name}** 을 개인용으로 되돌렸어요"),
+                None if to_guild => format!("{actor}님이 재생목록을 서버 전체에 공개했어요"),
+                None => format!("{actor}님이 재생목록을 개인용으로 되돌렸어요"),
+            }
+        }
         "playlist.delete" => match playlist_name(item) {
             Some(name) => format!("{actor}님이 재생목록 **{name}** 을 지웠어요"),
             None => format!("{actor}님이 재생목록을 지웠어요"),
