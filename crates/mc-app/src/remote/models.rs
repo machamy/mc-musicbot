@@ -1673,6 +1673,14 @@ pub struct AuditFeedItem {
      * 곡이 이유 없이 사라진 것으로 보였다. 그래서 접어서 한 문장만 낸다. */
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /* **눌러서 자세히 볼 원문.**
+     *
+     * 한 문장으로 접어 두면 "왜 그런지" 까지는 알 수 없다. 그래서 원문도 같이 보내되
+     * **호스트 경로는 지우고** 보낸다(`redact_paths`) — 리모컨은 서버에 있는 사람
+     * 누구나 보는 화면이라, 도구가 뱉은 `C:\Users\...` 가 그대로 나가면 안 된다.
+     * 기본은 접혀 있으니 §13.2 가 막으려던 "못 읽는 화면" 도 되지 않는다. */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_count: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1690,10 +1698,16 @@ impl AuditEntry {
             text: self.text.clone(),
             track_title: self.target.clone(),
             created_utc: self.created_utc.clone(),
-            // 원문을 그대로 넘기지 않는다. 사람 말 한 문장으로 접어서 낸다.
+            // 보이는 줄은 사람 말 한 문장. 원문은 아래 `failure_detail` 로 접어서 같이 보낸다.
             failure_reason: self.failure_reason.as_deref().map(|raw| {
                 crate::media::ytdlp::fail_code(raw).long.to_string()
             }),
+            failure_detail: self
+                .failure_reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+                .map(crate::media::ytdlp::redact_paths),
             merged_count: (self.merged_count > 1).then_some(self.merged_count),
             merged_items: self.merged_items.clone(),
         }

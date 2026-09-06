@@ -276,6 +276,13 @@ pub fn observed_jsc() -> Option<String> {
     OBSERVED_JSC.get().cloned()
 }
 
+/// **우리가 못 박아 준** JS 런타임 (`--js-runtimes deno:<경로>` 의 뒷부분). 못 박았으면
+/// 곡을 안 틀어 봐도 알 수 있다 — `observed_jsc` 는 실제로 받아 봐야 채워지므로,
+/// 화면은 이것을 **먼저** 봐야 한다.
+pub fn js_runtime_status() -> Option<String> {
+    JS_RUNTIME_ARGS.get()?.get(1).cloned()
+}
+
 /// 처음 한 번만 `Some` 을 돌려준다 — 기동 로그의 "다시 적힙니다" 를 실제로 지키는 자리다.
 /// 곡마다 같은 줄을 쏟아 내면 그건 그것대로 소음이라 한 번으로 끊는다.
 pub fn take_jsc_notice() -> Option<String> {
@@ -336,6 +343,83 @@ pub struct FailCode {
     pub short: &'static str,
     /// 리모컨에 보일 한 문장.
     pub long: &'static str,
+}
+
+/* ── 원문을 사람에게 보여 주기 전에 경로를 지운다 ────────────────
+ *
+ * 리모컨은 서버에 있는 사람 누구나 본다. 그런데 도구가 뱉는 오류에는 호스트의 절대 경로가
+ * 섞여 나온다(`C:\Users\macham\Desktop\musicbot-portable-...\tools\yt-dlp.exe`). 그게 그대로
+ * 나가면 남의 PC 안쪽 구조를 알려 주는 셈이다.
+ *
+ * **그렇다고 원문을 안 보여 주는 것은 답이 아니었다.** 처음엔 그렇게 했는데, 그러면
+ * "자세히 보기" 로 볼 것이 없어진다. 지울 것만 지우고 나머지는 그대로 보여 준다 —
+ * 파일 이름은 남긴다(`…\yt-dlp.exe`). 무엇이 문제인지 아는 데는 그게 필요하다.
+ */
+static PATH_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+/// 절대 경로를 `…\마지막이름` 으로 줄인다. 사람에게 보여 줄 원문에만 쓴다.
+pub fn redact_paths(text: &str) -> String {
+    let re = PATH_RE.get_or_init(|| {
+        // 드라이브 문자 경로(C:\...), UNC(\\서버\...), 유닉스 홈(/home/..., /Users/...).
+        regex::Regex::new(
+            r#"(?x)
+              [A-Za-z]:[\\/][^\s"'|,;)\]}]*      # C:\... 또는 C:/...
+            | \\\\[^\s"'|,;)\]}]+                # \\서버\공유\...
+            | /(?:home|Users|root)/[^\s"'|,;)\]}]*  # /home/me/...
+            "#,
+        )
+        .expect("경로 정규식")
+    });
+    re.replace_all(text, |caps: &regex::Captures| {
+        let whole = &caps[0];
+        // 마지막 조각(파일 이름)만 남긴다. 그것마저 없으면 통째로 가린다.
+        match whole.rsplit(['\\', '/']).find(|s| !s.is_empty()) {
+            Some(name) => format!("…/{name}"),
+            None => "…".to_string(),
+        }
+    })
+    .into_owned()
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_paths;
+
+    /// **호스트 경로가 리모컨으로 새면 안 된다.** 이 저장소의 실제 배포 경로로 검사한다.
+    #[test]
+    fn absolute_paths_are_reduced_to_their_file_name() {
+        let raw = r"yt-dlp 실행 실패: C:\Users\macham\Desktop\musicbot-portable-20260601-2005\tools\yt-dlp.exe 없음";
+        let out = redact_paths(raw);
+        assert!(!out.contains("macham"), "사용자 이름이 남았어요: {out}");
+        assert!(!out.contains("Desktop"), "폴더 구조가 남았어요: {out}");
+        assert!(out.contains("yt-dlp.exe"), "무엇이 문제인지까지 지웠어요: {out}");
+    }
+
+    /// 유닉스와 UNC 도 같이 가린다.
+    #[test]
+    fn unix_and_unc_paths_are_covered() {
+        assert!(!redact_paths("/home/macham/bot/data/x.opus 없음").contains("macham"));
+        assert!(!redact_paths(r"\\NAS\music\a.opus 없음").contains("NAS"));
+    }
+
+    /// **경로가 아닌 것은 건드리지 않는다.** 실서버에서 실제로 난 오류들이 그대로 남아야 한다.
+    #[test]
+    fn ordinary_errors_pass_through_untouched() {
+        for raw in [
+            "ERROR: [youtube] xgQHpTdw6Kg: Video unavailable",
+            "ERROR: unable to download video data: HTTP Error 403: Forbidden",
+            "ERROR: [youtube] s29lt0E27Mc: Private video",
+        ] {
+            assert_eq!(redact_paths(raw), raw, "멀쩡한 오류를 건드렸어요");
+        }
+    }
+
+    /// 시각처럼 콜론이 든 평범한 글자를 경로로 오해하지 않는다.
+    #[test]
+    fn a_timestamp_is_not_a_path() {
+        let raw = "01:39:47 에 실패";
+        assert_eq!(redact_paths(raw), raw);
+    }
 }
 
 /// 오류 원문을 사람이 읽는 짧은 말로 접는다.

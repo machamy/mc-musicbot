@@ -1185,9 +1185,16 @@ pub async fn tools_page(State(state): Ctx, cookies: Cookies) -> Response {
     /* 무엇으로 유튜브 서명을 푸는지. 곡을 한 곡이라도 받아 봐야 알 수 있다
      * (yt-dlp 가 stderr 로 알려 준다). **'없음' 이라고 단정하지 않는다** — 우리가
      * 못 박지 못한 것과 yt-dlp 가 못 찾은 것은 다르고, 없어도 곡은 받아진다. */
-    let jsc = match crate::media::ytdlp::observed_jsc() {
-        Some(name) => format!("{name} (yt-dlp 자체 탐색)"),
-        None => "아직 모름 — 곡을 하나 틀면 여기 적힙니다".to_string(),
+    /* **못 박아 준 값이 먼저다.** 처음엔 `observed_jsc`(실제로 곡을 받아 봐야 채워짐)만
+     * 봐서, 기동 로그에는 `deno 를 씁니다` 가 찍혀 있는데도 이 화면은 `아직 모름` 이라고
+     * 했다. 우리가 경로를 넘겨 준 경우가 제일 확실한데 그걸 안 보고 있었다. */
+    let jsc = match (
+        crate::media::ytdlp::js_runtime_status(),
+        crate::media::ytdlp::observed_jsc(),
+    ) {
+        (Some(pinned), _) => format!("{pinned} (우리가 지정)"),
+        (None, Some(name)) => format!("{name} (yt-dlp 자체 탐색)"),
+        (None, None) => "아직 모름 — 곡을 새로 받아 보면 여기 적힙니다".to_string(),
     };
     let ff_ver = tool_version(&app.config.ffmpeg_path, "-version").await;
     let yt_ok = !yt_ver.starts_with("실행 실패");
@@ -2261,6 +2268,11 @@ pub struct LogsQuery {
     count: Option<usize>,
 }
 
+/// 로그 한 줄을 접기 시작하는 길이. 이보다 길면 `<details>` 로 감싼다.
+/// 너무 짧으면 멀쩡한 줄까지 접혀 오히려 읽기 나빠지고, 너무 길면 접는 뜻이 없다.
+/// 실서버 로그에서 평범한 줄은 대개 80자 안쪽이고, 다운로드 오류는 200자를 넘는다.
+const LOG_FOLD_CHARS: usize = 120;
+
 pub async fn logs_page(
     State(state): Ctx,
     cookies: Cookies,
@@ -2301,12 +2313,30 @@ pub async fn logs_page(
                 "Error" => "logrow log-err",
                 _ => "logrow log-info",
             };
+            /* **긴 줄은 접어서 보여 준다.**
+             *
+             * 다운로드 오류는 stderr 를 ` | ` 로 이어 붙여 오기 때문에 한 줄이 길다.
+             * 그대로 펼쳐 두면 목록에서 다른 줄이 안 보이고, 그렇다고 자르면 정작
+             * 필요한 뒷부분을 되찾을 방법이 없다.
+             *
+             * 이 화면은 서버가 HTML 을 통째로 찍는 곳이라 새 자바스크립트를 들이지
+             * 않는다. `<details>` 는 브라우저가 알아서 접고 펴 주고 키보드·스크린리더도
+             * 그냥 된다. */
+            let msg = if l.message.chars().count() > LOG_FOLD_CHARS {
+                let head: String = l.message.chars().take(LOG_FOLD_CHARS).collect();
+                format!(
+                    r#"<details class="logmore"><summary>{}…</summary><div class="logfull">{}</div></details>"#,
+                    html_escape(head.trim_end()),
+                    html_escape(&l.message)
+                )
+            } else {
+                html_escape(&l.message)
+            };
             format!(
-                r#"<div class="{cls}"><span class="logtime">{}</span><span class="loglevel">{}</span><span class="logcat">{}</span><span class="logmsg">{}</span></div>"#,
+                r#"<div class="{cls}"><span class="logtime">{}</span><span class="loglevel">{}</span><span class="logcat">{}</span><span class="logmsg">{msg}</span></div>"#,
                 fmt_ts(&l.timestamp),
                 l.level,
                 html_escape(&l.category),
-                html_escape(&l.message)
             )
         })
         .collect();

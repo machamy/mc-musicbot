@@ -7999,12 +7999,31 @@ function auditLine(entry, merged) {
     ? h('span', { class: 'logrow__why' }, ` — ${entry.failureReason}`)
     : null;
 
+  /* 한 문장으로는 "왜 그런지" 까지 안 된다. 원문을 접어 두고 눌러서 보게 한다 —
+   * 서버가 호스트 경로를 지우고 보낸다(`AuditFeedItem.failure_detail`).
+   * 아래 합쳐진 줄 펼치기와 **같은 관용구**를 쓴다: 버튼 하나 + aria-expanded + hidden. */
+  let detail = null;
+  let detailToggle = null;
+  if (entry.failureDetail && entry.failureDetail !== entry.failureReason) {
+    detail = h('div', { class: 'logrow__items', hidden: true },
+      h('div', { class: 'logrow__raw' }, entry.failureDetail));
+    detailToggle = h('button', {
+      class: 'logrow__toggle', type: 'button', 'aria-expanded': 'false',
+      tip: '도구가 남긴 원문을 봐요',
+      onClick: () => {
+        detail.hidden = !detail.hidden;
+        detailToggle.setAttribute('aria-expanded', String(!detail.hidden));
+        detailToggle.textContent = detail.hidden ? '▸ 자세히' : '▾ 접기';
+      },
+    }, '▸ 자세히');
+  }
+
   /* 합쳐진 줄의 항목은 서버가 `mergedItems` 라는 이름으로, **문자열 배열**로 준다
    * (`AuditFeedItem.merged_items`). 예전에는 `entry.items` 를 읽고 각 항목을 객체 취급했다 —
    * 이름도 모양도 어긋나서 **펼치기가 한 번도 뜬 적이 없다.** */
   const merges = entry.mergedItems || [];
   if (merged <= 1 || !merges.length) {
-    return h('div', { class: 'logrow__text' }, actor, h('span', null, ...markdownBold(bodyText)), reason);
+    return h('div', { class: 'logrow__text' }, actor, h('span', null, ...markdownBold(bodyText)), reason, detailToggle, detail);
   }
 
   const items = h('div', { class: 'logrow__items', hidden: true },
@@ -8019,7 +8038,7 @@ function auditLine(entry, merged) {
     },
   }, `▸ ${merged}곡 보기`);
 
-  return h('div', { class: 'logrow__text' }, actor, h('span', null, ...markdownBold(bodyText)), reason, toggle, items);
+  return h('div', { class: 'logrow__text' }, actor, h('span', null, ...markdownBold(bodyText)), reason, detailToggle, detail, toggle, items);
 }
 
 /* ═══════════════════════ 모바일 하단 탭바 ═══════════════════════ */

@@ -1771,6 +1771,11 @@ body[data-dragging="tab"] { user-select: none; }
    자르면 이유를 되찾을 방법이 없다. */
 .logrow__why { color: var(--text-4); overflow-wrap: anywhere; }
 .logrow--fail .logrow__why { color: var(--danger); }
+/* 도구가 남긴 원문. 한 줄로 흘리면 못 읽으니 줄바꿈을 살리고, 좁은 화면에서
+   가로로 삐져나가지 않게 어디서든 끊는다. */
+.logrow__raw { font-family: var(--font-mono, ui-monospace, Consolas, monospace);
+  font-size: var(--fs-xs); color: var(--text-3); white-space: pre-wrap;
+  overflow-wrap: anywhere; }
 
 .filterbar { flex: none; padding: var(--sp-3) var(--sp-3) var(--sp-2); }
 

@@ -706,6 +706,12 @@ pre.log{background:#0B1220;color:#E2E8F0;border-radius:10px;padding:14px;font-fa
 .loglevel{font-weight:700}
 .logcat{color:#1D4ED8;font-weight:600}
 .logmsg{white-space:pre-wrap;word-break:break-word}
+/* 긴 줄 접기. 목록에서 한 줄이 화면을 다 먹지 않게 하면서, 눌러서 전문을 되찾게 한다. */
+.logmore summary{cursor:pointer;list-style:none}
+.logmore summary::-webkit-details-marker{display:none}
+.logmore summary::before{content:'▸ ';color:#64748B}
+.logmore[open] summary::before{content:'▾ '}
+.logfull{margin-top:4px;padding:6px 8px;background:#F8FAFC;border-left:2px solid #CBD5E1;white-space:pre-wrap;word-break:break-word}
 .logrow.log-info .loglevel{color:#0F766E}
 .logrow.log-warn{background:#FFFBEB}
 .logrow.log-warn .loglevel{color:#C2410C}

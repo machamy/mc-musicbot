@@ -5564,14 +5564,44 @@ mod tests {
             "봇이 남긴 실패가 사람 피드에서 걸러지면 '문제' 칩이 다시 텅 빈다"
         );
 
-        let json = serde_json::to_string(&entry.feed_item()).unwrap();
-        assert!(json.contains("failureReason"), "이유 없이 곡만 사라져 보인다");
-        // 사람 말로 접힌 것이지 원문이 새어 나간 게 아니다.
-        assert!(!json.contains("unable to download"), "원문이 그대로 나갔어요");
-        assert!(!json.contains("HTTP Error"), "원문이 그대로 나갔어요");
+        let feed = entry.feed_item();
+        // 보이는 줄은 사람 말 한 문장이다 — 기계 덩어리가 아니다 (§13.2).
+        assert_eq!(
+            feed.failure_reason.as_deref(),
+            Some("유튜브가 거절했어요(403). yt-dlp 가 낡았을 때 가장 흔해요.")
+        );
+        // 눌러서 볼 원문도 같이 간다 — 한 문장만으로는 왜 그런지까지 알 수 없다.
+        assert!(
+            feed.failure_detail.as_deref().is_some_and(|d| d.contains("403")),
+            "자세히 볼 원문이 없어요"
+        );
 
-        // 관리 콘솔은 원문을 그대로 본다 — 접는 건 사람 화면뿐이다.
+        // 관리 콘솔은 원문을 손대지 않은 채로 본다.
         assert_eq!(entry.failure_reason.as_deref(), Some(raw));
+        let _ = path;
+    }
+
+    /* **호스트 경로가 리모컨으로 새면 안 된다.**
+     *
+     * 리모컨은 서버에 있는 사람 누구나 보는 화면이다. 도구가 뱉는 오류에는 봇이 깔린
+     * 절대 경로가 섞여 나오는데, 그게 그대로 나가면 남의 PC 안쪽 구조를 알려 주는 셈이다.
+     * 그렇다고 원문을 통째로 안 보내면 '자세히' 로 볼 것이 없어진다 — 지울 것만 지운다.
+     */
+    #[test]
+    fn the_human_feed_never_leaks_a_host_path() {
+        let (store, path) = temp_store("audit-failure-redact");
+        let raw = r"yt-dlp 실행 실패: C:\Users\macham\Desktop\musicbot-portable-20260601-2005\tools\yt-dlp.exe";
+        store
+            .add_audit(1, 0, "봇", "playback.failed", Some("어떤 곡"), None, None, false, Some(raw))
+            .unwrap();
+
+        let entry = store.list_audit(1, 50, None).into_iter().next().unwrap();
+        let json = serde_json::to_string(&entry.feed_item()).unwrap();
+        for secret in ["macham", "Desktop", "musicbot-portable"] {
+            assert!(!json.contains(secret), "'{secret}' 가 리모컨으로 새 나갔어요: {json}");
+        }
+        // 그래도 무엇이 문제인지는 남아야 한다 — 다 지워 버리면 볼 이유가 없다.
+        assert!(json.contains("yt-dlp.exe"), "무엇이 문제인지까지 지웠어요: {json}");
         let _ = path;
         assert!(json.contains("actorName"));
         cleanup(store, path);
