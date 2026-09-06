@@ -2907,7 +2907,15 @@ body.gate {
 .logrow__items { margin-top: var(--sp-1); padding-left: var(--sp-3); border-left: 1px solid var(--line-2); }
 
 /* ── 우클릭 메뉴 (§24.1) ── */
-.ctxmenu { min-width: 220px; max-width: 300px; }
+/* **시트 위에서도 보여야 한다.**
+ *
+ * `.pop` 은 `--z-dropdown`(200)이고 시트는 `--z-sheet`(300)이다. 그래서 시트 안에서
+ * 우클릭하면 메뉴가 **열리기는 하는데 시트 뒤에 깔려** 아무 일도 안 일어난 것처럼
+ * 보였다(`전체 후보` 시트에서 실제로 그랬다).
+ *
+ * 우클릭 메뉴는 늘 사용자가 방금 부른 것이라 무엇 위에든 떠야 한다. 다만 말풍선
+ * (`--z-tooltip` 500)보다는 아래에 둔다 — 메뉴 항목의 설명이 메뉴에 가리면 안 된다. */
+.ctxmenu { min-width: 220px; max-width: 300px; z-index: calc(var(--z-sheet) + 10); }
 .ctxmenu .dd__item { font-size: var(--fs-md); }
 .ctxmenu__sub { padding-left: var(--sp-4); border-left: 1px solid var(--line-2); margin-left: var(--sp-3); }
 .dd__grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
