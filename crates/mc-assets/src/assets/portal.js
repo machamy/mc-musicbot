@@ -6606,10 +6606,23 @@ function renderNow(state) {
   // 재생 중인 줄 알고 왜 소리가 안 나는지 찾게 된다.
   el.nowCard.classList.toggle('now--stopped', !!clock.stopped);
 
+  /* **어떤 반복인지 눈으로 알 수 있어야 한다.**
+   *
+   * 예전에는 세 상태가 사실상 구분되지 않았다. 끔과 대기열반복이 **같은 글자**(🔁)라
+   * 옅은 배경색 하나로만 갈렸고, 대기열과 한곡은 🔁/🔂 인데 이 둘은 38px 버튼에서
+   * 거의 같아 보인다. 상태 이름은 툴팁에만 있어서 **손가락으로 쓰는 화면에서는 볼 방법이
+   * 없었다** — 누르기 전에는 지금 뭐가 켜져 있는지 알 수 없었다.
+   *
+   * 글자는 🔁 하나로 두고 상태는 CSS 가 그린다(`data-repeat`): 끔은 흐리게 + 빗금,
+   * 한곡은 모서리에 `1`. 그림만으로 못 읽는 사람을 위해 `aria-label` 에도 같은 말을 넣는다 —
+   * 툴팁(`data-tip`)은 마우스가 있어야 보이므로 그것만 믿으면 안 된다. */
   const repeat = String(player.repeatMode || 'off').toLowerCase();
+  const repeatWord = repeat === 'off' ? '반복 끔' : repeat === 'track' ? '한 곡 반복' : '대기열 반복';
   el.repeatBtn.setAttribute('aria-pressed', String(repeat !== 'off'));
-  el.repeatBtn.textContent = repeat === 'track' ? '🔂' : '🔁';
-  el.repeatBtn.setAttribute('data-tip', repeat === 'off' ? '반복 끔' : repeat === 'track' ? '한 곡 반복' : '대기열 반복');
+  el.repeatBtn.setAttribute('data-repeat', repeat);
+  el.repeatBtn.textContent = '🔁';
+  el.repeatBtn.setAttribute('data-tip', repeatWord);
+  el.repeatBtn.setAttribute('aria-label', repeatWord);
   el.shuffleBtn.setAttribute('aria-pressed', String(!!player.shuffleEnabled));
 
   if (Number.isFinite(player.effectiveVolume) && document.activeElement !== el.volume) {

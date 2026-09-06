@@ -1025,6 +1025,33 @@ body[data-dragging="tab"] { user-select: none; }
 .pbtn:hover { background: var(--surface-4); }
 .pbtn:active { transform: scale(0.94); }
 .pbtn[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-line); }
+
+/* ── 반복 버튼: 세 상태를 눈으로 가른다 ──────────────────────────
+ *
+ * 끔 / 대기열반복 / 한곡반복이 사실상 구분되지 않았다. 끔과 대기열반복은 같은 글자에
+ * 옅은 배경색 차이뿐이었고, 대기열과 한곡은 🔁/🔂 라 이 크기에서 거의 같아 보인다.
+ * 글자는 하나로 두고 여기서 상태를 그린다.
+ */
+.pbtn[data-repeat] { position: relative; }
+
+/* 끔 — 빗금을 긋고 색을 뺀다. 색만으로는 못 읽는 사람도 있어서 **모양**으로도 가른다.
+   글자가 텍스트 노드라 자식 선택자로는 못 잡는다 — 버튼째로 처리한다.
+   (그러면 아래 빗금도 같이 흐려지는데, 빗금은 currentColor 라 그대로 읽힌다.) */
+.pbtn[data-repeat="off"] { color: var(--text-4); filter: grayscale(1); opacity: .7; }
+.pbtn[data-repeat="off"]::after {
+  content: ''; position: absolute; left: 22%; right: 22%; top: 50%;
+  border-top: 2px solid currentColor; transform: rotate(-45deg); opacity: .85;
+}
+
+/* 한 곡 반복 — 모서리에 1. 🔂 의 작은 숫자는 이 크기에서 안 보인다. */
+.pbtn[data-repeat="track"]::after {
+  content: '1'; position: absolute; right: -1px; bottom: -1px;
+  min-width: 15px; height: 15px; padding: 0 3px;
+  border-radius: var(--r-full);
+  background: var(--accent); color: var(--text-on-accent);
+  font-size: 10px; font-weight: var(--fw-bold); line-height: 15px;
+  text-align: center; font-variant-numeric: tabular-nums;
+}
 .pbtn--main {
   width: 50px; height: 50px;
   background: var(--art-1);
