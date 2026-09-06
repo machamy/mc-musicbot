@@ -5,9 +5,17 @@ use crate::app::App;
 use crate::models::*;
 use crate::player::autoplay::{AutoplayContext, AutoplayTuning};
 
-/// 다음 곡 후보를 몇 개 보여 줄지 (§8.6). 하나만 정해 주는 대신 고르게 한다.
-/// 모바일 세로에서 세 줄이 적당하고, 후보를 더 뽑는 비용은 0이다(라디오는 이미 긁었다).
-const AUTOPLAY_OPTION_COUNT: usize = 3;
+/* 다음 곡 후보를 몇 개 뽑을지 (§8.6). 하나만 정해 주는 대신 고르게 한다.
+ *
+ * **뽑는 수와 보여 주는 수는 다르다.** 좁은 화면에 열 줄을 깔 수는 없어서 리모컨은
+ * 앞의 셋만 늘어놓고 나머지는 `전체 후보` 시트에서 본다.
+ *
+ * 더 뽑는 비용은 **0이다** — 라디오는 이미 한 번 긁었고 정책도 이미 열 곡짜리
+ * 바구니를 만들어 둔다(운영 로그의 `정책 balanced(정책 그대로 후보 10곡)`).
+ * 예전에는 그 열 곡에서 셋만 쓰고 일곱을 버렸다. 버리는 대신 보여 준다 —
+ * 고를 게 많으면 `🎲 다시 뽑기` 를 덜 누르게 되고, 그 버튼은 누를 때마다
+ * 라디오를 통째로 다시 긁어서 10초 안팎이 든다. */
+const AUTOPLAY_OPTION_COUNT: usize = 10;
 use crate::player::coordinator::Coordinator;
 use crate::player::manager::PlayerManager;
 use crate::remote::AutoplayMode;

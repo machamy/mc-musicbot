@@ -582,6 +582,10 @@ let auditQuery = '';
 /* 볼륨 슬라이더에 손이 닿아 있는 동안만 참. 서버가 보내오는 값이 끌고 있는
    손잡이를 빼앗지 않게 한다 — 자세한 사정은 아래 볼륨 갱신 자리에 적어 뒀다. */
 let volumeDragging = false;
+/* 다음 곡 후보를 화면에 몇 줄까지 늘어놓을지. 서버는 이보다 많이 보낸다(뽑는 비용이
+   0이라 열 곡을 뽑는다) — 나머지는 `전체 후보` 시트에서 본다. */
+const INLINE_OPTION_COUNT = 3;
+let optionsSheet = null;   // { handle, body } — 열려 있을 때만
 let libraryQuery = '';
 let lastCurrentId = null;
 let acState = null;            // 자동완성 { kind, from, to, items, index }
@@ -5039,7 +5043,9 @@ function renderNextOptions(state) {
   el.nextOptions.__key = key;
   clear(el.nextOptions);
   put(el.nextOptions, h('span', { class: 'nextopts__tag' }, '하나 고르면 그걸로 가요'));
-  for (const option of options) {
+  /* **뽑은 수와 늘어놓는 수는 다르다.** 서버는 열 곡을 보내지만(뽑는 비용이 0이라)
+   * 좁은 화면에 열 줄을 깔 수는 없다. 앞의 셋만 늘어놓고 나머지는 시트에서 본다. */
+  for (const option of options.slice(0, INLINE_OPTION_COUNT)) {
     const track = option.item?.track || option.track;
     if (!track) continue;
     const id = option.item?.id ?? option.id;
@@ -5059,7 +5065,85 @@ function renderNextOptions(state) {
     bindContextTarget(chip, () => trackMenu(track, { source: 'option', optionId: id, picked }));
     put(el.nextOptions, chip);
   }
+  /* 나머지는 버려지는 게 아니라 여기 있다. 고를 게 많으면 `🎲 다시 뽑기` 를 덜
+   * 누르게 되고, 그 버튼은 누를 때마다 라디오를 통째로 다시 긁어 10초 안팎이 든다. */
+  if (options.length > INLINE_OPTION_COUNT) {
+    put(el.nextOptions, bindAct(h('button', {
+      class: 'btn btn--sm btn--ghost nextopts__more', type: 'button',
+      tip: '이번에 고른 후보를 전부 봐요. 다시 뽑지 않아요',
+    }, `▤ 전체 후보 ${options.length}곡`), openOptionsSheet));
+  }
   marquee.scan(el.nextOptions);
+  renderOptionsSheet();
+}
+
+/* ── 전체 후보 시트 (§8.6) ────────────────────────────────────────
+ *
+ * 자동 재생은 열 곡을 뽑아 두는데 화면에는 셋만 늘어놓는다(좁은 화면). 예전에는 나머지
+ * 일곱을 **버렸다** — 그래서 셋이 다 안 당기면 `🎲 다시 뽑기` 밖에 방법이 없었고,
+ * 그 버튼은 누를 때마다 라디오를 통째로 다시 긁어 10초 안팎을 쓴다.
+ *
+ * 이미 뽑아 둔 것을 보여 주는 것뿐이라 **유튜브를 다시 부르지 않는다.**
+ * 다시 뽑기도 여기 같이 둔다 — 다 보고도 마음에 안 들 때 누르는 게 자연스럽다.
+ */
+function openOptionsSheet() {
+  if (optionsSheet) return;                 // 이미 열려 있으면 한 장 더 띄우지 않는다
+  const body = h('div', { class: 'optsheet' });
+  const handle = sheet({
+    title: '▤ 다음 곡 후보',
+    desc: '자동 재생이 이번에 고른 곡들이에요. 하나 누르면 그게 다음에 나가요.',
+    wide: true,
+    body,
+    dismissValue: null,
+    actions: [{ label: '닫기', kind: 'primary', value: null }],
+  });
+  optionsSheet = { handle, body };
+  renderOptionsSheet();
+  handle.result.then(() => { optionsSheet = null; });
+}
+
+/** 후보가 바뀔 때마다 시트 속을 통째로 다시 그린다 (`renderAutoplaySheet` 와 같은 방식).
+ *  남이 고르거나 다시 뽑으면 열어 둔 사람 화면도 같이 바뀌어야 한다. */
+function renderOptionsSheet() {
+  if (!optionsSheet) return;
+  const body = optionsSheet.body;
+  clear(body);
+  const payload = store.get().nextOptions || {};
+  const options = Array.isArray(payload.items) ? payload.items : [];
+
+  if (payload.resolving || !options.length) {
+    // 비워 두지 않고 말한다 (§23.3) — 셋이 사라졌다 나타나면 고장으로 읽힌다.
+    put(body, emptyState('📻', '후보를 고르는 중이에요',
+      '자동 재생이 라디오에서 곡을 고르고 있어요. 잠시만요.'));
+    return;
+  }
+
+  for (const option of options) {
+    const track = option.item?.track || option.track;
+    if (!track) continue;
+    const id = option.item?.id ?? option.id;
+    const picked = !!option.picked;
+    const row = bindAct(h('button', {
+      class: 'optrow', type: 'button', 'aria-pressed': String(picked),
+      tip: picked ? '지금 이 곡이 다음에 나가요' : '이 곡을 다음에 틀어요',
+    },
+      h('span', { class: 'optrow__dot', 'aria-hidden': 'true' }, picked ? '●' : '○'),
+      h('span', { class: 'optrow__main' },
+        h('span', { class: 'optrow__title' }, trackTitle(track)),
+        track.artist ? h('span', { class: 'optrow__by' }, track.artist) : null),
+      h('span', { class: 'optrow__len' }, fmtTime(trackSeconds(track))),
+    ), () => pickNextOption(id));
+    // 곡 하나에 할 수 있는 일은 여기서도 똑같이 (제목 복사 · 원본 열기 등).
+    bindContextTarget(row, () => trackMenu(track, { source: 'option', optionId: id, picked }));
+    put(body, row);
+  }
+
+  const reroll = bindAct(h('button', {
+    class: 'btn btn--sm btn--ghost', type: 'button',
+    tip: '후보를 전부 새로 골라요. 차단하지는 않아요 (라디오를 다시 긁어서 10초쯤 걸려요)',
+  }, '🎲 다시 뽑기'), refreshAutoplayOptions);
+  setLock(reroll, !canAutoplay(), lockReason('autoplay'));
+  put(body, h('div', { class: 'optsheet__foot' }, reroll));
 }
 
 async function pickNextOption(itemId) {

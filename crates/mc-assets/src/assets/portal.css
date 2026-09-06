@@ -1797,6 +1797,28 @@ body[data-dragging="tab"] { user-select: none; }
 /* 못 튼 이유. 제목 뒤에 이어 붙는 한 문장이라 좁은 화면에서도 접혀 내려가게 둔다 —
    자르면 이유를 되찾을 방법이 없다. */
 .logrow__why { color: var(--text-4); overflow-wrap: anywhere; }
+
+/* ── 전체 후보 시트 (§8.6) ───────────────────────────────────────
+   자동 재생이 뽑아 둔 곡을 전부 늘어놓는다. 좁은 화면에도 한 줄에 하나씩 들어가야
+   하므로 제목은 남는 폭을 다 쓰고, 길이는 오른쪽에 고정폭으로 붙인다. */
+.optsheet { display: flex; flex-direction: column; gap: var(--sp-1); }
+.optrow {
+  display: flex; align-items: center; gap: var(--sp-2);
+  width: 100%; padding: var(--sp-2) var(--sp-2);
+  border: 1px solid var(--line-1); border-radius: var(--r-md, 10px);
+  background: var(--surface-2); color: var(--text-1); text-align: left;
+}
+.optrow:hover { background: var(--surface-4); }
+.optrow[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent-line); }
+.optrow__dot { flex: none; color: var(--accent); }
+/* 제목이 길어도 줄을 밀어내지 않게 남는 폭 안에서만 자른다. */
+.optrow__main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.optrow__title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.optrow__by { color: var(--text-3); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.optrow__len { flex: none; color: var(--text-4); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.optsheet__foot { display: flex; justify-content: flex-end; margin-top: var(--sp-2); }
+/* 인라인 줄의 `전체 후보` 버튼 — 후보 칩과 같은 줄에 붙는다. */
+.nextopts__more { flex: none; }
 .logrow--fail .logrow__why { color: var(--danger); }
 /* 도구가 남긴 원문. 한 줄로 흘리면 못 읽으니 줄바꿈을 살리고, 좁은 화면에서
    가로로 삐져나가지 않게 어디서든 끊는다. */
