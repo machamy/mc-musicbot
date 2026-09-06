@@ -306,6 +306,23 @@ async function ") {
             }
             let body = chunk.split("
 async function ").next().unwrap_or(chunk);
+            /* **재생목록에 담는 검색은 규칙이 다르다.**
+             *
+             * 이 불변식은 "링크에 재생목록이 딸려 있으면 **대기열에** 통째로 담을지
+             * 물어본다" 는 것이다. 그런데 `openPlaylistAdder` 안의 검색은 대기열이
+             * 아니라 **재생목록**을 채운다 — 거기서 `offerPlaylist` 를 부르면 사람이
+             * 재생목록을 채우려는 중에 곡이 대기열로 쏟아진다.
+             *
+             * **이름이 아니라 하는 일로 가른다.** 함수 이름으로 거르면 앞으로 생기는
+             * 같은 이름의 함수가 이 예외를 조용히 물려받는다.
+             *
+             * 남은 구멍은 알고 둔다: 재생목록에 담기 창에 재생목록 링크를 넣으면 앞
+             * 50곡이 나열될 뿐 `전부 이 목록에 담기` 가 없다. 서버에 목록 대 목록으로
+             * 담는 길이 아직 없어서다(`addTrack` 은 한 곡씩이다). 그 길이 생기면 이
+             * 예외를 지우고 그쪽을 부르게 하면 된다. */
+            if body.contains("'addTrack'") {
+                continue;
+            }
             if body.contains("searchTracks(") && !body.contains("offerPlaylist(") {
                 missing.push(name.to_string());
             }
@@ -352,7 +369,7 @@ async function ").next().unwrap_or(chunk);
 
     #[test]
     fn version_hash_is_pinned() {
-        assert_eq!(version(), "64bbff4c334233f2");
+        assert_eq!(version(), "b9008cdcd2234c8d");
     }
 
     /// 이름과 바이트가 서로 **뒤바뀌어도** 버전 해시는 그대로다(같은 것을 다 더하므로).
@@ -382,7 +399,7 @@ async function ").next().unwrap_or(chunk);
             ),
             (
                 "portal.js",
-                "c5c8713302d32ba970baaadfd8660a3b6240431fbedf12df27c7e5212c8031ef",
+                "8ad8ac911039be9c03dd3acf10b86a2233694f39f2bc176b34ea7ba23d8a84c9",
             ),
             (
                 "console.js",

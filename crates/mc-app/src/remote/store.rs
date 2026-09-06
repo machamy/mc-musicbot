@@ -2951,6 +2951,48 @@ impl RemoteStore {
             .unwrap_or_default()
     }
 
+    /* 서버가 직접 등록하는 차트 (§15.2e).
+     *
+     * 기본 제공 차트도 원래 **유튜브 재생목록 주소**를 그대로 쓴다(`remote_charts.url`).
+     * 즉 인프라는 처음부터 있었고 등록할 길만 없었다. `builtin = 0` 으로 넣으면 갱신·캐시·
+     * 담기까지 기존 길을 그대로 탄다.
+     *
+     * **길드에 묶는다.** 다른 서버 목록에 남의 재생목록이 나타나면 안 된다.
+     */
+    pub fn add_custom_chart(
+        &self,
+        guild_id: u64,
+        name: &str,
+        provider: crate::models::ProviderKind,
+        url: &str,
+    ) -> rusqlite::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        // 맨 뒤에 붙인다 — 먼저 등록한 것이 앞이다.
+        let next: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM remote_charts                  WHERE guild_id = ?1 AND category = 'custom'",
+                params![guild_id as i64],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
+        conn.execute(
+            "INSERT INTO remote_charts(guild_id, category, name, provider, url, sort_order, enabled, builtin)              VALUES(?1, 'custom', ?2, ?3, ?4, ?5, 1, 0)",
+            params![guild_id as i64, name, provider.as_str(), url, next],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 등록한 차트를 지운다. **기본 제공분은 못 지운다** — 지우면 되살릴 길이 없다.
+    pub fn delete_custom_chart(&self, guild_id: u64, chart_id: i64) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM remote_charts WHERE id = ?1 AND guild_id = ?2 AND builtin = 0",
+            params![chart_id, guild_id as i64],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
     pub fn get_chart(&self, guild_id: u64, chart_id: i64) -> Option<ChartDef> {
         self.list_charts(guild_id)
             .into_iter()
@@ -5970,7 +6012,18 @@ mod tests {
         let (store, path) = temp_store("charts");
         let charts = store.list_charts(1);
         assert_eq!(charts.len(), BUILTIN_CHARTS.len());
+        /* **`커스텀` 만 예외다.** 그건 서버 관리자가 재생목록 주소를 직접 등록해 만드는
+         * 분류라 기본 제공분이 있을 수 없다 — 등록한 게 없으면 카드도 안 나온다.
+         * 나머지는 전부 기본 차트가 하나씩은 있어야 한다(카드만 있고 안이 빈 분류가
+         * 생기면 눌러 보고 빈 화면을 만나게 된다). */
         for category in ChartCategory::ALL {
+            if category == ChartCategory::Custom {
+                assert!(
+                    !charts.iter().any(|chart| chart.category == category),
+                    "커스텀 분류에 기본 차트가 심어졌다 — 그건 사람이 등록하는 자리다"
+                );
+                continue;
+            }
             assert!(
                 charts.iter().any(|chart| chart.category == category),
                 "{} 분류의 기본 차트가 없다",

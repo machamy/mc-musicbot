@@ -679,6 +679,11 @@ pub fn router() -> Router<Arc<WebState>> {
         )
         // 차트 (V3 §15.5)
         .route("/music/api/guilds/{guild_id}/charts", get(api_charts))
+        // 서버가 직접 등록하는 차트 (§15.2e). 관리자 전용 — 서버 사람 모두가 본다.
+        .route(
+            "/music/api/guilds/{guild_id}/charts/custom",
+            post(api_custom_chart),
+        )
         .route(
             "/music/api/guilds/{guild_id}/charts/{chart_id}",
             get(api_chart_detail),
@@ -10325,6 +10330,112 @@ fn chart_def_json(chart: &ChartDef) -> Value {
 ///
 /// **작동하지 않는 차트는 유저 UI 목록에서 뺀다**(§15.2). 빈 차트를 눌렀는데 아무 일도
 /// 안 일어나는 게 제일 나쁘다. 관리자에게는 실패까지 그대로 보여 준다.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CustomChartRequest {
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    chart_id: Option<i64>,
+}
+
+/* `POST .../charts/custom` — 서버가 직접 등록한 재생목록 차트 (§15.2e).
+ *
+ * 기본 제공 차트도 유튜브 재생목록 주소를 그대로 쓴다. 그래서 새로 만들 것이 거의
+ * 없었다 — `builtin = 0` 으로 한 줄 넣으면 갱신·캐시·전부 담기가 기존 길을 그대로 탄다.
+ *
+ * **관리자 전용이다.** 등록하면 그 서버 사람 모두의 차트 화면에 나타난다.
+ */
+async fn api_custom_chart(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    headers: HeaderMap,
+    Json(request): Json<CustomChartRequest>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, Some(&headers)).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if let Err(response) = ctx.require_manager() {
+        return response;
+    }
+    let session = &ctx.session;
+    match request.action.as_str() {
+        "add" => {
+            let name = request.name.as_deref().map(str::trim).unwrap_or("");
+            if name.is_empty() || name.chars().count() > 40 {
+                return json_error(StatusCode::BAD_REQUEST, "이름은 1~40자로 입력해요.");
+            }
+            let url = request.url.as_deref().map(str::trim).unwrap_or("");
+            /* **주소부터 알아본다.** 재생목록이 아닌 것을 넣으면 차트는 만들어지는데
+             * 열 때마다 비어 있다 — 등록은 성공했다고 해 놓고 못 쓰는 물건을 준 셈이다. */
+            let collection = match crate::media::resolver::resolve(url) {
+                Ok(crate::media::resolver::Resolved::Collection(collection)) => collection,
+                _ => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "재생목록 주소가 아니에요. 유튜브·유튜브뮤직의 재생목록 링크를 넣어 주세요.",
+                    );
+                }
+            };
+            let id = match state.app.remote.add_custom_chart(
+                guild_id,
+                name,
+                collection.provider,
+                &collection.source_url,
+            ) {
+                Ok(id) => id,
+                Err(_) => {
+                    return json_error(StatusCode::CONFLICT, "차트를 등록하지 못했어요.");
+                }
+            };
+            audit_ok(
+                &state,
+                guild_id,
+                session,
+                "chart.customAdd",
+                Some(name),
+                Some("ok"),
+            );
+            emit_bare(&state, guild_id, "charts");
+            json_ok(json!({ "ok": true, "chartId": id }))
+        }
+        "remove" => {
+            let Some(chart_id) = request.chart_id else {
+                return json_error(StatusCode::BAD_REQUEST, "지울 차트를 지정해 주세요.");
+            };
+            let name = state
+                .app
+                .remote
+                .get_chart(guild_id, chart_id)
+                .map(|chart| chart.name)
+                .unwrap_or_default();
+            if !state.app.remote.delete_custom_chart(guild_id, chart_id) {
+                return json_error(
+                    StatusCode::NOT_FOUND,
+                    "그 차트를 못 지웠어요. 기본 제공 차트는 지울 수 없어요.",
+                );
+            }
+            audit_ok(
+                &state,
+                guild_id,
+                session,
+                "chart.customRemove",
+                Some(&name),
+                Some("ok"),
+            );
+            emit_bare(&state, guild_id, "charts");
+            json_ok(json!({ "ok": true }))
+        }
+        _ => json_error(StatusCode::BAD_REQUEST, "알 수 없는 동작이에요."),
+    }
+}
+
 async fn api_charts(
     State(state): State<Arc<WebState>>,
     cookies: Cookies,

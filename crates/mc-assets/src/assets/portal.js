@@ -157,6 +157,7 @@ const CHART_CATEGORIES = {
   japan_genre: { icon: '🇯🇵', label: '일본 장르', desc: 'J-POP·애니송·시티팝' },
   karaoke: { icon: '🎤', label: '노래방', desc: 'TJ 공식 순위' },
   soundcloud: { icon: '☁', label: 'SoundCloud', desc: '사운드클라우드 인기곡' },
+  custom: { icon: '📌', label: '커스텀 재생목록', desc: '이 서버가 등록해 둔 재생목록' },
 };
 const CHART_PERIODS = [['week', '이번 주'], ['month', '이번 달'], ['all', '전체']];
 
@@ -4588,7 +4589,14 @@ function renderLibrary(state) {
     const rows = state.playlists.filter((playlist) => isMyPlaylist(playlist) === mine
       && (!needle || String(playlist.name || '').toLowerCase().includes(needle)));
 
-    if (mine) el.libBody.appendChild(newPlaylistRow());
+    /* **서버 재생목록을 만들 길이 아예 없었다.**
+     *
+     * 서버는 `create` 에서 `scope: 'guild'` 를 받을 준비가 돼 있는데(관리자 권한),
+     * 화면에는 `내 재생목록` 탭에만 만들기 칸이 있었다. 그래서 서버 목록은 화면에서
+     * 만들 방법이 없고 `서버 재생목록이 없어요` 만 계속 보였다.
+     *
+     * 어느 탭에 있느냐가 곧 만들 범위다 — 따로 고르게 하면 탭과 어긋날 수 있다. */
+    if (mine || can('console')) el.libBody.appendChild(newPlaylistRow(mine ? 'user' : 'guild'));
     if (!rows.length) {
       el.libBody.appendChild(emptyState('📁',
         mine ? '내 재생목록이 없어요' : '서버 재생목록이 없어요',
@@ -4612,9 +4620,10 @@ function renderLibrary(state) {
 }
 
 /** 모달 없이 인라인으로. 이름만 넣으면 끝이다 (§12.2). */
-function newPlaylistRow() {
+function newPlaylistRow(scope) {
+  const server = scope === 'guild';
   const input = h('input', {
-    class: 'field', placeholder: '새 재생목록 이름', maxlength: '60',
+    class: 'field', placeholder: server ? '새 서버 재생목록 이름' : '새 재생목록 이름', maxlength: '60',
     onKeydown: (event) => { if (event.key === 'Enter') { event.preventDefault(); submit(); } },
   });
   const button = bindAct(h('button', { class: 'btn btn--sm btn--primary', type: 'button', tip: '이름만 넣으면 바로 만들어져요' }, '+ 만들기'),
@@ -4623,8 +4632,8 @@ function newPlaylistRow() {
   async function submit() {
     const name = input.value.trim();
     if (!name) { input.focus(); return; }
-    const created = await call(() => api('/playlists/action', { body: { action: 'create', name, scope: 'user' } }),
-      `재생목록 '${name}'을 만들었어요.`);
+    const created = await call(() => api('/playlists/action', { body: { action: 'create', name, scope } }),
+      `${server ? '서버 ' : ''}재생목록 '${name}'을 만들었어요.`);
     if (created) { input.value = ''; refetchCold(); }
   }
 
@@ -4711,9 +4720,107 @@ function playlistMenu(playlist, mine) {
   const reason = mine ? '' : '서버 재생목록은 서버 관리자만 고칠 수 있어요';
   return [
     { icon: '▶', label: '전부 대기열에 담기', disabled: !canBulk(), reason: lockReason('bulkEnqueue'), onPick: () => enqueuePlaylist(playlist) },
+    { icon: '🔎', label: '곡 찾아서 담기', disabled: !editable || !can('search'), reason: reason || lockReason('search'), onPick: () => openPlaylistAdder(playlist) },
     { icon: '✏', label: '이름 바꾸기', disabled: !editable, reason, onPick: () => renamePlaylist(playlist) },
+    /* 공개 범위 바꾸기 (§12.2). **양쪽 다 서버 관리자만** — 올리는 것은 서버 사람
+     * 모두가 보게 만드는 일이고, 내리는 것은 같이 쓰던 것을 한 사람 것으로 가져가는
+     * 일이다. 서버 판정도 같은 규칙이라 화면과 어긋나지 않는다. */
+    {
+      icon: mine ? '🌐' : '📃',
+      label: mine ? '서버 전체에 공개' : '내 것으로 되돌리기',
+      disabled: !can('console'),
+      reason: '서버 관리자만 공개 범위를 바꿀 수 있어요',
+      onPick: () => togglePlaylistScope(playlist, mine),
+    },
     { icon: '🗑', label: '재생목록 삭제', danger: true, disabled: !editable, reason, onPick: () => deletePlaylist(playlist) },
   ];
+}
+
+/** 공개 범위 전환. **되돌릴 수 있지만 남에게 보이는 것이 달라지므로 한 번 묻는다.** */
+async function togglePlaylistScope(playlist, mine) {
+  const toGuild = mine;
+  const ok = await confirmSheet({
+    title: toGuild ? '서버 전체에 공개할까요' : '내 것으로 되돌릴까요',
+    desc: toGuild
+      ? `'${playlist.name}' 을 이 서버 사람 모두가 보고 쓸 수 있게 돼요. 언제든 되돌릴 수 있어요.`
+      : `'${playlist.name}' 이 내 재생목록으로 돌아와요. 서버 사람들은 더 이상 못 봐요.`,
+    confirmText: toGuild ? '공개하기' : '되돌리기',
+  });
+  if (!ok) return;
+  await call(() => api('/playlists/action', {
+    body: { action: 'setScope', playlistId: playlist.id, scope: toGuild ? 'guild' : 'user' },
+  }), toGuild ? '서버 전체에 공개했어요.' : '내 재생목록으로 되돌렸어요.');
+  refetchCold();
+}
+
+/* ── 재생목록에 곡 찾아서 담기 (§12.2) ───────────────────────────
+ *
+ * 예전에는 **곡을 먼저 찾아 놓고** 그 곡의 우클릭 메뉴에서만 담을 수 있었다. 그래서
+ * "이 재생목록을 채우자" 는 순서로는 담을 방법이 없었다 — 목록을 열어 둔 채로 곡을
+ * 하나씩 검색해서, 결과에서 우클릭하고, 메뉴에서 목록을 다시 고르는 길뿐이었다.
+ *
+ * 여기서는 목록이 이미 정해져 있으니 검색해서 누르면 바로 담긴다. **시트를 닫지
+ * 않는다** — 재생목록을 채우는 일은 보통 한 곡으로 안 끝난다. */
+function openPlaylistAdder(playlist) {
+  const input = h('input', {
+    class: 'field', placeholder: '곡 이름이나 링크', autofocus: true,
+    onKeydown: (event) => { if (event.key === 'Enter') { event.preventDefault(); run(); } },
+  });
+  const results = h('div', { class: 'pladd__results' });
+  const body = h('div', { class: 'pladd' },
+    h('div', { class: 'pladd__bar' }, input,
+      bindAct(h('button', { class: 'btn btn--sm btn--primary', type: 'button' }, '찾기'), () => run())),
+    results);
+  const added = new Set();
+
+  async function run() {
+    const query = input.value.trim();
+    if (!query) { input.focus(); return; }
+    clear(results).appendChild(h('div', { class: 'row__sub' }, '찾는 중이에요…'));
+    let found;
+    try {
+      found = await searchTracks(query, el.searchProvider?.value || 'YouTube');
+    } catch (error) {
+      clear(results).appendChild(emptyState('⚠', '찾지 못했어요', error.message));
+      return;
+    }
+    const rows = found.results || [];
+    clear(results);
+    if (!rows.length) {
+      results.appendChild(emptyState('🔍', '결과가 없어요', found.note || '다른 말로 찾아 보세요.'));
+      return;
+    }
+    for (const track of rows) {
+      const key = trackKey(track);
+      const button = bindAct(h('button', { class: 'optrow', type: 'button' },
+        artNode(track, 'optrow__art'),
+        h('span', { class: 'optrow__main' },
+          h('span', { class: 'optrow__title' }, trackTitle(track)),
+          track.artist ? h('span', { class: 'optrow__by' }, track.artist) : null),
+        h('span', { class: 'optrow__len' }, added.has(key) ? '담김' : '＋'),
+      ), async () => {
+        // 같은 곡을 두 번 누르면 두 번 담긴다. 눌린 것을 표시해 그걸 막는다.
+        if (added.has(key)) return;
+        const ok = await call(() => api('/playlists/action', {
+          body: { action: 'addTrack', playlistId: playlist.id, track },
+        }), `'${trackTitle(track)}' 을 담았어요.`);
+        if (!ok) return;
+        added.add(key);
+        button.lastChild.textContent = '담김';
+        refetchCold();
+      });
+      results.appendChild(button);
+    }
+  }
+
+  sheet({
+    title: `🔎 ${playlist.name} 에 담기`,
+    desc: '찾아서 누르면 바로 담겨요. 여러 곡을 이어서 담을 수 있어요.',
+    wide: true,
+    body,
+    dismissValue: null,
+    actions: [{ label: '닫기', kind: 'primary', value: null }],
+  });
 }
 
 async function renamePlaylist(playlist) {

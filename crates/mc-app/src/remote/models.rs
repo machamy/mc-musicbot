@@ -664,6 +664,9 @@ pub enum ChartCategory {
     Region,
     Karaoke,
     Soundcloud,
+    /// 서버 관리자가 직접 등록한 재생목록 (§15.2e). 유튜브·유튜브뮤직 재생목록
+    /// 주소를 그대로 차트로 쓴다 — 기본 제공 차트도 원래 그 구조였다.
+    Custom,
 }
 
 impl ChartCategory {
@@ -677,6 +680,7 @@ impl ChartCategory {
             Self::JapanGenre => "japan_genre",
             Self::Karaoke => "karaoke",
             Self::Soundcloud => "soundcloud",
+            Self::Custom => "custom",
         }
     }
 
@@ -690,6 +694,7 @@ impl ChartCategory {
             "japan_genre" => Some(Self::JapanGenre),
             "karaoke" => Some(Self::Karaoke),
             "soundcloud" => Some(Self::Soundcloud),
+            "custom" => Some(Self::Custom),
             _ => None,
         }
     }
@@ -704,6 +709,7 @@ impl ChartCategory {
             Self::JapanGenre => "일본 장르",
             Self::Karaoke => "노래방",
             Self::Soundcloud => "SoundCloud",
+            Self::Custom => "커스텀 재생목록",
         }
     }
 
@@ -717,6 +723,7 @@ impl ChartCategory {
             Self::JapanGenre => "🇯🇵",
             Self::Karaoke => "🎤",
             Self::Soundcloud => "☁",
+            Self::Custom => "📌",
         }
     }
 
@@ -732,12 +739,16 @@ impl ChartCategory {
              * 전부 TJ 공식 순위다. 없는 걸 있다고 적어 두면 안 보인다고 신고가 온다. */
             Self::Karaoke => "TJ 공식 순위",
             Self::Soundcloud => "SoundCloud 인기곡",
+            Self::Custom => "이 서버가 등록해 둔 재생목록",
         }
     }
 
     /// 첫 화면 카드 순서. **지역이 먼저 보이게** 늘어놓는다 — "한국 힙합이 어디 있냐" 는
     /// 물음이 나온 이유가 장르가 한 칸에 섞여 있어서 어느 나라 것인지 알 수 없어서였다.
-    pub const ALL: [Self; 8] = [
+    /* 커스텀은 **맨 앞**이다. 이 서버 사람이 직접 등록한 것이라 기본 제공 차트보다
+     * 먼저 찾는다. 등록한 게 없으면 카드 자체가 안 나오므로 자리를 뺏지도 않는다. */
+    pub const ALL: [Self; 9] = [
+        Self::Custom,
         Self::Ours,
         Self::Popular,
         Self::KoreaGenre,
@@ -1543,6 +1554,14 @@ pub fn audit_text(
         /* 공개 범위 바꾸기. **어느 쪽으로 갔는지가 이 기록의 핵심이다** — 서버 사람
          * 모두가 보게 됐는지, 한 사람 것으로 내려갔는지는 전혀 다른 일이다. 그런데
          * 대상 문자열에는 `id:이름` 뿐이라 방향이 안 들어 있어서 전후값에서 읽는다. */
+        "chart.customAdd" => match item {
+            Some(name) => format!("{actor}님이 차트에 재생목록 **{name}** 을 등록했어요"),
+            None => format!("{actor}님이 차트에 재생목록을 등록했어요"),
+        },
+        "chart.customRemove" => match item {
+            Some(name) => format!("{actor}님이 등록한 차트 **{name}** 을 뺐어요"),
+            None => format!("{actor}님이 등록한 차트를 뺐어요"),
+        },
         "playlist.setScope" => {
             let to_guild = after.is_some_and(|v| v.contains("guild"));
             match playlist_name(item) {
