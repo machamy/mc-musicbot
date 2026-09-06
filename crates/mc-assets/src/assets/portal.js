@@ -5128,6 +5128,9 @@ function renderOptionsSheet() {
       tip: picked ? '지금 이 곡이 다음에 나가요' : '이 곡을 다음에 틀어요',
     },
       h('span', { class: 'optrow__dot', 'aria-hidden': 'true' }, picked ? '●' : '○'),
+      /* 썸네일. `artNode` 는 주소를 모르면 `<img>` 대신 빈 칸을 만든다 —
+       * `src=""` 는 브라우저가 실패로 보고 깨진 이미지를 그린다(그 주석 참고). */
+      artNode(track, 'optrow__art'),
       h('span', { class: 'optrow__main' },
         h('span', { class: 'optrow__title' }, trackTitle(track)),
         track.artist ? h('span', { class: 'optrow__by' }, track.artist) : null),

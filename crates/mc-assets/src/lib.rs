@@ -352,7 +352,7 @@ async function ").next().unwrap_or(chunk);
 
     #[test]
     fn version_hash_is_pinned() {
-        assert_eq!(version(), "15207ce812bcb957");
+        assert_eq!(version(), "30fc31c761803c80");
     }
 
     /// 이름과 바이트가 서로 **뒤바뀌어도** 버전 해시는 그대로다(같은 것을 다 더하므로).
@@ -366,7 +366,7 @@ async function ").next().unwrap_or(chunk);
             ),
             (
                 "portal.css",
-                "82b70c067cd24ac45b1422c0e8675bc8a720481ea75d0c0b04bbe00f34bbd1f7",
+                "72664f0e2bd7dd7f026b111a4381e2317852b005729049cd84cdbb653a9ff790",
             ),
             (
                 "console.css",
@@ -382,7 +382,7 @@ async function ").next().unwrap_or(chunk);
             ),
             (
                 "portal.js",
-                "ea4727f18fc7d32589a446224248b26a3e70ee8b111793fc53296946ab5ce44a",
+                "458211907b395d06ce0cbdfb0831230c2f88e013df9518ea8d562a1abdd6dc60",
             ),
             (
                 "console.js",

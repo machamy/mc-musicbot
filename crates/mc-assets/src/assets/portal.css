@@ -1811,6 +1811,13 @@ body[data-dragging="tab"] { user-select: none; }
 .optrow:hover { background: var(--surface-4); }
 .optrow[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent-line); }
 .optrow__dot { flex: none; color: var(--accent); }
+/* 썸네일. 유튜브 미리보기는 16:9 라 그 비율로 두되, 좌우가 검게 남는 곡도 있어서
+   `cover` 로 채운다. 주소를 모르면 `.row__art--none` 이 같은 크기의 빈 칸이 된다. */
+.optrow__art {
+  flex: none; width: 64px; height: 36px;
+  border-radius: var(--r-sm); object-fit: cover;
+  background: var(--surface-3);
+}
 /* 제목이 길어도 줄을 밀어내지 않게 남는 폭 안에서만 자른다. */
 .optrow__main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
 .optrow__title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
