@@ -138,13 +138,21 @@ fn dead_sources() -> &'static std::sync::Mutex<std::collections::HashSet<String>
 /// 쿠키를 못 읽어서 난 실패인가. **곡을 못 받은 것과 구분해야 한다.**
 pub(crate) fn is_cookie_source_failure(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-    const NEEDLES: [&str; 6] = [
+    const NEEDLES: [&str; 8] = [
         "could not copy",
         "cookie database",
         "unable to decrypt",
         "could not find",
         "unsupported browser",
         "permission denied",
+        /* **엣지가 내는 문구를 못 알아보고 있었다.**
+         *
+         * 실서버가 매번 `Failed to decrypt with DPAPI` 로 실패하는데, 위의
+         * `unable to decrypt` 로는 안 걸린다("failed" 와 "unable" 은 다른 낱말이다).
+         * 그래서 이 창구는 **한 번도 접힌 적이 없고** 곡마다·조회마다 다시 시도해
+         * 왔다. 실측 1.9초씩이다. */
+        "failed to decrypt",
+        "dpapi",
     ];
     NEEDLES.iter().any(|needle| lower.contains(needle))
 }
@@ -158,6 +166,15 @@ mod cookie_source_tests {
     fn a_locked_cookie_database_is_a_source_failure() {
         assert!(is_cookie_source_failure(
             "ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271"
+        ));
+    }
+
+    /* **실서버 엣지가 내는 문구.** 이걸 못 알아보는 바람에 이 창구가 한 번도
+     * 접히지 않았고, 검색·라디오·메타조회마다 1.9초씩 헛돌았다. */
+    #[test]
+    fn a_dpapi_failure_is_a_source_failure() {
+        assert!(is_cookie_source_failure(
+            "ERROR: Failed to decrypt with DPAPI. See  https://github.com/yt-dlp/yt-dlp/issues/10927"
         ));
     }
 
@@ -661,6 +678,13 @@ pub async fn init_js_runtime(exe: &str) -> Option<String> {
     described
 }
 
+/* 라디오에서 가져올 후보 상한 (`expand_collection_capped` 참고).
+ *
+ * 정책이 고르는 것은 열 곡 남짓이고 앞쪽이 유사도 순위다. 다만 최근 재생·차단·
+ * 아티스트 쿨다운으로 걸러내는 양이 많은 서버도 있어서, 열 곡을 뽑을 여유는
+ * 넉넉히 둔다. 모자라면 2순위 검색과 시드 8회 재시도가 받아 준다. */
+const RADIO_CANDIDATE_CAP: usize = 150;
+
 pub enum AuthMode {
     BrowserProfile,
     CookieFile,
@@ -720,21 +744,36 @@ impl YtDlp {
     }
 
     /// 메타 조회 1회 실행. 30초 타임아웃 — 초과 시 future drop 으로 프로세스가 kill 된다.
-    async fn run_json_once(&self, args: &[String]) -> Option<Value> {
+    /* 조회 한 번. **stderr 를 버리지 않는다.**
+     *
+     * 예전에는 `Stdio::null()` 이라 무엇 때문에 실패했는지 알 수 없었다. 그래서
+     * 이 경로는 **죽은 쿠키 창구를 영영 못 접었다** — 다운로드 쪽은 접는데 조회 쪽은
+     * 못 접으니, 검색·라디오·메타조회마다 못 읽는 창구 둘을 매번 다시 두드렸다
+     * (실서버 실측 1.9초 + 2.7초). 자동추천이 곡마다 라디오를 도는 것을 생각하면
+     * 이게 그대로 다음 곡 지연이다.
+     *
+     * `source_key` 는 부르는 쪽이 준다 — 어느 창구로 시도했는지는 거기만 안다. */
+    async fn run_json_once(&self, args: &[String], source_key: &str) -> Option<Value> {
         let mut full = self.base_args();
         full.extend_from_slice(args);
         let fut = Command::new(&self.exe)
             .args(&full)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .output();
         let out = tokio::time::timeout(std::time::Duration::from_secs(30), fut)
             .await
             .ok()?
             .ok()?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        observe_stderr(&stderr);
         if !out.status.success() {
+            // 쿠키를 아예 못 읽는 창구면 이번 실행 동안 접는다 (다운로드 쪽과 같은 규칙).
+            if !source_key.is_empty() && is_cookie_source_failure(&stderr) {
+                dead_sources().lock().unwrap().insert(source_key.to_string());
+            }
             return None;
         }
         serde_json::from_slice(&out.stdout).ok()
@@ -744,9 +783,10 @@ impl YtDlp {
     /// (유튜브 봇 차단 시 로그인 쿠키로 우회, 쿠키 만료 시 공개 접근 폴백).
     async fn run_json(&self, args: &[String]) -> Option<Value> {
         for (_mode, auth_args) in self.auth_chain() {
+            let source_key = auth_args.join(" ");
             let mut full: Vec<String> = auth_args;
             full.extend(args.iter().cloned());
-            if let Some(v) = self.run_json_once(&full).await {
+            if let Some(v) = self.run_json_once(&full, &source_key).await {
                 return Some(v);
             }
         }
@@ -854,13 +894,41 @@ impl YtDlp {
 
     /// 플레이리스트/세트 펼치기.
     pub async fn expand_collection(&self, url: &str, provider: ProviderKind) -> Vec<TrackRef> {
-        let args: Vec<String> = vec![
+        // 사람이 담는 재생목록은 **끝까지 다 가져온다.** 여기서 자르면 §48 의
+        // `재생목록 링크 전체 담기` 가 조용히 일부만 담게 된다.
+        self.expand_collection_capped(url, provider, None).await
+    }
+
+    /* 앞에서 `limit` 곡만 가져오는 판. **라디오에만 쓴다.**
+     *
+     * 라디오 믹스는 400~1000곡을 돌려주는데, 자동추천은 그중 열 곡 남짓만 쓴다.
+     * 그런데 그 전부를 받아 오느라 한 번에 16~18초를 썼다(실서버 실측). 그동안
+     * 다음 곡 자리가 비어 있고, 곡이 그 사이 넘어가면 받아 온 것을 통째로 버리고
+     * 처음부터 다시 돈다.
+     *
+     * **앞쪽이 곧 유사도 순위**라(§gather_candidates 주석) 앞에서 자르는 것은
+     * 무작위로 줄이는 것과 다르다 — 가장 비슷한 곡들만 남는다.
+     *
+     * 실측 (같은 시드, 실서버):
+     *   제한 없음  15.7초 / 406곡      100곡  6.4초      50곡  4.4초
+     */
+    async fn expand_collection_capped(
+        &self,
+        url: &str,
+        provider: ProviderKind,
+        limit: Option<usize>,
+    ) -> Vec<TrackRef> {
+        let mut args: Vec<String> = vec![
             "--flat-playlist".into(),
             "--dump-single-json".into(),
             "--no-warnings".into(),
-            "--".into(),
-            url.to_string(),
         ];
+        if let Some(n) = limit {
+            args.push("--playlist-end".into());
+            args.push(n.to_string());
+        }
+        args.push("--".into());
+        args.push(url.to_string());
         let Some(json) = self.run_json(&args).await else {
             return Vec::new();
         };
@@ -893,7 +961,8 @@ impl YtDlp {
                 format!("{}/recommended", seed.source_url.trim_end_matches('/'))
             }
         };
-        self.expand_collection(&url, seed.provider).await
+        self.expand_collection_capped(&url, seed.provider, Some(RADIO_CANDIDATE_CAP))
+            .await
     }
 
     /// 곡 다운로드 — 인증 fallback 체인을 따라 시도, 성공 시 실제 파일 경로 반환.
