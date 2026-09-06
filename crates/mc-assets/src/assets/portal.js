@@ -5033,13 +5033,20 @@ function renderNextOptions(state) {
     if (!track) continue;
     const id = option.item?.id ?? option.id;
     const picked = !!option.picked;
-    put(el.nextOptions, bindAct(h('button', {
+    const chip = bindAct(h('button', {
       class: 'nextopt', type: 'button', 'aria-pressed': String(picked),
       tip: picked ? '지금 이 곡이 다음에 나가요' : '이 곡을 다음에 틀어요',
     },
       h('span', { class: 'nextopt__dot', 'aria-hidden': 'true' }, picked ? '●' : '○'),
       mqText(trackTitle(track), 'nextopt__title'),
-    ), () => pickNextOption(id)));
+    ), () => pickNextOption(id));
+    /* **후보에도 우클릭이 있어야 한다.**
+     *
+     * 여기만 빠져 있었다. 배경 우클릭 메뉴는 `button` 을 제외하므로 후보를 우클릭하면
+     * 아무것도 안 열렸다 — 제목을 복사하거나 원본을 열어 보려면 방법이 없었다.
+     * 곡 하나에 할 수 있는 일은 다른 줄과 똑같이 여기서도 된다. */
+    bindContextTarget(chip, () => trackMenu(track, { source: 'option', optionId: id, picked }));
+    put(el.nextOptions, chip);
   }
   marquee.scan(el.nextOptions);
 }
@@ -9010,6 +9017,20 @@ function trackMenu(track, opts = {}) {
       disabled: !canAutoplay(), reason: lockReason('autoplay'),
       onPick: rejectPreviewTrack,
     });
+  } else if (opts.source === 'option') {
+    /* 다음 곡 후보 셋 (§8.6). 왼쪽 클릭이 하는 일을 메뉴에도 둔다 — 우클릭으로 연
+     * 사람이 메뉴를 닫고 다시 왼쪽 클릭하러 가야 하면 그건 메뉴가 아니다.
+     *
+     * **대기열 항목처럼 다루면 안 된다.** 이 곡들은 아직 대기열에 없는 후보라
+     * `맨 앞으로 올리기`·`대기열에서 빼기` 는 가리킬 대상이 없다. 그래서 `itemId` 를
+     * 넘기지 않고 이 갈래로 따로 온다. */
+    items.push({
+      icon: '●', label: '이 곡으로 정하기',
+      tip: '다음에 이 곡이 나가요',
+      disabled: !opts.optionId || !!opts.picked || !canAutoplay(),
+      reason: opts.picked ? '이미 이 곡으로 정해져 있어요' : lockReason('autoplay'),
+      onPick: () => pickNextOption(opts.optionId),
+    });
   } else if (itemId) {
     if (!memberOnly) {
       items.push({
@@ -9025,7 +9046,13 @@ function trackMenu(track, opts = {}) {
     });
   }
 
-  items.push({
+  /* **표를 던질 대상이 없으면 투표 묶음을 안 만든다.**
+   *
+   * 투표는 대기열 항목(`itemId`)에 붙는다. 검색 결과·다음 곡 후보·남의 기록처럼
+   * 아직 담기지 않은 곡에는 가리킬 대상이 없어서, 열어 보면 **세 줄이 전부 잠긴
+   * 빈 서랍**이었다. 이 파일 첫머리에 적어 둔 규칙이 그것이다 — 영영 안 되는 일을
+   * 잠긴 줄로 남기면 소음일 뿐이다. 담고 나면 그 줄에서 투표할 수 있다. */
+  if (itemId) items.push({
     icon: '👍',
     label: '투표',
     children: [
