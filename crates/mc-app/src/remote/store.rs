@@ -5632,14 +5632,14 @@ mod tests {
     #[test]
     fn the_human_feed_never_leaks_a_host_path() {
         let (store, path) = temp_store("audit-failure-redact");
-        let raw = r"yt-dlp 실행 실패: C:\Users\macham\Desktop\musicbot-portable-20260601-2005\tools\yt-dlp.exe";
+        let raw = r"yt-dlp 실행 실패: C:\Users\someone\Desktop\musicbot-portable\tools\yt-dlp.exe";
         store
             .add_audit(1, 0, "봇", "playback.failed", Some("어떤 곡"), None, None, false, Some(raw))
             .unwrap();
 
         let entry = store.list_audit(1, 50, None).into_iter().next().unwrap();
         let json = serde_json::to_string(&entry.feed_item()).unwrap();
-        for secret in ["macham", "Desktop", "musicbot-portable"] {
+        for secret in ["someone", "Desktop", "musicbot-portable"] {
             assert!(!json.contains(secret), "'{secret}' 가 리모컨으로 새 나갔어요: {json}");
         }
         // 그래도 무엇이 문제인지는 남아야 한다 — 다 지워 버리면 볼 이유가 없다.

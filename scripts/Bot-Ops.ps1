@@ -3,7 +3,7 @@
 # 왜 있나 — 사고가 났을 때 매번 이런 걸 손으로 쳤다.
 #
 #     $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
-#     ssh aux-server "powershell -NoProfile -EncodedCommand $enc"
+#     ssh $env:MUSICBOT_DEPLOY_REMOTE "powershell -NoProfile -EncodedCommand $enc"
 #
 # 그리고 돌아온 한글이 전부 깨졌다(`ó�� ����ϱ�`). 원격 PowerShell 이 CLIXML 로 감싸
 # 보내면서 콘솔 코드페이지를 타기 때문이다. 그래서 **결과를 UTF-8 base64 로 감싸

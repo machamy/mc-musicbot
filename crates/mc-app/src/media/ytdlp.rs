@@ -405,9 +405,9 @@ mod redact_tests {
     /// **호스트 경로가 리모컨으로 새면 안 된다.** 이 저장소의 실제 배포 경로로 검사한다.
     #[test]
     fn absolute_paths_are_reduced_to_their_file_name() {
-        let raw = r"yt-dlp 실행 실패: C:\Users\macham\Desktop\musicbot-portable-20260601-2005\tools\yt-dlp.exe 없음";
+        let raw = r"yt-dlp 실행 실패: C:\Users\someone\Desktop\musicbot-portable\tools\yt-dlp.exe 없음";
         let out = redact_paths(raw);
-        assert!(!out.contains("macham"), "사용자 이름이 남았어요: {out}");
+        assert!(!out.contains("someone"), "사용자 이름이 남았어요: {out}");
         assert!(!out.contains("Desktop"), "폴더 구조가 남았어요: {out}");
         assert!(out.contains("yt-dlp.exe"), "무엇이 문제인지까지 지웠어요: {out}");
     }
@@ -415,7 +415,7 @@ mod redact_tests {
     /// 유닉스와 UNC 도 같이 가린다.
     #[test]
     fn unix_and_unc_paths_are_covered() {
-        assert!(!redact_paths("/home/macham/bot/data/x.opus 없음").contains("macham"));
+        assert!(!redact_paths("/home/someone/bot/data/x.opus 없음").contains("someone"));
         assert!(!redact_paths(r"\\NAS\music\a.opus 없음").contains("NAS"));
     }
 
