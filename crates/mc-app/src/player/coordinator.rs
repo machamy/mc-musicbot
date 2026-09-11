@@ -1407,6 +1407,19 @@ impl Coordinator {
         // 4) 재생 시작 (play_only: 이전 트랙 자동 중지) + 볼륨/일시정지 반영.
         let handle = {
             let mut call_guard = call.lock().await;
+            /* **128 이 천장인 것은 우연이 아니다.**
+             *
+             * 캐시 파일은 이미 `--audio-quality 128K` 로 재인코딩된 128k opus 다
+             * (`media/ytdlp.rs`). 그 위로 올려 봐야 복원할 정보가 없다 — 입력이
+             * 이미 128k 를 두 번 통과한 물건이라 더 높은 비트레이트는 잡음까지
+             * 더 정밀하게 옮길 뿐이다.
+             *
+             * 반대로 96 은 **songbird 자체 기본값(128k, `constants.rs`)보다 낮다.**
+             * 즉 우리가 아무것도 안 했을 때보다 한 단계 더 깎고 있었다. 그걸 안 깎는
+             * 것이 이 값의 전부이고, 체감이 크게 달라지기를 기대할 것은 아니다.
+             *
+             * `Bitrate::Auto` 는 이 구성에서 약 99k 라 지금과 사실상 같고 라이브러리가
+             * 권하지 않는다. `Max` 는 약 570k 로 대역폭만 다섯 배가 된다. 둘 다 아니다. */
             call_guard.set_bitrate(songbird::driver::Bitrate::Bits(
                 (global.voice_bitrate_kbps.clamp(32, 128) * 1000) as i32,
             ));

@@ -212,7 +212,7 @@ cp .env.sample .env      # Windows: copy .env.sample .env
 **자동추천(라디오)** — 아래 [작동 방식](#자동추천라디오-작동-방식) 참고
 
 **오디오 / 품질**
-- 볼륨 0–200% (전역 + 길드별 override), 음량 평준화(loudness normalize)
+- 볼륨 0–200% (전역 + 길드별 override), 음량 평준화
 - 송출 비트레이트 설정
 - 끊김 방지: 스톨 워치독(10초 멈춤 감지) + 위치 보존 자동 이어재생
 - 인트로/아웃트로 제거 (SponsorBlock, 선택)

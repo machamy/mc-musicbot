@@ -580,7 +580,7 @@ pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
 <label class="checkbox" title="ffmpeg -probesize 32k -analyzeduration 0 -fflags +nobuffer — 곡 시작 지연 단축"><input type="checkbox" name="tweak_ffmpeg_fast_start" {t1}/> ① ffmpeg 빠른 시작 (probe/analyze 생략)</label>
 <label class="checkbox" title="ffmpeg -avioflags direct -flush_packets 1 — 파이프 즉시 flush"><input type="checkbox" name="tweak_ffmpeg_direct_output" {t2}/> ② ffmpeg 즉시 출력 (pipe flush)</label>
 <p class="kv">③ 작은 송신 버퍼 · ④ 낮은 패킷로스 힌트 · ⑤ 전용 송출 스레드 — songbird 엔진은 전용 스레드 페이싱이 기본이라 항상 적용된 것과 같아 토글이 없습니다.</p>
-<label class="field">송출 비트레이트 (kbps, 32–128 · 기본 96)</label><input type="number" name="voice_bitrate_kbps" min="32" max="128" value="{br}"/>
+<label class="field">송출 비트레이트 (kbps, 32–128 · 기본 128 · 받아 둔 파일이 128k라 그 위는 의미 없어요)</label><input type="number" name="voice_bitrate_kbps" min="32" max="128" value="{br}"/>
 </div>
 <div class="actions"><button class="btn btn-primary" type="submit">재생 설정 저장</button></div>
 </form>

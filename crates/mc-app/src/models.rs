@@ -403,7 +403,9 @@ impl Default for GlobalSettings {
             tweak_small_buffer: false,
             tweak_low_packet_loss: false,
             tweak_dedicated_send_thread: false,
-            voice_bitrate_kbps: 96,
+            // songbird 자체 기본값과 같은 값. 그보다 낮추면 한 단계 더 깎는 셈이다
+            // (`coordinator.rs` 의 `set_bitrate` 주석 참고). 상한 128 은 그대로 둔다.
+            voice_bitrate_kbps: 128,
             sponsorblock_remove: false,
             auto_update_tools: true,
         }

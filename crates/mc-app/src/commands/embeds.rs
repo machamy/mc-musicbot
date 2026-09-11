@@ -336,13 +336,20 @@ pub fn status_embed(
         g.cache_limit_gb,
         g.log_retention_days,
     );
+    /* **없는 토글을 광고하고 있었다.**
+     *
+     * `smallBuf`·`lowLoss`·`sendThread` 셋은 C# 시절 값이고, songbird 로 오면서 의미를
+     * 잃었다. 웹 운영 패널은 이미 걷어내고 그 자리에 이유까지 적어 뒀다 —
+     * *"songbird 엔진은 전용 스레드 페이싱이 기본이라 항상 적용된 것과 같아 토글이
+     * 없습니다"* (`web/pages.rs:582`). 그런데 이 임베드만 남아서 **켤 수 없는 것을
+     * 계속 `off` 로 보여 주고 있었다.** 그걸 보고 켜려 웹을 뒤지면 찾을 수 없다.
+     *
+     * 실제로 동작하는 둘만 남기고, 나머지는 왜 없는지 한 줄로 말한다. */
     let tweaks = format!(
-        "fastStart: {} · directOut: {} · smallBuf: {} · lowLoss: {} · sendThread: {}",
+        "fastStart: {} · directOut: {}
+작은 버퍼 · 낮은 패킷로스 · 전용 송출 스레드는          songbird 가 기본으로 하고 있어서 따로 켤 것이 없어요.",
         on(g.tweak_ffmpeg_fast_start),
         on(g.tweak_ffmpeg_direct_output),
-        on(g.tweak_small_buffer),
-        on(g.tweak_low_packet_loss),
-        on(g.tweak_dedicated_send_thread),
     );
     CreateEmbed::new()
         .colour(0x2ECC71)
