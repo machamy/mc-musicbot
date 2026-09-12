@@ -1052,6 +1052,36 @@ body[data-dragging="tab"] { user-select: none; }
   font-size: 10px; font-weight: var(--fw-bold); line-height: 15px;
   text-align: center; font-variant-numeric: tabular-nums;
 }
+/* ── 자동 재생 버튼: 켜 뒀는데 안 도는 세 번째 상태 ──────────────
+ *
+ * 반복이 켜져 있으면 서버는 자동 재생을 통째로 건너뛴다. 그런데 설정은 여전히 켜짐이라
+ * 버튼이 `aria-pressed="true"` 로 강조색을 뒤집어쓰고 있었다 — 돌지도 않으면서 옆의 어떤
+ * 버튼보다 활발해 보이는 꼴이었다.
+ *
+ * 글자는 📻 그대로 둔다. 설정은 진짜 켜져 있으니 글자까지 바꾸면 그건 다른 거짓말이 된다.
+ * 강조색만 걷고, 반복 버튼이 쓰는 **모서리 배지 자리**에 ↻ 를 붙여 누가 잡고 있는지를 가리킨다.
+ * 끔(🚫 + 빗금)과는 글자도 배지도 달라서 섞이지 않는다.
+ *
+ * 배지가 이모지(🔁)가 아니라 글자(↻)인 이유: 15px 배지 안의 이모지는 이 크기에서 뭉개지고,
+ * 위의 `grayscale(1)` 에 같이 걸려 회색 덩어리가 된다. 글자는 `color` 가 먹어서 또렷하다.
+ *
+ * 흐리게 하는 방식은 반복 '끔' 과 일부러 같게 뒀다 — 이 화면에서 '지금 이 버튼은 일을 안 한다'
+ * 는 말은 한 가지 모습으로만 해야 한다. */
+.pbtn[data-autoplay] { position: relative; }
+.pbtn[data-autoplay="held"] {
+  background: var(--surface-2); border-color: var(--line-1);
+  color: var(--text-4); filter: grayscale(1); opacity: .72;
+}
+.pbtn[data-autoplay="held"]::after {
+  content: '↻'; position: absolute; right: -1px; bottom: -1px;
+  min-width: 15px; height: 15px;
+  border-radius: var(--r-full);
+  background: var(--surface-4); border: 1px solid var(--line-1);
+  color: var(--text-1);
+  font-size: 12px; font-weight: var(--fw-bold); line-height: 13px;
+  text-align: center;
+}
+
 .pbtn--main {
   width: 50px; height: 50px;
   background: var(--art-1);
@@ -1401,6 +1431,31 @@ body[data-dragging="tab"] { user-select: none; }
 /* 지금 방식이 참고하지 않는 칸. 지우지 않고 흐리게만 둔다 — 없애 버리면
  * 방식을 바꿨을 때 그게 어디서 나타나는지 알 수가 없다. */
 .ap__sec--idle { opacity: 0.62; }
+
+/* 시트 맨 위 — 반복이 자동 재생을 잡고 있다는 안내.
+ *
+ * 아래 칸들의 '흐리게'(`ap__sec--idle`)와 일부러 반대로 간다. 그건 칸 **하나**가 지금 방식에서
+ * 안 쓰인다는 말이라 물러나 있어야 맞지만, 이건 시트 **전체**가 효력이 없다는 말이라 눈에 띄어야
+ * 한다. 흐리게 처리하면 정작 가장 먼저 읽어야 할 문장이 가장 안 읽힌다.
+ *
+ * 색은 이미 쓰는 경고 어휘(`--warn-soft` + `--warn` 테두리, `.gate__note` 와 같다)를 그대로 쓴다. */
+.ap__held {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  border-radius: var(--r-sm);
+}
+.ap__held-icon { font-size: var(--fs-lg); flex: none; }
+.ap__held-main { flex: 1; min-width: 0; }
+.ap__held-title { color: var(--text-1); font-size: var(--fs-sm); font-weight: var(--fw-bold); }
+.ap__held-sub { margin-top: 2px; color: var(--text-3); font-size: var(--fs-xs); line-height: var(--lh-base); }
+
+/* 좁은 화면에서는 버튼이 글자를 밀어낸다. 아래로 내린다. */
+@media (max-width: 420px) {
+  .ap__held { flex-wrap: wrap; }
+  .ap__held .btn { width: 100%; }
+}
 .ap__head { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .ap__icon { flex: none; }
 .ap__title { font-size: var(--fs-md); color: var(--text-1); }

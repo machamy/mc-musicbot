@@ -1072,7 +1072,16 @@ async fn dispatch(
                 RepeatMode::Track => "한곡 반복",
                 RepeatMode::Queue => "전체 반복",
             };
-            respond_text(ctx, cmd, &format!("🔁 반복: **{label}**"), false).await;
+            // 반복을 켜면 자동 재생은 통째로 멈춘다(`should_seed_autoplay`·`should_fill_preview`).
+            // 설정은 켜짐으로 남아 있어서, 안 알려 주면 "자동 재생 켜 놨는데 왜 곡이 안 붙지" 가 된다.
+            let held = mode != RepeatMode::Off
+                && app.player.get_state(guild_id).await.autoplay_enabled;
+            let note = if held {
+                " · 자동 재생은 반복이 끝날 때까지 쉬어요"
+            } else {
+                ""
+            };
+            respond_text(ctx, cmd, &format!("🔁 반복: **{label}**{note}"), false).await;
             Ok(())
         }
         "autoplay" => {
@@ -1099,13 +1108,16 @@ async fn dispatch(
                 .await;
                 app.coordinator.sync_guild(app, guild_id).await;
             }
-            respond_text(
-                ctx,
-                cmd,
-                &format!("✨ 자동 재생: **{}**", if enabled { "켜짐" } else { "꺼짐" }),
-                false,
-            )
-            .await;
+            // 반복 중에 켜면 **저장만 되고 지금은 아무 일도 안 난다.** 그냥 "켜짐" 만 띄우면
+            // 곡이 안 붙는 이유를 찾을 데가 없다. 왜 조용한지까지 같이 말한다.
+            let repeat_holds = enabled
+                && app.player.get_state(guild_id).await.repeat_mode != RepeatMode::Off;
+            let message = if repeat_holds {
+                "✨ 자동 재생: **켜짐** — 다만 지금은 **반복이 켜져 있어서 쉬어요.** 반복을 끄면 그때부터 곡을 골라 와요.".to_string()
+            } else {
+                format!("✨ 자동 재생: **{}**", if enabled { "켜짐" } else { "꺼짐" })
+            };
+            respond_text(ctx, cmd, &message, false).await;
             Ok(())
         }
         "pause" => {

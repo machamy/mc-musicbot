@@ -595,6 +595,7 @@ let lastBotState = null;       // presence.bot — WS 이벤트가 안 실어 �
 let seedState = null;          // { seeds, max, canEdit } — 없으면 서버가 아직 시드곡을 모른다는 뜻
 let autoplaySheet = null;      // 열려 있는 자동 재생 시트 { handle, body } — 갱신이 오면 안을 다시 그린다
 let autoplayState = null;      // { mode, recentCount, genres, policy, genreOptions, canEdit }
+let autoplayHeldKey = null;    // 마지막으로 그린 '반복이 자동 재생을 잡고 있음' 상태 — 바뀔 때만 시트를 다시 그린다
 let myScore = null;            // 마참 점수 (§22.4)
 let chartState = null;         // 차트 화면 상태 — 없으면 서버가 차트를 모른다는 뜻
 let suggestUnread = false;
@@ -3538,12 +3539,38 @@ function renderAutoplaySheet() {
     return;
   }
   put(body,
+    apHeldBanner(),
     apModeSection(),
     apSeedSection(),
     apRecentSection(),
     apGenreSection(),
     apBlockedSection(),
     apPolicySection());
+}
+
+/** **반복이 켜져 있으면 이 시트에서 뭘 고르든 지금은 아무 일도 안 난다.** 그 사실을 맨 위에 둔다.
+ *
+ * 설정을 바꾸러 온 사람을 한참 만지게 두고 나서야 '왜 안 되지' 를 겪게 하면 안 된다. 아래 칸들이
+ * 이미 쓰는 어휘(`ap__sec--idle`, '지금 방식에서는 참고하지 않아요')와 같은 결이지만, 이건 칸 하나가
+ * 아니라 **시트 전체**가 쉬는 얘기라 맨 위에 따로 세운다.
+ *
+ * 끄는 버튼을 같이 둔다 — 알려만 주고 손댈 데가 없으면 알림이 아니라 잔소리다. 반복을 바꾸는 건
+ * 재생 제어라 권한 키도 `playback` 으로, 옆 반복 버튼과 같은 기준을 쓴다. */
+function apHeldBanner() {
+  const player = store.get().player || {};
+  const repeat = String(player.repeatMode || 'off').toLowerCase();
+  if (repeat === 'off' || !autoplayIsOn(player)) return null;
+  const word = repeat === 'track' ? '한 곡 반복' : '대기열 반복';
+  const off = bindAct(h('button', { class: 'btn btn--sm', type: 'button' }, '반복 끄기'),
+    () => control('repeat', null, { mode: 'off' }));
+  setLock(off, !can('playback'), lockReason('playback'));
+  return h('div', { class: 'ap__held' },
+    h('span', { class: 'ap__held-icon', 'aria-hidden': 'true' }, '🔁'),
+    h('div', { class: 'ap__held-main' },
+      h('div', { class: 'ap__held-title' }, `${word}이 켜져 있어서 자동 재생은 쉬고 있어요`),
+      h('div', { class: 'ap__held-sub' },
+        '반복 중에는 곡을 새로 고르지도, 다음 곡을 미리 잡아 두지도 않아요. 아래 설정은 반복을 끈 뒤부터 쓰여요.')),
+    off);
 }
 
 /** 시트 안 카드 한 장. `used === false` 면 지금 방식이 참고하지 않는 칸이라 흐리게 둔다. */
@@ -6867,11 +6894,23 @@ function renderNow(state) {
    * 툴팁(`data-tip`)은 마우스가 있어야 보이므로 그것만 믿으면 안 된다. */
   const repeat = String(player.repeatMode || 'off').toLowerCase();
   const repeatWord = repeat === 'off' ? '반복 끔' : repeat === 'track' ? '한 곡 반복' : '대기열 반복';
+
+  /* **반복이 켜져 있으면 자동 재생은 아예 안 돈다.**
+   *
+   * 서버가 그렇게 정해 놨다 — `should_seed_autoplay` 와 `should_fill_preview` 가 둘 다 첫 줄에서
+   * `repeat_mode != Off` 면 곧장 돌아간다. 곡을 새로 고르지도, 다음 곡을 미리 잡아 두지도 않는다.
+   *
+   * 그런데 **설정 자체는 여전히 켜짐**이라 버튼도 켜진 얼굴이었다. 그래서 '자동 재생 켜 뒀는데
+   * 왜 곡이 안 붙지' 의 답이 화면 어디에도 없었다 — 두 버튼은 나란히 붙어 있으면서 서로를 모르는
+   * 척했다. 양쪽에 다 적는다. 반복 쪽에는 '자동 재생이 쉰다', 자동 재생 쪽에는 '반복이 잡고 있다'. */
+  const autoplayOn = autoplayIsOn(player);
+  const autoplayHeld = autoplayOn && repeat !== 'off';
+
   el.repeatBtn.setAttribute('aria-pressed', String(repeat !== 'off'));
   el.repeatBtn.setAttribute('data-repeat', repeat);
   el.repeatBtn.textContent = '🔁';
-  el.repeatBtn.setAttribute('data-tip', repeatWord);
-  el.repeatBtn.setAttribute('aria-label', repeatWord);
+  el.repeatBtn.setAttribute('data-tip', autoplayHeld ? `${repeatWord} · 자동 재생은 쉬어요` : repeatWord);
+  el.repeatBtn.setAttribute('aria-label', autoplayHeld ? `${repeatWord} · 자동 재생은 쉬는 중` : repeatWord);
   el.shuffleBtn.setAttribute('aria-pressed', String(!!player.shuffleEnabled));
 
   /* **끌고 있는 동안만 손을 뗀다 — 포커스가 남아 있다고 계속 손을 떼면 안 된다.**
@@ -6890,11 +6929,27 @@ function renderNow(state) {
     el.volumeLabel.textContent = `${player.effectiveVolume}%`;
   }
 
-  // 자동 재생 토글 (§24.3)
-  const autoplayOn = autoplayIsOn(player);
+  // 자동 재생 토글 (§24.3) — `autoplayOn`·`autoplayHeld` 는 반복 버튼과 같이 위에서 구했다.
   el.autoplayBtn.setAttribute('aria-pressed', String(autoplayOn));
   // 색만으로 구분하면 흑백·고대비 화면에서 켜짐/꺼짐이 같아 보인다. 아이콘도 바꾼다.
   el.autoplayBtn.textContent = autoplayOn ? '📻' : '🚫';
+
+  /* 세 번째 상태(`held`). `aria-pressed` 는 **켜짐 그대로 둔다** — 설정은 진짜 켜져 있고 누르면
+   * 꺼진다. 거짓이 아니다. 다만 그것만 보면 '지금 돌고 있다' 로 읽히므로, 생김새(`data-autoplay`)와
+   * 이름표가 쉬는 중임을 따로 말한다. 이름표까지 손대는 이유는 툴팁은 마우스가 있어야 보이기 때문이다. */
+  el.autoplayBtn.setAttribute('data-autoplay', autoplayOn ? (autoplayHeld ? 'held' : 'on') : 'off');
+  el.autoplayBtn.setAttribute('aria-label', autoplayHeld
+    ? `자동 재생 켜짐 · ${repeatWord} 때문에 지금은 쉬는 중`
+    : autoplayOn ? '자동 재생 켜짐' : '자동 재생 꺼짐');
+
+  /* 시트가 열려 있는데 반복이 바뀌면 시트 맨 위 안내도 같이 바뀌어야 한다. 시트는 `loadSeeds()`
+   * (통신이다) 때만 다시 그려져서, 반복만 바뀐 경우에는 옛 안내가 그대로 남는다.
+   *
+   * 매번 부르지는 않는다 — 시트를 통째로 비우고 다시 그리는 일이라 스크롤과 포커스가 날아간다.
+   * 상태가 실제로 바뀐 순간에만 한 번 부른다. */
+  const heldKey = autoplayHeld ? repeat : 'off';
+  if (autoplaySheet && heldKey !== autoplayHeldKey) renderAutoplaySheet();
+  autoplayHeldKey = heldKey;
 
   /* 봇이 음성에 없다고 무조건 잠그지 않는다.
    *
@@ -6927,9 +6982,11 @@ function renderNow(state) {
   setLock(el.autoplayBtn, autoplayOffline || !canAutoplay(),
     autoplayOffline ? offlineReason : lockReason('autoplay'));
   if (!autoplayOffline && canAutoplay()) {
-    el.autoplayBtn.setAttribute('data-tip', autoplayOn
-      ? '자동 재생이 켜져 있어요 · 대기열이 비면 알아서 골라 와요'
-      : '자동 재생이 꺼져 있어요 · 대기열이 비면 조용해져요');
+    el.autoplayBtn.setAttribute('data-tip', autoplayHeld
+      ? `${repeatWord}이 켜져 있어서 자동 재생은 쉬고 있어요 · 반복을 끄면 다시 골라 와요`
+      : autoplayOn
+        ? '자동 재생이 켜져 있어요 · 대기열이 비면 알아서 골라 와요'
+        : '자동 재생이 꺼져 있어요 · 대기열이 비면 조용해져요');
   }
   renderSkipButton(offline, offlineReason);
   renderNextRow(state);
