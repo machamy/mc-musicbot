@@ -1811,4 +1811,49 @@ mod tests {
         assert_eq!(player.sort_mode(guild_id), QueueSortMode::Fair);
         cleanup(player, remote, root);
     }
+
+    /* **"자동 재생 켜짐 + 트는 곡 없음" 은 눌러앉으면 안 되는 상태다.**
+     *
+     * 이 판정이 거짓을 돌려주면 `sync_guild` 의 빈 갈래가 곡을 안 채우고 그냥 돌아간다.
+     * 그러면 `/부르기` 로 봇을 불러도 조용하고, 사용자는 "불렀는데 재생이 안 된다" 로
+     * 읽는다 — 운영 로그에서 `/부르기` 11번 중 5번이 실제로 그 상태였다(2026-09-12).
+     */
+    fn empty_state(autoplay: bool) -> GuildPlayerState {
+        GuildPlayerState {
+            autoplay_enabled: autoplay,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_idle_guild_with_autoplay_on_must_be_refilled() {
+        assert!(
+            PlayerManager::should_seed_autoplay(&empty_state(true), true),
+            "자동 재생이 켜져 있고 트는 곡이 없으면 반드시 채워야 한다"
+        );
+    }
+
+    /// 꺼져 있으면 건드리지 않는다 — 끈 사람의 뜻을 뒤집으면 안 된다.
+    #[test]
+    fn autoplay_off_stays_silent() {
+        assert!(!PlayerManager::should_seed_autoplay(&empty_state(false), false));
+        assert!(!PlayerManager::should_seed_autoplay(&empty_state(false), true));
+    }
+
+    /* **한 곡 반복·대기열 반복 중에는 채우지 않는다.**
+     * 반복은 "이것만 계속" 이라는 뜻이라, 거기에 추천을 밀어 넣으면 반복이 깨진다. */
+    #[test]
+    fn repeat_wins_over_autoplay() {
+        for mode in [RepeatMode::Track, RepeatMode::Queue] {
+            let state = GuildPlayerState {
+                autoplay_enabled: true,
+                repeat_mode: mode,
+                ..Default::default()
+            };
+            assert!(
+                !PlayerManager::should_seed_autoplay(&state, true),
+                "{mode:?} 반복 중에 추천을 밀어 넣으면 안 된다"
+            );
+        }
+    }
 }

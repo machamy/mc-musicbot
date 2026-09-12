@@ -1174,16 +1174,30 @@ async fn dispatch(
             // 곡이 걸려 있는데 소리가 안 나던 상태였으면 여기서 이어진다.
             // 이미 같은 곡을 재생 중이면 sync_guild 는 볼륨·일시정지만 맞추고 지나간다.
             app.coordinator.sync_guild(app, guild_id).await;
-            respond_text(
-                ctx,
-                cmd,
-                &format!(
-                    "👋 <#{requester_vc}> {}",
-                    if moved { "로 옮겼어요." } else { "에 들어왔어요." }
+            /* **들어왔다고만 하면 안 된다.**
+             *
+             * 예전에는 결과를 안 보고 무조건 `들어왔어요` 라고 답했다. 그런데 틀 곡이
+             * 없으면 `sync_guild` 는 조용히 돌아간다 — 사용자는 "불렀는데 재생이 안 된다"
+             * 로 읽는다. 실제로 운영 로그의 `/부르기` 11번 중 5번이 그 상태였다.
+             *
+             * 자동 재생이 켜져 있으면 `sync_guild` 가 방금 한 곡 채웠을 것이다(§그쪽 주석).
+             * 그래도 못 채우는 서버가 있다(기준 곡·최근 곡·차트가 전부 빈 경우). 그때는
+             * 왜 조용한지 말해 준다. */
+            let after = app.player.get_state(guild_id).await;
+            let where_to = format!(
+                "👋 <#{requester_vc}> {}",
+                if moved { "로 옮겼어요." } else { "에 들어왔어요." }
+            );
+            let message = match (&after.current_item, after.autoplay_enabled) {
+                (Some(item), _) => format!("{where_to} ▶ {}", item.track.display_title()),
+                (None, true) => format!(
+                    "{where_to} 그런데 **틀 곡을 못 찾았어요** — 자동 재생은 켜져 있는데 참고할 곡이 없어요. `/재생` 으로 한 곡 넣어 주시면 그다음부터는 알아서 이어가요."
                 ),
-                false,
-            )
-            .await;
+                (None, false) => format!(
+                    "{where_to} 그런데 **대기열이 비어 있어요** — `/재생` 으로 곡을 넣어 주세요."
+                ),
+            };
+            respond_text(ctx, cmd, &message, false).await;
             Ok(())
         }
         "leave" => {

@@ -1091,9 +1091,45 @@ impl Coordinator {
                 return;
             };
 
-            // 현재 곡 없음 → 송출 중지 (연결은 유지: 빈채널 정책이 따로 정리).
+            /* 현재 곡 없음 → 송출 중지 (연결은 유지: 빈채널 정책이 따로 정리).
+             *
+             * **다만 자동 재생이 켜져 있으면 빈 채로 두지 않는다.**
+             *
+             * 예전에는 여기서 그냥 돌아갔다. 그래서 "자동 재생 켜짐 + 트는 곡 없음" 이라는
+             * 상태가 **그대로 눌러앉았다.** 자동 재생을 채우는 일이 전부 사건에 걸려 있어서다 —
+             * 곡이 끝날 때, 스킵할 때, 토글을 켤 때. 그 사건이 한 번 빗나가면(추천이 실패했거나
+             * 봇이 튕겨 나갔거나) 아무도 다시 채우지 않는다.
+             *
+             * 실제로 그렇게 됐다. 운영 로그에서 `/부르기` 11번 중 5번이 **들어가기만 하고
+             * 아무것도 안 틀었다** — 틀 곡이 없었는데 그 사실을 아무도 말해 주지 않았다.
+             *
+             * `sync_guild` 는 담기·빼기·스킵·부르기가 전부 지나는 목이다. 여기서 한 번
+             * 채우면 그 길 전부가 같이 고쳐진다. 한 곳에 걸어 두는 편이 부르는 자리마다
+             * 흩어 놓는 것보다 빠뜨릴 데가 적다.
+             *
+             * 채워졌으면 위로 돌아가 그 곡으로 맞춘다. 못 채웠으면(참고할 곡이 없는 서버)
+             * 예전처럼 조용히 끝낸다 — `ensure_autoplay` 가 그 사정을 로그로 남긴다.
+             * 한 번 채우면 `current_item` 이 생기므로 이 갈래를 다시 타지 않는다. */
             let Some(current) = state.current_item.clone() else {
                 self.cancel_current(guild_id).await;
+                if crate::player::manager::PlayerManager::should_seed_autoplay(&state, true) {
+                    crate::player::side_effects::ensure_autoplay(
+                        app.clone(),
+                        self.clone(),
+                        guild_id,
+                        true,
+                    )
+                    .await;
+                    if app
+                        .player
+                        .get_state(guild_id)
+                        .await
+                        .current_item
+                        .is_some()
+                    {
+                        continue;
+                    }
+                }
                 return;
             };
 
