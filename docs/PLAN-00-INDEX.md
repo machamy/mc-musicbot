@@ -29,7 +29,7 @@
 | [PLAN-02-CRATE-SPLIT.md](PLAN-02-CRATE-SPLIT.md) | 워크스페이스 크레이트 분리 ("어셈블리 분리"). 무엇이 어디로 가는지, 어떤 순서로 떼는지 | 중간 |
 | [PLAN-03-DISCORD-OPTIONAL.md](PLAN-03-DISCORD-OPTIONAL.md) | 디스코드 없이도 도는 서비스. 방·신원·권한을 디스코드에서 떼어내기 | 큰 공사 |
 | [PLAN-04-ZERO-DOWNTIME.md](PLAN-04-ZERO-DOWNTIME.md) | 노래 안 끊고 배포하기. **지금 당장 고쳐야 할 버그 포함** | 작음 |
-| [PLAN-05-WEB-DIRECT-STREAM.md](PLAN-05-WEB-DIRECT-STREAM.md) | 웹에 우리가 직접 소리 보내기. **1단계가 코드가 아니라 반나절 실측이다** | 중간 |
+| [PLAN-05-WEB-DIRECT-STREAM.md](PLAN-05-WEB-DIRECT-STREAM.md) | 웹에 우리가 직접 소리 보내기. **실측 끝났다(§0) — 안드로이드에서 지금 방식은 확실히 멈추고 이 방식은 된다. 남은 판단은 기술이 아니라 유튜브 약관이다(§6)** | 중간 |
 
 ---
 

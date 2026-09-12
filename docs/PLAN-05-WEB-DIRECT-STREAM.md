@@ -10,37 +10,46 @@
 
 ---
 
-## 0. 먼저 — 이걸 재기 전에는 한 줄도 쓰지 마라
+## 0. 실측 — 끝났다 (2026-09-13, 안드로이드)
 
-이 전환의 **유일한 큰 보상**은 "아이폰에서 홈 화면으로 나가도 소리가 계속 나는 것"이다.
-그런데 저장소는 이미 두 번 "이 구조로는 안 된다"고 적어 뒀다.
+> **이 절은 원래 '재기 전에는 한 줄도 쓰지 마라' 였다.** 그리고 표에 *"안드로이드가 이미 잘
+> 된다 → v4.57 로 충분했다"* 라고 적어 뒀는데 **그게 틀렸다.** 문제는 아이폰이 아니라
+> **안드로이드**였고, v4.69 를 배포한 뒤에도 안 고쳐졌다. 아래는 그걸 실제로 잰 결과다.
 
-> `docs/WEB-PLAYER-DESIGN.md:176` — "**모바일 백그라운드** → 임베드 정책이라 이 설계로도 안 풀린다"
-> `docs/CHANGELOG.md` v4.55 — "그 구조로는 iOS가 배경 재생을 허용하지 않아요. **이건 재생 방식을 바꿔야 하는 일이라 따로 봐야 해요.**"
+재는 장비를 만들어 뒀다 — `scripts/Test-AndroidBackgroundAudio.ps1`. 에뮬레이터(API 36,
+`google_apis_playstore`)에 실제 크롬을 띄워 두 갈래를 같은 조건으로 돌린다. 남의 폰을
+빌리지 않고 고칠 때마다 다시 잴 수 있다.
 
-여기서 "그 구조" 는 **소리가 교차 출처 iframe 안에서 난다**는 것을 가리킨다. 이 계획은
-그걸 우리 오리진의 `<audio>` 로 바꾸는 것이다. 그러면 풀릴 **것 같다**. 그런데 iOS 의
-설치형 웹앱(standalone PWA)은 오리진과 **무관하게** 백그라운드 오디오를 끊는다는 보고가
-여럿이다. 그렇다면 900줄을 쓰고도 아무것도 안 고쳐진다.
+### 결과
 
-### 실측 (반나절, 코드 0줄)
-
-1. 정적 HTML 한 장을 만든다. `<audio src="어떤.opus" controls loop>` 와
-   `navigator.mediaSession.metadata` 설정 몇 줄이 전부다.
-2. 우리 도메인 아래 아무 경로에나 올린다.
-3. **아이폰에서 홈 화면에 추가**해 설치형으로 연다. 재생을 누르고 홈 버튼으로 나간다.
-4. 안드로이드에서도 같은 것을 한다.
-
-| 결과 | 뜻 | 다음 |
+| 갈래 | JS 판정 | 플랫폼 신호 (`dumpsys audio` 의 `state:started`) |
 |---|---|---|
-| iOS 에서 **계속 난다** | 원인이 iframe 이었다 | 이 계획을 진행한다 |
-| iOS 에서 **멈춘다** | 원인이 iOS PWA 정책이다 | **여기서 멈춘다.** 아래는 전부 무의미하다 |
-| 안드로이드가 이미 잘 된다 | v4.57 로 충분했다 | 안드로이드는 전환 사유가 아니다 |
+| **A** 우리 오리진 `<audio>` (128k opus) | **계속 재생됨** · 벽시계 24.42s / 진행 24.42s (비율 1.000) | 전경 1 → 배경 **1, 1, 1** |
+| **B** 유튜브 1×1 iframe (지금 방식) | **멈췄음** · `getPlayerState()` 1→**2**(PAUSED), 시간 동결 | 전경 1 → 배경 **0, 0, 0** |
 
-50줄로 답이 나오는 것을 900줄 쓰고 알게 될 이유가 없다.
+숨는 순간(`document.hidden`) B 는 곧바로 멈춘다. A 는 25초 내내 1초당 1.00초씩 흐르고
+`paused:false` 였다 — JS 조차 안 졸았다(소리가 나는 페이지는 크롬이 덜 조인다).
+
+**대조군이 결론을 지탱한다.** B 가 같은 브라우저·같은 세션에서 멈추는 것을 같이 보지 못하면,
+A 가 살아남은 것이 "에뮬레이터가 원래 배경 정책을 안 걸기 때문" 인지 구별할 수 없다.
+둘이 갈렸으므로 에뮬레이터는 정책을 걸고 있고, A 의 성공은 진짜다.
+
+### 이 측정이 증명하지 못하는 것
+
+정직하게 적는다. 셋 다 결론을 바꿀 수 있다.
+
+1. ~~누가 멈췄는지는 모른다.~~ **해결됐다 — 유튜브다.** 측정만으로는 "유튜브가 스스로
+   멈춘다" 와 "크롬이 숨은 교차 출처 비디오를 특별 취급한다" 를 가를 수 없었는데, 크롬의
+   문서가 가려 준다: 크롬은 배경에서 **오디오 트랙이 없는** 미디어만 자동으로 멈추고,
+   소리가 있는 미디어는 **비디오 트랙만 끄고 계속 재생한다.** 즉 크롬이라면 멈추지 않았다.
+   (§7 참고)
+2. **"크롬이 배경 웹오디오를 죽인다" 는 배제됐다.** 이건 확정이다 — A 가 같은 환경에서 살았다.
+3. **제조사 절전은 아직 안 쟀다.** 에뮬레이터는 맨 안드로이드다. 삼성 One UI·샤오미는
+   프로세스를 더 적극적으로 죽인다. 여기서 통과해도 실기기 확인이 남는다 —
+   30분 이상 곡 경계를 넘겨서, 화면 잠금, 절전 모드, 블루투스 끊김, 밤새 한 번.
+   **25초 홈 시험은 "즉시 멈추는가" 만 답한다.**
 
 ---
-
 ## 1. 걱정했던 것 — 대역폭은 문제가 아니다
 
 실측 (봇 호스트 캐시 3,614곡): **평균 3.77 MB**, 최소 0.24 MB, **최대 286.74 MB**, 총 13.32 GB.
@@ -219,13 +228,61 @@ server: cloudflare · cf-ray: ...-HKG · cf-cache-status: DYNAMIC
 그러면 **집 IP 가 노출되고** 포트를 직접 열어야 한다 — `README.md:159` 의 권장과 정반대다.
 **지금 판단: 상한 10명이면 월 69GB 수준이라 일단 진행하되, 늘릴 때 다시 본다.**
 
-### 유튜브 약관
+### 유튜브 약관 — **여기가 가장 무거운 항목이다**
 
-지금은 각 브라우저가 유튜브에서 직접 받는다. 바뀌면 **재배포 주체가 사용자에서 서버로**
-옮겨 간다. 그리고 §5 의 "임베드 금지 곡이 들린다" 는 **원저작자가 건 제한을 우회하는
-것**이다. 디스코드 재생도 같은 다운로드를 하지만 청취자 수와 무관하게 한 스트림이고
-파일이 사용자에게 넘어가지 않는다 — 그 점이 다르다. 사실만 적는다.
+2026-09-13 조사(서브에이전트 + Codex)로 확인했다. 사실만 적는다.
 
+**① 지금 쓰는 1×1 임베드가 이미 규정 위반이다.** 이건 계획과 무관하게 지금 그렇다.
+
+> *"Embedded players must have a viewport that is at least 200px by 200px"*
+> — [required-minimum-functionality](https://developers.google.com/youtube/terms/required-minimum-functionality)
+
+**② 배경 재생 자체가 명시적으로 금지돼 있다.** 즉 우리가 "고치려는" 동작은 버그가 아니라
+의도된 차단이다.
+
+> *"create, include, or promote features that play content, including audio or video
+> components, from a background player, meaning a player that is not displayed in the page,
+> tab, or screen that the user is viewing"* — 개발자 정책 §III.F.3
+> — [developer-policies](https://developers.google.com/youtube/terms/developer-policies)
+
+**③ 오디오만 떼어내는 것도 금지 조항에 그대로 있다.** 이 계획의 핵심이 바로 그것이다.
+
+> *"separate, isolate, or modify the audio or video components of any YouTube audiovisual
+> content"* — 같은 문서 §III.I
+
+**④ 유튜브가 2026년 2월에 실제로 조이기 시작했다.** 구글이 공식으로 확인한 발언이다.
+우회로가 점점 막히는 방향이라는 뜻이다.
+
+> *"Background playback is a feature intended to be exclusive for YouTube Premium members. …
+> we have updated the experience to ensure consistency across all our platforms."*
+> — [9to5Google (2026-02-02)](https://9to5google.com/2026/02/02/youtube-background-playback-workarounds-not-working-third-party-browsers/)
+
+**⑤ 이 사유로 앱이 플레이 스토어에서 실제로 내려갔다.** 개발자가 배경 재생 API 를 부르지도
+않았고 유튜브 임베드 기본 컨트롤만 있었는데도 심사에서 걸렸다.
+
+- [react-native-youtube-iframe #72](https://github.com/LonelyCpp/react-native-youtube-iframe/issues/72)
+  — *"your app violates the Device and Network Abuse policy by enabling background play of YouTube videos"*
+- 안드로이드용 유튜브 플레이어 라이브러리도 같은 경고를 문서에 박아 뒀다:
+  *"you won't be able to publish your app on the Play Store"*
+  — [android-youtube-player wiki](https://github.com/PierfrancescoSoffritti/android-youtube-player/wiki/Useful-info)
+
+### 그래서 이 계획이 바꾸는 것은 무엇인가
+
+**"약관을 안 지키던 것을 지키게 되는" 변화가 아니다.** 위반의 성격이 옮겨 간다.
+
+| | 지금 | 이 계획 뒤 |
+|---|---|---|
+| 위반 조항 | §III.F.3 (배경 플레이어) · 200×200 | §III.I (오디오 분리) · 다운로드·캐싱 |
+| 누가 재배포하나 | 각 브라우저가 유튜브에서 직접 받는다 | **우리 서버가 파일을 내려준다** |
+| 노출 | 숨은 임베드 하나 | 서버가 오디오를 서빙하는 엔드포인트 |
+
+디스코드 재생도 같은 다운로드를 하지만, 그건 **청취자 수와 무관한 한 스트림이고 파일이
+사용자에게 넘어가지 않는다.** 이 계획은 그 선을 넘는다 — 파일이 사용자 브라우저로 간다.
+그게 실질적인 차이다.
+
+**판단은 이 문서가 하지 않는다.** 위험을 감수할지는 봇 주인이 정할 일이고, 이 절은 그 결정에
+필요한 사실을 갖춰 두기 위해 있다. 다만 **기술적으로는 이 길밖에 없다는 것**이 §7 에서
+확인됐으므로, 선택지는 "이 계획" 과 "안드로이드 배경 재생을 포기" 둘이다.
 ### 캐시 미스 지연
 
 웹 전용 모드의 첫 곡은 캐시에 없다. v4.56 이 기록한 "통째로 받아 재인코딩" 지연이
@@ -238,6 +295,105 @@ server: cloudflare · cf-ray: ...-HKG · cf-cache-status: DYNAMIC
 
 ---
 
+## 7. 왜 다른 길이 없는가 (2026-09-13 조사)
+
+"우리 오리진 `<audio>` 로 옮기는 것" 이 유일한 길인지 확인했다. **전부 막혀 있다.**
+
+### 멈추는 주체는 크롬이 아니라 유튜브다
+
+크롬의 배경 미디어 정책은 **오디오 트랙이 없는** 미디어만 멈춘다. 소리가 있으면 비디오
+트랙만 끄고 계속 재생한다. 그래서 크롬 탓이라면 우리 임베드는 안 멈췄어야 한다.
+
+> *"Chrome now disables video tracks when the video is played in the background … If the video
+> doesn't contain any audio tracks, the video will be automatically paused when played in the
+> background."* — [Media updates in Chrome 61](https://developer.chrome.com/blog/media-updates-in-chrome-61)
+
+유튜브 플레이어는 **Page Visibility API** 로 배경 전환을 감지해 스스로 멈춘다. 이걸 무력화
+하는 유저스크립트들이 전부 `document.hidden` 을 `false` 로, `visibilityState` 를 `visible` 로
+고정하는 방식인 것이 그 증거다 —
+[video-bg-play-userscript](https://github.com/Delphox/video-bg-play-userscript)
+
+**그래서 고치려면 유튜브 문서 안에서 코드가 돌아야 한다.** 교차 출처 `www.youtube.com/embed`
+안으로는 손이 안 들어간다. 이걸 끄는 파라미터·playerVar·`allow=` 토큰은 없다.
+
+### 시도해 볼 만해 보였던 것들 — 전부 아니오
+
+| 방법 | 되나 | 왜 |
+|---|---|---|
+| `allow="autoplay"` | ✘ | 자동재생 권한만 위임한다. 정지와 무관 |
+| 부모에서 PiP 호출 | ✘ | `requestPictureInPicture()` 는 **내 문서의** `<video>` 에만 부를 수 있다. IFrame API 에 PiP 메서드도 없다 |
+| Document PiP (iframe 을 PiP 창에) | ✘ | **안드로이드 크롬 미지원** |
+| MediaSession 핸들러로 다시 `playVideo()` | ✘ | 다시 멈춘다. 반복해서 싸우는 건 금지 조항 우회 시도다 |
+| Web Worker · 서비스워커 | ✘ | 미디어 요소를 소유하지 않는다. 페이지 가시성을 바꿀 수 없다 |
+| Wake Lock · 무음 오디오 · 소켓 심박 | ✘ | 배경 자격을 주지 않는다 |
+| PWA 로 설치 | ✘ | 설치는 임베드의 재생 계약을 바꾸지 않는다 |
+
+PiP 는 명세가 못 박아 준다 — 알고리즘이 `HTMLVideoElement` 에 정의돼 있고 호출 문서의
+transient activation 을 요구한다. 교차 출처 프레임에는 둘 다 없다.
+[W3C Picture-in-Picture](https://www.w3.org/TR/picture-in-picture/)
+
+### APK 는 답이 아니다 — 이 일의 **하류**다
+
+| | 결과 |
+|---|---|
+| **TWA** | WebView 가 아니라 **크롬**을 쓴다(Custom Tabs). 유튜브 정지를 그대로 물려받는다 |
+| **WebView 껍데기** (Capacitor·Cordova) | **크롬보다 나쁘다.** WebView 는 창 가시성이 바뀌면 미디어를 멈춘다 — 크롬에 없는 WebView 고유 동작이다. `onWindowVisibilityChanged` 를 네이티브로 덮어 억지로 살릴 수는 있는데, 그러면 **알림·잠금화면 컨트롤이 사라지고** 스토어에서 내려간다 |
+| **네이티브 플레이어** (Media3/ExoPlayer + `MediaSessionService` 포그라운드 서비스) | 확실히 튼튼하다. **그런데 재생할 스트림이 먼저 있어야 한다** |
+
+마지막 줄이 핵심이다. 네이티브 앱도 유튜브를 직접 못 튼다 — 우리 서버가 파일을 내려줘야
+한다. 즉 **1단계(`stream.rs`)를 건너뛰는 길이 아니라, 그 위에 얹는 추가 공사다.**
+[Android 배경 재생](https://developer.android.com/media/media3/session/background-playback)
+
+### 우리 오리진 `<audio>` 는 문서로 보장된 길이다
+
+크롬 안드로이드는 `<audio>`/`<video>` 재생에 알림·잠금화면 컨트롤을 띄우고, 그게 배경
+재생을 지탱한다. `display: standalone` PWA 에서도 된다.
+[미디어 알림](https://developer.chrome.com/blog/media-notifications)
+
+조건이 몇 개 붙는데, 구현할 때 그대로 지켜야 한다.
+
+- **5초보다 긴 미디어만** 알림이 뜬다.
+- **Web Audio 만으로 소리를 내면 알림이 없다.** 반드시 `<audio>` 요소를 거쳐야 한다.
+- `<audio>` 요소를 **항상 DOM 에 살려 둔다.** 붙였다 떼면 재생 권한이 흐트러진다.
+- `metadata` 와 `play`/`pause`/`previoustrack`/`nexttrack` 핸들러를 채워 둔다.
+
+### 남은 진짜 위험은 제조사 절전이다
+
+API 문제가 아니라 **기기 설정 문제**다. 샤오미·삼성·화웨이는 맨 안드로이드 위에 자체
+절전을 얹어 배경 앱을 얼린다(삼성은 기본으로 사흘 안 쓴 앱을 잠재운다).
+[dontkillmyapp.com](https://dontkillmyapp.com/problem)
+
+사용자 쪽 해결은 한 줄이다 — **설정 → 앱 → 크롬(또는 설치한 PWA) → 배터리 사용량 →
+"제한 없음".** 이걸 안내 문구로 넣어야 한다.
+
+오래 배경에 있으면 결국 멈추는 크로미움 버그도 열려 있다 —
+[issue 375973479](https://issues.chromium.org/issues/375973479)
+
+---
+
+## 8. 구현할 때 틀리기 쉬운 것 (Codex 검토)
+
+계획 초안에 있던 낙관을 고친다.
+
+- **`<audio>` 두 개로 진짜 무간격은 안 된다.** `ended`·`timeupdate`·타이머는 샘플 단위가
+  아니고, Opus 의 pre-skip/end padding 과 디코더 기동 시간이 있다. B 를 미리 완전히 준비해
+  A 가 끝나기 조금 전에 시작하고 크로스페이드하면 **주관적으로** 촘촘해진다. 코덱 수준
+  무간격은 약속하지 마라.
+- **Range 만으로 탐색 정확도가 보장되지 않는다.** 컨테이너 타임스탬프·pre-skip·연속성을
+  서버에서 검증해야 한다. 바이트 범위는 바이트만 준다.
+- **`immutable` 보다 내용 주소가 먼저다.** 순서가 바뀌면 잘못 만든 파일이 캐시에 박혀
+  안 빠진다. `cache_key` 가 이미 내용 주소이므로 그걸 URL 에 넣고 나서 `immutable` 을 건다.
+- **`206`·`Content-Range`·`Accept-Ranges`·MIME·검증자(ETag)·CORS 를 제대로 준다.**
+- **MediaSession 은 문서 단위다.** 두 `<audio>` 사이에 "인계" 같은 것은 없다. 핸들러 한 벌을
+  두고 어느 쪽이 주인이 됐을 때 `metadata`·`positionState` 만 갱신한다.
+- **두 요소가 동시에 소리를 내지 않게 한다**(의도한 크로스페이드 구간 제외). 안 그러면
+  크롬·시스템의 미디어 상태 판정이 흐려진다.
+- **첫 재생은 탭이 직접 `play()` 를 불러야 한다.** 사이에 `await` 를 끼우면 사용자 활성화가
+  소모돼 거절된다. 불러오기·디코딩·MediaSession 설정은 활성화를 만족시키지 않는다.
+- **브라우저 캐시는 할당량 관리 대상이라 언제든 비워진다.** 미리받기는 최적화일 뿐
+  저장소로 취급하면 안 된다.
+
+---
 ## 단계
 
 | # | 무엇 | 선행 | 크기 |
