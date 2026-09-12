@@ -3716,6 +3716,10 @@ async fn api_state_hot(
 }
 
 /// `GET /state/cold` — 진입 시 1회 + `settings`/`library`/`suspension` 이벤트 시.
+/// 🕘 최근 탭에 보여 줄 곡 수. DB 보존량(`recent_keep`, 기본 500)과는 다른 값이다 —
+/// 이건 **한 번에 보여 줄 개수**고, 그쪽은 얼마나 오래 남겨 두느냐다.
+const RECENT_PANE_LIMIT: usize = 100;
+
 async fn api_state_cold(
     State(state): State<Arc<WebState>>,
     cookies: Cookies,
@@ -3767,10 +3771,13 @@ async fn api_state_cold(
         .iter()
         .map(|row| json!({ "track": track_json(&row.track) }))
         .collect();
+    /* 🕘 최근 탭이 받는 목록. DB 는 `recent_keep`(기본 500)까지 들고 있어서 여기 숫자만큼
+     * 보인다 — 50 이던 것을 100 으로 올렸다. 페이지를 열 때 한 번 나가는 스냅샷이라
+     * (`api_state_cold`) 반복 트래픽이 아니고, 화면은 받은 만큼 그대로 그린다(`renderRecent`). */
     let recent: Vec<Value> = state
         .app
         .remote
-        .list_recent(guild_id, 50)
+        .list_recent(guild_id, RECENT_PANE_LIMIT)
         .iter()
         .map(|row| {
             json!({
