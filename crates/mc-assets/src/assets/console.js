@@ -45,6 +45,7 @@ import { store, connect, api, h, list, tooltip, toast, sheet, confirmSheet, them
 const M = window.MACHAM || {};
 const GUILD_ID = String(M.guildId || '');
 const IS_OWNER = M.tier === 'owner';
+const OWNER_ONLY = M.ownerOnly === true;
 const CAN_MANAGE = IS_OWNER || M.tier === 'manager';
 
 /* ═══════════════════════════ 상수 테이블 ═══════════════════════════ */
@@ -70,10 +71,11 @@ const SECTIONS = [
  * 되돌릴 방법이 사람의 기억밖에 없다.
  */
 const OWNER_SECTION = {
-  id: 'owner', icon: '🌐', label: '전역 강제값',
+  id: 'owner', icon: '🌐', label: '봇 주인 설정',
   desc: '봇 주인만 보이는 화면이에요. 여기서 고정한 항목은 모든 서버에서 같은 값이 되고, 서버 관리자 화면에서는 자물쇠가 걸려요.',
 };
 if (IS_OWNER) SECTIONS.push(OWNER_SECTION);
+if (OWNER_ONLY) SECTIONS.splice(0, SECTIONS.length, OWNER_SECTION);
 
 /** 권한 규칙 5종. desc 는 드롭다운 옆 한 줄 설명(구림 해소 #1). */
 const RULE_OPTIONS = [
@@ -713,12 +715,12 @@ function dirtyKeys(sectionId) {
 function anyDirty() {
   // 전역 강제값은 `SECTION_KEYS` 밖에 있다. 여기 안 세면 저장 안 하고 창을 닫아도 아무 말이 없다.
   return Object.keys(SECTION_KEYS).some((id) => dirtyKeys(id).length > 0)
-    || ownerDirtyKeys().length > 0;
+    || ownerDirtyKeys().length > 0 || S.streamDirty || S.playbackDirty;
 }
 
 /** 섹션 하나의 저장 안 한 변경 수 — 전역 강제값만 셈법이 다르다. */
 function sectionDirtyCount(id) {
-  return id === 'owner' ? ownerDirtyKeys().length : dirtyKeys(id).length;
+  return id === 'owner' ? ownerDirtyKeys().length + Number(!!S.streamDirty) + Number(!!S.playbackDirty) : dirtyKeys(id).length;
 }
 
 /** 변경된 항목만 강조 + 섹션 푸터 갱신 (구림 해소 #5). */
@@ -4033,6 +4035,7 @@ async function loadOwnerOverrides() {
     const data = await api('/music/api/owner/overrides');
     const overrides = (data && data.overrides) || {};
     S.owner.data = overrides;
+    S.owner.defaults = data.defaults || {};
     S.owner.unlimitedKeys = Array.isArray(data && data.unlimitedKeys) ? data.unlimitedKeys : [];
     S.owner.saved = ownerMapFrom(overrides);
     S.owner.draft = clone(S.owner.saved);
@@ -4063,7 +4066,7 @@ function ownerKind(key) {
  * 모든 서버가 그 값으로 끌려간다 — 켜기만 했는데 사고가 나는 자리다.
  */
 function ownerSeedValue(key) {
-  const current = S.saved ? S.saved[key] : undefined;
+  const current = OWNER_ONLY ? S.owner.defaults?.[key] : S.saved?.[key];
   if (ownerKind(key) === 'bool') return typeof current === 'boolean' ? current : false;
   if (typeof current === 'number' && Number.isFinite(current)) return Math.round(current);
   const spec = NUM_SPECS[key];
@@ -4369,9 +4372,17 @@ function sectionOwner() {
     body.append(h('p', { class: 'hint' }, '봇 주인만 볼 수 있는 화면이에요.'));
     return body;
   }
+  if (!OWNER_ONLY) {
+    body.append(h('p', { class: 'hint' }, '봇 전체 설정은 서버별 관리 화면과 분리해 한곳에서 관리해요.'),
+      h('a', { class: 'btn btn--primary', href: '/music/owner' }, '봇 주인 설정 열기'));
+    return body;
+  }
 
   ownerBox = h('div', { class: 'ovr' });
   body.append(streamSettingsPanel());
+  body.append(ownerPlaybackPanel());
+  body.append(h('p', { class: 'hint' }, 'OAuth·봇 주인 ID·호스트 쿠키는 별도 인증이 필요한 운영 연결 설정에서 관리해요.'),
+    h('a', { class: 'btn btn--ghost', href: M.opsUrl || '/', target: '_blank', rel: 'noreferrer' }, '운영 연결·시크릿 설정 열기'));
   body.append(
     h('div', { class: 'ovrwarn' },
       h('span', { class: 'ovrwarn__ico', 'aria-hidden': 'true' }, '🌐'),
@@ -4529,7 +4540,7 @@ async function saveSection(id) {
 async function guardLeave() {
   if (!anyDirty()) return true;
   const count = Object.keys(SECTION_KEYS).reduce((sum, id) => sum + dirtyKeys(id).length, 0)
-    + ownerDirtyKeys().length;
+    + sectionDirtyCount('owner');
   return confirmSheet({
     title: '저장하지 않은 변경이 있어요',
     desc: `${count}개 항목을 바꿔 두고 아직 저장하지 않으셨어요. 이대로 나가면 변경은 사라져요.`,
@@ -4610,6 +4621,8 @@ function revertSectionSilently(id) {
   // 전역 강제값은 길드 설정 draft 가 아니라 자기 맵을 들고 있다.
   if (id === 'owner') {
     if (S.owner.saved) S.owner.draft = clone(S.owner.saved);
+    S.streamDirty = false;
+    S.playbackDirty = false;
     return;
   }
   (SECTION_KEYS[id] || []).forEach((key) => { S.draft[key] = clone(S.saved[key]); });
@@ -4749,12 +4762,12 @@ function renderShell() {
 
   const back = h('a', {
     class: 'btn btn--ghost head__back',
-    href: `/music/guilds/${GUILD_ID}`,
+    href: OWNER_ONLY ? '/music' : `/music/guilds/${GUILD_ID}`,
     'data-tip': '유저용 리모컨 화면으로 가요',
     'aria-label': '리모컨으로 돌아가기',
     onclick: async (event) => {
       event.preventDefault();
-      if (await guardLeave()) location.href = `/music/guilds/${GUILD_ID}`;
+      if (await guardLeave()) location.href = OWNER_ONLY ? '/music' : `/music/guilds/${GUILD_ID}`;
     },
   },
     h('span', { class: 'head__back-ico', 'aria-hidden': 'true' }, '←'),
@@ -4764,7 +4777,7 @@ function renderShell() {
   const head = h('header', { class: 'cs__head' },
     back,
     h('div', { class: 'head__title' },
-      h('h1', null, '서버 관리'),
+      h('h1', null, OWNER_ONLY ? '봇 주인 설정' : '서버 관리'),
       h('span', { class: 'head__guild' }, (M.guild && M.guild.name) || ''),
     ),
     dirtyBadge,
@@ -4848,7 +4861,7 @@ async function boot() {
   main.append(h('div', { class: 'skel', style: 'height:60vh' }));
 
   try {
-    const [settings, roles] = await Promise.all([
+    const [settings, roles] = OWNER_ONLY ? [{}, { roles: [] }] : await Promise.all([
       api('/admin/settings'),
       api('/admin/roles').catch(() => ({ roles: [] })),   // 역할은 없어도 나머지는 동작해야 한다
     ]);
@@ -4871,7 +4884,7 @@ async function boot() {
 
   main.replaceChildren();
   const wanted = location.hash.replace('#', '');
-  renderSection(SECTIONS.some((spec) => spec.id === wanted) ? wanted : 'order');
+  renderSection(SECTIONS.some((spec) => spec.id === wanted) ? wanted : OWNER_ONLY ? 'owner' : 'order');
 
   // 저장 안 하고 창을 닫으려 하면 브라우저 확인 (구림 해소 #5).
   window.addEventListener('beforeunload', (event) => {
@@ -4898,7 +4911,7 @@ async function boot() {
   // WS — 콘솔이 열려 있는 동안 정지/설정/접속/시드 변화를 따라간다.
   // onEvent 는 core.js 가 처리하지 않은 토픽에만 오고, presence/settings/suspension/queue.set 은
   // core.js 가 자체 머지한다. 콘솔은 그 토픽들도 봐야 하므로 모든 프레임을 주는 onAny 를 쓴다.
-  connect(GUILD_ID, {
+  if (!OWNER_ONLY) connect(GUILD_ID, {
     onAny: (topic, data) => onRemoteEvent(topic, data),
   });
 
@@ -4992,9 +5005,24 @@ function streamSettingsPanel() {
   const status = h('p', { class: 'hint' }, '설정을 읽고 있어요…');
   panel.append(status);
   api('/music/api/owner/stream').then((data) => {
+    const markDirty = () => { S.streamDirty = true; refreshDirty(); };
+    panel.addEventListener('input', markDirty);
     const enabled = h('input', { type: 'checkbox', checked: data.enabled });
     const transfers = h('input', { class: 'field', type: 'number', min: '1', max: '30', value: data.maxTransfers });
     const bandwidth = h('input', { class: 'field', type: 'number', min: '128', max: '20000', value: data.bandwidthKbps });
+    const prefetch = h('input', { type: 'checkbox', checked: data.prefetch !== false });
+    const routes = clone(data.routes || ['origin', 'server', 'embed'].map(source => ({ source, enabled: true })));
+    const routeNames = { origin: '원본에서 클라이언트가 직접 받기', server: '봇 서버 캐시에서 받기', embed: '유튜브·사운드클라우드 임베드' };
+    const routeList = h('div', { class: 'ovr' });
+    const paintRoutes = () => {
+      routeList.replaceChildren(...routes.map((route, index) => h('div', { class: 'actions' },
+        h('label', null, h('input', { type: 'checkbox', checked: route.enabled, onChange: event => { route.enabled = event.target.checked; } }), `${index + 1}. ${routeNames[route.source]}`),
+        h('button', { class: 'btn btn--ghost', type: 'button', disabled: index === 0,
+          'aria-label': `${routeNames[route.source]} 우선순위 올리기`, onClick: () => { [routes[index - 1], routes[index]] = [routes[index], routes[index - 1]]; markDirty(); paintRoutes(); } }, '↑'),
+        h('button', { class: 'btn btn--ghost', type: 'button', disabled: index === routes.length - 1,
+          'aria-label': `${routeNames[route.source]} 우선순위 내리기`, onClick: () => { [routes[index + 1], routes[index]] = [routes[index], routes[index + 1]]; markDirty(); paintRoutes(); } }, '↓'))));
+    };
+    paintRoutes();
     status.textContent = `현재 전송 ${data.active}개 · 대기 ${data.queued}개. 모든 서버가 같은 업로드 예산을 나눠 써요.`;
     const save = h('button', { class: 'btn btn--primary', type: 'button', onClick: async () => {
       if (!transfers.reportValidity() || !bandwidth.reportValidity()) return;
@@ -5002,17 +5030,71 @@ function streamSettingsPanel() {
       try {
         const result = await api('/music/api/owner/stream', { method: 'PUT', body: {
           enabled: enabled.checked, maxTransfers: Number(transfers.value), bandwidthKbps: Number(bandwidth.value),
+          routes, prefetch: prefetch.checked,
         } });
         transfers.value = result.maxTransfers;
         bandwidth.value = result.bandwidthKbps;
+        S.streamDirty = false; refreshDirty();
         toast('웹 직접 받기 설정을 저장했어요.', 'ok');
       } catch (error) { toast(error.message, 'warn'); }
       finally { save.disabled = false; }
     } }, '직접 받기 설정 저장');
     panel.append(h('label', null, enabled, ' 웹 직접 받기 허용'),
-      h('label', null, '동시 전송 수 (1~30개)', transfers),
-      h('label', null, '전체 업로드 상한 (128~20,000 kbps)', bandwidth),
+      h('p', { class: 'hint' }, '켜 둔 경로를 위에서 아래 순서로 시도해요. 원본·서버 모두 작은 파일은 전체 받기, 큰 파일은 구간 재생이에요. 전부 끄면 직접 받기에서는 소리가 나지 않아요.'),
+      routeList, h('label', null, prefetch, ' 다음 곡도 미리 받기'),
+      h('label', { class: 'fld__ctl' }, '동시 전송 수 (1~30개)', transfers),
+      h('label', { class: 'fld__ctl' }, '전체 업로드 상한 (128~20,000 kbps)', bandwidth),
       h('p', { class: 'hint' }, '실제 업로드에서 Discord와 다른 사용량을 뺀 여유 안에서 정해 주세요. 0은 무제한이 아니에요. 기본 2,000 kbps는 약 15명분이며, 전송 수가 회선 용량을 늘리지는 않아요.'), save);
   }).catch((error) => { status.textContent = error.message; });
+  return panel;
+}
+
+function ownerPlaybackPanel() {
+  const panel = h('div', { class: 'ovr' }, h('h3', null, '전역 재생 기본값·호스트 자원'));
+  const status = h('p', { class: 'hint' }, '서버별 설정과 달리 모든 서버의 기본값을 바꿔요. 읽고 있어요…');
+  panel.append(status);
+  api('/music/api/owner/playback').then(data => {
+    const specs = [
+      ['masterVolume', '마스터 볼륨 (0~200)', 0, 200], ['normalizeEnabled', '볼륨 평준화'],
+      ['autoplayDefault', '자동추천 기본값'], ['announceNowPlaying', '곡 시작 알림'],
+      ['emptyVoiceForced', '빈 채널 정책을 모든 서버에 강제 적용'], ['autoLeaveWhenEmpty', '빈 음성 채널 감지'],
+      ['autoLeaveDelaySeconds', '빈 채널 대기 시간 (초)', 5, 3600],
+      ['emptyVoicePolicy', '빈 채널 정책', ['AutoLeave', '자동 퇴장'], ['StopPlayback', '재생 중단'], ['DoNothing', '그대로 두기']],
+      ['cacheLimitGb', '서버 캐시 한도 (GB)', 1, 4096], ['logRetentionDays', '운영 로그 보관 (일)', 1, 3650],
+      ['sponsorblockRemove', '새 캐시의 인트로·아웃트로 제거 (SponsorBlock)'],
+      ['tweakFfmpegFastStart', 'ffmpeg 빠른 시작 (실험)'], ['tweakFfmpegDirectOutput', 'ffmpeg 즉시 출력 (실험)'],
+      ['voiceBitrateKbps', 'Discord 송출 비트레이트 (kbps)', 32, 128],
+    ];
+    const fields = specs.map(([key, label, minimum, maximum, ...rest]) => {
+      const control = Array.isArray(minimum)
+        ? h('select', { class: 'field' }, [minimum, maximum, ...rest].map(([value, title]) => h('option', { value, selected: data[key] === value }, title)))
+        : h('input', { class: minimum === undefined ? '' : 'field', type: minimum === undefined ? 'checkbox' : 'number',
+          ...(minimum === undefined ? { checked: data[key] } : { min: minimum, max: maximum, value: data[key] }) });
+      const read = () => Array.isArray(minimum) ? control.value : minimum === undefined ? control.checked : Number(control.value);
+      panel.append(minimum === undefined
+        ? h('label', { class: 'fld__head' }, control, h('span', null, label))
+        : h('label', { class: 'fld__ctl' }, label, control));
+      return { key, control, read };
+    });
+    const changes = () => Object.fromEntries(fields.filter(field => field.read() !== data[field.key]).map(field => [field.key, field.read()]));
+    panel.addEventListener('input', () => { S.playbackDirty = Object.keys(changes()).length > 0; refreshDirty(); });
+    const save = h('button', { class: 'btn btn--primary', type: 'button', onClick: async () => {
+      if (!fields.every(field => field.control.reportValidity())) return;
+      save.disabled = true;
+      try {
+        const saved = await api('/music/api/owner/playback', { method: 'PUT', body: changes() });
+        Object.assign(data, saved);
+        for (const field of fields) {
+          if (field.control.type === 'checkbox') field.control.checked = data[field.key];
+          else field.control.value = data[field.key];
+        }
+        S.playbackDirty = false; refreshDirty();
+        toast('전역 기본값을 저장했어요. 볼륨은 바로, 나머지는 다음 적용 시점부터 반영돼요.', 'ok');
+      } catch (error) { toast(error.message, 'warn'); }
+      finally { save.disabled = false; }
+    } }, '전역 재생 기본값 저장');
+    status.textContent = '빈 채널 강제를 끄면 각 서버가 정한 정책을 따라요. SponsorBlock은 새 캐시에만 적용되며 원본 음원과 길이가 달라질 수 있어요.';
+    panel.append(save);
+  }).catch(error => { status.textContent = error.message; });
   return panel;
 }

@@ -277,6 +277,13 @@ pub fn admin(
     )
 }
 
+pub fn owner(session: &RemoteSession, build_id: &str) -> String {
+    shell("봇 주인 설정", build_id, "console.css", "console.js", &json!({
+        "ownerOnly": true, "csrf": session.csrf_token, "buildId": build_id,
+        "user": user_json(session), "tier": "owner", "opsUrl": super::ops_panel_url(),
+    }), r#"<div id="app"></div><noscript>봇 주인 설정은 자바스크립트가 필요해요.</noscript>"#)
+}
+
 /// 로그인 없이 보는 "지금 이 곡" 화면 (§29).
 ///
 /// **일부러 아주 작다.** 리모컨 셸을 재사용하면 로그인 안 한 사람에게 채팅·멤버·대기열

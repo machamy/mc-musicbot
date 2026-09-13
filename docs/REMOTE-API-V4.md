@@ -357,13 +357,24 @@ WebSocket 대신 5초 폴링 + ETag를 쓴다. 로그인 안 한 사람에게 �
 `PUT /music/api/owner/stream`: 봇 주인 세션 + `X-CSRF-Token`, 설정 문서 전체 교체.
 
 ```json
-{ "enabled": false, "maxTransfers": 10, "bandwidthKbps": 2000 }
+{
+  "enabled": false, "maxTransfers": 10, "bandwidthKbps": 2000, "prefetch": true,
+  "routes": [
+    { "source": "origin", "enabled": true },
+    { "source": "server", "enabled": true },
+    { "source": "embed", "enabled": true }
+  ]
+}
 ```
 
 - `maxTransfers`: 1~30, 기본 10. 청취자 수가 아니라 전송 중인 응답 수다.
 - `bandwidthKbps`: 128~20,000, 기본 2,000. 십진 kbps이며 모든 길드·Range 요청이 공유한다.
   이 안전 예산에는 0=무제한 규칙을 적용하지 않는다. 저장/읽기 양쪽에서 범위를 제한한다.
 - `settings` 테이블의 `remote_web_stream` 키에 저장한다. 레거시 스키마 변경은 없다.
+- `routes`: 위에서 아래로 켜진 경로만 시도한다. origin=원본 CDN, server=봇 캐시, embed=외부 임베드.
+  중복 source는 첫 항목만 유지하고 누락 source는 꺼짐으로 뒤에 붙인다. 모르는 source는 거부한다.
+  `routes` 자체를 생략한 옛 설정은 기본 순서를 받는다. 빈 배열은 모든 경로 꺼짐이다.
+- `prefetch`: 기본 true. 현재·다음 곡 동시 준비 여부다. false이면 현재 곡만 받는다.
 - GET/PUT 응답에는 `active`, `queued`, `sentBytes`, `blobLimitBytes`가 추가된다.
   `sentBytes`는 속도 제한기에 청구한 본문 바이트이며 네트워크 수신 완료 통계는 아니다.
 
@@ -390,6 +401,26 @@ descriptor의 `durationSeconds`는 서버 시각표의 곡 길이다. 디코딩�
 다르면 이번 곡은 폴백한다. 구간 제거된 캐시를 원본 시각표로 틀어 무음이 생기는 것을 막는다.
 URL은 파일 경로가 아니라 길드의 큐 항목 ID를 받는다. 논리 캐시 키를 내용 해시로 보지 않는다.
 
+상태 객체에는 `routes`와 `prefetch`, descriptor에는 원본 조회용 `sourceUrl`도 포함한다.
+서명된 CDN URL 자체를 WS 상태 프레임에 싣지 않는다.
+
+### 원본 주소 조회
+
+`GET /music/api/guilds/{guild_id}/stream/{item_id}/source`는 파일 응답과 같은 인가·현재/다음
+허용 목록을 검사한다. 전역 기능과 origin 경로가 모두 켜져 있어야 한다. 추출 뒤에도 다시 검사한다.
+응답은 `{ "source": null }` 또는 `{ "source": { "url", "mime", "sizeBytes", "durationSeconds", "expiresAt" } }`다.
+크기/만료 시각은 null일 수 있다. `Cache-Control: private, no-store`이며 사용자별 현재/다음 각 1초 제한이다.
+추출은 전역 최대 2개, 15초 한도, 곡별 결과 60초 공유(최대 128개)이며 재생 전송 슬롯과는 별개다.
+yt-dlp 설정 파일·인증 체인을 사용하지 않는 익명 메타데이터 조회다. 오디오 파일은 서버가 받지 않는다.
+서버 쿠키·프로필·HTTP 헤더·전체 추출 JSON을 클라이언트에 반환하지 않는다.
+HTTPS의 googlevideo.com/sndcdn.com 하위 도메인과 지원하는 오디오 형식만 허용한다.
+
+클라이언트는 원본의 작은 파일을 `credentials:omit` CORS fetch로 받고, 크기 미상/큰 파일은
+native audio로 재생한다. fetch 실패 뒤에는 원본 native audio도 한 번 시도한 뒤 다음 경로로 간다.
+native audio는 브라우저의 교차 출처 미디어 정책을 따르며 서버 소유자의 인증을 대신 보내지 않는다.
+IP·브라우저 헤더·만료·원본 접근 제한 때문에 원본 경로는 실패할 수 있다. 원본 성공 시에만 봇의
+음원 업로드를 줄이며, 원본 조회 CPU/메타데이터 트래픽까지 0인 것은 아니다.
+
 ### 파일 응답
 
 `GET|HEAD /music/api/guilds/{guild_id}/stream/{item_id}`:
@@ -400,6 +431,11 @@ URL은 파일 경로가 아니라 길드의 큐 항목 ID를 받는다. 논리 �
 `If-None-Match`의 `304`, `If-Range` 불일치 시 전체 `200`을 지원한다.
 HEAD는 Range를 무시하고 전체 길이만 준다. 잘못된 형식/다중 Range는 Range를 무시하고 200이다.
 MIME은 `audio/ogg; codecs=opus`, ETag는 실제 파일 SHA-256이다.
+단일 206 본문은 최대 1 MiB다. 요청 범위가 더 크면 `Content-Range`의 끝 다음부터
+클라이언트가 재요청한다. 전체 200/HEAD 및 If-Range 불일치 의미는 바꾸지 않는다.
+이는 [RFC 9110 §15.3.7](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.7)의
+요청 범위 일부 응답이다. 큰 파일의 SHA-256은 경로·크기·수정 시각별 최대 128개를
+메모리에 보관하여 매 Range마다 전체 파일을 다시 읽지 않는다. 파일 수정 시 다시 계산한다.
 `Cache-Control: private, no-cache`, `Vary: Cookie`로 인가 재검증과 공용 캐시 금지를 명시한다.
 CORS를 열지 않는 동일 오리진 API이고, 서비스워커 `/music/api/*` 우회 경로를 쓴다.
 
@@ -413,12 +449,22 @@ CORS를 열지 않는 동일 오리진 API이고, 서비스워커 `/music/api/*`
 본문은 16 KiB 단위, 사용자당 고정 60초 창 64 MiB를 넘으면 연결을 끝낸다.
 소비자가 읽지 않아도 시한이 지나면 파일 pin과 슬롯을 반납한다.
 
-클라이언트는 최대 32 MiB 파일 두 개만 Blob으로 유지한다. 대기/실패에는 지연을 두고
-재시도하며, 후보 교체·끄기·페이지 종료 때 요청을 취소하고 URL을 해제한다.
-큰 파일의 Range API는 지원하지만 이번 포털은 큰 파일/라이브를 임베드로 재생한다.
-다운로드는 예산·동시성에 따라 180초 안에 끝나지 않을 수 있으며 이때도 폴백한다.
+클라이언트는 최대 32 MiB 파일 두 개만 Blob으로 유지한다. 실패하면 설정된 다음 경로로
+이동하며, 후보 교체·끄기·정책 변경·페이지 종료 때 요청을 취소하고 URL을 해제한다.
+32 MiB 초과 파일은 같은 audio에 인증된 동일 오리진 URL을 연결한다. 브라우저가
+Range로 필요한 부분을 받고 다음 곡도 `preload=auto`로 준비한다. 이는 힌트이며 MSE·remux는 없다.
+전체 선다운로드나 오프라인 재생은 보장하지 않으며, 버퍼 밖으로 이동하면 네트워크가 필요하다.
+라이브·코덱/디코딩 오류에는 기존 임베드로 폴백한다.
+다운로드는 예산·동시성에 따라 180초 안에 끝나지 않을 수 있으며 이때 다음 경로로 이동한다.
+원본 Blob은 30초, 원본 조회 클라이언트 대기는 17초, native 초기 준비/버퍼 정지는 20초 한도다.
+서버 캐시가 없으면 최대 30초 기다린다. 모든 경로가 꺼졌거나 실패했고 embed도 없으면 무음과 안내다.
 두 audio는 DOM에 계속 유지한다. 다음 곡은 서버가 실제로 바꾼 뒤에만 틀고,
 진짜 무간격이나 JS 동결 상태의 곡 전환은 보장하지 않는다.
+
+포털의 다운로드 현황은 서버 descriptor의 `ready`/`sizeBytes`와 기기의 수신 상태를
+구분한다. Blob은 수신 바이트·남은 바이트·진행률·전송 평균 속도 기반 예상 시간을 표시한다.
+전송 큐 대기 시간은 예측하지 않으며, Range는 정확한 받은 바이트 대신 현재 위치 이후
+연속 `audio.buffered` 초를 표시한다. 탭 메모리 보관을 영구 저장이나 서버 캐시 목록으로 부르지 않는다.
 
 ### 검증
 
@@ -428,3 +474,36 @@ CORS를 열지 않는 동일 오리진 API이고, 서비스워커 `/music/api/*`
 `PLAN05_BASE`(기본 `http://127.0.0.1:8791`), `PLAN05_CHROME`, `PLAN05_AUDIO`로 지정한다.
 실제 포털·오디오 디코더를 사용하고 곡 일정·외부 임베드·파일 응답은 고정 fixture로 대체한다.
 장시간 Android 실기기/잠금/절전/블루투스 검증은 별도로 남는다. 배포는 이 작업에 포함하지 않는다.
+
+Android 포털 검증은 `scripts/Test-AndroidWebDirectStream.cjs`다. 위 로컬 서버와
+Play Store 이미지의 실행 중인 AVD(Chrome 설치), `playwright-core`가 필요하다.
+`PLAN05_DEVICE`는 에뮬레이터 serial(기본 `emulator-5554`)만 받는다. 해당 AVD의 Chrome을
+시험 사이에 종료하므로 개인 작업용 AVD에서는 실행하지 않는다. 운영 서버에는 접속하지 않는다.
+
+```powershell
+ffmpeg -y -loglevel error -f lavfi -i sine=frequency=440:duration=90 -c:a libopus -b:a 128k .devrun/plan05-avd-tone.opus
+ffmpeg -y -loglevel error -f lavfi -i sine=frequency=440:duration=2100 -c:a libopus -b:a 128k .devrun/plan05-avd-long.opus
+node scripts/Test-AndroidWebDirectStream.cjs
+$env:PLAN05_RANGE = '1'
+node scripts/Test-AndroidWebDirectStream.cjs
+Remove-Item Env:PLAN05_RANGE
+```
+
+실제 portal/core와 Android Opus 디코더를 쓰며, 일정·외부 임베드·음원은 로컬 fixture다.
+Range 시험은 32 MiB 초과의 실제 Opus를 1 MiB씩 응답한다. 홈 45초·화면 꺼짐 45초·
+꺼진 화면에서 곡 경계 110초를 측정한다. CDP는 조작에만 쓰고 측정 전에 분리한다.
+복귀 첫 visibility 이벤트의 미디어 시각과 Android `dumpsys audio`를 함께 검사하며,
+실패 시 종료 코드 1이다. `.devrun/plan05-avd-{blob,range}*`에 보고와 스크린샷을 남긴다.
+네트워크는 localhost/adb reverse이고 로그인도 개발 계정이다. 이 결과는 운영 OAuth·프록시·
+실제 이동통신망·제조사 절전 정책·블루투스 검증을 대체하지 않는다.
+
+### 봇 주인 설정 단일 진입점
+
+`GET /music/owner`: Discord 봇 주인 전용, 길드 선택과 무관한 설정 화면이다. 서버별
+`/music/guilds/{id}/admin#owner`에서는 이 페이지로 안내한다.
+`GET /music/api/owner/playback`는 전역 재생 기본값·캐시/로그 한도·음성 정책만 반환한다.
+`PUT`은 봇 주인 + CSRF가 필요하며 보낸 필드만 바꾼다. 숫자는 기존 범위로 제한하고
+모르는 키·잘못된 타입은 400이다. 볼륨은 활성 길드에 즉시 반영한다.
+호스트 쿠키 경로·브라우저 프로필·OAuth 비밀값은 이 API에 없고 변경도 거부한다.
+기존 운영 `/settings`는 연결·도구 전용이며 CSRF 검증 후 해당 필드만 저장한다.
+운영 사이트의 `/botsettings` 인증 설정과 Discord OAuth의 보안 경계는 합치지 않는다.

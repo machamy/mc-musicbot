@@ -532,179 +532,58 @@ pub async fn diagnostics(State(state): Ctx, cookies: Cookies) -> Response {
 // ───────── 재생 설정 ─────────
 
 pub async fn settings_page(State(state): Ctx, cookies: Cookies) -> Response {
-    if let Some(r) = require_auth(&state, &cookies) {
-        return r;
-    }
-    let s = state.app.db.load_global_settings();
-    // 올려 둔 쿠키의 **요약만** 읽는다 (줄 수·유튜브 개수·로그인 여부). 내용은 안 본다.
-    let cookie_line = cookie_status_line(&state);
-    let chk = |b: bool| if b { "checked" } else { "" };
-    let pol = |p: EmptyVoiceChannelPolicy, v: EmptyVoiceChannelPolicy| {
-        if p == v { "selected" } else { "" }
-    };
-    let body = format!(
-        r#"<h1 class="page-title">재생 설정</h1><p class="page-sub">모든 서버가 기본으로 따르는 전역 재생 옵션입니다.</p>
+    if let Some(response) = require_auth(&state, &cookies) { return response; }
+    let settings = state.app.db.load_global_settings();
+    let csrf = html_escape(&admin_csrf_token(&state, &cookies).unwrap_or_default());
+    let status = cookie_status_line(&state);
+    let body = format!(r#"<h1 class="page-title">연결·도구 설정</h1>
+<p class="page-sub">재생 정책과 웹 직접 받기는 봇 주인 설정 한곳에서 관리해요. 이곳에는 호스트의 연결 정보와 시크릿만 남겨요.</p>
+<div class="card"><h2>봇 주인 설정</h2><p>전역 재생 기본값·빈 채널 정책·웹 재생 경로 순서·전역 강제값을 한곳에서 바꿔요.</p>
+<a class="btn btn-primary" href="{owner}">봇 주인 설정 열기</a><p class="hint">리모컨의 Discord 봇 주인 계정으로 로그인해 주세요. 운영 비밀번호와 쿠키를 다른 사이트로 넘기지 않아요.</p></div>
 <form method="post" action="/settings">
-<div class="card"><h2>기본 재생</h2>
-<label class="field">마스터 볼륨 (0–200)</label><input type="number" name="master_volume" min="0" max="200" value="{mv}"/>
-<label class="checkbox"><input type="checkbox" name="normalize_enabled" {ne}/> 볼륨 평준화 켜기</label>
-<label class="checkbox"><input type="checkbox" name="autoplay_default" {ad}/> 자동추천 기본값 켜기</label>
-</div>
-<div class="card"><h2>음성 채널 / 알림</h2>
-<p class="hint">평소에는 <b>서버마다 리모컨에서 각자 정한다.</b> 아래 값은 강제로 걸 때만 쓰인다.</p>
-<label class="checkbox" title="켜면 모든 서버가 아래 설정을 그대로 따르고, 서버 관리자는 리모컨에서 바꿀 수 없다. 끄면 아래 세 값은 쓰이지 않는다."><input type="checkbox" name="empty_voice_forced" {evf}/> <b>모든 서버에 강제 적용</b> (서버 주인도 못 바꿈)</label>
-<label class="checkbox"><input type="checkbox" name="auto_leave_when_empty" {al}/> 빈 음성 채널 감지 켜기</label>
-<label class="field">빈 채널 대기 시간(초, 5–3600)</label><input type="number" name="auto_leave_delay_seconds" min="5" max="3600" value="{ald}"/>
-<label class="field">빈 음성 채널 정책</label>
-<select name="empty_voice_policy" title="자동 퇴장: 대기 시간이 지나면 재생을 멈추고 음성 채널에서 나가요. 재생 중단: 재생만 멈추고 채널에는 그대로 머물러요. 그대로 둠: 아무도 없어도 계속 재생해요.">
-<option value="AutoLeave" {p1} title="대기 시간이 지나면 재생을 멈추고 음성 채널에서 나가요.">자동 퇴장</option>
-<option value="StopPlayback" {p2} title="대기 시간이 지나면 재생만 멈추고 음성 채널에는 그대로 남아요.">재생 중단</option>
-<option value="DoNothing" {p3} title="채널이 비어도 아무것도 하지 않고 계속 재생해요.">그대로 둠</option>
-</select>
-<label class="checkbox"><input type="checkbox" name="announce_now_playing" {an}/> 곡 시작 시 '현재 재생 중' 알림 보내기</label>
-</div>
-<div class="card"><h2>캐시 / 로그 / 소싱</h2>
-<label class="field">캐시 한도(GB, 1–4096)</label><input type="number" name="cache_limit_gb" min="1" max="4096" value="{cl}"/>
-<label class="field">로그 보관 일수 (1–3650)</label><input type="number" name="log_retention_days" min="1" max="3650" value="{lr}"/>
-<label class="field">선호 브라우저 프로필 (쿠키 추출)</label><input type="text" name="preferred_browser_profile" value="{bp}"/>
-<label class="field">쿠키 파일 경로 (선택)</label><input type="text" name="cookie_file_path" value="{cf}"/>
-<p class="hint">이 칸은 <b>봇 호스트에 이미 있는 파일의 경로</b>예요. 파일을 새로 올리려면 <a href='#cookies'>이 페이지 맨 아래 &quot;유튜브 쿠키&quot;</a> 에서 올리세요.</p>
-<label class="checkbox" title="yt-dlp --sponsorblock-remove music_offtopic,intro,outro — SponsorBlock 데이터가 있는 영상의 인트로/아웃트로/비음악 구간을 다운로드 시 잘라냅니다. 이미 캐시된 곡엔 적용 안 되고 새로 받는 곡부터 적용됩니다."><input type="checkbox" name="sponsorblock_remove" {sb}/> 인트로/아웃트로 제거 (SponsorBlock · 새로 받는 곡부터)</label>
-<label class="checkbox" title="봇이 받은(tools 폴더 안의) yt-dlp 를 하루 1회 자동으로 yt-dlp -U 합니다. YouTube 변경으로 다운로드가 깨지는 것을 예방합니다. 시스템/PATH 의 yt-dlp 는 건드리지 않습니다."><input type="checkbox" name="auto_update_tools" {au}/> yt-dlp 자동 업데이트 (하루 1회)</label>
-</div>
-<div class="card"><h2>끊김 최적화 (실험)</h2>
-<p class="sub">
-기본은 모두 꺼짐(검증된 보수 경로). 하나씩 켜고 디스코드에서 실제로 들어보며 검증하세요.
-저장하면 <b>다음 곡부터</b> 반영됩니다.
-</p>
-<label class="checkbox" title="ffmpeg -probesize 32k -analyzeduration 0 -fflags +nobuffer — 곡 시작 지연 단축"><input type="checkbox" name="tweak_ffmpeg_fast_start" {t1}/> ① ffmpeg 빠른 시작 (probe/analyze 생략)</label>
-<label class="checkbox" title="ffmpeg -avioflags direct -flush_packets 1 — 파이프 즉시 flush"><input type="checkbox" name="tweak_ffmpeg_direct_output" {t2}/> ② ffmpeg 즉시 출력 (pipe flush)</label>
-<p class="kv">③ 작은 송신 버퍼 · ④ 낮은 패킷로스 힌트 · ⑤ 전용 송출 스레드 — songbird 엔진은 전용 스레드 페이싱이 기본이라 항상 적용된 것과 같아 토글이 없습니다.</p>
-<label class="field">송출 비트레이트 (kbps, 32–128 · 기본 128 · 받아 둔 파일이 128k라 그 위는 의미 없어요)</label><input type="number" name="voice_bitrate_kbps" min="32" max="128" value="{br}"/>
-</div>
-<div class="actions"><button class="btn btn-primary" type="submit">재생 설정 저장</button></div>
-</form>
-<div class="card" id="cookies"><h2>유튜브 쿠키 {cookie_badge}</h2>
-<p class="sub">유튜브가 <code>403 Forbidden</code> 을 뿌려 곡이 자꾸 넘어갈 때 쓰는 마지막 수단입니다. 로그인한 세션의 쿠키를 주면 대부분 해결됩니다.</p>
-<p class="kv">현재: {cookie_status}</p>
+<input type="hidden" name="csrf_token" value="{csrf}"/>
+<div class="card"><h2>호스트의 소싱 도구</h2>
+<label class="field">선호 브라우저 프로필 (쿠키 추출)</label><input type="text" name="preferred_browser_profile" value="{profile}"/>
+<label class="field">봇 호스트의 쿠키 파일 경로</label><input type="text" name="cookie_file_path" value="{cookie_path}"/>
+<label class="checkbox"><input type="checkbox" name="auto_update_tools" {update}/> yt-dlp 자동 업데이트 (직접 관리하는 도구만)</label>
+<button class="btn btn-primary" type="submit">연결·도구 설정 저장</button></div></form>
+<div class="card" id="cookies"><h2>유튜브 쿠키</h2><p class="kv">현재: {cookie_status}</p>
+<p class="hint">쿠키는 로그인 권한이에요. 내용은 클라이언트 원본 직접 받기에도 전달하지 않아요.</p>
 <form method="post" action="/botsettings/cookies" enctype="multipart/form-data">
-<input type="hidden" name="csrf_token" value="{cookie_csrf}"/>
+<input type="hidden" name="csrf_token" value="{csrf}"/>
 <label class="field" for="cookie-file">cookies.txt 올리기 (넷스케이프 형식)</label>
 <input id="cookie-file" type="file" name="cookies" accept=".txt,text/plain"/>
-<p class="kv">브라우저에서 <b>youtube.com 에 로그인한 채로</b> 확장 프로그램(Get cookies.txt LOCALLY 등)으로 내보낸 파일을 그대로 올리면 됩니다. 올리면 위의 경로 칸이 자동으로 채워져서 <b>다음 곡부터</b> 쓰입니다.</p>
-<p class="kv"><strong>⚠ 쿠키는 그 자체가 로그인입니다.</strong> 이 파일을 가진 사람은 그 계정으로 들어갈 수 있어요. 평소 쓰시는 계정 말고 <b>버리는 계정</b>을 권합니다 — 유튜브가 자동 다운로드에 쓰인 계정을 제재하는 경우가 있어요. 내용은 화면·로그 어디에도 안 띄웁니다.</p>
 <div class="actions"><button class="btn btn-primary" type="submit">쿠키 올리기</button>
 <button class="btn btn-secondary" type="submit" name="remove" value="1">저장된 쿠키 지우기</button></div>
-</form>
-</div>"#,
-        mv = s.master_volume,
-        ne = chk(s.normalize_enabled),
-        ad = chk(s.autoplay_default),
-        an = chk(s.announce_now_playing),
-        al = chk(s.auto_leave_when_empty),
-        evf = chk(s.empty_voice_forced),
-        ald = s.auto_leave_delay_seconds,
-        p1 = pol(s.empty_voice_policy, EmptyVoiceChannelPolicy::AutoLeave),
-        p2 = pol(s.empty_voice_policy, EmptyVoiceChannelPolicy::StopPlayback),
-        p3 = pol(s.empty_voice_policy, EmptyVoiceChannelPolicy::DoNothing),
-        cookie_badge = if cookie_line.is_some() { "· 등록됨" } else { "" },
-        cookie_status = html_escape(
-            cookie_line
-                .as_deref()
-                .unwrap_or("올려 둔 쿠키가 없어요. 지금은 로그인 없이 받고 있어요.")
-        ),
-        cookie_csrf = html_escape(&admin_csrf_token(&state, &cookies).unwrap_or_default()),
-        cl = s.cache_limit_gb,
-        lr = s.log_retention_days,
-        bp = html_escape(&s.preferred_browser_profile),
-        cf = html_escape(s.cookie_file_path.as_deref().unwrap_or("")),
-        sb = chk(s.sponsorblock_remove),
-        au = chk(s.auto_update_tools),
-        t1 = chk(s.tweak_ffmpeg_fast_start),
-        t2 = chk(s.tweak_ffmpeg_direct_output),
-        br = s.voice_bitrate_kbps,
+</form></div>"#,
+        owner = html_escape(&super::owner_panel_url()),
+        profile = html_escape(&settings.preferred_browser_profile),
+        cookie_path = html_escape(settings.cookie_file_path.as_deref().unwrap_or("")),
+        update = if settings.auto_update_tools { "checked" } else { "" },
+        cookie_status = html_escape(status.as_deref().unwrap_or("등록된 쿠키가 없어요.")),
     );
-    layout(&state, "재생 설정", "/settings", &body).into_response()
+    layout(&state, "연결·도구 설정", "/settings", &body).into_response()
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 pub struct SettingsForm {
-    master_volume: Option<i32>,
-    normalize_enabled: Option<String>,
-    autoplay_default: Option<String>,
-    announce_now_playing: Option<String>,
-    auto_leave_when_empty: Option<String>,
-    empty_voice_forced: Option<String>,
-    auto_leave_delay_seconds: Option<i32>,
-    empty_voice_policy: Option<String>,
-    cache_limit_gb: Option<i32>,
-    log_retention_days: Option<i32>,
+    csrf_token: String,
     preferred_browser_profile: Option<String>,
     cookie_file_path: Option<String>,
-    sponsorblock_remove: Option<String>,
     auto_update_tools: Option<String>,
-    tweak_ffmpeg_fast_start: Option<String>,
-    tweak_ffmpeg_direct_output: Option<String>,
-    voice_bitrate_kbps: Option<i32>,
 }
 
-pub async fn settings_post(
-    State(state): Ctx,
-    cookies: Cookies,
-    Form(f): Form<SettingsForm>,
-) -> Response {
-    if let Some(r) = require_auth(&state, &cookies) {
-        return r;
+pub async fn settings_post(State(state): Ctx, cookies: Cookies, Form(form): Form<SettingsForm>) -> Response {
+    if let Some(response) = require_auth(&state, &cookies) { return response; }
+    if !verify_admin_csrf(&state, &cookies, &form.csrf_token) {
+        return (axum::http::StatusCode::FORBIDDEN, "CSRF 검증에 실패했어요.").into_response();
     }
-    let mut s = state.app.db.load_global_settings();
-    s.master_volume = f.master_volume.unwrap_or(s.master_volume).clamp(0, 200);
-    s.normalize_enabled = f.normalize_enabled.is_some();
-    s.autoplay_default = f.autoplay_default.is_some();
-    s.announce_now_playing = f.announce_now_playing.is_some();
-    s.auto_leave_when_empty = f.auto_leave_when_empty.is_some();
-    s.empty_voice_forced = f.empty_voice_forced.is_some();
-    s.auto_leave_delay_seconds = f
-        .auto_leave_delay_seconds
-        .unwrap_or(s.auto_leave_delay_seconds)
-        .clamp(5, 3600);
-    s.empty_voice_policy = match f.empty_voice_policy.as_deref() {
-        Some("StopPlayback") => EmptyVoiceChannelPolicy::StopPlayback,
-        Some("DoNothing") => EmptyVoiceChannelPolicy::DoNothing,
-        _ => EmptyVoiceChannelPolicy::AutoLeave,
-    };
-    s.cache_limit_gb = f.cache_limit_gb.unwrap_or(s.cache_limit_gb).clamp(1, 4096);
-    s.log_retention_days = f
-        .log_retention_days
-        .unwrap_or(s.log_retention_days)
-        .clamp(1, 3650);
-    s.preferred_browser_profile = f
-        .preferred_browser_profile
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "Default".into());
-    s.cookie_file_path = f.cookie_file_path.filter(|v| !v.trim().is_empty());
-    s.sponsorblock_remove = f.sponsorblock_remove.is_some();
-    s.auto_update_tools = f.auto_update_tools.is_some();
-    s.tweak_ffmpeg_fast_start = f.tweak_ffmpeg_fast_start.is_some();
-    s.tweak_ffmpeg_direct_output = f.tweak_ffmpeg_direct_output.is_some();
-    s.voice_bitrate_kbps = f
-        .voice_bitrate_kbps
-        .unwrap_or(s.voice_bitrate_kbps)
-        .clamp(32, 128);
-    state.app.db.save_global_settings(&s);
-    // 마스터 볼륨/평준화 변경을 재생 중인 길드에 즉시 반영 (per-guild override 는 그대로 존중).
-    for gid in state.app.coordinator.active_guild_ids().await {
-        let st = state.app.player.apply_configured_settings(gid).await;
-        state.app.coordinator.apply_volume(gid, st.effective_volume).await;
-    }
-    state
-        .app
-        .log
-        .info("Web", "재생 설정 저장됨 (볼륨은 즉시, 그 외는 다음 곡부터 반영).");
-    redirect_flash(
-        "/settings",
-        "재생 설정이 저장되었습니다. (볼륨은 바로, 그 외 설정은 다음 곡부터 반영됩니다.)",
-        false,
-    )
+    let mut settings = state.app.db.load_global_settings();
+    settings.preferred_browser_profile = form.preferred_browser_profile.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "Default".into());
+    settings.cookie_file_path = form.cookie_file_path.filter(|value| !value.trim().is_empty());
+    settings.auto_update_tools = form.auto_update_tools.is_some();
+    state.app.db.save_global_settings(&settings);
+    redirect_flash("/settings", "연결·도구 설정을 저장했어요. 재생 정책은 봇 주인 설정에서 바꿔 주세요.", false)
 }
 
 // ───────── 봇 설정 / 공용 설정 (읽기 전용 정보) ─────────

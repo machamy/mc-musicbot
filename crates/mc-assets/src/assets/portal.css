@@ -1550,6 +1550,10 @@ body[data-dragging="tab"] { user-select: none; }
 
 .webbtn[aria-pressed="true"] { box-shadow: 0 0 0 1px var(--accent-line); }
 .webnote { flex: 1 0 100%; color: var(--warn); font-size: var(--fs-xs); line-height: 1.45; }
+.direct-status { flex: 1 0 100%; min-width: 0; font-size: var(--fs-xs); line-height: 1.5; }
+.direct-status summary { cursor: pointer; font-weight: 600; }
+.direct-status__item { padding-top: var(--sp-2); overflow-wrap: anywhere; }
+.direct-status__item progress { display: block; width: 100%; height: 8px; margin: 4px 0; accent-color: var(--accent); }
 
 /* 숨긴 유튜브 플레이어. 화면 밖으로 완전히 빼면 브라우저가 재생을 미루는 경우가 있어
  * 화면 구석에 2px로 남겨 둔다. 듣기 전용이라 조작 UI는 노출하지 않는다. */

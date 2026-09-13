@@ -3540,11 +3540,26 @@ pub struct WebStreamSettings {
     pub enabled: bool,
     pub max_transfers: u32,
     pub bandwidth_kbps: u32,
+    pub routes: Vec<WebStreamRoute>,
+    pub prefetch: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebStreamSource { Origin, Server, Embed }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebStreamRoute {
+    pub source: WebStreamSource,
+    pub enabled: bool,
 }
 
 impl Default for WebStreamSettings {
     fn default() -> Self {
-        Self { enabled: false, max_transfers: 10, bandwidth_kbps: 2_000 }
+        Self { enabled: false, max_transfers: 10, bandwidth_kbps: 2_000, prefetch: true,
+            routes: [WebStreamSource::Origin, WebStreamSource::Server, WebStreamSource::Embed]
+                .into_iter().map(|source| WebStreamRoute { source, enabled: true }).collect() }
     }
 }
 
@@ -3552,5 +3567,34 @@ impl WebStreamSettings {
     pub fn sanitize(&mut self) {
         self.max_transfers = self.max_transfers.clamp(1, 30);
         self.bandwidth_kbps = self.bandwidth_kbps.clamp(128, 20_000);
+        let mut seen = Vec::new();
+        self.routes.retain(|route| {
+            if seen.contains(&route.source) { return false; }
+            seen.push(route.source); true
+        });
+        for source in [WebStreamSource::Origin, WebStreamSource::Server, WebStreamSource::Embed] {
+            if !seen.contains(&source) { self.routes.push(WebStreamRoute { source, enabled: false }); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod web_stream_settings_tests {
+    use super::*;
+
+    #[test]
+    fn routes_keep_order_disable_missing_sources_and_reject_unknown_sources() {
+        let mut settings: WebStreamSettings = serde_json::from_str(r#"{"routes":[{"source":"server","enabled":true},{"source":"origin","enabled":false},{"source":"server","enabled":false}]}"#).unwrap();
+        settings.sanitize();
+        assert_eq!(settings.routes.len(), 3);
+        assert_eq!(settings.routes[0].source, WebStreamSource::Server);
+        assert!(settings.routes[0].enabled);
+        assert!(!settings.routes[1].enabled);
+        assert_eq!(settings.routes[2].source, WebStreamSource::Embed);
+        assert!(!settings.routes[2].enabled);
+        assert!(serde_json::from_str::<WebStreamSettings>(r#"{"routes":[{"source":"unknown","enabled":true}]}"#).is_err());
+        let defaults: WebStreamSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.routes[0].source, WebStreamSource::Origin);
+        assert!(defaults.prefetch);
     }
 }

@@ -17,6 +17,59 @@ pub struct YtDlp {
     pub retry_rounds: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectAudioSource {
+    pub url: String,
+    pub mime: String,
+    pub size_bytes: Option<u64>,
+    pub duration_seconds: Option<f64>,
+    pub expires_at: Option<i64>,
+}
+
+fn direct_audio_source(value: &Value) -> Option<DirectAudioSource> {
+    if value.get("protocol")?.as_str()? != "https" || value.get("vcodec")?.as_str()? != "none" || value.get("is_live").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let raw = value.get("url")?.as_str()?;
+    if raw.len() > 16384 { return None; }
+    let url = reqwest::Url::parse(raw).ok()?;
+    let host = url.host_str()?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() || url.port().is_some()
+        || !(host.ends_with(".googlevideo.com") || host.ends_with(".sndcdn.com")) { return None; }
+    let mime = match value.get("ext")?.as_str()? {
+        "webm" => "audio/webm", "m4a" => "audio/mp4", "mp3" => "audio/mpeg",
+        "ogg" | "opus" => "audio/ogg", _ => return None,
+    };
+    let expires_at = url.query_pairs().find(|(key, _)| key == "expire")
+        .and_then(|(_, value)| value.parse::<i64>().ok());
+    if expires_at.is_some_and(|expiry| expiry <= chrono::Utc::now().timestamp() + 30) { return None; }
+    Some(DirectAudioSource { url: raw.to_owned(), mime: mime.to_owned(),
+        size_bytes: value.get("filesize").and_then(Value::as_u64).filter(|size| *size > 0),
+        duration_seconds: value.get("duration").and_then(Value::as_f64).filter(|duration| duration.is_finite() && *duration > 0.0),
+        expires_at })
+}
+
+#[cfg(test)]
+mod direct_source_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn public_source_only_exposes_allowlisted_audio_fields() {
+        let mut value = json!({ "url": "https://test.googlevideo.com/videoplayback?expire=9999999999", "ext": "webm", "vcodec": "none", "protocol": "https", "filesize": 1234,
+            "http_headers": { "Cookie": "private-cookie", "Authorization": "private-token" } });
+        let source = direct_audio_source(&value).unwrap();
+        let encoded = serde_json::to_string(&source).unwrap();
+        assert!(!encoded.contains("private"));
+        assert_eq!(source.mime, "audio/webm");
+        for url in ["http://test.googlevideo.com/audio", "https://googlevideo.com.evil.example/audio", "https://user@test.googlevideo.com/audio", "https://127.0.0.1/audio", "https://test.googlevideo.com/audio?expire=1"] {
+            value["url"] = json!(url);
+            assert!(direct_audio_source(&value).is_none());
+        }
+    }
+}
+
 /// 연속 실패 횟수에 따라 사다리를 몇 바퀴 돌지.
 ///
 /// **첫 실패는 반드시 3이다.** 여기가 1로 바뀌면 v4.14 가 잡은 "들쭉날쭉한 403 하나에
@@ -706,6 +759,26 @@ impl YtDlp {
     /// 아직 안 물어봤으면 빈 목록 — 그때는 기능이 생기기 전과 완전히 같다.
     fn base_args(&self) -> Vec<String> {
         JS_RUNTIME_ARGS.get().cloned().unwrap_or_default()
+    }
+
+    pub async fn public_audio_source(&self, track: &TrackRef) -> Option<DirectAudioSource> {
+        if track.is_live { return None; }
+        let target = match track.provider {
+            ProviderKind::YouTube | ProviderKind::YouTubeMusic => {
+                if track.content_id.len() != 11 || !track.content_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') { return None; }
+                format!("https://www.youtube.com/watch?v={}", track.content_id)
+            }
+            ProviderKind::SoundCloud => {
+                let url = reqwest::Url::parse(&track.source_url).ok()?;
+                if url.scheme() != "https" || !matches!(url.host_str(), Some("soundcloud.com" | "www.soundcloud.com")) || !url.username().is_empty() || url.password().is_some() || url.port().is_some() { return None; }
+                track.source_url.clone()
+            }
+        };
+        let args = ["--ignore-config", "--no-playlist", "--skip-download", "--dump-single-json",
+            "--no-warnings", "--socket-timeout", "8", "--retries", "0", "--extractor-retries", "0",
+            "--format", "bestaudio[protocol=https]", "--", &target].into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let value = tokio::time::timeout(std::time::Duration::from_secs(15), self.run_json_once(&args, "")).await.ok()??;
+        direct_audio_source(&value)
     }
 
     /// C# YtDlpAuthArguments.Build 과 동일: 프로필에 ':' 가 있으면 그대로,

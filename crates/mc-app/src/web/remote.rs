@@ -629,6 +629,8 @@ pub fn router() -> Router<Arc<WebState>> {
         .route("/music/logout", post(remote_logout))
         .route("/music/guilds/{guild_id}", get(guild_page))
         .route("/music/guilds/{guild_id}/admin", get(admin_page))
+        .route("/music/owner", get(owner_page))
+        .route("/music/api/owner/playback", get(api_owner_playback_get).put(api_owner_playback_put))
         // 정적 에셋 (리모컨 도메인에서 서빙된다 — host_scope_guard가 /music/* 를 통과시킨다)
         .route("/music/assets/{name}", get(super::assets::serve_asset))
         .route("/music/sw.js", get(super::assets::serve_service_worker))
@@ -819,6 +821,7 @@ pub fn router() -> Router<Arc<WebState>> {
         )
         .route("/music/api/owner/stream", get(api_owner_stream_get).put(api_owner_stream_put))
         .route("/music/api/guilds/{guild_id}/stream/{item_id}", get(api_stream))
+        .route("/music/api/guilds/{guild_id}/stream/{item_id}/source", get(api_stream_source))
         // 서버 관리 콘솔 API — 전부 Manager 이상
         .route(
             "/music/api/guilds/{guild_id}/admin/settings",
@@ -3108,6 +3111,13 @@ async fn guild_page(
         )),
         // 로그인만 안 된 경우에는 이 서버로 되돌아오도록 next 를 달아 준다.
         Err(response) => page_error_returning_to(response, &format!("/music/guilds/{guild_id}")),
+    }
+}
+
+async fn owner_page(State(state): State<Arc<WebState>>, cookies: Cookies) -> Response {
+    match require_owner(&state, &cookies, None) {
+        Ok(session) => html_page(remote_page::owner(&session, &state.app.build_id)),
+        Err(response) => page_error_returning_to(response, "/music/owner"),
     }
 }
 
@@ -11148,6 +11158,7 @@ fn stream_payload(state: &WebState, player: &crate::models::GuildPlayerState) ->
         json!({
             "id": item.id,
             "streamUrl": format!("/music/api/guilds/{}/stream/{}", player.guild_id, item.id),
+            "sourceUrl": format!("/music/api/guilds/{}/stream/{}/source", player.guild_id, item.id),
             "ready": ready.is_some(), "sizeBytes": ready.map(|meta| meta.len()),
             "durationSeconds": item.track.duration.map(|duration| duration.as_secs_f64()),
         })
@@ -11156,8 +11167,36 @@ fn stream_payload(state: &WebState, player: &crate::models::GuildPlayerState) ->
     json!({
         "enabled": settings.enabled, "blobLimitBytes": super::stream::BLOB_LIMIT,
         "maxTransfers": settings.max_transfers, "bandwidthKbps": settings.bandwidth_kbps,
+        "routes": settings.routes, "prefetch": settings.prefetch,
         "current": player.current_item.as_ref().map(describe), "next": next.map(describe),
     })
+}
+
+async fn api_stream_source(
+    State(state): State<Arc<WebState>>, cookies: Cookies,
+    Path((guild_id, item_id)): Path<(u64, String)>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx, Err(response) => return response,
+    };
+    let allowed = || {
+        let settings = state.streams.settings.read().unwrap();
+        settings.enabled && settings.routes.iter().any(|route| route.enabled && route.source == crate::remote::models::WebStreamSource::Origin)
+    };
+    if !allowed() { return super::stream::unavailable(StatusCode::SERVICE_UNAVAILABLE); }
+    let player = state.app.player.get_state(guild_id).await;
+    let Some((item, prefetch)) = stream_item(&player, &item_id) else { return super::stream::unavailable(StatusCode::NOT_FOUND); };
+    if item.track.is_live { return super::stream::unavailable(StatusCode::NOT_FOUND); }
+    if rate_limited(&state, guild_id, ctx.user_id(), if prefetch { "origin-next" } else { "origin-current" }, Duration::from_secs(1)) {
+        return super::stream::unavailable(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let source = state.streams.origin_source(&item.track, &state.app.ytdlp()).await;
+    if let Err(response) = authorize(&state, &cookies, guild_id, None).await { return response; }
+    let latest = state.app.player.get_state(guild_id).await;
+    if !allowed() || stream_item(&latest, &item_id).is_none() { return super::stream::unavailable(StatusCode::NOT_FOUND); }
+    let mut response = json_ok(json!({ "source": source }));
+    response.headers_mut().insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
+    response
 }
 
 async fn api_stream(
@@ -11170,6 +11209,12 @@ async fn api_stream(
     let ctx = match authorize(&state, &cookies, guild_id, None).await {
         Ok(ctx) => ctx, Err(response) => return response,
     };
+    {
+        let settings = state.streams.settings.read().unwrap();
+        if !settings.enabled || !settings.routes.iter().any(|route| route.enabled && route.source == crate::remote::models::WebStreamSource::Server) {
+            return super::stream::unavailable(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
     let player = state.app.player.get_state(guild_id).await;
     let Some((item, prefetch)) = stream_item(&player, &item_id) else {
         return super::stream::unavailable(StatusCode::NOT_FOUND);
@@ -11200,12 +11245,30 @@ async fn api_stream(
     let Ok(file) = tokio::fs::File::open(path).await else {
         return super::stream::unavailable(StatusCode::SERVICE_UNAVAILABLE);
     };
-    super::stream::file_response(file, pin, transfer, headers, method).await
+    super::stream::file_response(file, path, pin, transfer, headers, method).await
 }
 
 async fn api_owner_stream_get(State(state): State<Arc<WebState>>, cookies: Cookies) -> Response {
     if let Err(response) = require_owner(&state, &cookies, None) { return response; }
     json_ok(state.streams.status())
+}
+
+async fn api_owner_playback_get(State(state): State<Arc<WebState>>, cookies: Cookies) -> Response {
+    if let Err(response) = require_owner(&state, &cookies, None) { return response; }
+    json_ok(super::owner_settings::public_settings(&state.app.db.load_global_settings()))
+}
+
+async fn api_owner_playback_put(State(state): State<Arc<WebState>>, cookies: Cookies, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if let Err(response) = require_owner(&state, &cookies, Some(&headers)) { return response; }
+    let settings = match super::owner_settings::apply(&state.app.db.load_global_settings(), &body) {
+        Ok(settings) => settings, Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
+    };
+    state.app.db.save_global_settings(&settings);
+    for guild_id in state.app.coordinator.active_guild_ids().await {
+        let player = state.app.player.apply_configured_settings(guild_id).await;
+        state.app.coordinator.apply_volume(guild_id, player.effective_volume).await;
+    }
+    json_ok(super::owner_settings::public_settings(&settings))
 }
 
 async fn api_owner_stream_put(
@@ -11234,6 +11297,7 @@ async fn api_owner_overrides_get(State(state): State<Arc<WebState>>, cookies: Co
     let overrides = state.app.remote.load_global_overrides();
     json_ok(json!({
         "overrides": overrides_json(&overrides),
+        "defaults": crate::remote::models::RemoteGuildSettings::default(),
         // 화면이 `∞` 칸을 그리려면 어떤 항목이 무제한을 받는지 알아야 한다 (§23.1).
         "unlimitedKeys": UNLIMITED_KEYS,
     }))
@@ -12364,6 +12428,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_hub_and_playback_settings_require_owner_and_csrf() {
+        use tower::ServiceExt;
+        let (state, root) = test_web_state();
+        assert_eq!(stream_test_request(state.clone(), "/music/api/owner/playback", "GET", &[], false).await.status(), StatusCode::UNAUTHORIZED);
+        let session = auth_context(AccessTier::Manager, MemberContext::default()).session;
+        state.remote_sessions.lock().unwrap().insert("stream-test".into(), session.clone());
+        assert_eq!(stream_test_request(state.clone(), "/music/owner", "GET", &[], true).await.status(), StatusCode::FORBIDDEN);
+        let mut owner = session;
+        owner.is_developer = true;
+        let csrf = owner.csrf_token.clone();
+        state.remote_sessions.lock().unwrap().insert("stream-test".into(), owner);
+        let response = stream_test_request(state.clone(), "/music/owner", "GET", &[], true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = axum::body::to_bytes(response.into_body(), 100000).await.unwrap();
+        assert!(String::from_utf8_lossy(&html).contains("\"ownerOnly\":true"));
+        for (token, body, expected) in [
+            ("wrong", "{\"masterVolume\":123}", StatusCode::FORBIDDEN),
+            (csrf.as_str(), "{\"cookieFilePath\":\"private\"}", StatusCode::BAD_REQUEST),
+            (csrf.as_str(), "{\"masterVolume\":123}", StatusCode::OK),
+        ] {
+            let request = axum::http::Request::builder().uri("/music/api/owner/playback").method("PUT")
+                .header(header::COOKIE, "macham_session=stream-test").header(header::CONTENT_TYPE, "application/json")
+                .header("X-CSRF-Token", token).body(axum::body::Body::from(body)).unwrap();
+            let response = router().layer(tower_cookies::CookieManagerLayer::new()).with_state(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(state.app.db.load_global_settings().master_volume, 123);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn stream_http_checks_auth_ranges_validators_and_cache_pins() {
         let (state, root) = test_web_state();
         state.streams.settings.write().unwrap().enabled = true;
@@ -12382,6 +12478,12 @@ mod tests {
         let item = QueueItem::new_user(track.clone(), "테스트".into(), Some(42));
         let url = format!("/music/api/guilds/1/stream/{}", item.id);
         state.app.player.enqueue(1, item, false).await;
+        assert_eq!(stream_test_request(state.clone(), &format!("{url}/source"), "GET", &[], false).await.status(), StatusCode::UNAUTHORIZED);
+        let response = stream_test_request(state.clone(), &format!("{url}/source"), "GET", &[], true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store");
+        let source: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1000).await.unwrap()).unwrap();
+        assert!(source["source"].is_null());
         assert_eq!(stream_test_request(state.clone(), &url, "GET", &[], false).await.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(stream_test_request(state.clone(), "/music/api/guilds/1/stream/unknown", "GET", &[], true).await.status(), StatusCode::NOT_FOUND);
         let response = stream_test_request(state.clone(), &url, "GET", &[("Range", "bytes=2-5")], true).await;
@@ -12408,6 +12510,28 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_ne!(response.headers()[header::ETAG].to_str().unwrap(), etag);
         assert_eq!(&axum::body::to_bytes(response.into_body(), 100).await.unwrap()[..], b"abcdefghij");
+        state.streams.settings.write().unwrap().bandwidth_kbps = 20000;
+        let large_size = super::super::stream::BLOB_LIMIT + 17;
+        std::fs::OpenOptions::new().write(true).open(&file).unwrap().set_len(large_size).unwrap();
+        let response = stream_test_request(state.clone(), &url, "GET", &[("Range", "bytes=0-")], true).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], format!("bytes 0-1048575/{large_size}"));
+        let large_etag = response.headers()[header::ETAG].to_str().unwrap().to_owned();
+        assert_eq!(axum::body::to_bytes(response.into_body(), 1048576).await.unwrap().len(), 1048576);
+        let response = stream_test_request(state.clone(), &url, "HEAD", &[("If-None-Match", &large_etag)], true).await;
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        let tail = format!("bytes={}-", large_size - 17);
+        let response = stream_test_request(state.clone(), &url, "GET", &[("Range", &tail)], true).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(axum::body::to_bytes(response.into_body(), 17).await.unwrap().len(), 17);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        {
+            let mut changed = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+            std::io::Write::write_all(&mut changed, b"changed").unwrap();
+        }
+        let response = stream_test_request(state.clone(), &url, "HEAD", &[("If-None-Match", &large_etag)], true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(response.headers()[header::ETAG].to_str().unwrap(), large_etag);
         let (_entry, pin) = state.app.cache.pin(&track.cache_key()).unwrap();
         state.app.cache.prune_to_limit(0);
         assert!(file.exists());
@@ -12437,7 +12561,7 @@ mod tests {
         let mut transfer = state.streams.acquire(1, false, tokio::time::Instant::now() + Duration::from_secs(5)).await.unwrap();
         transfer.expires = tokio::time::Instant::now() + Duration::from_millis(200);
         let response = super::super::stream::file_response(tokio::fs::File::open(&path).await.unwrap(),
-            pin, transfer, HeaderMap::new(), axum::http::Method::GET).await;
+            &path, pin, transfer, HeaderMap::new(), axum::http::Method::GET).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!state.app.cache.delete(&track.cache_key()));
         tokio::time::sleep(Duration::from_millis(300)).await;

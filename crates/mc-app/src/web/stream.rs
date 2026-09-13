@@ -1,6 +1,8 @@
 //! 청취 시간이 아니라 실제 전송만 세고, 모든 길드의 바이트를 같은 회선 예산으로 보낸다.
 
 use crate::media::cache::CachePin;
+use crate::media::ytdlp::{DirectAudioSource, YtDlp};
+use crate::models::TrackRef;
 use crate::remote::models::WebStreamSettings;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, StatusCode, header};
@@ -8,12 +10,15 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::Instant;
 
 pub const BLOB_LIMIT: u64 = 32 * 1024 * 1024;
+const RANGE_LIMIT: u64 = 1024 * 1024;
 const CHUNK: usize = 16 * 1024;
 const USER_MINUTE_BYTES: u64 = 64 * 1024 * 1024;
 const QUEUE_LIMIT: usize = 512;
@@ -39,6 +44,17 @@ pub struct StreamService {
     pub settings: RwLock<WebStreamSettings>,
     queue: Mutex<Queue>,
     pace: tokio::sync::Mutex<Instant>,
+    etags: Mutex<HashMap<PathBuf, (u64, SystemTime, String)>>,
+    origins: Mutex<
+        HashMap<
+            String,
+            (
+                Instant,
+                Arc<tokio::sync::OnceCell<Option<DirectAudioSource>>>,
+            ),
+        >,
+    >,
+    origin_limit: tokio::sync::Semaphore,
 }
 
 pub struct Transfer {
@@ -60,6 +76,9 @@ impl StreamService {
             settings: RwLock::new(settings),
             queue: Mutex::new(Queue::default()),
             pace: tokio::sync::Mutex::new(Instant::now()),
+            etags: Mutex::new(HashMap::new()),
+            origins: Mutex::new(HashMap::new()),
+            origin_limit: tokio::sync::Semaphore::new(2),
         })
     }
 
@@ -72,6 +91,37 @@ impl StreamService {
             "active": queue.jobs.values().filter(|job| job.active).count(),
             "queued": queue.jobs.values().filter(|job| !job.active).count(),
             "sentBytes": queue.sent,
+            "routes": settings.routes, "prefetch": settings.prefetch,
+        })
+    }
+
+    pub async fn origin_source(
+        &self,
+        track: &TrackRef,
+        extractor: &YtDlp,
+    ) -> Option<DirectAudioSource> {
+        let cell = {
+            let mut origins = self.origins.lock().unwrap();
+            origins.retain(|_, (created, _)| created.elapsed() < Duration::from_secs(60));
+            if origins.len() >= 128 && !origins.contains_key(&track.cache_key()) {
+                return None;
+            }
+            origins
+                .entry(track.cache_key())
+                .or_insert_with(|| (Instant::now(), Arc::new(tokio::sync::OnceCell::new())))
+                .1
+                .clone()
+        };
+        cell.get_or_init(|| async {
+            let _permit = self.origin_limit.try_acquire().ok()?;
+            extractor.public_audio_source(track).await
+        })
+        .await
+        .clone()
+        .filter(|source| {
+            source
+                .expires_at
+                .is_none_or(|expiry| expiry > chrono::Utc::now().timestamp() + 30)
         })
     }
 
@@ -156,7 +206,11 @@ impl StreamService {
         // 잠금을 기다리는 시간까지 본문 수명에 넣어 느린 연결이 영구 슬롯이 되지 않게 한다.
         let mut pace = self.pace.lock().await;
         let settings = self.settings.read().unwrap().clone();
-        if !settings.enabled {
+        if !settings.enabled
+            || !settings.routes.iter().any(|route| {
+                route.enabled && route.source == crate::remote::models::WebStreamSource::Server
+            })
+        {
             return Err(std::io::Error::other("stream disabled"));
         }
         {
@@ -219,7 +273,8 @@ fn byte_range(value: Option<&str>, size: u64) -> RangeResult {
         if suffix == 0 || size == 0 {
             return RangeResult::Unsatisfiable;
         }
-        return RangeResult::Partial(size.saturating_sub(suffix), size - 1);
+        let start = size.saturating_sub(suffix);
+        return RangeResult::Partial(start, (size - 1).min(start.saturating_add(RANGE_LIMIT - 1)));
     }
     let Some(start) = number(first) else {
         return RangeResult::Full;
@@ -234,7 +289,10 @@ fn byte_range(value: Option<&str>, size: u64) -> RangeResult {
     if start >= size || start > end {
         return RangeResult::Unsatisfiable;
     }
-    RangeResult::Partial(start, end.min(size - 1))
+    RangeResult::Partial(
+        start,
+        end.min(size - 1).min(start.saturating_add(RANGE_LIMIT - 1)),
+    )
 }
 
 pub fn unavailable(status: StatusCode) -> Response {
@@ -251,13 +309,25 @@ pub fn unavailable(status: StatusCode) -> Response {
 
 pub async fn file_response(
     mut file: tokio::fs::File,
+    path: &Path,
     pin: CachePin,
     transfer: Transfer,
     headers: HeaderMap,
     method: Method,
 ) -> Response {
     let result = tokio::time::timeout_at(transfer.expires, async {
-        let size = file.metadata().await?.len();
+        let metadata = file.metadata().await?;
+        let size = metadata.len();
+        let modified = metadata.modified()?;
+        if size > BLOB_LIMIT {
+            if let Some((cached_size, cached_modified, etag)) =
+                transfer.service.etags.lock().unwrap().get(path)
+            {
+                if *cached_size == size && *cached_modified == modified {
+                    return Ok((size, etag.clone()));
+                }
+            }
+        }
         let mut digest = Sha256::new();
         let mut buffer = vec![0; 64 * 1024];
         loop {
@@ -273,6 +343,17 @@ pub async fn file_response(
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let etag = format!("\"{hex}\"");
+        let after = file.metadata().await?;
+        if after.len() != size || after.modified()? != modified {
+            return Err(std::io::Error::other("cache changed during hashing"));
+        }
+        if size > BLOB_LIMIT {
+            let mut etags = transfer.service.etags.lock().unwrap();
+            if etags.len() >= 128 {
+                etags.clear();
+            }
+            etags.insert(path.to_owned(), (size, modified, etag.clone()));
+        }
         Ok::<_, std::io::Error>((size, etag))
     })
     .await;
@@ -415,6 +496,30 @@ mod tests {
         assert_eq!(byte_range(Some("bytes=0-"), 0), RangeResult::Unsatisfiable);
     }
 
+    #[test]
+    fn large_ranges_are_bounded_and_resume_at_the_reported_end() {
+        assert_eq!(
+            byte_range(Some("bytes=0-"), 3 * RANGE_LIMIT),
+            RangeResult::Partial(0, RANGE_LIMIT - 1)
+        );
+        assert_eq!(
+            byte_range(Some(&format!("bytes={RANGE_LIMIT}-")), 3 * RANGE_LIMIT),
+            RangeResult::Partial(RANGE_LIMIT, 2 * RANGE_LIMIT - 1)
+        );
+        assert_eq!(
+            byte_range(Some("bytes=7-9999999"), 3 * RANGE_LIMIT),
+            RangeResult::Partial(7, RANGE_LIMIT + 6)
+        );
+        assert_eq!(
+            byte_range(
+                Some(&format!("bytes=-{}", 2 * RANGE_LIMIT)),
+                3 * RANGE_LIMIT
+            ),
+            RangeResult::Partial(RANGE_LIMIT, 2 * RANGE_LIMIT - 1)
+        );
+        assert_eq!(byte_range(None, 3 * RANGE_LIMIT), RangeResult::Full);
+    }
+
     #[tokio::test]
     async fn current_has_priority_and_cancelled_jobs_release_capacity() {
         let service = StreamService::new(WebStreamSettings {
@@ -446,6 +551,7 @@ mod tests {
             enabled: true,
             max_transfers: 99,
             bandwidth_kbps: 0,
+            ..Default::default()
         });
         assert_eq!(service.settings.read().unwrap().max_transfers, 30);
         assert_eq!(service.settings.read().unwrap().bandwidth_kbps, 128);

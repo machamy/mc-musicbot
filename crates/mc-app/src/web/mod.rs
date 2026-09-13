@@ -8,6 +8,7 @@ pub mod pages;
 pub mod remote;
 pub mod remote_page;
 pub mod stream;
+mod owner_settings;
 
 use crate::app::App;
 use axum::body::Body;
@@ -75,6 +76,10 @@ fn remote_host() -> Option<&'static str> {
 /// 호스트 분리를 안 켠 로컬 개발에서는 같은 서버의 `/` 가 진짜 운영 패널이라 그대로 둔다.
 pub(crate) fn ops_panel_url() -> String {
     build_ops_url(admin_host())
+}
+
+pub(crate) fn owner_panel_url() -> String {
+    remote_host().map(|host| format!("https://{host}/music/owner")).unwrap_or_else(|| "/music/owner".into())
 }
 
 fn build_ops_url(admin: Option<&str>) -> String {
@@ -758,8 +763,8 @@ pub fn layout(state: &WebState, title: &str, active: &str, body: &str) -> Html<S
         ("/diagnostics", "진단 / 상태", "길드별 재생 · 자동추천 · 큐"),
         (
             "/settings",
-            "재생 설정",
-            "볼륨 · 자동추천 · 자동퇴장 · 알림",
+            "연결·도구 설정",
+            "호스트 쿠키 · yt-dlp · 봇 주인 설정 안내",
         ),
         ("/botsettings", "봇 설정", "토큰 · 명령 등록 · override"),
         ("/sharedconfig", "공용 설정", "owner · 데이터/도구 경로"),
