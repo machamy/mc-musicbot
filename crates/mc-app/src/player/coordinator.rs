@@ -806,6 +806,22 @@ impl Coordinator {
         }
         let current = state.current_item.clone().expect("바로 위에서 확인함");
 
+        if !current.track.is_live && app.remote.load_stream_settings().enabled
+            && app.cache.get(&current.track.cache_key()).is_none()
+            && app.cache.begin_background_prepare(&current.track.cache_key()) {
+            let preparing = app.clone();
+            let track = current.track.clone();
+            // 다운로드 완료를 기다리면 임베드로 이미 듣는 사람의 시각표까지 밀린다.
+            tokio::spawn(async move {
+                let global = preparing.db.load_global_settings();
+                let ytdlp = preparing.ytdlp().with_retry_rounds(1);
+                if let Err(error) = preparing.cache.prepare(&track, &ytdlp,
+                    global.cache_limit_gb, global.sponsorblock_remove).await {
+                    preparing.log.warn("Download", &format!("웹 현재 곡을 준비하지 못했어요: {error}"));
+                }
+            });
+        }
+
         // **길이를 모르면 시작하지 않는다.** 0 으로 두면 곡이 즉시 끝난 것으로 처리돼
         // 대기열이 순식간에 비워진다. 대기열은 손대지 않고 그 자리에 멈춘 채 둔다.
         /* **길이를 모르면 물어보고, 그래도 모르면 넘긴다.**

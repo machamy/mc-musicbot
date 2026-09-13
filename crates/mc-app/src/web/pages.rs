@@ -1804,10 +1804,9 @@ pub async fn cache_delete(
     if let Some(r) = require_auth(&state, &cookies) {
         return r;
     }
-    if let Some(entry) = state.app.db.get_cache_entry(&f.cache_key) {
-        let _ = std::fs::remove_file(&entry.file_path);
+    if !state.app.cache.delete(&f.cache_key) {
+        return redirect_flash("/cache", "전송 중이거나 잠긴 곡은 삭제하지 않았습니다.", true);
     }
-    state.app.db.delete_cache_entries(&[f.cache_key]);
     redirect_flash("/cache", "캐시에서 1곡을 삭제했습니다.", false)
 }
 
@@ -1834,13 +1833,7 @@ pub async fn cache_bulk_delete(
     if keys.is_empty() {
         return redirect_flash("/cache", "선택된 곡이 없습니다.", true);
     }
-    // cache_delete 와 동일 로직: 파일 제거 후 DB 항목 삭제 (파일 잠금 등 실패는 무시 — DB 만 정리).
-    for k in &keys {
-        if let Some(entry) = state.app.db.get_cache_entry(k) {
-            let _ = std::fs::remove_file(&entry.file_path);
-        }
-    }
-    state.app.db.delete_cache_entries(&keys);
+    let keys: Vec<String> = keys.into_iter().filter(|key| state.app.cache.delete(key)).collect();
     state.app.log.info(
         "Cache",
         &format!("웹에서 캐시 일괄 삭제: {}곡.", keys.len()),

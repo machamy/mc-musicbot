@@ -945,6 +945,28 @@ impl RemoteStore {
     /// 길드 JSON 에 섞으면 길드 저장 한 번에 강제값이 통째로 날아간다.
     const GLOBAL_OVERRIDES_KEY: &'static str = "remote_global_overrides";
 
+    pub fn load_stream_settings(&self) -> super::models::WebStreamSettings {
+        let conn = self.conn.lock().unwrap();
+        let stored = conn.query_row(
+            "SELECT json FROM settings WHERE key = 'remote_web_stream'", [],
+            |row| row.get::<_, String>(0),
+        ).optional().ok().flatten();
+        let mut settings: super::models::WebStreamSettings = stored
+            .and_then(|value| serde_json::from_str(&value).ok()).unwrap_or_default();
+        settings.sanitize();
+        settings
+    }
+
+    pub fn save_stream_settings(&self, settings: &super::models::WebStreamSettings) -> rusqlite::Result<()> {
+        let mut settings = settings.clone();
+        settings.sanitize();
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO settings(key, json) VALUES('remote_web_stream', ?1) ON CONFLICT(key) DO UPDATE SET json = excluded.json",
+            params![serde_json::to_string(&settings).unwrap()],
+        )?;
+        Ok(())
+    }
+
     /// 봇 주인이 걸어 둔 전역 강제값. 아직 아무것도 안 걸었으면 전부 `None` 이라
     /// `apply` 가 아무 일도 하지 않는다 — 도입 전과 완전히 같은 동작이다.
     pub fn load_global_overrides(&self) -> GlobalOverrides {

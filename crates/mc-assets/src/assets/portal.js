@@ -5054,7 +5054,7 @@ function buildStage() {
         el.lyricsToggle,
         el.videoBtn,
         el.webBtn),
-      h('div', { class: 'vols' }, el.volumeWrap, el.webVolWrap, el.webSync, el.webNote)),
+      h('div', { class: 'vols' }, el.volumeWrap, el.webVolWrap, el.webSync, el.directBtn, el.directRetry, el.webNote)),
     el.nextRow,
     el.nextOptions);
 
@@ -5423,6 +5423,189 @@ let webSource = null;
 let webTimer = 0;
 let webBlocked = '';           // 외부 스크립트를 못 불러왔을 때의 이유
 let webOffset = clampOffset(Number(prefGet('webOffset')));
+let directWanted = false;
+try { directWanted = localStorage.getItem('macham.direct-stream') === '1'; } catch {}
+let directActive = null;
+let webLocalPaused = false;
+const directSlots = [];
+
+function releaseDirect(slot) {
+  slot.controller?.abort();
+  slot.audio.pause();
+  slot.audio.removeAttribute('src');
+  slot.audio.load();
+  if (slot.blobUrl) URL.revokeObjectURL(slot.blobUrl);
+  Object.assign(slot, { id: null, controller: null, blobUrl: null, ready: false, blocked: false, retryAt: 0 });
+  if (directActive === slot) directActive = null;
+}
+
+function stopDirect() { directSlots.forEach(releaseDirect); }
+
+function directAllowed() {
+  return webOn && directWanted && !videoJoined && store.get().stream?.enabled;
+}
+
+function directFallbackNote() {
+  if (!directAllowed()) return '';
+  const descriptor = store.get().stream?.current;
+  if (!descriptor) return '이 곡은 직접 받기를 지원하지 않아 유튜브·사운드클라우드로 들어요.';
+  if (descriptor.sizeBytes > store.get().stream.blobLimitBytes) return '긴 곡은 기기 메모리를 보호하려고 유튜브·사운드클라우드로 들어요.';
+  if (directSlots.some((slot) => slot.id === descriptor.id && slot.blocked)) return '파일이 준비됐어요. 직접 재생 버튼을 한 번 눌러 주세요.';
+  if (!directSlots[0]?.audio.canPlayType('audio/ogg; codecs="opus"')) return '이 브라우저는 직접 받기 형식을 지원하지 않아 유튜브·사운드클라우드로 들어요.';
+  return '직접 받기를 기다리는 동안 유튜브·사운드클라우드로 들어요.';
+}
+
+function buildDirectAudio() {
+  for (let index = 0; index < 2; index++) {
+    const audio = document.createElement('audio');
+    audio.preload = 'auto';
+    audio.hidden = true;
+    document.body.appendChild(audio);
+    const slot = { audio, id: null, controller: null, blobUrl: null, ready: false, blocked: false, retryAt: 0 };
+    audio.addEventListener('loadedmetadata', () => {
+      if (!slot.ready) return;
+      const stream = store.get().stream;
+      const descriptor = [stream?.current, stream?.next].find((item) => item?.id === slot.id);
+      const expected = Number(descriptor?.durationSeconds);
+      // 구간 제거된 캐시는 원본 시각표와 다를 수 있다. 어긋난 파일을 끝까지 따라가면
+      // 뒷부분이 무음이 되므로 기존 임베드의 원본 시간축으로 돌아간다.
+      if (!Number.isFinite(audio.duration) || audio.duration <= 0 || (expected > 0 && Math.abs(audio.duration - expected) > 2)) {
+        const id = slot.id;
+        releaseDirect(slot);
+        Object.assign(slot, { id, retryAt: Infinity });
+      }
+      syncWebNow(false);
+    });
+    audio.addEventListener('error', () => {
+      if (!slot.id) return;
+      const id = slot.id;
+      releaseDirect(slot);
+      Object.assign(slot, { id, retryAt: Date.now() + 60000 });
+      syncWebNow(true);
+      setWebNote('직접 재생을 준비하지 못해서 유튜브·사운드클라우드로 들어요.');
+    });
+    directSlots.push(slot);
+  }
+}
+
+async function fetchDirect(slot, descriptor) {
+  const controller = new AbortController();
+  slot.controller = controller;
+  const timeout = setTimeout(() => controller.abort(), 210000);
+  try {
+    const response = await fetch(descriptor.streamUrl, { credentials: 'same-origin', signal: controller.signal, cache: 'no-cache' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const limit = Math.min(32 * 1024 * 1024, Number(store.get().stream?.blobLimitBytes) || 0);
+    const expected = Number(response.headers.get('Content-Length'));
+    if (!limit || !Number.isFinite(expected) || expected <= 0 || expected > limit) throw new Error('size');
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > limit) { await reader.cancel(); throw new Error('size'); }
+      chunks.push(value);
+    }
+    if (received !== expected || !directAllowed() || slot.controller !== controller) return;
+    slot.blobUrl = URL.createObjectURL(new Blob(chunks, { type: 'audio/ogg; codecs=opus' }));
+    slot.ready = true;
+    slot.audio.src = slot.blobUrl;
+    slot.audio.load();
+    syncWebNow(false);
+  } catch {
+    if (slot.controller === controller) {
+      slot.retryAt = Date.now() + 5000 + Math.random() * 5000;
+      if (directAllowed() && slot.id === store.get().current?.id) {
+        setWebNote('직접 받기를 기다리는 동안 유튜브·사운드클라우드로 들어요.');
+      }
+    }
+  } finally {
+    clearTimeout(timeout);
+    if (slot.controller === controller) slot.controller = null;
+  }
+}
+
+function playDirect(slot) {
+  slot.blocked = false;
+  slot.audio.volume = webVolume / 100;
+  stopVideoQuietly();
+  if (directActive && directActive !== slot) directActive.audio.pause();
+  directActive = slot;
+  slot.audio.currentTime = Math.min(webTargetPosition(), Math.max(0, slot.audio.duration - 0.01));
+  const attempt = slot.audio.play();
+  attempt?.catch((error) => {
+    if (directActive !== slot) return;
+    slot.audio.pause();
+    directActive = null;
+    slot.blocked = error.name === 'NotAllowedError';
+    slot.retryAt = Date.now() + 10000;
+    syncWebNow(true);
+    syncWebUi();
+    if (slot.blocked) setWebNote('파일이 준비됐어요. 직접 재생 버튼을 한 번 눌러 주세요.');
+  });
+  syncWebUi();
+}
+
+function syncDirect(force = false) {
+  const state = store.get();
+  if (!directAllowed()) {
+    if (directSlots.some((slot) => slot.id)) stopDirect();
+    return false;
+  }
+  const stream = state.stream;
+  const wanted = [stream.current, stream.next].filter((item) => item?.id);
+  for (const slot of directSlots) {
+    if (slot.id && !wanted.some((item) => item.id === slot.id)) releaseDirect(slot);
+  }
+  if (directActive && directActive.id !== state.current?.id) {
+    directActive.audio.pause();
+    directActive = null;
+  }
+  for (const descriptor of wanted) {
+    if (!descriptor.ready || descriptor.sizeBytes > stream.blobLimitBytes || descriptor.sizeBytes <= 0) continue;
+    let slot = directSlots.find((candidate) => candidate.id === descriptor.id);
+    if (!slot) {
+      slot = directSlots.find((candidate) => !candidate.id);
+      if (!slot) continue;
+      slot.id = descriptor.id;
+    }
+    if (!slot.audio.canPlayType('audio/ogg; codecs="opus"')) continue;
+    if (!slot.ready && !slot.controller && Date.now() >= slot.retryAt) {
+      const currentReady = directSlots.some((candidate) => candidate.id === state.current?.id && candidate.ready);
+      if (descriptor.id === state.current?.id || currentReady) fetchDirect(slot, descriptor);
+    }
+  }
+  const slot = directSlots.find((candidate) => candidate.id === state.current?.id && candidate.ready);
+  if (!slot || slot.blocked || slot.audio.readyState < 1 || Date.now() < slot.retryAt) return false;
+  const paused = clock.paused || clock.stopped || webLocalPaused;
+  if (paused) {
+    stopVideoQuietly();
+    directActive = slot;
+    slot.audio.pause();
+  } else if (directActive !== slot || (slot.audio.paused && !slot.audio.ended)) {
+    playDirect(slot);
+  }
+  if (directActive !== slot) return false;
+  const difference = webTargetPosition() - slot.audio.currentTime;
+  if (force || Math.abs(difference) > 2) {
+    slot.audio.currentTime = Math.min(webTargetPosition(), Math.max(0, slot.audio.duration - 0.01));
+    slot.audio.playbackRate = 1;
+  } else {
+    slot.audio.playbackRate = Math.abs(difference) < 0.1 ? 1 : difference > 0 ? 1.002 : 0.998;
+  }
+  slot.audio.volume = webVolume / 100;
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.playbackState = paused ? 'paused' : 'playing';
+    try {
+      navigator.mediaSession.setPositionState({ duration: slot.audio.duration,
+        playbackRate: slot.audio.playbackRate, position: Math.min(slot.audio.currentTime, slot.audio.duration) });
+    } catch {}
+  }
+  setWebNote('직접 받아 듣고 있어요. 오래 잠갔을 때 멈추면 크롬의 배터리 사용량을 제한 없음으로 설정해 주세요.');
+  return true;
+}
 
 function clampVolume(value) {
   const n = Number.isFinite(value) ? value : 60;
@@ -5500,6 +5683,21 @@ function webTargetPosition() {
 }
 
 function buildWebPlayback() {
+  buildDirectAudio();
+  el.directBtn = h('button', { class: 'btn btn--sm btn--ghost', type: 'button', hidden: true,
+    onClick: () => {
+      directWanted = !directWanted;
+      try { localStorage.setItem('macham.direct-stream', directWanted ? '1' : '0'); } catch {}
+      syncWebNow(true);
+      syncWebUi();
+    },
+  }, '🔊 직접 받기');
+  el.directRetry = h('button', { class: 'btn btn--sm', type: 'button', hidden: true,
+    onClick: () => {
+      const slot = directSlots.find((candidate) => candidate.id === store.get().current?.id && candidate.ready);
+      if (slot && directAllowed()) { webLocalPaused = false; slot.retryAt = 0; playDirect(slot); }
+    },
+  }, '직접 재생');
   el.videoBtn = bindAct(h('button', {
     class: 'btn btn--sm btn--ghost videobtn', type: 'button', 'aria-pressed': 'false',
     tip: '재생 카드에 유튜브 영상을 띄우고 같이 봐요. 소리도 영상에서 나요.',
@@ -5524,6 +5722,7 @@ function buildWebPlayback() {
       webVolume = clampVolume(Number(el.webVol.value));
       el.webVolLabel.textContent = `${webVolume}%`;
       try { ytPlayer?.setVolume(webVolume); } catch { /* 아직 준비 전 */ }
+      directSlots.forEach((slot) => { slot.audio.volume = webVolume / 100; });
       prefSet('webVolume', String(webVolume));
     },
   });
@@ -6049,6 +6248,8 @@ async function joinVideo() {
   // 웹에서 듣기를 켠다 — 자동재생 제스처·리스너 보고·싱크 루프를 그 경로가 이미 다 한다.
   webWasOnBeforeVideo = webOn;
   videoJoined = true;
+  stopDirect();
+  if (webOn) syncWebNow(true);
   // 처음 켤 때 한 번 보여 준다 — 크기를 바꿀 수 있다는 걸 알려야 한다. 곧 사라진다.
   wakeVideoChrome();
   startVideoLoop();
@@ -6357,6 +6558,9 @@ async function toggleWebPlayback() {
 
   // 토글을 누르는 행위 자체가 사용자 제스처다. 자동재생 정책을 통과하는 유일한 타이밍이라 여기서 다 한다.
   webOn = true;
+  webLocalPaused = false;
+  syncDirect(true);
+  bindMediaSessionActions();
   prefSet('webPlayback', '1');
   reportWebListening(true);
   syncWebUi();
@@ -6390,6 +6594,7 @@ async function toggleWebPlayback() {
 }
 
 function stopWebPlayback() {
+  stopDirect();
   clearInterval(webTimer);
   webTimer = 0;
   stopVideoQuietly();
@@ -6455,7 +6660,7 @@ function syncMediaSession() {
     return;
   }
 
-  const key = `${trackKey(track)}:${clock.paused || clock.stopped ? 0 : 1}`;
+  const key = `${trackKey(track)}:${clock.paused || clock.stopped || webLocalPaused ? 0 : 1}`;
   if (mediaSessionKey === key) return;      // 프레임마다 새 객체를 만들 이유가 없다
   mediaSessionKey = key;
 
@@ -6467,7 +6672,7 @@ function syncMediaSession() {
       album: '마참뮤직',
       artwork: art ? [{ src: art, sizes: '480x360', type: 'image/jpeg' }] : [],
     });
-    session.playbackState = clock.paused || clock.stopped ? 'paused' : 'playing';
+    session.playbackState = clock.paused || clock.stopped || webLocalPaused ? 'paused' : 'playing';
   } catch { /* 브라우저마다 지원이 다르다. 실패해도 재생에는 지장이 없다. */ }
 }
 
@@ -6479,8 +6684,16 @@ function bindMediaSessionActions() {
   const set = (action, handler) => {
     try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* 미지원 */ }
   };
-  set('play', () => { try { ytPlayer?.playVideo?.(); scWidget?.play?.(); } catch {} });
-  set('pause', () => { try { ytPlayer?.pauseVideo?.(); scWidget?.pause?.(); } catch {} });
+  set('play', () => {
+    webLocalPaused = false;
+    if (!syncDirect(true)) { try { ytPlayer?.playVideo?.(); scWidget?.play?.(); } catch {} }
+  });
+  set('pause', () => {
+    webLocalPaused = true;
+    directActive?.audio.pause();
+    try { ytPlayer?.pauseVideo?.(); scWidget?.pause?.(); } catch {}
+    navigator.mediaSession.playbackState = 'paused';
+  });
   // 되감기·건너뛰기는 봇의 위치를 따라가는 구조라 뜻이 없다. 안 붙인다.
   set('previoustrack', null);
   set('nexttrack', null);
@@ -6510,6 +6723,7 @@ function webSourceOf(track) {
 /** 곡이 바뀌거나 일시정지가 바뀌면 부른다. force면 위치까지 다시 맞춘다. */
 function syncWebNow(force) {
   if (!webOn) return;
+  if (syncDirect(force)) return;
   const state = store.get();
   const current = state.current;
   const next = webSourceOf(current?.track);
@@ -6528,10 +6742,10 @@ function syncWebNow(force) {
   if (next.kind === 'yt' && !ytReady) { ensureYouTube(); return; }
   if (next.kind === 'sc' && !window.SC?.Widget) { ensureSoundCloud(); return; }
 
-  setWebNote('');
+  setWebNote(directFallbackNote());
   // 곡이 바뀌면 유튜브가 자막 모듈을 다시 올린다. 설정을 매번 다시 건다.
   applyVideoCaptions();
-  const paused = !!state.player?.isPaused;
+  const paused = !!state.player?.isPaused || webLocalPaused || clock.stopped;
   const position = webTargetPosition();
   const changed = force || !webSource || webSource.kind !== next.kind || webSource.key !== next.key;
 
@@ -6597,6 +6811,7 @@ function stopVideoQuietly() {
 
 /** 지금 위치를 강제로 맞춘다. 싱크 보정을 바꿨을 때 즉시 반영하려고 쓴다. */
 function seekWebTo(seconds) {
+  if (webOn && directActive) { directActive.audio.currentTime = seconds; return; }
   if (!webOn || !webSource) return;
   try {
     if (webSource.kind === 'yt' && ytReady) ytPlayer.seekTo(seconds, true);
@@ -6638,10 +6853,11 @@ const WEB_PRELOAD_LEAD = 8000;  // 다음 곡을 준비하기 시작하는 시�
 
 /** 매 프레임 맞추면 소리가 튄다. 2초 이상 벌어졌을 때만 조용히 옮긴다. */
 function webTick() {
+  if (webOn && syncDirect()) { syncMediaSession(); return; }
   if (!webOn || !webSource) return;
   // 봇이 음성에서 빠졌는데 웹만 계속 트는 상태를 막는다 (§36).
   // 리모컨은 멈춰 있는데 내 브라우저에서만 노래가 나오면 상황이 전혀 안 읽힌다.
-  if (clock.stopped) {
+  if (clock.stopped || webLocalPaused) {
     try { ytPlayer?.pauseVideo?.(); } catch { /* 무시 */ }
     try { scWidget?.pause?.(); } catch { /* 무시 */ }
     return;
@@ -6713,6 +6929,11 @@ function syncWebUi() {
   el.webBtn.classList.toggle('btn--primary', webOn);
   el.webBtn.textContent = webOn ? '🔊 웹에서 듣는 중' : '🔊 웹에서 듣기';
   el.webVolWrap.hidden = !webOn;
+  el.directBtn.hidden = !webOn || !store.get().stream?.enabled;
+  el.directBtn.disabled = videoJoined;
+  el.directBtn.setAttribute('aria-pressed', String(directWanted));
+  el.directBtn.textContent = directWanted ? '🔊 직접 받기 켜짐' : '🔊 직접 받기';
+  el.directRetry.hidden = !directAllowed() || !directSlots.some((slot) => slot.id === store.get().current?.id && slot.blocked);
   if (el.webSync) el.webSync.hidden = !webOn;
   if (!webOn) setWebNote(webBlocked || '');
 }
@@ -10503,6 +10724,7 @@ async function loadHot() {
   queueTail = [];
   store.patch({
     player: data.player || null,
+    stream: data.stream || null,
     current: data.current || null,
     queue: data.queue || [],
     queueMode: data.queueMode || data.mode || 'score',
@@ -10576,7 +10798,7 @@ async function boot() {
   // `watch` 도 본다 — 같이보기 표가 붙고 떨어지려면 명단이 바뀔 때 다시 그려야 한다.
   store.subscribe(['presence', 'members', 'intentStatus', 'watch'], renderMembers);
   store.subscribe(['queue', 'queueMode', 'permissions', 'suspension', 'tier', 'conn', 'hotAt', 'settings', 'superLike'], renderQueue);
-  store.subscribe(['current', 'player', 'permissions', 'suspension', 'tier', 'settings', 'conn', 'next', 'nextOptions', 'skipVote'], renderNow);
+  store.subscribe(['current', 'player', 'permissions', 'suspension', 'tier', 'settings', 'conn', 'next', 'nextOptions', 'skipVote', 'stream'], renderNow);
   store.subscribe(['chat', 'chatDelta', 'permissions', 'suspension', 'tier', 'conn', 'settings', 'coldAt'], renderChat);
   store.subscribe(['liked', 'saved', 'playlists', 'permissions', 'suspension', 'tier'], renderLibrary);
   store.subscribe(['recent', 'permissions', 'suspension', 'tier'], renderRecent);

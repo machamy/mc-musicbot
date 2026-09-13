@@ -18,6 +18,23 @@ pub struct CacheManager {
     ffmpeg: String,
     /// 지금 받고 있는 곡 → 그 곡 전용 잠금 (`prepare` 참고).
     inflight: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pins: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    background_attempts: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+pub struct CachePin {
+    cache: Arc<CacheManager>,
+    key: String,
+}
+
+impl Drop for CachePin {
+    fn drop(&mut self) {
+        let mut pins = self.cache.pins.lock().unwrap();
+        if let Some(count) = pins.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 { pins.remove(&self.key); }
+        }
+    }
 }
 
 fn sanitize_file_name(value: &str) -> String {
@@ -37,6 +54,8 @@ impl CacheManager {
             log,
             ffmpeg,
             inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pins: std::sync::Mutex::new(std::collections::HashMap::new()),
+            background_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -49,6 +68,34 @@ impl CacheManager {
         entry.last_access_utc = chrono::Utc::now().to_rfc3339();
         self.db.upsert_cache_entry(&entry);
         Some(entry)
+    }
+
+    /// 파일을 열기 전부터 보호해야 LRU 검사와 open 사이에 지워지지 않는다.
+    pub fn pin(self: &Arc<Self>, key: &str) -> Option<(CacheEntry, CachePin)> {
+        let mut pins = self.pins.lock().unwrap();
+        let entry = self.get(key)?;
+        *pins.entry(key.to_string()).or_default() += 1;
+        Some((entry, CachePin { cache: self.clone(), key: key.to_string() }))
+    }
+
+    pub fn delete(&self, key: &str) -> bool {
+        let pins = self.pins.lock().unwrap();
+        if pins.contains_key(key) { return false; }
+        if let Some(entry) = self.db.get_cache_entry(key) {
+            if Path::new(&entry.file_path).exists() && std::fs::remove_file(&entry.file_path).is_err() {
+                return false;
+            }
+        }
+        self.db.delete_cache_entries(&[key.to_string()]);
+        true
+    }
+
+    pub fn begin_background_prepare(&self, key: &str) -> bool {
+        let mut attempts = self.background_attempts.lock().unwrap();
+        attempts.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(60));
+        if attempts.contains_key(key) { return false; }
+        attempts.insert(key.to_string(), std::time::Instant::now());
+        true
     }
 
     pub fn register(&self, track: &TrackRef, file_path: &str, size_bytes: i64) {
@@ -216,6 +263,7 @@ impl CacheManager {
 
     /// LRU 정리: 상한 초과분을 오래된 접근순으로 삭제. 잠긴 파일(재생 중)은 건너뜀.
     pub fn prune_to_limit(&self, limit_bytes: i64) {
+        let pins = self.pins.lock().unwrap();
         let mut entries = self.db.all_cache_entries();
         let mut total: i64 = entries
             .iter()
@@ -231,6 +279,7 @@ impl CacheManager {
         entries.sort_by(|a, b| a.last_access_utc.cmp(&b.last_access_utc));
         let mut removed_keys = Vec::new();
         for e in entries {
+            if pins.contains_key(&e.cache_key) { continue; }
             if total <= limit_bytes {
                 break;
             }
@@ -269,10 +318,12 @@ impl CacheManager {
 
     /// 전체 비우기 — 파일+메타. 잠긴 파일은 skip 카운트로 보고.
     pub fn wipe_all(&self) -> (usize, usize) {
+        let pins = self.pins.lock().unwrap();
         let entries = self.db.all_cache_entries();
         let mut deleted = Vec::new();
         let mut skipped = 0usize;
         for e in entries {
+            if pins.contains_key(&e.cache_key) { skipped += 1; continue; }
             if Path::new(&e.file_path).is_file() {
                 if std::fs::remove_file(&e.file_path).is_err() {
                     skipped += 1;
@@ -321,6 +372,7 @@ impl CacheManager {
             .collect();
         let (mut ok, mut failed) = (0usize, 0usize);
         for mut entry in entries {
+            if self.pins.lock().unwrap().contains_key(&entry.cache_key) { failed += 1; continue; }
             let src = entry.file_path.clone();
             if !Path::new(&src).is_file() {
                 failed += 1;

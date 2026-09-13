@@ -7,6 +7,7 @@ pub mod assets;
 pub mod pages;
 pub mod remote;
 pub mod remote_page;
+pub mod stream;
 
 use crate::app::App;
 use axum::body::Body;
@@ -156,6 +157,7 @@ pub struct WatchParty {
 }
 
 pub struct WebState {
+    pub streams: Arc<stream::StreamService>,
     pub app: Arc<App>,
     /// 웹 비밀번호 SHA-256 해시. None 이면 미설정(최초 설정 필요) 상태.
     pub password_hash: Mutex<Option<[u8; 32]>>,
@@ -313,6 +315,7 @@ pub async fn serve(app: Arc<App>) {
         guild_refresh_at: Mutex::new(HashMap::new()),
         remote_action_rate: Mutex::new(HashMap::new()),
         presence: Mutex::new(HashMap::new()),
+        streams: stream::StreamService::new(app.remote.load_stream_settings()),
         web_listeners: Mutex::new(HashSet::new()),
         web_listener_grace: Mutex::new(HashMap::new()),
         watch_parties: Mutex::new(HashMap::new()),

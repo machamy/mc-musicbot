@@ -4371,6 +4371,7 @@ function sectionOwner() {
   }
 
   ownerBox = h('div', { class: 'ovr' });
+  body.append(streamSettingsPanel());
   body.append(
     h('div', { class: 'ovrwarn' },
       h('span', { class: 'ovrwarn__ico', 'aria-hidden': 'true' }, '🌐'),
@@ -4986,3 +4987,32 @@ function onRemoteEvent(topic, data) {
 }
 
 boot();
+function streamSettingsPanel() {
+  const panel = h('div', { class: 'ovr' }, h('h3', null, '웹 직접 받기'));
+  const status = h('p', { class: 'hint' }, '설정을 읽고 있어요…');
+  panel.append(status);
+  api('/music/api/owner/stream').then((data) => {
+    const enabled = h('input', { type: 'checkbox', checked: data.enabled });
+    const transfers = h('input', { class: 'field', type: 'number', min: '1', max: '30', value: data.maxTransfers });
+    const bandwidth = h('input', { class: 'field', type: 'number', min: '128', max: '20000', value: data.bandwidthKbps });
+    status.textContent = `현재 전송 ${data.active}개 · 대기 ${data.queued}개. 모든 서버가 같은 업로드 예산을 나눠 써요.`;
+    const save = h('button', { class: 'btn btn--primary', type: 'button', onClick: async () => {
+      if (!transfers.reportValidity() || !bandwidth.reportValidity()) return;
+      save.disabled = true;
+      try {
+        const result = await api('/music/api/owner/stream', { method: 'PUT', body: {
+          enabled: enabled.checked, maxTransfers: Number(transfers.value), bandwidthKbps: Number(bandwidth.value),
+        } });
+        transfers.value = result.maxTransfers;
+        bandwidth.value = result.bandwidthKbps;
+        toast('웹 직접 받기 설정을 저장했어요.', 'ok');
+      } catch (error) { toast(error.message, 'warn'); }
+      finally { save.disabled = false; }
+    } }, '직접 받기 설정 저장');
+    panel.append(h('label', null, enabled, ' 웹 직접 받기 허용'),
+      h('label', null, '동시 전송 수 (1~30개)', transfers),
+      h('label', null, '전체 업로드 상한 (128~20,000 kbps)', bandwidth),
+      h('p', { class: 'hint' }, '실제 업로드에서 Discord와 다른 사용량을 뺀 여유 안에서 정해 주세요. 0은 무제한이 아니에요. 기본 2,000 kbps는 약 15명분이며, 전송 수가 회선 용량을 늘리지는 않아요.'), save);
+  }).catch((error) => { status.textContent = error.message; });
+  return panel;
+}

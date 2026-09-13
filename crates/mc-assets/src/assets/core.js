@@ -1140,6 +1140,7 @@ function merge(type, data, handlers) {
         autoplayEnabled: data.autoplayEnabled ?? state.player?.autoplayEnabled,
       });
       const patch = { player };
+      if (data.stream !== undefined) patch.stream = data.stream;
       if (data.current !== undefined) patch.current = data.current;
       // 서버가 정한 일정 (§31). 웹 재생과 진행바가 둘 다 이걸 기준으로 움직인다.
       patch.schedule = {

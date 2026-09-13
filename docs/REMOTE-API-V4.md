@@ -346,3 +346,85 @@ WebSocket 대신 5초 폴링 + ETag를 쓴다. 로그인 안 한 사람에게 �
 이 경로를 지나므로 따로 초대 이벤트를 쏘지 않는다.
 
 소켓이 끊기면 `presence_remove` 가 웹 리스너와 같은 규칙(마지막 소켓일 때만)으로 정리한다.
+## 웹 직접 받기 (v4.72, PLAN-05)
+
+기본은 꺼짐이다. 봇 주인의 전역 허용과 브라우저의 `직접 받기` 선택이 모두 필요하다.
+개인 선택은 해당 브라우저에만 저장하며 계정 설정/서버 청취 인원 상한과는 다르다.
+
+### 전역 설정
+
+`GET /music/api/owner/stream`: 봇 주인만 현재 설정과 전송 상태를 읽는다.
+`PUT /music/api/owner/stream`: 봇 주인 세션 + `X-CSRF-Token`, 설정 문서 전체 교체.
+
+```json
+{ "enabled": false, "maxTransfers": 10, "bandwidthKbps": 2000 }
+```
+
+- `maxTransfers`: 1~30, 기본 10. 청취자 수가 아니라 전송 중인 응답 수다.
+- `bandwidthKbps`: 128~20,000, 기본 2,000. 십진 kbps이며 모든 길드·Range 요청이 공유한다.
+  이 안전 예산에는 0=무제한 규칙을 적용하지 않는다. 저장/읽기 양쪽에서 범위를 제한한다.
+- `settings` 테이블의 `remote_web_stream` 키에 저장한다. 레거시 스키마 변경은 없다.
+- GET/PUT 응답에는 `active`, `queued`, `sentBytes`, `blobLimitBytes`가 추가된다.
+  `sentBytes`는 속도 제한기에 청구한 본문 바이트이며 네트워크 수신 완료 통계는 아니다.
+
+### 상태 프레임
+
+`playback`, `/state/hot`, `/state/cold`, 기존 `/state`에 같은 `stream` 객체가 있다.
+watcher 서명에도 준비 여부/크기를 넣어 다운로드 완료를 곡 변경 없이 알린다.
+`current`와 `next`는 현재 곡과 바로 다음 곡(큐 첫 곡 또는 활성 자동추천)이다.
+
+```json
+{
+  "enabled": true, "maxTransfers": 10, "bandwidthKbps": 2000,
+  "blobLimitBytes": 33554432,
+  "current": {
+    "id": "큐-항목-ID", "ready": true, "sizeBytes": 3770000,
+    "streamUrl": "/music/api/guilds/1/stream/큐-항목-ID"
+  },
+  "next": null
+}
+```
+
+꺼짐/라이브/곡 없음은 descriptor가 null이다. 캐시 미스는 `ready:false`다.
+descriptor의 `durationSeconds`는 서버 시각표의 곡 길이다. 디코딩한 파일과 2초 넘게
+다르면 이번 곡은 폴백한다. 구간 제거된 캐시를 원본 시각표로 틀어 무음이 생기는 것을 막는다.
+URL은 파일 경로가 아니라 길드의 큐 항목 ID를 받는다. 논리 캐시 키를 내용 해시로 보지 않는다.
+
+### 파일 응답
+
+`GET|HEAD /music/api/guilds/{guild_id}/stream/{item_id}`:
+로그인·길드 멤버십/기존 승인 게이트 + **현재 또는 바로 다음 곡**인지 검사한다.
+슬롯 대기 뒤에도 인가와 큐를 다시 검사하며, 요청으로 yt-dlp 다운로드를 시작하지 않는다.
+
+`200`, 단일 Range의 `206`, 범위 밖의 `416`(`Content-Range: bytes */길이`),
+`If-None-Match`의 `304`, `If-Range` 불일치 시 전체 `200`을 지원한다.
+HEAD는 Range를 무시하고 전체 길이만 준다. 잘못된 형식/다중 Range는 Range를 무시하고 200이다.
+MIME은 `audio/ogg; codecs=opus`, ETag는 실제 파일 SHA-256이다.
+`Cache-Control: private, no-cache`, `Vary: Cookie`로 인가 재검증과 공용 캐시 금지를 명시한다.
+CORS를 열지 않는 동일 오리진 API이고, 서비스워커 `/music/api/*` 우회 경로를 쓴다.
+
+로그인 없음은 401, 길드 접근 거부는 403, 허용 목록 밖/라이브/미지원 파일은 404다.
+전역 꺼짐·캐시 미스·대기 시한은 503, 큐 또는 사용자 요청 상한은 429이며
+429/503은 `Retry-After: 5`를 준다. 오류 응답은 저장하지 않는다.
+
+전역 대기 포함 512건, 사용자별 최대 2건. 현재 곡 우선, 다음 곡은 종료 예정 시각 순이다.
+미리받기는 동시 전송 상한이 2 이상이면 최소 1자리를 현재 곡에 남긴다.
+대기는 최대 25초(다음 곡의 마감이 더 빠르면 그때), 전체 요청 수명은 180초다.
+본문은 16 KiB 단위, 사용자당 고정 60초 창 64 MiB를 넘으면 연결을 끝낸다.
+소비자가 읽지 않아도 시한이 지나면 파일 pin과 슬롯을 반납한다.
+
+클라이언트는 최대 32 MiB 파일 두 개만 Blob으로 유지한다. 대기/실패에는 지연을 두고
+재시도하며, 후보 교체·끄기·페이지 종료 때 요청을 취소하고 URL을 해제한다.
+큰 파일의 Range API는 지원하지만 이번 포털은 큰 파일/라이브를 임베드로 재생한다.
+다운로드는 예산·동시성에 따라 180초 안에 끝나지 않을 수 있으며 이때도 폴백한다.
+두 audio는 DOM에 계속 유지한다. 다음 곡은 서버가 실제로 바꾼 뒤에만 틀고,
+진짜 무간격이나 JS 동결 상태의 곡 전환은 보장하지 않는다.
+
+### 검증
+
+`cargo test --workspace`에 Range/인가/ETag/HEAD/캐시 pin/전역 속도·우선순위 테스트가 있다.
+실제 브라우저 검증은 `scripts/Test-WebDirectStream.cjs`다. 로컬 개발 서버와
+`playwright-core`, Chromium, 30초 이상 Opus 시험 파일이 필요하다.
+`PLAN05_BASE`(기본 `http://127.0.0.1:8791`), `PLAN05_CHROME`, `PLAN05_AUDIO`로 지정한다.
+실제 포털·오디오 디코더를 사용하고 곡 일정·외부 임베드·파일 응답은 고정 fixture로 대체한다.
+장시간 Android 실기기/잠금/절전/블루투스 검증은 별도로 남는다. 배포는 이 작업에 포함하지 않는다.

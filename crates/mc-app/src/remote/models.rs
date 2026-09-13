@@ -3534,3 +3534,23 @@ pub enum ReactionOutcome {
     /// 그 메시지가 없다 — 지워졌거나 보존 기간이 지나 사라졌다.
     MessageGone,
 }
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct WebStreamSettings {
+    pub enabled: bool,
+    pub max_transfers: u32,
+    pub bandwidth_kbps: u32,
+}
+
+impl Default for WebStreamSettings {
+    fn default() -> Self {
+        Self { enabled: false, max_transfers: 10, bandwidth_kbps: 2_000 }
+    }
+}
+
+impl WebStreamSettings {
+    pub fn sanitize(&mut self) {
+        self.max_transfers = self.max_transfers.clamp(1, 30);
+        self.bandwidth_kbps = self.bandwidth_kbps.clamp(128, 20_000);
+    }
+}
