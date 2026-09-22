@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 26;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -549,7 +549,7 @@ const MIGRATION_V15: &str = r#"
 ///   - `internal:...` — 우리가 튼 기록으로 만드는 차트(§15.2b). 외부 호출이 없다.
 ///
 /// 관리 콘솔에서 주소를 바꿀 수 있다. 여기 값은 **처음 한 번만** 심어진다.
-const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 61] = [
+const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 66] = [
     // 우리가 실제로 튼 것으로 만드는 차트 — 자동재생으로 나간 곡은 세지 않는다.
     (ChartCategory::Ours, "우리 서버 인기곡", "Internal", "internal:guild-plays"),
     (ChartCategory::Ours, "우리 서버 사랑받은 곡", "Internal", "internal:guild-love"),
@@ -619,6 +619,22 @@ const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 61] = [
     (ChartCategory::JapanGenre, "일본 애니송", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_mRcc2Y3l-RoZsDt27qu8CBGpKt-5w7v8g"),
     (ChartCategory::JapanGenre, "일본 시티팝", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_nEjjAWEM3M3fk2tT4Lhb5JOr_HoD0tjnk"),
     (ChartCategory::JapanGenre, "일본 시티팝 최신", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_muPPezCrTrwoL7Ep_9a69YkIaBjsyKTg0"),
+    /* 2026-09-22 추가. **한국에서 많이 듣는 일본 노래** 쪽을 채운다 — 이 서버의 자동 재생이
+     * 실제로 고르는 것이 あたらよ·ヨルシカ·Aimer·back number 같은 J-POP 발라드와 보컬로이드인데,
+     * 그 둘을 담은 차트가 하나도 없었다.
+     *
+     * 전부 yt-dlp 로 곡 수와 길이를 확인했다(괄호가 곡 수). **평균 3~4분대, 최장 10분**이라
+     * §15.2 가 경고한 "한 시간짜리 믹스 영상" 은 섞여 있지 않다. 검색(`ytsearchN:`)이 아니라
+     * 유튜브 뮤직이 큐레이션한 재생목록(`RDCLAK5uy_…`)이라 그 함정을 애초에 피한다. */
+    (ChartCategory::JapanGenre, "일본 발라드", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kSSYZ41jnUPCIaYvFSZnU67VJEosUro5Q"), // 100
+    (ChartCategory::JapanGenre, "일본 보컬로이드", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_mgu07-HoqLSU-WqjK2ldEQWLuPPm3CAy8"), // 96
+    (ChartCategory::JapanGenre, "일본 J-ROCK", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_ne3Hb9yPpt9ls4_grpyMUZTaH07kUA2y8"), // 50
+    (ChartCategory::JapanGenre, "일본 2010년대", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kCiC2hty_MCamSRVBdl1Bhcu-vRWxPBJw"), // 98
+    (ChartCategory::JapanGenre, "일본 노래방 인기", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kW4l3hmtC_Aq2XCvin1b3h6tziPMH0tsk"), // 89
+    /* **`TJ J-POP` 은 일본 칸이다.** 노래방 묶음에 있었는데, 일본 노래를 찾는 사람은
+     * 일본 칸만 훑는다 — 노래방 칸에 있으면 그 눈에 안 걸린다. 순위를 TJ 에서 빌려
+     * 오는 것은 그대로고(트는 것은 원곡), 보이는 자리만 옮긴다. */
+    (ChartCategory::JapanGenre, "TJ J-POP", "TJ", "tj:top:3"),
     // 노래방 — TJ 는 공식 API 를 직접 긁는다. 검색으로 흉내내지 않는다.
     (ChartCategory::Karaoke, "TJ 인기 100", "TJ", "tj:hot"),
     (ChartCategory::Karaoke, "TJ 가요 100", "TJ", "tj:top:1"),
@@ -627,7 +643,6 @@ const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 61] = [
     (ChartCategory::Karaoke, "TJ 트로트", "TJ", "tj:top:6"),
     (ChartCategory::Karaoke, "TJ 인디·어쿠스틱", "TJ", "tj:top:7"),
     (ChartCategory::Karaoke, "TJ 팝송", "TJ", "tj:top:2"),
-    (ChartCategory::Karaoke, "TJ J-POP", "TJ", "tj:top:3"),
     (ChartCategory::Karaoke, "TJ OST", "TJ", "tj:top:8"),
     /* 9·10·11 은 오래 빠져 있었다. TJ 가 분류 번호의 뜻을 안 알려 줘서 곡을 보고 하나씩
      * 채워 온 표인데, 이 셋은 있는지조차 몰랐다. 2026-08-17 에 실제 응답으로 확인했다.
@@ -3875,6 +3890,27 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                  * `chart.id.to_string()` 이다. 여기서 손댈 것이 없다. */
                 seed_builtin_charts(&tx)?;
             }
+            25 => {
+                /* **`TJ J-POP` 을 노래방에서 일본으로 옮긴다.**
+                 *
+                 * 일본 노래를 찾는 사람은 일본 칸만 훑는다. 노래방 칸에 있으면 그 눈에
+                 * 안 걸린다 — 한국 장르 차트를 만들 때(§15.2d) 겪은 것과 같은 문제다.
+                 *
+                 * **관리자가 옮겨 놓은 것은 건드리지 않는다.** 주소까지 옛 기본값과
+                 * 정확히 같고 아직 노래방에 있을 때만 옮긴다. */
+                tx.execute(
+                    "UPDATE remote_charts
+                        SET category = 'japan_genre'
+                      WHERE builtin = 1 AND name = 'TJ J-POP'
+                        AND url = 'tj:top:3' AND category = 'karaoke'",
+                    [],
+                )?;
+                /* **시더를 반드시 부른다.** `BUILTIN_CHARTS` 에 더하는 것만으로는 이미
+                 * 쓰던 서버에 안 들어간다 — v4.38 이 이 단계를 빼먹고 배포해서 운영 DB 가
+                 * 49개 그대로였다. 회귀 가드가 따로 있다
+                 * (`a_reseed_step_brings_new_builtin_charts_to_an_old_database`). */
+                seed_builtin_charts(&tx)?;
+            }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -6438,6 +6474,65 @@ mod tests {
         assert!(effective.default_volume <= 80);
         cleanup(store, path);
     }
+    /// **회귀 가드: `TJ J-POP` 은 일본 칸으로 옮겨져야 하고, 관리자가 옮긴 것은 안 건드린다.**
+    ///
+    /// 옮기는 일 자체는 `UPDATE` 한 줄이라 쉬운데, 조건을 느슨하게 쓰면 **관리자가 일부러
+    /// 다른 칸에 둔 차트까지 끌어온다.** 그래서 주소까지 옛 기본값과 같고 아직 노래방에
+    /// 있을 때만 옮기는지를 확인한다.
+    #[test]
+    fn tj_jpop_moves_to_japan_but_an_admin_moved_chart_is_left_alone() {
+        let (store, _path) = temp_store("chart-tj-jpop");
+        {
+            let conn = store.conn.lock().unwrap();
+            // 옛 상태로 되돌린다: TJ J-POP 이 노래방에 있다.
+            conn.execute(
+                "UPDATE remote_charts SET category = 'karaoke'
+                  WHERE builtin = 1 AND name = 'TJ J-POP'",
+                [],
+            )
+            .unwrap();
+            // 관리자가 손댄 셈 치고 주소를 바꾼 차트를 하나 심는다.
+            conn.execute(
+                "INSERT INTO remote_charts (guild_id, category, name, provider, url, sort_order, builtin)
+                 VALUES (NULL, 'karaoke', 'TJ J-POP (관리자)', 'TJ', 'tj:top:99', 998, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        rewind_and_migrate(&store, 25);
+
+        let conn = store.conn.lock().unwrap();
+        let moved: String = conn
+            .query_row(
+                "SELECT category FROM remote_charts WHERE builtin = 1 AND name = 'TJ J-POP'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, "japan_genre", "TJ J-POP 은 일본 칸으로 가야 한다");
+
+        let untouched: String = conn
+            .query_row(
+                "SELECT category FROM remote_charts WHERE name = 'TJ J-POP (관리자)'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched, "karaoke", "주소가 다르면 건드리지 않는다");
+
+        // 새로 더한 일본 차트도 같은 단계에서 심어져야 한다.
+        for name in ["일본 발라드", "일본 보컬로이드", "일본 노래방 인기"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM remote_charts WHERE builtin = 1 AND name = ?1 AND category = 'japan_genre'",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{name} 이 일본 칸에 심어져야 한다");
+        }
+    }
+
     /// **회귀 가드: 기본 차트를 늘려 놓고 기존 DB 에 안 심던 문제.**
     ///
     /// `BUILTIN_CHARTS` 에 항목을 더해도 그것만으로는 **이미 쓰던 서버에 안 들어간다.**

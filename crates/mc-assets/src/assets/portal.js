@@ -10613,6 +10613,50 @@ let chartView = { level: 'categories', category: null, chart: null, period: 'mon
  * 요청마다 번호를 매기고, 돌아왔을 때 내가 아직 최신 요청인지 확인한다. */
 let chartLoadSeq = 0;
 
+/* **기다리는 동안 화면이 살아 있어야 한다.**
+ *
+ * 스켈레톤만 깔아 두면 3초 뒤에도 30초 뒤에도 똑같이 생겼다. 차트 한 장을 처음 여는 데는
+ * 서버가 yt-dlp 로 목록을 긁어야 해서 오래 걸리고(노래방은 곡마다 원곡을 찾아 더 걸린다),
+ * 그동안 **고장인지 도는 중인지 구별할 방법이 없었다.** 그리고 `api()` 에는 기본 시간제한이
+ * 없어서, 요청이 한 번 멈추면 스켈레톤이 영영 남았다 — 그게 '아무 반응 없음' 의 정체다.
+ *
+ * 그래서 둘을 같이 건다. 흐른 시간을 1초마다 고쳐 쓰고, 넘으면 끊어서 실패 화면으로 보낸다.
+ * 실패 화면에는 이미 `다시 시도` 가 있다(§`openChart`). */
+const CHART_LOAD_TIMEOUT_MS = 90000;   // 클라우드플레어가 100초쯤에 끊는다. 그 전에 우리가 끊어야 안내를 띄울 수 있다
+
+function startChartWait(host, hint) {
+  const label = h('span', { class: 'chartwait__label' }, hint);
+  const elapsed = h('span', { class: 'chartwait__sec' }, '');
+  const line = h('div', { class: 'chartwait' },
+    h('span', { class: 'chartwait__dot', 'aria-hidden': 'true' }), label, elapsed);
+  host.prepend(line);
+  const began = Date.now();
+  // `aria-live` 는 안 쓴다 — 1초마다 읽어 주면 방해만 된다. 눈으로 보는 표시다.
+  const timer = setInterval(() => {
+    const sec = Math.round((Date.now() - began) / 1000);
+    elapsed.textContent = ` ${sec}초`;
+    // 8초를 넘기면 이유를 알려 준다. 그 전에는 굳이 겁줄 필요가 없다.
+    if (sec === 8) label.textContent = '처음 여는 차트는 목록을 새로 긁어와서 더 걸려요';
+  }, 1000);
+  return () => clearInterval(timer);
+}
+
+/** 시간제한이 걸린 차트 요청. 끊기면 `api()` 가 던지는 것과 같은 모양으로 맞춰 준다. */
+async function chartApi(path) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CHART_LOAD_TIMEOUT_MS);
+  try {
+    return await api(path, { signal: controller.signal });
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error(`${Math.round(CHART_LOAD_TIMEOUT_MS / 1000)}초 안에 응답이 없었어요. 잠시 뒤에 다시 눌러 주세요.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function buildChartsPane() {
   el.chartBack = h('button', {
     class: 'iconbtn', type: 'button', hidden: true, tip: '한 단계 뒤로', 'aria-label': '뒤로',
@@ -10648,8 +10692,9 @@ function buildChartsPane() {
 async function loadCharts() {
   if (chartState) { renderCharts(); return; }
   clear(el.chartBody).appendChild(skeletonRows(4));
+  const doneWaiting = startChartWait(el.chartBody, '차트 목록을 불러오는 중이에요');
   try {
-    const data = await api('/charts');
+    const data = await chartApi('/charts');
     chartState = { categories: data?.categories || [] };
   } catch (error) {
     // 서버가 아직 차트를 모르면 탭을 통째로 숨긴다. 빈 탭이 남아 있는 게 제일 나쁘다.
@@ -10658,8 +10703,11 @@ async function loadCharts() {
       hideChartsTab();
       return;
     }
-    clear(el.chartBody).appendChild(emptyState('📈', '차트를 못 불러왔어요', error.message));
+    clear(el.chartBody).appendChild(emptyState('📈', '차트를 못 불러왔어요', error.message,
+      { label: '다시 시도', onClick: () => loadCharts() }));
     return;
+  } finally {
+    doneWaiting();
   }
   renderCharts();
 }
@@ -10741,12 +10789,13 @@ async function openChart(chart, keepLevel) {
   if (!keepLevel) pushChartHistory();
   renderCharts();
   clear(el.chartBody).appendChild(skeletonRows(6));      // yt-dlp가 도는 몇 초 동안 빈 화면이면 고장으로 보인다
+  const doneWaiting = startChartWait(el.chartBody, `${chart.name} 을(를) 불러오는 중이에요`);
   try {
     // 서버가 읽는 쿼리 키는 `window` 다 (remote.rs `ChartWindowQuery`). `period` 만 보내면
     // serde 가 조용히 버려서 어느 기간을 눌러도 늘 `month` 가 나온다. 예전 빌드 호환으로 둘 다 보낸다.
     const value = encodeURIComponent(chartView.period);
     const query = chartView.category === 'ours' ? `?window=${value}&period=${value}` : '';
-    const data = await api(`/charts/${encodeURIComponent(chart.id)}${query}`);
+    const data = await chartApi(`/charts/${encodeURIComponent(chart.id)}${query}`);
     // 기다리는 사이에 뒤로 갔거나 다른 차트를 눌렀으면 여기서 끝낸다.
     if (token !== chartLoadSeq) return;
     // 우리 차트는 통계가 붙은 `rows` 와 맨 트랙 배열 `tracks` 를 둘 다 준다.
@@ -10763,6 +10812,8 @@ async function openChart(chart, keepLevel) {
       { label: '다시 시도', onClick: () => openChart(chart, true) },
     ));
     return;
+  } finally {
+    doneWaiting();
   }
   renderChartTracks();
 }

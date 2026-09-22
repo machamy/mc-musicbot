@@ -113,13 +113,20 @@ $prelude
 `$f = Join-Path `$logs 'mc-musicbot-$day.jsonl'
 if (-not (Test-Path `$f)) { "그 날짜 로그가 없어요: $day"; return }
 `$hits = New-Object Collections.Generic.List[string]
+`$broken = 0
 foreach (`$l in [IO.File]::ReadLines(`$f)) {
     if ('$Level'    -and `$l -notmatch ('"level":"' + '$Level' + '"')) { continue }
     if ('$Category' -and `$l -notmatch ('"category":"' + '$Category' + '"')) { continue }
     if ('$Match'    -and `$l -notmatch [regex]::Escape('$Match')) { continue }
-    try { `$o = `$l | ConvertFrom-Json } catch { continue }
+    try { `$o = `$l | ConvertFrom-Json } catch { `$broken++; continue }
+    # **깨진 줄 하나가 명령 전체를 죽이면 안 된다.** 로거가 한 줄에 레코드 둘을 붙여 놓는
+    # 버그가 있었고(2026-09-22 수정), 그때 `timestamp` 가 없는 객체가 나와 여기서
+    # null 에 `.Substring()` 을 부르다 ``$ErrorActionPreference='Stop'` 에 걸려 죽었다.
+    # 사고 났을 때 로그를 못 보는 게 제일 나쁘다 — 못 읽는 줄은 세고 넘어간다.
+    if (-not `$o.timestamp) { `$broken++; continue }
     `$hits.Add(('{0} {1,-5} {2,-10} {3}' -f `$o.timestamp.Substring(11,8), `$o.level, `$o.category, `$o.message))
 }
+if (`$broken) { "⚠ 읽지 못한 줄 `$broken 개 (로그 파일이 깨진 부분)" }
 "걸린 줄 `$(`$hits.Count) 개 중 마지막 $Lines 개"
 if (`$hits.Count -gt $Lines) { `$hits[(`$hits.Count - $Lines)..(`$hits.Count - 1)] } else { `$hits }
 "@
