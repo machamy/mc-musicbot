@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 27;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -549,7 +549,10 @@ const MIGRATION_V15: &str = r#"
 ///   - `internal:...` — 우리가 튼 기록으로 만드는 차트(§15.2b). 외부 호출이 없다.
 ///
 /// 관리 콘솔에서 주소를 바꿀 수 있다. 여기 값은 **처음 한 번만** 심어진다.
-const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 66] = [
+/// v4.74 가 이 재생목록을 두 이름으로 심었다. 마이그레이션 26 이 중복을 지우고 원래 줄을 옮긴다.
+const DUPLICATE_KARAOKE_JP: &str = "https://music.youtube.com/playlist?list=RDCLAK5uy_kW4l3hmtC_Aq2XCvin1b3h6tziPMH0tsk";
+
+const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 65] = [
     // 우리가 실제로 튼 것으로 만드는 차트 — 자동재생으로 나간 곡은 세지 않는다.
     (ChartCategory::Ours, "우리 서버 인기곡", "Internal", "internal:guild-plays"),
     (ChartCategory::Ours, "우리 서버 사랑받은 곡", "Internal", "internal:guild-love"),
@@ -630,11 +633,16 @@ const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 66] = [
     (ChartCategory::JapanGenre, "일본 보컬로이드", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_mgu07-HoqLSU-WqjK2ldEQWLuPPm3CAy8"), // 96
     (ChartCategory::JapanGenre, "일본 J-ROCK", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_ne3Hb9yPpt9ls4_grpyMUZTaH07kUA2y8"), // 50
     (ChartCategory::JapanGenre, "일본 2010년대", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kCiC2hty_MCamSRVBdl1Bhcu-vRWxPBJw"), // 98
-    (ChartCategory::JapanGenre, "일본 노래방 인기", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kW4l3hmtC_Aq2XCvin1b3h6tziPMH0tsk"), // 89
     /* **`TJ J-POP` 은 일본 칸이다.** 노래방 묶음에 있었는데, 일본 노래를 찾는 사람은
      * 일본 칸만 훑는다 — 노래방 칸에 있으면 그 눈에 안 걸린다. 순위를 TJ 에서 빌려
      * 오는 것은 그대로고(트는 것은 원곡), 보이는 자리만 옮긴다. */
     (ChartCategory::JapanGenre, "TJ J-POP", "TJ", "tj:top:3"),
+    /* `일본 노래방 히트` 도 같이 옮긴다. **이름에 "일본" 이 붙어 있는데 노래방 칸에**
+     * 있었다 — 일본 노래를 찾는 사람이 가장 먼저 놓치는 자리다.
+     *
+     * v4.74 에서 이 줄을 못 보고 같은 재생목록을 `일본 노래방 인기` 라는 다른 이름으로
+     * 하나 더 심었다. 주소가 글자까지 같은 중복이었다. 마이그레이션에서 그 줄을 지운다. */
+    (ChartCategory::JapanGenre, "일본 노래방 히트", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kW4l3hmtC_Aq2XCvin1b3h6tziPMH0tsk"), // 89
     // 노래방 — TJ 는 공식 API 를 직접 긁는다. 검색으로 흉내내지 않는다.
     (ChartCategory::Karaoke, "TJ 인기 100", "TJ", "tj:hot"),
     (ChartCategory::Karaoke, "TJ 가요 100", "TJ", "tj:top:1"),
@@ -658,7 +666,6 @@ const BUILTIN_CHARTS: [(ChartCategory, &str, &str, &str); 66] = [
     (ChartCategory::Karaoke, "TJ 종합", "TJ", "tj:top:9"),
     (ChartCategory::Karaoke, "TJ 힙합·랩", "TJ", "tj:top:10"),
     (ChartCategory::Karaoke, "TJ R&B·소울", "TJ", "tj:top:11"),
-    (ChartCategory::Karaoke, "일본 노래방 히트", "YouTube", "https://music.youtube.com/playlist?list=RDCLAK5uy_kW4l3hmtC_Aq2XCvin1b3h6tziPMH0tsk"),
     // 금영은 공개 API 를 못 찾아서 검색으로 남긴다. 노래방 채널은 개별 곡을 올리므로
     // 인기곡 검색과 달리 모음 영상이 안 잡힌다(2026-08-07 실측: 6/6 개별 반주).
     // SoundCloud
@@ -3911,6 +3918,39 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                  * (`a_reseed_step_brings_new_builtin_charts_to_an_old_database`). */
                 seed_builtin_charts(&tx)?;
             }
+            26 => {
+                /* **v4.74 가 만든 중복을 되돌린다.**
+                 *
+                 * `일본 노래방 히트` 가 이미 노래방 칸에 있었는데 그걸 못 보고, 같은 재생목록을
+                 * `일본 노래방 인기` 라는 다른 이름으로 하나 더 심었다. 주소가 글자까지 같다.
+                 * 이름에 unique 인덱스가 걸려 있어서 이름이 다르면 중복이 걸러지지 않는다 —
+                 * **이름이 아니라 주소로 봐야 했다.**
+                 *
+                 * 지우는 것은 `builtin = 1` 이고 v4.74 가 심은 이름·주소 조합일 때뿐이다.
+                 * 관리자가 같은 재생목록을 자기 차트로 등록해 뒀을 수 있는데 그건 남의 것이다. */
+                tx.execute(
+                    "DELETE FROM remote_chart_cache WHERE chart_id IN (
+                         SELECT id FROM remote_charts
+                          WHERE builtin = 1 AND name = '일본 노래방 인기' AND url = ?1)",
+                    params![DUPLICATE_KARAOKE_JP],
+                )?;
+                tx.execute(
+                    "DELETE FROM remote_charts
+                      WHERE builtin = 1 AND name = '일본 노래방 인기' AND url = ?1",
+                    params![DUPLICATE_KARAOKE_JP],
+                )?;
+                /* 그리고 **원래 것**을 일본 칸으로 옮긴다. 이게 애초에 했어야 할 일이다 —
+                 * 이름에 '일본' 이 붙어 있는데 노래방 칸에 있었다. 관리자가 옮겨 둔 것은
+                 * 건드리지 않는다(주소까지 같고 아직 노래방일 때만). */
+                tx.execute(
+                    "UPDATE remote_charts
+                        SET category = 'japan_genre'
+                      WHERE builtin = 1 AND name = '일본 노래방 히트'
+                        AND url = ?1 AND category = 'karaoke'",
+                    params![DUPLICATE_KARAOKE_JP],
+                )?;
+                seed_builtin_charts(&tx)?;
+            }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -6474,6 +6514,79 @@ mod tests {
         assert!(effective.default_volume <= 80);
         cleanup(store, path);
     }
+    /// **회귀 가드: 기본 차트 목록에 같은 주소가 두 번 들어가면 안 된다.**
+    ///
+    /// v4.74 가 정확히 이걸 어겼다. `일본 노래방 히트` 가 이미 있는데 같은 재생목록을
+    /// `일본 노래방 인기` 로 하나 더 심었다. DB 의 unique 인덱스는 **이름**에 걸려 있어서
+    /// 이름만 다르면 그대로 통과한다 — 코드 쪽에서 막는 수밖에 없다.
+    ///
+    /// 이름 중복도 같이 본다. 그쪽은 DB 가 막아 주지만, 막히는 순간 조용히 무시돼서
+    /// (`INSERT OR IGNORE`) 새로 더한 차트가 안 심어진 줄도 모르게 된다.
+    #[test]
+    fn builtin_charts_never_repeat_a_url_or_a_name() {
+        let mut by_url: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut by_name: HashMap<&str, usize> = HashMap::new();
+        for (_, name, _, url) in BUILTIN_CHARTS {
+            by_url.entry(url).or_default().push(name);
+            *by_name.entry(name).or_default() += 1;
+        }
+        let shared: Vec<_> = by_url.iter().filter(|(_, names)| names.len() > 1).collect();
+        assert!(
+            shared.is_empty(),
+            "같은 주소를 여러 이름으로 심고 있다 — 화면에 같은 차트가 두 번 뜬다: {shared:?}"
+        );
+        let repeated: Vec<_> = by_name.iter().filter(|(_, count)| **count > 1).collect();
+        assert!(repeated.is_empty(), "이름이 겹친다 — 뒤엣것이 조용히 안 심어진다: {repeated:?}");
+    }
+
+    /// **회귀 가드: 같은 재생목록을 두 이름으로 심지 않는다.**
+    ///
+    /// v4.74 가 `일본 노래방 히트` 가 이미 있는 줄 모르고 같은 주소를 `일본 노래방 인기` 로
+    /// 하나 더 심었다. 이름에 unique 인덱스가 걸려 있어서 **이름이 다르면 안 걸린다** —
+    /// 중복은 이름이 아니라 주소로 봐야 한다는 것을 여기서 못 박는다.
+    #[test]
+    fn the_japanese_karaoke_playlist_appears_once_and_sits_in_japan() {
+        let (store, _path) = temp_store("chart-jp-karaoke");
+        {
+            let conn = store.conn.lock().unwrap();
+            // v4.74 가 남긴 상태를 흉내 낸다: 중복이 있고 원래 것은 노래방에 있다.
+            conn.execute(
+                "UPDATE remote_charts SET category = 'karaoke'
+                  WHERE builtin = 1 AND name = '일본 노래방 히트'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO remote_charts
+                   (guild_id, category, name, provider, url, sort_order, enabled, builtin)
+                 VALUES (NULL, 'japan_genre', '일본 노래방 인기', 'YouTube', ?1, 997, 1, 1)",
+                params![DUPLICATE_KARAOKE_JP],
+            )
+            .unwrap();
+        }
+        rewind_and_migrate(&store, 26);
+
+        let conn = store.conn.lock().unwrap();
+        let same_url: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM remote_charts WHERE builtin = 1 AND url = ?1",
+                params![DUPLICATE_KARAOKE_JP],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(same_url, 1, "같은 재생목록이 두 줄로 남으면 안 된다");
+
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT name, category FROM remote_charts WHERE builtin = 1 AND url = ?1",
+                params![DUPLICATE_KARAOKE_JP],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "일본 노래방 히트", "살아남는 것은 원래 이름이다");
+        assert_eq!(row.1, "japan_genre", "일본 칸에 있어야 한다");
+    }
+
     /// **회귀 가드: `TJ J-POP` 은 일본 칸으로 옮겨져야 하고, 관리자가 옮긴 것은 안 건드린다.**
     ///
     /// 옮기는 일 자체는 `UPDATE` 한 줄이라 쉬운데, 조건을 느슨하게 쓰면 **관리자가 일부러
@@ -6521,7 +6634,7 @@ mod tests {
         assert_eq!(untouched, "karaoke", "주소가 다르면 건드리지 않는다");
 
         // 새로 더한 일본 차트도 같은 단계에서 심어져야 한다.
-        for name in ["일본 발라드", "일본 보컬로이드", "일본 노래방 인기"] {
+        for name in ["일본 발라드", "일본 보컬로이드", "일본 노래방 히트"] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM remote_charts WHERE builtin = 1 AND name = ?1 AND category = 'japan_genre'",
