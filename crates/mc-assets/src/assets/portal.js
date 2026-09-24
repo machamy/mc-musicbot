@@ -3466,7 +3466,7 @@ async function loadSeeds() {
 const AUTOPLAY_MODES = [
   ['seed', '📻 기준 곡', '내가 고른 곡들과 비슷한 노래를 골라 와요'],
   ['recent', '🕘 최근 튼 곡', '최근에 튼 곡 몇 개를 참고해서 골라 와요'],
-  ['genre', '🎸 장르', '고른 장르 차트에서 골라 와요'],
+  ['genre', '🎸 차트·재생목록', '고른 차트와 보관함 재생목록에서 골라 와요'],
 ];
 
 const AUTOPLAY_POLICIES = [
@@ -3804,6 +3804,14 @@ function apRecentSection() {
   });
 }
 
+/* 보관함 재생목록의 묶음 이름. 서버가 보내는 `category` 는 저장용 scope 값이라 그대로 쓰면
+ * `User` 같은 영어가 머리글에 뜬다. 차트 분류표(`CHART_CATEGORIES`)와 자리는 같고 출처만 다르다. */
+const PLAYLIST_GROUPS = {
+  User: { icon: '📃', label: '내 재생목록' },
+  Guild: { icon: '🌐', label: '서버 재생목록' },
+  Global: { icon: '🌏', label: '전체 공개 재생목록' },
+};
+
 function apGenreSection() {
   if (!autoplayState) return null;
   const editable = autoplayEditable();
@@ -3816,10 +3824,17 @@ function apGenreSection() {
    * 한 줄에 섞이게 돼서, 어느 나라 것인지 이름만으로 가려야 하는 상태가 된다. */
   const chip = (option) => {
     const on = autoplayState.genres.includes(option.key);
+    // 보관함 재생목록은 곡 수까지 보여 준다. 차트와 달리 내가 직접 채운 것이라 '몇 곡짜리였더라'
+    // 가 바로 궁금해진다. 차트는 수가 계속 바뀌므로 안 적는다.
+    const label = option.group === 'playlist' && option.count
+      ? `${option.label} · ${option.count}곡`
+      : option.label;
     return setLock(bindAct(h('button', {
       class: 'seg', type: 'button', 'aria-pressed': String(on), dataset: { seg: option.key },
-      tip: `${option.label} 차트에서 곡을 골라 와요`,
-    }, option.label), () => saveAutoplay({
+      tip: option.group === 'playlist'
+        ? `${option.label} 에 담긴 곡을 기준으로 골라 와요`
+        : `${option.label} 차트에서 곡을 골라 와요`,
+    }, label), () => saveAutoplay({
       genres: on
         ? autoplayState.genres.filter((key) => key !== option.key)
         : autoplayState.genres.concat(option.key),
@@ -3831,7 +3846,9 @@ function apGenreSection() {
     const key = option.category || 'genre';
     let group = groups.find((entry) => entry.key === key);
     if (!group) {
-      const meta = CHART_CATEGORIES[key] || {};
+      // 보관함 쪽은 차트 분류표에 없다. scope 값(`User`·`Guild`·`Global`)을 그대로 띄우면
+      // 영어 머리글이 되므로 여기서 이름을 준다.
+      const meta = PLAYLIST_GROUPS[key] || CHART_CATEGORIES[key] || {};
       groups.push(group = { key, icon: meta.icon || '🎸', label: meta.label || key, items: [] });
     }
     group.items.push(option);
@@ -3846,7 +3863,7 @@ function apGenreSection() {
       ]))
     : h('p', {
       class: 'ap__note', tip: '장르 차트가 준비되면 여기에 고를 수 있는 장르가 나와요',
-    }, '고를 수 있는 장르가 아직 없어요. 관리 콘솔에서 장르 차트를 켜면 여기에 나와요.');
+    }, '고를 수 있는 것이 아직 없어요. 관리 콘솔에서 차트를 켜거나, 보관함에 재생목록을 만들면 여기에 나와요.');
 
   return apSection({
     icon: '🎸', name: '장르',

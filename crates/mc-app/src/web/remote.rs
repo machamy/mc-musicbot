@@ -21,7 +21,8 @@ use crate::remote::{
     as_limit, as_limit_u32,
 };
 use crate::remote::{
-    AutoplayMode, AutoplayPolicy, BoomttaAction, ChartCategory, ChartDef, ChartSnapshot,
+    AutoplayMode, AutoplayPolicy, AutoplaySource, BoomttaAction, ChartCategory, ChartDef,
+    ChartSnapshot,
     INTERNAL_CHART_PREFIX, VOTE_POINT_MAX, VOTE_POINT_MIN,
 };
 use std::collections::BTreeMap;
@@ -7483,7 +7484,12 @@ fn autoplay_seed_json(state: &WebState, guild_id: u64, seed: &AutoplaySeed) -> V
 }
 
 /// 목록 + 상한 + 내가 고칠 수 있는지. 권한이 없어도 **보이기는 한다**(V3 §8.5).
-async fn autoplay_payload(state: &WebState, guild_id: u64, can_edit: bool) -> Value {
+async fn autoplay_payload(
+    state: &WebState,
+    guild_id: u64,
+    can_edit: bool,
+    viewer: Option<u64>,
+) -> Value {
     let settings = state.app.remote.load_guild_settings(guild_id);
     /* **엔진과 같은 출처를 본다.** 바구니는 "추천이 무엇을 참고하는가" 를 보여 주는
      * 화면인데, 엔진(`recent_seeds`)은 `state.current_item` 을 맨 앞에 두는 반면
@@ -7523,7 +7529,7 @@ async fn autoplay_payload(state: &WebState, guild_id: u64, can_edit: bool) -> Va
         // **고를 수 있는 장르 목록** (V3 §8.6). 이게 없으면 유저 UI 는 `🎸 장르` 를 골라도
         // 선택 줄 자체를 안 그려서 `autoplay_genres` 가 영원히 비고, 폴백 사슬이 곧장 내려간다.
         // 관리 콘솔은 `/charts` 폴백이 있어 살아 있었지만 유저 UI 에는 그 폴백이 없다.
-        "genreOptions": genre_options(state, guild_id),
+        "genreOptions": genre_options(state, guild_id, viewer),
         // **무엇이 추천 근거로 쌓이고 있는지** (V3 §8.7). 화면이 이걸 그대로 보여준다.
         // 이게 없으면 자동재생은 "어디서 나온지 모를 곡을 트는 기계"로 보인다.
         "basket": autoplay_basket(state, guild_id, &settings, current_track.as_ref()),
@@ -7699,7 +7705,7 @@ async fn api_autoplay_reset(
     );
 
     let can_edit = ctx.allows("autoplay", ctx.settings.autoplay_rule);
-    let mut payload = autoplay_payload(&state, guild_id, can_edit).await;
+    let mut payload = autoplay_payload(&state, guild_id, can_edit, Some(ctx.user_id())).await;
     payload["message"] = json!(summary);
     json_ok(payload)
 }
@@ -7712,8 +7718,16 @@ async fn api_autoplay_reset(
 ///
 /// 노래방 차트도 장르처럼 고를 수 있게 같이 싣는다. 실패한 차트는 뺀다 —
 /// 고를 수는 있는데 아무 곡도 안 나오는 항목이 제일 나쁘다 (§15.2).
-fn genre_options(state: &WebState, guild_id: u64) -> Vec<Value> {
-    state
+/// 자동 재생 설정 화면이 고를 수 있는 목록 (§8.4).
+///
+/// 차트와 **보관함 재생목록**을 같이 내려준다. 화면은 `group` 으로 나눠 그린다 —
+/// 둘은 성격이 달라서(차트는 남이 만든 순위, 보관함은 우리가 모은 곡) 한 덩어리로
+/// 늘어놓으면 뭘 고르는 건지 알 수 없다.
+///
+/// 보관함 쪽은 **이 서버에서 보이는 것만** 준다 — 서버 재생목록, 전체 공개, 그리고
+/// 고르는 사람 본인의 개인 재생목록. 남의 개인 재생목록은 애초에 목록에 안 나온다.
+fn genre_options(state: &WebState, guild_id: u64, viewer: Option<u64>) -> Vec<Value> {
+    let mut options: Vec<Value> = state
         .app
         .remote
         .list_charts(guild_id)
@@ -7725,17 +7739,61 @@ fn genre_options(state: &WebState, guild_id: u64) -> Vec<Value> {
                     | ChartCategory::Genre
                     | ChartCategory::JapanGenre
                     | ChartCategory::Karaoke
+                    // 관리자가 등록한 재생목록도 고를 수 있어야 한다. 기본 차트와 같은
+                    // 캐시·갱신을 쓰는데 이 목록에서만 빠져 있었다.
+                    | ChartCategory::Custom
             )
         })
         .filter(|chart| chart.enabled && chart.ok())
         .map(|chart| {
             json!({
-                "key": chart.id.to_string(),
+                "key": AutoplaySource::Chart(chart.id).key(),
                 "label": chart.name,
                 "category": chart.category.as_str(),
+                "group": "chart",
             })
         })
-        .collect()
+        .collect();
+
+    let mut playlists = state
+        .app
+        .db
+        .list_playlists(PlaylistScope::Guild, Some(guild_id));
+    playlists.extend(state.app.db.list_playlists(PlaylistScope::Global, None));
+    /* **개인 재생목록은 본인에게 주는 응답에만 싣는다.**
+     *
+     * 이 payload 는 `broadcast_autoplay` 로 **서버 사람 전체에게** 나간다. 거기에 개인
+     * 재생목록 이름을 넣으면 남의 보관함 제목이 그대로 새어 나간다. 방송 쪽은
+     * `viewer = None` 으로 부른다.
+     *
+     * 남이 자기 개인 재생목록을 골라 둔 경우, 다른 사람 화면에는 그 칩이 안 보인다.
+     * 설정 자체는 그대로 살아 있고 추천도 그대로 돈다 — **이름을 감추는 것이지**
+     * 고른 것을 지우는 게 아니다. */
+    if let Some(user_id) = viewer {
+        playlists.extend(
+            state
+                .app
+                .db
+                .list_playlists(PlaylistScope::User, None)
+                .into_iter()
+                .filter(|playlist| playlist.owner_user_id == user_id),
+        );
+    }
+    for playlist in playlists {
+        // 빈 재생목록은 골라 봐야 아무 곡도 안 준다. 눈에 안 띄게 뺀다.
+        let count = state.app.db.playlist_entries(playlist.id).len();
+        if count == 0 {
+            continue;
+        }
+        options.push(json!({
+            "key": AutoplaySource::Playlist(playlist.id).key(),
+            "label": playlist.name,
+            "category": playlist.scope.as_str(),
+            "group": "playlist",
+            "count": count,
+        }));
+    }
+    options
 }
 
 #[derive(Debug, Deserialize)]
@@ -7829,7 +7887,7 @@ async fn api_autoplay_put(
     }
     broadcast_autoplay(&state, guild_id).await;
     emit_bare(&state, guild_id, "settings");
-    json_ok(json!({ "ok": true, "autoplay": autoplay_payload(&state, guild_id, true).await }))
+    json_ok(json!({ "ok": true, "autoplay": autoplay_payload(&state, guild_id, true, Some(ctx.user_id())).await }))
 }
 
 /// `GET .../autoplay` — 시드 + 추천 방식 (V3 §8.6).
@@ -7843,12 +7901,13 @@ async fn api_autoplay_get(
         Err(response) => return response,
     };
     let can_edit = ctx.allows("autoplay", ctx.settings.autoplay_rule);
-    json_ok(autoplay_payload(&state, guild_id, can_edit).await)
+    json_ok(autoplay_payload(&state, guild_id, can_edit, Some(ctx.user_id())).await)
 }
 
 /// 시드가 바뀌면 보고 있는 사람 모두에게 알린다. 개인화 필드가 없어서 그대로 보내도 된다.
 async fn broadcast_autoplay(state: &Arc<WebState>, guild_id: u64) {
-    let payload = autoplay_payload(state, guild_id, true).await;
+    // 방송은 전원에게 간다 — 개인 재생목록 이름을 실으면 안 된다(`genre_options` 주석).
+    let payload = autoplay_payload(state, guild_id, true, None).await;
     emit(state, guild_id, "autoplay", payload);
 }
 
@@ -7862,7 +7921,7 @@ async fn api_autoplay_seeds(
         Err(response) => return response,
     };
     let can_edit = ctx.allows("autoplay", ctx.settings.autoplay_rule);
-    json_ok(autoplay_payload(&state, guild_id, can_edit).await)
+    json_ok(autoplay_payload(&state, guild_id, can_edit, Some(ctx.user_id())).await)
 }
 
 /// 기준 곡 편집 공통 게이트 — 권한 + 신청 정지.

@@ -18,6 +18,7 @@ use crate::player::autoplay::{AutoplayContext, AutoplayTuning};
 const AUTOPLAY_OPTION_COUNT: usize = 10;
 use crate::player::coordinator::Coordinator;
 use crate::player::manager::PlayerManager;
+use crate::remote::models::AutoplaySource;
 use crate::remote::AutoplayMode;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -209,16 +210,37 @@ fn seeds_for_mode(
             settings.recent_count_limit(),
         ),
         AutoplayMode::Genre => {
-            // §15 의 차트 인프라를 그대로 쓴다. **캐시만 본다** — 재생 경로에서 yt-dlp 를 돌리면
-            // 곡 경계가 몇 초씩 밀린다. 캐시가 비어 있으면 폴백 사슬이 알아서 내려간다.
-            let per_genre: Vec<Vec<TrackRef>> = settings
+            /* §15 의 차트 인프라를 그대로 쓴다. **캐시만 본다** — 재생 경로에서 yt-dlp 를 돌리면
+             * 곡 경계가 몇 초씩 밀린다. 캐시가 비어 있으면 폴백 사슬이 알아서 내려간다.
+             *
+             * 보관함 재생목록도 같은 자리에서 고를 수 있다. 그쪽은 **우리 DB 에 이미 있는 곡**이라
+             * 네트워크가 아예 필요 없다 — 차트보다 오히려 싸다.
+             *
+             * 목록이 사라졌으면(차트 캐시가 비었거나 재생목록이 지워졌거나) 그 줄만 조용히
+             * 빠진다. 설정을 건드려 고쳐 주지 않는다 — 잠깐 비었을 뿐인 경우가 많고,
+             * 그때 설정을 지우면 사용자가 고른 것이 말없이 날아간다. */
+            let per_source: Vec<Vec<TrackRef>> = settings
                 .autoplay_genres
                 .iter()
-                .filter_map(|key| key.parse::<i64>().ok())
-                .filter_map(|chart_id| app.remote.chart_cache(chart_id))
-                .map(|snapshot| snapshot.tracks.into_iter().take(GENRE_SEEDS_PER_CHART).collect())
+                .filter_map(|key| AutoplaySource::parse(key))
+                .filter_map(|source| match source {
+                    AutoplaySource::Chart(id) => app
+                        .remote
+                        .chart_cache(id)
+                        .map(|snapshot| snapshot.tracks),
+                    AutoplaySource::Playlist(id) => {
+                        let tracks: Vec<TrackRef> = app
+                            .db
+                            .playlist_entries(id)
+                            .into_iter()
+                            .filter_map(|entry| entry.track)
+                            .collect();
+                        (!tracks.is_empty()).then_some(tracks)
+                    }
+                })
+                .map(|tracks| tracks.into_iter().take(GENRE_SEEDS_PER_CHART).collect())
                 .collect();
-            genre_seeds(per_genre)
+            genre_seeds(per_source)
         }
     }
 }

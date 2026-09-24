@@ -508,8 +508,42 @@ pub enum AutoplayMode {
     /// 최근에 튼 N곡 중 무작위 (기본, 지금 동작).
     #[default]
     Recent,
-    /// 고른 장르 차트에서 무작위.
+    /// 고른 차트·보관함 재생목록에서 무작위. **값은 `"genre"` 그대로 둔다** —
+    /// 쓰던 서버의 설정이 그 문자열로 저장돼 있다. 뜻만 넓어졌다.
     Genre,
+}
+
+/// 자동 재생이 참고할 목록 하나. `autoplay_genres` 에 문자열로 저장된다.
+///
+/// **옛 값은 맨 숫자다.** 처음엔 차트만 고를 수 있어서 차트 ID 를 그대로 넣었다.
+/// 보관함 재생목록이 더해지면서 둘을 갈라야 했는데, 이미 저장된 값을 건드리지 않으려고
+/// **새로 생긴 쪽에만 접두사를 붙인다** — 맨 숫자는 예나 지금이나 차트다.
+/// 마이그레이션이 필요 없고, 옛 빌드로 되돌려도 차트 선택은 그대로 읽힌다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoplaySource {
+    /// 차트 ID. 저장 형태는 `"12"`.
+    Chart(i64),
+    /// 보관함 재생목록 ID. 저장 형태는 `"pl:12"`.
+    Playlist(i64),
+}
+
+impl AutoplaySource {
+    pub const PLAYLIST_PREFIX: &'static str = "pl:";
+
+    pub fn parse(key: &str) -> Option<Self> {
+        let key = key.trim();
+        if let Some(rest) = key.strip_prefix(Self::PLAYLIST_PREFIX) {
+            return rest.trim().parse::<i64>().ok().map(Self::Playlist);
+        }
+        key.parse::<i64>().ok().map(Self::Chart)
+    }
+
+    pub fn key(self) -> String {
+        match self {
+            Self::Chart(id) => id.to_string(),
+            Self::Playlist(id) => format!("{}{id}", Self::PLAYLIST_PREFIX),
+        }
+    }
 }
 
 impl AutoplayMode {
@@ -542,7 +576,7 @@ impl AutoplayMode {
         match self {
             Self::Seed => "직접 고른 기준 곡을 돌아가며 참고해요.",
             Self::Recent => "최근에 튼 곡 중 하나를 골라 참고해요.",
-            Self::Genre => "고른 장르 차트에서 한 곡을 골라 참고해요.",
+            Self::Genre => "고른 차트·재생목록에서 한 곡을 골라 참고해요.",
         }
     }
 
@@ -2710,6 +2744,35 @@ pub struct LyricsDocument {
 pub struct LyricsLine {
     pub start_ms: u64,
     pub text: String,
+}
+
+#[cfg(test)]
+mod autoplay_source_tests {
+    use super::AutoplaySource;
+
+    /// **회귀 가드: 옛 설정(맨 숫자)은 앞으로도 차트여야 한다.**
+    ///
+    /// `autoplay_genres` 에는 이미 `"12"` 같은 차트 ID 가 저장돼 있다. 보관함 재생목록을
+    /// 더하면서 접두사를 **새 쪽에만** 붙인 이유가 이것이다 — 여기가 뒤집히면 쓰던 서버의
+    /// 자동 재생 설정이 통째로 엉뚱한 곳을 가리킨다.
+    #[test]
+    fn old_plain_numbers_stay_charts_and_only_playlists_carry_a_prefix() {
+        assert_eq!(AutoplaySource::parse("12"), Some(AutoplaySource::Chart(12)));
+        assert_eq!(AutoplaySource::parse(" 12 "), Some(AutoplaySource::Chart(12)));
+        assert_eq!(AutoplaySource::parse("pl:12"), Some(AutoplaySource::Playlist(12)));
+        assert_eq!(AutoplaySource::parse("pl: 12"), Some(AutoplaySource::Playlist(12)));
+
+        // 저장 형태로 되돌렸다가 다시 읽어도 같아야 한다.
+        for source in [AutoplaySource::Chart(7), AutoplaySource::Playlist(7)] {
+            assert_eq!(AutoplaySource::parse(&source.key()), Some(source));
+        }
+        // 차트 7 과 재생목록 7 은 **다른 것**이다. 접두사가 사라지면 여기서 걸린다.
+        assert_ne!(AutoplaySource::Chart(7).key(), AutoplaySource::Playlist(7).key());
+
+        for junk in ["", "pl:", "pl:abc", "abc", "12abc"] {
+            assert_eq!(AutoplaySource::parse(junk), None, "{junk:?} 는 못 읽어야 한다");
+        }
+    }
 }
 
 #[cfg(test)]
