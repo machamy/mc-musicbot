@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 27;
+const SCHEMA_VERSION: i64 = 28;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -1342,6 +1342,86 @@ impl RemoteStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// 재생목록 스냅샷을 저장하고 코드를 준다 (§12.4).
+    ///
+    /// 코드가 겹치면 다시 뽑는다. 30^8 이라 실제로는 거의 안 일어나지만, `INSERT` 가
+    /// 조용히 실패해서 **남의 재생목록 코드를 돌려주는 일**만큼은 막아야 한다.
+    pub fn create_playlist_share(
+        &self,
+        owner_user_id: u64,
+        name: &str,
+        tracks: &[crate::models::TrackRef],
+    ) -> Option<String> {
+        let payload = serde_json::to_string(tracks).ok()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        // 한 사람이 코드를 무한정 쌓지 못하게 오래된 것부터 버린다.
+        let _ = conn.execute(
+            "DELETE FROM remote_playlist_shares
+              WHERE owner_user_id = ?1 AND code NOT IN (
+                  SELECT code FROM remote_playlist_shares WHERE owner_user_id = ?1
+                  ORDER BY created_utc DESC LIMIT ?2)",
+            params![owner_user_id as i64, (SHARE_PER_USER - 1) as i64],
+        );
+        for _ in 0..8 {
+            let body: String = (0..SHARE_BODY_LEN)
+                .map(|_| {
+                    let index = rand::random::<u32>() as usize % SHARE_ALPHABET.len();
+                    SHARE_ALPHABET[index] as char
+                })
+                .collect();
+            let code = format!("{SHARE_PREFIX}{body}");
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO remote_playlist_shares
+                   (code, owner_user_id, name, payload_json, track_count, created_utc)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    code,
+                    owner_user_id as i64,
+                    name,
+                    payload,
+                    tracks.len() as i64,
+                    now
+                ],
+            );
+            if matches!(inserted, Ok(1)) {
+                return Some(code);
+            }
+        }
+        None
+    }
+
+    /// 코드로 스냅샷을 읽는다. **지우지 않는다** — 한 코드를 여러 사람이 쓸 수 있어야 한다.
+    pub fn playlist_share(&self, code: &str) -> Option<PlaylistShare> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT code, owner_user_id, name, payload_json
+                   FROM remote_playlist_shares WHERE code = ?1",
+                params![code],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .ok()?;
+        let tracks = serde_json::from_str(&row.3).ok()?;
+        let _ = conn.execute(
+            "UPDATE remote_playlist_shares SET used_count = used_count + 1 WHERE code = ?1",
+            params![code],
+        );
+        Some(PlaylistShare {
+            code: row.0,
+            owner_user_id: row.1 as u64,
+            name: row.2,
+            tracks,
+        })
     }
 
     pub fn list_recent(&self, guild_id: u64, limit: usize) -> Vec<RecentTrack> {
@@ -3951,6 +4031,34 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                 )?;
                 seed_builtin_charts(&tx)?;
             }
+            27 => {
+                /* 재생목록 공유 코드 (§12.4).
+                 *
+                 * **왜 서버에 두는가** — 곡 100개짜리를 코드 안에 담으면 base64 로 수만 자가
+                 * 된다. 붙여넣을 수 있는 길이가 아니다. 스냅샷은 여기 두고 짧은 코드만 준다.
+                 *
+                 * 봇은 한 프로세스가 모든 서버를 보므로, 이 표에 있는 코드는 **어느 서버에서든**
+                 * 통한다. '서버간 공유' 가 따로 할 일 없이 성립하는 이유다.
+                 *
+                 * 받는 쪽은 **복사본**이다. 그래서 원본이 바뀌든 지워지든 상관이 없고,
+                 * 남의 재생목록을 계속 읽어 갈 필요도 없다 — 권한·삭제·비공개 전환을
+                 * 뒤쫓지 않아도 된다는 뜻이다. */
+                tx.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS remote_playlist_shares (
+                        code TEXT PRIMARY KEY,
+                        owner_user_id INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        track_count INTEGER NOT NULL,
+                        created_utc TEXT NOT NULL,
+                        used_count INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_playlist_shares_owner
+                        ON remote_playlist_shares(owner_user_id, created_utc DESC);
+                    "#,
+                )?;
+            }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -3959,6 +4067,59 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.commit()?;
     }
     Ok(())
+}
+
+/* ── 재생목록 공유 코드 (§12.4) ───────────────────────────────────────────── */
+
+/// 코드에 쓰는 글자. **헷갈리는 글자를 뺐다** — `0·O`, `1·I·L`, `U`(V 와 손글씨에서 겹침).
+/// 사람이 눈으로 읽고 손으로 옮겨 적는 물건이라, 경우의 수보다 안 헷갈리는 게 중요하다.
+const SHARE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTVWXYZ";
+/// 글자 수. 30^8 ≈ 6,561억 가지라 충돌은 실질적으로 없고, 있어도 아래에서 다시 뽑는다.
+const SHARE_BODY_LEN: usize = 8;
+pub const SHARE_PREFIX: &str = "MCP";
+/// 한 사람이 들고 있을 수 있는 코드 수. 넘으면 가장 오래된 것부터 버린다.
+const SHARE_PER_USER: usize = 20;
+/// 한 코드에 담을 수 있는 곡 수. 이걸 넘는 재생목록은 공유가 거절된다.
+pub const SHARE_TRACK_MAX: usize = 500;
+
+/// 공유 코드 한 장.
+#[derive(Debug, Clone)]
+pub struct PlaylistShare {
+    pub code: String,
+    pub owner_user_id: u64,
+    pub name: String,
+    pub tracks: Vec<crate::models::TrackRef>,
+}
+
+/// 사람이 친 코드를 표준형으로. 대소문자·띄어쓰기·하이픈을 받아 준다.
+///
+/// 알파벳에 없는 글자는 **버리지 않고 실패로 본다.** 조용히 버리면 `MCP-A8CD-EF2G` 의
+/// `O` 오타가 한 글자 짧은 코드가 되어 "그런 코드가 없어요" 로 끝난다 — 어디를 잘못
+/// 쳤는지 알 수가 없다.
+pub fn normalize_share_code(raw: &str) -> Option<String> {
+    let upper = raw.trim().to_ascii_uppercase();
+    let body: String = upper
+        .chars()
+        .filter(|ch| !matches!(ch, '-' | ' ' | '_'))
+        .collect();
+    let body = body.strip_prefix(SHARE_PREFIX).unwrap_or(&body);
+    if body.len() != SHARE_BODY_LEN {
+        return None;
+    }
+    if !body.bytes().all(|byte| SHARE_ALPHABET.contains(&byte)) {
+        return None;
+    }
+    Some(format!("{SHARE_PREFIX}{body}"))
+}
+
+/// 보여 줄 때의 모양. `MCP-A8CD-EF2G` 처럼 네 글자씩 끊는다 — 옮겨 적기 쉬우라고.
+pub fn format_share_code(code: &str) -> String {
+    let body = code.strip_prefix(SHARE_PREFIX).unwrap_or(code);
+    if body.len() == SHARE_BODY_LEN {
+        format!("{SHARE_PREFIX}-{}-{}", &body[..4], &body[4..])
+    } else {
+        code.to_string()
+    }
 }
 
 /// 기본 제공 차트를 한 번 심는다 (§15.2). `guild_id IS NULL` 이라 모든 서버가 같이 본다.
@@ -6514,6 +6675,74 @@ mod tests {
         assert!(effective.default_volume <= 80);
         cleanup(store, path);
     }
+    /// **공유는 찍어 내는 순간의 사본이다.**
+    ///
+    /// 코드를 만든 뒤에 원본을 고쳐도 이미 나간 코드는 안 바뀌어야 한다 — 받는 쪽이
+    /// 복사본을 갖는 설계라 그래야 앞뒤가 맞는다. 받는 사람마다 내용이 달라지면
+    /// "그 코드로 받았다" 는 말이 뜻을 잃는다.
+    ///
+    /// 그리고 **한 코드를 여러 사람이 쓸 수 있어야 한다** — 읽었다고 지우면 단체방에
+    /// 올린 코드를 한 사람만 쓰게 된다.
+    #[test]
+    fn a_share_code_is_a_snapshot_and_survives_being_used_more_than_once() {
+        let (store, _path) = temp_store("playlist-share");
+        let first = vec![test_track("aaa"), test_track("bbb")];
+        let code = store
+            .create_playlist_share(7, "출근길", &first)
+            .expect("코드가 나와야 한다");
+        assert_eq!(normalize_share_code(&code).as_deref(), Some(code.as_str()));
+
+        // 원본이 바뀐 셈 치고 같은 사람이 다른 목록을 또 공유한다.
+        let second = vec![test_track("zzz")];
+        let other = store.create_playlist_share(7, "밤에", &second).unwrap();
+        assert_ne!(other, code, "코드는 겹치면 안 된다");
+
+        // 처음 코드는 처음 내용 그대로여야 한다.
+        let got = store.playlist_share(&code).expect("읽혀야 한다");
+        assert_eq!(got.name, "출근길");
+        assert_eq!(got.tracks.len(), 2);
+        assert_eq!(got.owner_user_id, 7);
+
+        // 두 번째로 읽어도 그대로 있어야 한다.
+        let again = store.playlist_share(&code).expect("두 번째도 읽혀야 한다");
+        assert_eq!(again.tracks.len(), 2);
+
+        assert!(store.playlist_share("MCP22222222").is_none(), "없는 코드");
+    }
+
+    /// **공유 코드는 사람이 눈으로 읽고 손으로 옮겨 적는 물건이다.**
+    ///
+    /// 그래서 헷갈리는 글자(`0·O`, `1·I·L`, `U`)를 아예 안 쓴다. 대소문자·하이픈·띄어쓰기는
+    /// 받아 주되, **알파벳에 없는 글자는 조용히 버리지 않고 실패로 본다** — 버리면 오타가
+    /// 한 글자 짧은 코드가 되어 "그런 코드가 없어요" 로 끝나고, 어디를 틀렸는지 알 수 없다.
+    #[test]
+    fn share_codes_avoid_lookalike_letters_and_reject_typos() {
+        for confusing in [b'0', b'O', b'1', b'I', b'L', b'U'] {
+            assert!(
+                !SHARE_ALPHABET.contains(&confusing),
+                "{} 는 다른 글자와 헷갈린다",
+                confusing as char
+            );
+        }
+
+        let code = format!("{SHARE_PREFIX}A8CDEF2G");
+        // 보여 주는 모양과 사람이 칠 법한 변형이 모두 같은 코드로 돌아와야 한다.
+        assert_eq!(format_share_code(&code), "MCP-A8CD-EF2G");
+        for typed in [
+            "MCP-A8CD-EF2G",
+            "mcp-a8cd-ef2g",
+            "  MCP A8CD EF2G  ",
+            "A8CDEF2G",
+        ] {
+            assert_eq!(normalize_share_code(typed).as_deref(), Some(code.as_str()), "{typed:?}");
+        }
+
+        // 오타는 '못 읽음' 이어야 한다. 잘라 내고 넘어가면 안 된다.
+        for bad in ["MCP-A8CD-EF2O", "MCP-A8CD-EF2", "MCP-A8CD-EF2GH", "", "MCP"] {
+            assert_eq!(normalize_share_code(bad), None, "{bad:?} 는 거절해야 한다");
+        }
+    }
+
     /// **회귀 가드: 기본 차트 목록에 같은 주소가 두 번 들어가면 안 된다.**
     ///
     /// v4.74 가 정확히 이걸 어겼다. `일본 노래방 히트` 가 이미 있는데 같은 재생목록을

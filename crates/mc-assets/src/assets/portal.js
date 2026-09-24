@@ -4683,7 +4683,13 @@ function newPlaylistRow(scope) {
     if (created) { input.value = ''; refetchCold(); }
   }
 
-  return h('div', { class: 'plnew' }, input, button);
+  /* **코드로 받기는 내 재생목록 칸에만 둔다.** 받은 것은 언제나 내 개인 재생목록이 되므로
+   * (서버 목록으로 바로 들어가지 않는다) 서버 칸에 두면 서버에 들어간다고 오해하게 된다. */
+  const paste = server ? null : bindAct(h('button', {
+    class: 'btn btn--sm btn--ghost', type: 'button', tip: '받은 공유 코드로 재생목록을 가져와요',
+  }, '🔗 코드로 받기'), () => importPlaylistCode());
+
+  return h('div', { class: 'plnew' }, input, button, paste);
 }
 
 function playlistDuration(entries) {
@@ -4778,8 +4784,60 @@ function playlistMenu(playlist, mine) {
       reason: '서버 관리자만 공개 범위를 바꿀 수 있어요',
       onPick: () => togglePlaylistScope(playlist, mine),
     },
+    /* 공유는 **읽기**다 — 보이는 목록의 사본을 뜨는 것이라 편집 권한이 필요 없다.
+     * 서버 판정도 같은 규칙이라(`share` 를 `enqueue` 와 같은 자리에 뒀다) 화면과 안 어긋난다. */
+    { icon: '🔗', label: '공유 코드 만들기', onPick: () => sharePlaylist(playlist) },
     { icon: '🗑', label: '재생목록 삭제', danger: true, disabled: !editable, reason, onPick: () => deletePlaylist(playlist) },
   ];
+}
+
+/** 공유 코드를 받아 보여 준다. **코드는 찍어 내는 순간의 사본**이라, 뒤에 목록을 고쳐도
+ *  이미 나간 코드는 안 바뀐다. 그 말을 화면에도 적어 둔다 — 안 적으면 "고쳤는데 왜 그대로냐"
+ *  가 된다. */
+async function sharePlaylist(playlist) {
+  const result = await call(() => api('/playlists/action', {
+    body: { action: 'share', playlistId: playlist.id },
+  }));
+  if (!result?.code) return;
+  const field = h('input', { class: 'field', value: result.code, readonly: true,
+    style: { fontSize: 'var(--fs-lg)', textAlign: 'center', letterSpacing: '0.08em' } });
+  // 열자마자 골라 둔다. 클립보드가 막힌 브라우저에서는 이게 유일한 복사 수단이다.
+  setTimeout(() => { try { field.select(); } catch { /* 무시 */ } }, 0);
+  const copy = bindAct(h('button', { class: 'btn btn--sm', type: 'button' }, '복사'), async () => {
+    try { await navigator.clipboard.writeText(result.code); toast('코드를 복사했어요.', 'ok'); }
+    catch { toast('복사가 막혀 있어요. 코드를 길게 눌러 직접 복사해 주세요.', 'warn'); }
+  });
+  await sheet({
+    title: '공유 코드',
+    desc: `'${playlist.name}' ${result.count}곡을 담았어요. 이 코드를 받은 사람은 어느 서버에서든 자기 보관함으로 가져갈 수 있어요.`,
+    body: h('div', { style: { display: 'grid', gap: 'var(--sp-2)' } }, field, copy,
+      h('p', { class: 'hint' }, '지금 담긴 곡을 그대로 찍어 둔 거예요. 나중에 이 재생목록을 고쳐도 이 코드로 받는 내용은 안 바뀌어요.')),
+    dismissValue: null,
+    actions: [{ label: '닫기', kind: 'primary', value: null }],
+  }).result;
+}
+
+/** 코드로 받기. 들어오는 것은 **복사본**이라 원본과 이어지지 않는다. */
+async function importPlaylistCode() {
+  const input = h('input', { class: 'field', placeholder: 'MCP-A8CD-EF2G', maxlength: '24',
+    style: { textAlign: 'center', letterSpacing: '0.08em' } });
+  const ok = await sheet({
+    title: '코드로 받기',
+    desc: '받은 코드를 넣으면 내 재생목록에 사본이 생겨요.',
+    body: input,
+    dismissValue: false,
+    actions: [{ label: '취소', kind: 'ghost', value: false },
+      { label: '받기', kind: 'primary', value: true, autofocus: true }],
+  }).result;
+  if (!ok) return;
+  const code = input.value.trim();
+  if (!code) return;
+  const result = await call(() => api('/playlists/action', { body: { action: 'import', code } }));
+  if (!result) return;
+  // 곡 수를 그대로 말한다. 길이 제한이나 차단곡 때문에 몇 곡이 빠질 수 있어서,
+  // "42곡" 이라고 들은 사람이 40곡을 받는 경우가 실제로 생긴다.
+  toast(`'${result.name}' 으로 ${result.count}곡을 받았어요.`, 'ok');
+  refetchCold();
 }
 
 /** 공개 범위 전환. **되돌릴 수 있지만 남에게 보이는 것이 달라지므로 한 번 묻는다.** */

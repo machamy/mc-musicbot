@@ -6562,6 +6562,9 @@ struct PlaylistActionRequest {
     /// 자리 번호가 밀렸을 때의 대조용. 번호로 못 찾으면 이걸로 찾는다.
     #[serde(default)]
     cache_key: Option<String>,
+    /// 공유 코드 (§12.4). `import` 에서만 쓴다.
+    #[serde(default)]
+    code: Option<String>,
     /// `"user"` 면 **개인 재생목록**(V3 §12), 그 밖은 서버 재생목록.
     /// `create` 에서만 의미가 있고, 나머지는 대상 재생목록의 실제 범위를 따른다.
     scope: Option<String>,
@@ -6616,7 +6619,8 @@ async fn api_playlist_action(
     let personal = target
         .as_ref()
         .map(|playlist| playlist.scope == PlaylistScope::User)
-        .unwrap_or(personal_new);
+        // `import` 는 대상이 없다 — 코드를 풀어 **내 개인 재생목록**을 새로 만든다 (§12.4).
+        .unwrap_or(personal_new || request.action == "import");
     if let Some(playlist) = target.as_ref() {
         match playlist.scope {
             // 개인 재생목록은 **내 것만** 보인다. 남의 것은 있는지조차 알려 주지 않는다.
@@ -6632,7 +6636,9 @@ async fn api_playlist_action(
                 // **서버 재생목록을 고치는 건 관리자 권한이다** (V3 §12.3).
                 // 만든 사람이라는 이유로 열어 두면 화면(`can('console')` 로 잠금)과
                 // 서버 판정이 어긋나서, 어느 쪽이 진짜인지 아무도 모르게 된다.
-                if request.action != "enqueue" && !ctx.tier.is_manager() {
+                // `share` 는 **읽기**다 — 보이는 목록의 사본을 뜨는 것이라 편집 권한이
+                // 필요 없다. `enqueue` 와 같은 자리에 둔다.
+                if !matches!(request.action.as_str(), "enqueue" | "share") && !ctx.tier.is_manager() {
                     return json_error(
                         StatusCode::FORBIDDEN,
                         "서버 재생목록은 서버 관리자만 고칠 수 있어요.",
@@ -6649,11 +6655,13 @@ async fn api_playlist_action(
     }
     // 서버 재생목록을 **만드는** 것도 관리자다 (V3 §12.3). 위 블록은 이미 있는 재생목록만
     // 검사하므로, 대상이 없는 `create` 는 여기서 막는다.
-    if !personal && request.action != "enqueue" {
+    if !personal && !matches!(request.action.as_str(), "enqueue" | "share") {
         if let Err(response) = ctx.require_manager() {
             return response;
         }
     }
+    // 공유·받기는 결과값(코드·곡 수)을 돌려줘야 한다. 나머지 액션은 `ok:true` 면 충분하다.
+    let mut extra = serde_json::Map::new();
     let audit_target = match request.action.as_str() {
         "create" => {
             if name.is_empty() || name.chars().count() > 80 {
@@ -6885,6 +6893,98 @@ async fn api_playlist_action(
             );
             format!("{}:{}", playlist.id, playlist.name)
         }
+        /* 공유 코드 만들기 (§12.4).
+         *
+         * **찍어 내는 순간의 사본**이다. 뒤에 원본을 고쳐도 이미 나간 코드는 안 바뀐다.
+         * 받는 쪽이 복사본을 갖는 설계라 그래야 앞뒤가 맞는다 — 받는 사람마다 다른
+         * 내용이 되면 "그 코드로 받았다" 는 말이 뜻을 잃는다. */
+        "share" => {
+            let Some(playlist) = target.as_ref() else {
+                return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
+            };
+            let tracks: Vec<TrackRef> = state
+                .app
+                .db
+                .playlist_entries(playlist.id)
+                .into_iter()
+                .filter_map(|entry| entry.track)
+                .collect();
+            if tracks.is_empty() {
+                return json_error(StatusCode::BAD_REQUEST, "빈 재생목록은 공유할 수 없어요.");
+            }
+            if tracks.len() > crate::remote::store::SHARE_TRACK_MAX {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "한 번에 공유할 수 있는 건 {}곡까지예요. 지금은 {}곡이에요.",
+                        crate::remote::store::SHARE_TRACK_MAX,
+                        tracks.len()
+                    ),
+                );
+            }
+            let Some(code) =
+                state
+                    .app
+                    .remote
+                    .create_playlist_share(session.user_id, &playlist.name, &tracks)
+            else {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "공유 코드를 만들지 못했어요. 잠시 뒤에 다시 해 주세요.",
+                );
+            };
+            extra.insert(
+                "code".into(),
+                json!(crate::remote::store::format_share_code(&code)),
+            );
+            extra.insert("count".into(), json!(tracks.len()));
+            // 코드 자체는 감사 기록에 남기지 않는다 — 기록을 볼 수 있는 사람이 남의
+            // 재생목록을 통째로 가져갈 수 있게 된다.
+            format!("{}:{}", playlist.id, playlist.name)
+        }
+        /* 코드로 받기 (§12.4). 내 개인 재생목록으로 **복사본**이 생긴다. */
+        "import" => {
+            let Some(code) = request
+                .code
+                .as_deref()
+                .and_then(crate::remote::store::normalize_share_code)
+            else {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "코드 모양이 달라요. `MCP-A8CD-EF2G` 처럼 생긴 코드예요.",
+                );
+            };
+            let Some(share) = state.app.remote.playlist_share(&code) else {
+                return json_error(
+                    StatusCode::NOT_FOUND,
+                    "그런 코드가 없어요. 만든 사람이 새로 만들었을 수도 있어요.",
+                );
+            };
+            let name: String = format!("{} (받은 것)", share.name).chars().take(80).collect();
+            let id = state.app.db.create_user_playlist(session.user_id, &name);
+            let mut added = 0usize;
+            for track in share.tracks {
+                // 받는 서버의 규칙을 그대로 적용한다. 길이 제한·차단곡은 **여기 기준**이다.
+                if track_too_long(ctx.settings.max_track_seconds, &track)
+                    || state.app.blacklist.is_blocked(guild_id, &track)
+                {
+                    continue;
+                }
+                state.app.db.add_playlist_entry(
+                    id,
+                    &PlaylistEntry {
+                        track: Some(track),
+                        collection: None,
+                        start_offset: None,
+                        extra: serde_json::Map::new(),
+                    },
+                );
+                added += 1;
+            }
+            extra.insert("name".into(), json!(name));
+            extra.insert("count".into(), json!(added));
+            format!("{id}:{name}")
+        }
         _ => {
             return json_error(
                 StatusCode::BAD_REQUEST,
@@ -6913,7 +7013,10 @@ async fn api_playlist_action(
         emit_bare(&state, guild_id, "library");
     }
     broadcast_queue(&state, guild_id).await;
-    json_ok(json!({ "ok": true }))
+    let mut body = serde_json::Map::new();
+    body.insert("ok".into(), json!(true));
+    body.append(&mut extra);
+    json_ok(Value::Object(body))
 }
 
 // ───────────────────────── 채팅 쓰기 ─────────────────────────
