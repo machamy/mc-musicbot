@@ -4703,17 +4703,21 @@ function playlistCard(playlist, mine) {
   const entries = (playlist.entries || []).filter((entry) => entry.track);
   const count = playlist.entryCount ?? entries.length;
   const length = playlistDuration(entries);
+  // 링크로 연결된 목록은 곡을 손으로 넣고 빼면 다음 갱신 때 덮인다. 그 버튼들을 안 그린다.
+  const linked = !!playlist.link;
 
   const enqueueAll = bindAct(h('button', {
     class: 'btn btn--sm', type: 'button', tip: '이 목록을 통째로 대기열에 담아요',
   }, '▶ 전부 담기'), () => enqueuePlaylist(playlist));
   setLock(enqueueAll, !canBulk(), lockReason('bulkEnqueue'));
 
+  /* **⋯ 버튼 자체는 잠그지 않는다.** 예전에는 서버 재생목록이면 관리자가 아닌 사람에게 통째로
+   * 잠겼는데, 그 안에는 누구나 써도 되는 항목(전부 담기·공유 코드)이 있다. 항목마다 자기
+   * 잠금이 따로 있으므로(`playlistMenu`) 버튼까지 잠글 이유가 없다. */
   const more = h('button', {
-    class: 'iconbtn', type: 'button', tip: '이름 바꾸기 · 삭제', 'aria-label': '재생목록 메뉴',
+    class: 'iconbtn', type: 'button', tip: '재생목록 메뉴', 'aria-label': '재생목록 메뉴',
     onClick: (event) => openContextMenu(playlistMenu(playlist, mine), { anchor: event.currentTarget }),
   }, '⋯');
-  setLock(more, !mine && !can('console'), mine ? '' : '서버 재생목록은 서버 관리자만 고칠 수 있어요');
 
   const card = h('div', {
     class: `card plcard plcard--${mine ? 'mine' : 'server'}`,
@@ -4725,19 +4729,143 @@ function playlistCard(playlist, mine) {
       h('span', { class: 'chip', tip: length ? `${count}곡 · 다 들으면 ${length}쯤 걸려요` : `${count}곡이에요` },
         length ? `${count}곡 · ${length}` : `${count}곡`),
       enqueueAll, more),
+    playlistMetaLine(playlist, mine),
     h('div', { class: 'plcard__entries' },
       entries.slice(0, 5).map((entry) => h('div', { class: 'plcard__entry' },
         h('span', { class: 'row__sub' }, trackTitle(entry.track)),
         setLock(bindAct(h('button', {
           class: 'iconbtn', type: 'button', tip: '이 곡만 대기열에 담기', 'aria-label': '대기열에 담기',
         }, '＋'), () => enqueue(entry.track)), !can('search'), lockReason('search')),
-        mine ? bindAct(h('button', {
+        mine && !linked ? bindAct(h('button', {
           class: 'iconbtn iconbtn--danger', type: 'button', tip: '재생목록에서 빼기', 'aria-label': '재생목록에서 빼기',
         }, '✕'), () => removeFromPlaylist(playlist, entry)) : null)),
-      count > 5 ? h('div', { class: 'row__sub' }, `· 외 ${count - 5}곡`) : null));
+      /* 예전엔 `· 외 N곡` 글자뿐이라 **나머지를 볼 방법이 없었다.** 서버는 곡을 전부 내려주는데
+       * 화면이 앞 다섯 곡에서 잘랐다. 누르면 전부 보이게 한다. */
+      count > 5 ? bindAct(h('button', {
+        class: 'btn btn--sm btn--ghost plcard__all', type: 'button', tip: '이 재생목록의 곡을 전부 봐요',
+      }, `전체 ${count}곡 보기`), () => openPlaylistEntries(playlist, mine)) : null));
 
   bindContextTarget(card, () => playlistMenu(playlist, mine));
   return card;
+}
+
+const LINKED_REASON = '링크로 연결된 재생목록이라 다음 갱신 때 덮여요. 연결을 끊으면 직접 고칠 수 있어요';
+
+/** 카드 머리 밑 한 줄 — 만든 사람과 링크 상태. 둘 다 없으면 아무것도 안 그린다. */
+function playlistMetaLine(playlist, mine) {
+  const bits = [];
+  // 만든 사람은 **서버 재생목록에만** 적는다. 개인 재생목록은 어차피 내 것이다.
+  if (!mine && playlist.scope === 'Guild') {
+    bits.push(h('span', { tip: '이 서버 재생목록을 만든 사람이에요' },
+      `👤 ${playlist.ownerName || '알 수 없음'}`));
+  }
+  if (playlist.link) {
+    const link = playlist.link;
+    const when = link.syncedUtc ? `${fmtAgo(link.syncedUtc)} 받음` : '아직 안 받음';
+    /* 마지막 갱신이 실패했으면 **옛 목록이 남아 있다는 것**까지 말한다. 서버는 실패해도
+     * 곡을 지우지 않는다(`sync_linked_playlist`). 그걸 모르면 "왜 안 바뀌지" 가 된다. */
+    bits.push(h('span', {
+      class: link.lastError ? 'plcard__link plcard__link--warn' : 'plcard__link',
+      tip: link.lastError
+        ? `마지막 갱신이 실패했어요: ${link.lastError} 지금 곡은 그 전 것이에요.`
+        : `이 링크를 30시간마다 다시 받아요: ${link.url}`,
+    }, link.lastError ? `⚠ 갱신 실패 · ${when}` : `🔗 링크 연결 · ${when}`));
+  }
+  return bits.length ? h('div', { class: 'plcard__meta' }, ...bits) : null;
+}
+
+/** 재생목록의 곡 전부. 카드는 다섯 곡만 보여 준다. */
+async function openPlaylistEntries(playlist, mine) {
+  const entries = (playlist.entries || []).filter((entry) => entry.track);
+  const linked = !!playlist.link;
+  const list = h('div', { class: 'scroll', style: { maxHeight: '60vh' } },
+    ...entries.map((entry, index) => h('div', { class: 'plcard__entry' },
+      h('span', { class: 'row__sub', style: { minWidth: '2.2em', textAlign: 'right' } }, String(index + 1)),
+      h('span', { class: 'row__sub', style: { flex: '1' } }, trackTitle(entry.track)),
+      setLock(bindAct(h('button', {
+        class: 'iconbtn', type: 'button', tip: '이 곡만 대기열에 담기', 'aria-label': '대기열에 담기',
+      }, '＋'), () => enqueue(entry.track)), !can('search'), lockReason('search')),
+      mine && !linked ? bindAct(h('button', {
+        class: 'iconbtn iconbtn--danger', type: 'button', tip: '재생목록에서 빼기', 'aria-label': '재생목록에서 빼기',
+      }, '✕'), () => removeFromPlaylist(playlist, entry)) : null)));
+  const owner = !mine && playlist.scope === 'Guild' ? ` · 만든 사람 ${playlist.ownerName || '알 수 없음'}` : '';
+  await sheet({
+    title: playlist.name,
+    desc: `${entries.length}곡${owner}`,
+    body: list, wide: true, dismissValue: null,
+    actions: [{ label: '닫기', kind: 'primary', value: null }],
+  }).result;
+}
+
+/** 재생목록 링크 넣기 (§12.5). **복사**와 **연결** 중 고른다. */
+async function openPlaylistUrlImport(playlist) {
+  const linked = !!playlist.link;
+  const count = playlist.entryCount ?? (playlist.entries || []).length;
+  const input = h('input', {
+    class: 'field', placeholder: 'https://www.youtube.com/playlist?list=…',
+    value: linked ? playlist.link.url : '',
+  });
+  const note = h('div', { class: 'hint', style: { display: 'grid', gap: 'var(--sp-1)' } },
+    h('div', null, h('strong', null, '복사해 넣기'), ' — 지금 링크에 있는 곡을 이 재생목록 뒤에 붙여요. 원본이 바뀌어도 안 따라가요. 이미 있는 곡은 건너뛰어요.'),
+    h('div', null, h('strong', null, '링크로 연결'), ' — 차트처럼 30시간마다 다시 받아요. 곡 목록이 링크의 것으로 바뀌고, 그동안은 손으로 곡을 넣고 뺄 수 없어요.'));
+  const choice = await sheet({
+    title: linked ? '연결할 링크 바꾸기' : '재생목록 링크 넣기',
+    desc: `'${playlist.name}' 에 유튜브·유튜브뮤직 재생목록을 한 번에 넣어요. 500곡까지예요.`,
+    body: h('div', { style: { display: 'grid', gap: 'var(--sp-2)' } }, input, note),
+    dismissValue: null,
+    actions: [
+      { label: '취소', kind: 'ghost', value: null },
+      // 연결된 목록에 복사해 넣으면 다음 갱신 때 덮인다. 서버도 거절하지만 버튼부터 안 준다.
+      linked ? null : { label: '복사해 넣기', kind: 'ghost', value: 'snapshot' },
+      { label: '링크로 연결', kind: 'primary', value: 'link', autofocus: true },
+    ].filter(Boolean),
+  }).result;
+  if (!choice) return;
+  const url = input.value.trim();
+  if (!url) { toast('재생목록 링크를 넣어 주세요.', 'warn'); return; }
+  /* 연결하면 **지금 곡이 전부 링크의 것으로 바뀐다.** 곡이 있는데 말없이 갈아 끼우면
+   * 공들여 모은 목록이 사라진다. 한 번 묻는다. */
+  if (choice === 'link' && count > 0 && !linked) {
+    const ok = await confirmSheet({
+      title: '지금 곡을 바꿀까요',
+      desc: `'${playlist.name}' 에 담긴 ${count}곡이 링크의 곡으로 바뀌어요. 지금 곡을 남기려면 취소하고 '복사해 넣기' 를 쓰세요.`,
+      confirmText: '바꾸고 연결',
+      danger: true,
+    });
+    if (!ok) return;
+  }
+  toast('재생목록을 받는 중이에요. 곡이 많으면 몇 초 걸려요.', 'info');
+  const result = await call(() => api('/playlists/action', {
+    body: { action: 'importUrl', playlistId: playlist.id, url, mode: choice },
+  }));
+  if (!result) return;
+  if (result.mode === 'link') toast(`링크로 연결했어요. ${result.count}곡을 받았어요.`, 'ok');
+  else if (result.skipped) toast(`${result.count}곡을 넣었어요. ${result.skipped}곡은 이미 있거나 규칙에 걸려 건너뛰었어요.`, 'ok');
+  else toast(`${result.count}곡을 넣었어요.`, 'ok');
+  refetchCold();
+}
+
+async function refreshPlaylistLink(playlist) {
+  toast('링크를 다시 받는 중이에요.', 'info');
+  const result = await call(() => api('/playlists/action', {
+    body: { action: 'refreshLink', playlistId: playlist.id },
+  }));
+  if (result) toast(`다시 받았어요. ${result.count}곡이에요.`, 'ok');
+  // 실패해도 다시 그린다 — 실패 사유가 카드의 링크 줄에 떠야 한다.
+  refetchCold();
+}
+
+async function unlinkPlaylist(playlist) {
+  const ok = await confirmSheet({
+    title: '연결을 끊을까요',
+    desc: `'${playlist.name}' 은 더 이상 갱신되지 않아요. 지금 담긴 곡은 그대로 남고, 이제 손으로 넣고 뺄 수 있어요.`,
+    confirmText: '연결 끊기',
+  });
+  if (!ok) return;
+  await call(() => api('/playlists/action', {
+    body: { action: 'unlink', playlistId: playlist.id },
+  }), '연결을 끊었어요. 지금 곡은 그대로예요.');
+  refetchCold();
 }
 
 /** 전부 담기는 별도 권한이다 (§15.4). 서버가 아직 이 키를 모르면 검색 권한으로 판단한다. */
@@ -4770,9 +4898,14 @@ async function removeFromPlaylist(playlist, entry) {
 function playlistMenu(playlist, mine) {
   const editable = mine || can('console');
   const reason = mine ? '' : '서버 재생목록은 서버 관리자만 고칠 수 있어요';
+  const linked = !!playlist.link;
   return [
     { icon: '▶', label: '전부 대기열에 담기', disabled: !canBulk(), reason: lockReason('bulkEnqueue'), onPick: () => enqueuePlaylist(playlist) },
-    { icon: '🔎', label: '곡 찾아서 담기', disabled: !editable || !can('search'), reason: reason || lockReason('search'), onPick: () => openPlaylistAdder(playlist) },
+    { icon: '🔎', label: '곡 찾아서 담기', disabled: !editable || !can('search') || linked, reason: linked ? LINKED_REASON : (reason || lockReason('search')), onPick: () => openPlaylistAdder(playlist) },
+    /* 재생목록 링크 한 번에 넣기 (§12.5). 복사해 넣기와 연결하기를 한 시트에서 고른다. */
+    { icon: '📥', label: linked ? '연결할 링크 바꾸기' : '재생목록 링크 넣기', disabled: !editable, reason, onPick: () => openPlaylistUrlImport(playlist) },
+    linked ? { icon: '🔄', label: '지금 다시 받기', disabled: !editable, reason, onPick: () => refreshPlaylistLink(playlist) } : null,
+    linked ? { icon: '✂', label: '연결 끊기', disabled: !editable, reason, onPick: () => unlinkPlaylist(playlist) } : null,
     { icon: '✏', label: '이름 바꾸기', disabled: !editable, reason, onPick: () => renamePlaylist(playlist) },
     /* 공개 범위 바꾸기 (§12.2). **양쪽 다 서버 관리자만** — 올리는 것은 서버 사람
      * 모두가 보게 만드는 일이고, 내리는 것은 같이 쓰던 것을 한 사람 것으로 가져가는
@@ -4788,7 +4921,7 @@ function playlistMenu(playlist, mine) {
      * 서버 판정도 같은 규칙이라(`share` 를 `enqueue` 와 같은 자리에 뒀다) 화면과 안 어긋난다. */
     { icon: '🔗', label: '공유 코드 만들기', onPick: () => sharePlaylist(playlist) },
     { icon: '🗑', label: '재생목록 삭제', danger: true, disabled: !editable, reason, onPick: () => deletePlaylist(playlist) },
-  ];
+  ].filter(Boolean);
 }
 
 /** 공유 코드를 받아 보여 준다. **코드는 찍어 내는 순간의 사본**이라, 뒤에 목록을 고쳐도
@@ -4979,8 +5112,11 @@ function openPlaylistPicker(track, anchor) {
 
   for (const playlist of mine.slice(0, 8)) {
     items.push({
-      icon: '📃', label: playlist.name,
+      icon: playlist.link ? '🔗' : '📃', label: playlist.name,
       hint: `${playlist.entryCount ?? (playlist.entries || []).length}곡`,
+      // 연결된 목록은 담아도 다음 갱신 때 덮인다. 목록에서 빼지 않고 잠가서 **왜 안 되는지** 보여 준다.
+      disabled: !!playlist.link,
+      reason: playlist.link ? LINKED_REASON : undefined,
       onPick: async () => {
         await call(() => api('/playlists/action', { body: { action: 'addTrack', playlistId: playlist.id, track } }),
           `'${playlist.name}'에 담았어요.`);

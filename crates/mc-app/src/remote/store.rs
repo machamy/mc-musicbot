@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 /// 마참뮤직 전용 스키마 버전. `PRAGMA user_version`에 기록된다.
 /// 레거시(C# 공용) 테이블은 이 러너가 절대 건드리지 않는다.
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 
 /// 채팅 페이지 기본 크기.
 pub const CHAT_PAGE_LIMIT: usize = 50;
@@ -1342,6 +1342,99 @@ impl RemoteStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// 링크를 건다(또는 바꾼다). 받은 시각은 비워 둔다 — 첫 동기화가 채운다.
+    pub fn set_playlist_link(&self, playlist_id: i64, url: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO remote_playlist_links(playlist_id, url, synced_utc, last_error, created_utc)
+             VALUES(?1, ?2, NULL, NULL, ?3)
+             ON CONFLICT(playlist_id) DO UPDATE SET url = excluded.url, synced_utc = NULL, last_error = NULL",
+            params![playlist_id, url, chrono::Utc::now().to_rfc3339()],
+        );
+    }
+
+    pub fn remove_playlist_link(&self, playlist_id: i64) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "DELETE FROM remote_playlist_links WHERE playlist_id = ?1",
+            params![playlist_id],
+        );
+    }
+
+    /// 동기화 결과를 남긴다. **실패해도 받은 시각을 올린다** — 안 올리면 죽은 링크를
+    /// 10분마다 다시 긁느라 yt-dlp 를 계속 태운다. 오류는 따로 적어 화면에 보여 준다.
+    pub fn mark_playlist_link_synced(&self, playlist_id: i64, error: Option<&str>) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE remote_playlist_links SET synced_utc = ?2, last_error = ?3 WHERE playlist_id = ?1",
+            params![playlist_id, chrono::Utc::now().to_rfc3339(), error],
+        );
+    }
+
+    pub fn playlist_link(&self, playlist_id: i64) -> Option<PlaylistLink> {
+        self.playlist_links().remove(&playlist_id)
+    }
+
+    /// 전부 한 번에. 재생목록 목록을 그릴 때 줄마다 질의하지 않으려고.
+    pub fn playlist_links(&self) -> HashMap<i64, PlaylistLink> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut statement) = conn.prepare(
+            "SELECT playlist_id, url, synced_utc, last_error FROM remote_playlist_links",
+        ) else {
+            return HashMap::new();
+        };
+        statement
+            .query_map([], |row| {
+                Ok(PlaylistLink {
+                    playlist_id: row.get(0)?,
+                    url: row.get(1)?,
+                    synced_utc: row.get(2)?,
+                    last_error: row.get(3)?,
+                })
+            })
+            .map(|rows| rows.flatten().map(|link| (link.playlist_id, link)).collect())
+            .unwrap_or_default()
+    }
+
+    /// 받은 지 `max_age_hours` 가 넘은 링크. **한 번도 안 받은 것이 맨 앞**이다.
+    pub fn stale_playlist_links(&self, max_age_hours: i64, limit: usize) -> Vec<PlaylistLink> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut statement) = conn.prepare(
+            "SELECT playlist_id, url, synced_utc, last_error FROM remote_playlist_links
+              WHERE synced_utc IS NULL
+                 OR julianday(synced_utc) < julianday('now', ?1)
+              ORDER BY synced_utc IS NOT NULL, synced_utc
+              LIMIT ?2",
+        ) else {
+            return Vec::new();
+        };
+        statement
+            .query_map(params![format!("-{max_age_hours} hours"), limit as i64], |row| {
+                Ok(PlaylistLink {
+                    playlist_id: row.get(0)?,
+                    url: row.get(1)?,
+                    synced_utc: row.get(2)?,
+                    last_error: row.get(3)?,
+                })
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    /// 이 사람이 마지막으로 웹에 들어왔을 때의 이름. **로그인 용도가 아니다** — 만료된
+    /// 세션도 본다. 서버를 떠난 사람이 만든 재생목록에도 이름을 붙이려고 쓴다.
+    pub fn last_known_display_name(&self, user_id: u64) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT display_name FROM remote_web_sessions
+              WHERE user_id = ?1 AND display_name <> ''
+              ORDER BY created_utc DESC LIMIT 1",
+            params![user_id as i64],
+            |row| row.get(0),
+        )
+        .ok()
     }
 
     /// 재생목록 스냅샷을 저장하고 코드를 준다 (§12.4).
@@ -4059,6 +4152,28 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
                     "#,
                 )?;
             }
+            28 => {
+                /* 재생목록을 **링크로 연결**해 차트처럼 갱신한다 (§12.5).
+                 *
+                 * `playlists` 표에 컬럼을 덧대지 않고 따로 둔다. 그 표는 옛 C# 엔진과 같은
+                 * 스키마를 공유하고(`db.rs` 머리 주석), 거기에는 마이그레이션 장치도 없다.
+                 * 연결 정보는 우리만 쓰는 것이라 우리 쪽 표에 둔다.
+                 *
+                 * 곡 자체는 여전히 `playlist_entries` 에 들어간다 — 갱신할 때 통째로 갈아
+                 * 끼운다. 그래서 전부 담기·자동 추천·공유 코드가 **연결 여부를 몰라도**
+                 * 그대로 동작한다. */
+                tx.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS remote_playlist_links (
+                        playlist_id INTEGER PRIMARY KEY,
+                        url TEXT NOT NULL,
+                        synced_utc TEXT NULL,
+                        last_error TEXT NULL,
+                        created_utc TEXT NOT NULL
+                    );
+                    "#,
+                )?;
+            }
             // 여기 오면 SCHEMA_VERSION 만 올리고 단계를 안 쓴 것이다.
             _ => {}
         }
@@ -4081,6 +4196,15 @@ pub const SHARE_PREFIX: &str = "MCP";
 const SHARE_PER_USER: usize = 20;
 /// 한 코드에 담을 수 있는 곡 수. 이걸 넘는 재생목록은 공유가 거절된다.
 pub const SHARE_TRACK_MAX: usize = 500;
+
+/// 재생목록 하나에 걸린 링크 (§12.5).
+#[derive(Debug, Clone)]
+pub struct PlaylistLink {
+    pub playlist_id: i64,
+    pub url: String,
+    pub synced_utc: Option<String>,
+    pub last_error: Option<String>,
+}
 
 /// 공유 코드 한 장.
 #[derive(Debug, Clone)]
@@ -6675,6 +6799,58 @@ mod tests {
         assert!(effective.default_volume <= 80);
         cleanup(store, path);
     }
+    /// **연결된 재생목록 갱신 대상 고르기 (§12.5).**
+    ///
+    /// 세 가지를 못 박는다.
+    ///   1. 한 번도 안 받은 링크가 **맨 앞**이다 — 방금 건 링크가 제일 급하다.
+    ///   2. 막 받은 링크는 대상이 아니다.
+    ///   3. **실패해도 받은 시각이 올라간다.** 안 올라가면 죽은 링크를 10분마다 다시 긁느라
+    ///      yt-dlp 를 계속 태운다. 대신 오류가 남아 화면이 "옛 목록 유지 중" 을 알린다.
+    #[test]
+    fn stale_links_come_first_and_a_failed_sync_is_not_retried_every_tick() {
+        let (store, _path) = temp_store("playlist-links");
+        store.set_playlist_link(1, "https://www.youtube.com/playlist?list=PLold");
+        store.set_playlist_link(2, "https://www.youtube.com/playlist?list=PLnew");
+        store.set_playlist_link(3, "https://www.youtube.com/playlist?list=PLfresh");
+
+        // 1 은 오래전에 받았고, 3 은 방금 받았다. 2 는 한 번도 안 받았다.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE remote_playlist_links SET synced_utc = datetime('now', '-40 hours') WHERE playlist_id = 1",
+                [],
+            )
+            .unwrap();
+        }
+        store.mark_playlist_link_synced(3, None);
+
+        let stale: Vec<i64> = store
+            .stale_playlist_links(30, 10)
+            .into_iter()
+            .map(|link| link.playlist_id)
+            .collect();
+        assert_eq!(stale, vec![2, 1], "안 받은 것 → 오래된 것 순이어야 하고, 막 받은 3 은 빠진다");
+
+        // 실패로 끝나도 시각이 올라가 다음 tick 에 다시 안 고른다.
+        store.mark_playlist_link_synced(2, Some("재생목록에서 곡을 못 읽었어요."));
+        let after: Vec<i64> = store
+            .stale_playlist_links(30, 10)
+            .into_iter()
+            .map(|link| link.playlist_id)
+            .collect();
+        assert_eq!(after, vec![1], "실패한 2 를 곧바로 다시 고르면 죽은 링크를 계속 긁는다");
+        let failed = store.playlist_link(2).unwrap();
+        assert!(failed.last_error.is_some(), "실패 이유는 남아 있어야 화면이 알린다");
+
+        // 다시 걸면(주소를 바꾸면) 오류와 시각이 지워져 곧바로 대상이 된다.
+        store.set_playlist_link(2, "https://www.youtube.com/playlist?list=PLother");
+        let relinked = store.playlist_link(2).unwrap();
+        assert!(relinked.synced_utc.is_none() && relinked.last_error.is_none());
+
+        store.remove_playlist_link(1);
+        assert!(store.playlist_link(1).is_none());
+    }
+
     /// **공유는 찍어 내는 순간의 사본이다.**
     ///
     /// 코드를 만든 뒤에 원본을 고쳐도 이미 나간 코드는 안 바뀌어야 한다 — 받는 쪽이

@@ -632,6 +632,42 @@ impl Db {
         }
     }
 
+    /// 재생목록의 곡을 **통째로 갈아 끼운다.** 링크로 연결된 재생목록을 다시 받을 때 쓴다.
+    ///
+    /// 한 트랜잭션으로 지우고 넣는다. 중간에 실패하면 옛 목록이 그대로 남는다 — 반쯤 비운
+    /// 재생목록이 남는 것보다, 갱신이 한 번 안 된 채로 남는 게 낫다.
+    pub fn replace_playlist_entries(&self, playlist_id: i64, entries: &[PlaylistEntry]) -> bool {
+        let mut conn = self.conn.lock().unwrap();
+        let Ok(tx) = conn.transaction() else {
+            return false;
+        };
+        if tx
+            .execute("DELETE FROM playlist_entries WHERE playlist_id = ?1", params![playlist_id])
+            .is_err()
+        {
+            return false;
+        }
+        for (order, entry) in entries.iter().enumerate() {
+            let Ok(json) = serde_json::to_string(entry) else {
+                continue;
+            };
+            if tx
+                .execute(
+                    "INSERT INTO playlist_entries(playlist_id, sort_order, payload_json) VALUES(?1,?2,?3)",
+                    params![playlist_id, order as i64, json],
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+        let _ = tx.execute(
+            "UPDATE playlists SET updated_utc = ?2 WHERE id = ?1",
+            params![playlist_id, Self::now_iso()],
+        );
+        tx.commit().is_ok()
+    }
+
     pub fn remove_playlist_entry(&self, playlist_id: i64, index: usize) -> bool {
         let conn = self.conn.lock().unwrap();
         let ids: Vec<i64> = conn
@@ -700,5 +736,49 @@ impl Db {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod playlist_replace_tests {
+    use super::*;
+
+    fn entry(id: &str) -> PlaylistEntry {
+        PlaylistEntry {
+            track: Some(TrackRef {
+                provider: ProviderKind::YouTube,
+                content_id: id.to_string(),
+                source_url: format!("https://www.youtube.com/watch?v={id}"),
+                title: Some(id.to_string()),
+                artist: None,
+                duration: None,
+                variant_key: None,
+                is_live: false,
+            }),
+            collection: None,
+            start_offset: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// **갱신은 통째로 갈아 끼운다** — 옛 곡이 섞여 남으면 안 되고, 순서는 받은 순서다.
+    #[test]
+    fn replacing_entries_drops_the_old_list_and_keeps_the_new_order() {
+        let path = std::env::temp_dir().join(format!("mc-db-replace-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let id = db.create_user_playlist(1, "연결됨");
+        for old in ["old1", "old2", "old3"] {
+            db.add_playlist_entry(id, &entry(old));
+        }
+        assert!(db.replace_playlist_entries(id, &[entry("new1"), entry("new2")]));
+        let ids: Vec<String> = db
+            .playlist_entries(id)
+            .into_iter()
+            .filter_map(|entry| entry.track.map(|track| track.content_id))
+            .collect();
+        assert_eq!(ids, vec!["new1", "new2"]);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }

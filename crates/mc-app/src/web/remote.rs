@@ -3755,6 +3755,8 @@ async fn api_state_cold(
         .map(OAuthGuild::to_json)
         .collect();
 
+    // 링크 정보는 한 번에 읽어 둔다 — 재생목록마다 질의하면 목록이 길수록 느려진다.
+    let links = state.app.remote.playlist_links();
     // 서버 재생목록 + **내 개인 재생목록** (V3 §12). 개인 것은 길드에 안 묶여서
     // 어느 서버에서 열어도 같이 보인다.
     let playlists: Vec<Value> = state
@@ -3762,14 +3764,14 @@ async fn api_state_cold(
         .db
         .list_playlists(PlaylistScope::Guild, Some(guild_id))
         .into_iter()
-        .map(|playlist| playlist_json(&playlist, session.user_id))
+        .map(|playlist| playlist_json(&state, guild_id, &playlist, session.user_id, &links))
         .chain(
             state
                 .app
                 .db
                 .list_user_playlists(session.user_id)
                 .into_iter()
-                .map(|playlist| playlist_json(&playlist, session.user_id)),
+                .map(|playlist| playlist_json(&state, guild_id, &playlist, session.user_id, &links)),
         )
         .collect();
 
@@ -3901,7 +3903,21 @@ async fn api_state_cold(
 /// 키는 브라우저로 그대로 나가는 값이라 리퍼러 제한이 전제다 — 운영 패널에 그렇게 적어 뒀다.
 /// 재생목록 한 장. 개인(`User`)과 서버(`Guild`)를 **아이콘과 색으로 확실히 구분**할 수 있게
 /// `scope` 를 같이 준다 — 실수로 서버 것을 지우면 곤란하다 (V3 §12.2).
-fn playlist_json(playlist: &crate::models::Playlist, viewer: u64) -> Value {
+fn playlist_json(
+    state: &WebState,
+    guild_id: u64,
+    playlist: &crate::models::Playlist,
+    viewer: u64,
+    links: &HashMap<i64, crate::remote::store::PlaylistLink>,
+) -> Value {
+    let link = links.get(&playlist.id).map(|link| {
+        json!({
+            "url": link.url,
+            "syncedUtc": link.synced_utc,
+            // 마지막 갱신이 실패했으면 그 이유. 화면은 이걸 보고 "옛 목록이 남아 있음" 을 알린다.
+            "lastError": link.last_error,
+        })
+    });
     let total_seconds: f64 = playlist
         .entries
         .iter()
@@ -3914,7 +3930,13 @@ fn playlist_json(playlist: &crate::models::Playlist, viewer: u64) -> Value {
         "name": playlist.name,
         "scope": playlist.scope.as_str(),
         "ownerUserId": playlist.owner_user_id.to_string(),
+        // 만든 사람 이름 (§12.2). **서버 재생목록에만 준다** — 개인 재생목록은 어차피 본인 것이라
+        // 이름을 매번 풀 이유가 없다.
+        "ownerName": (playlist.scope == PlaylistScope::Guild)
+            .then(|| owner_display_name(state, guild_id, playlist.owner_user_id))
+            .flatten(),
         "isMine": playlist.owner_user_id == viewer,
+        "link": link,
         "entryCount": playlist.entries.len(),
         // `12곡 · 48분` 처럼 총 길이까지 보여주면 고를 때 편하다 (§12.2).
         "totalSeconds": total_seconds,
@@ -3937,6 +3959,26 @@ fn playlist_json(playlist: &crate::models::Playlist, viewer: u64) -> Value {
             })
             .collect::<Vec<_>>(),
     })
+}
+
+/// 사람 이름 풀기. **지금 서버 멤버 → 마지막 웹 로그인 기록** 순으로 본다.
+///
+/// 디스코드 캐시만 보면 서버를 떠난 사람이 만든 재생목록에는 이름이 안 붙는다. 그런데
+/// 떠난 사람이 만든 것일수록 "이거 누가 만들었지" 가 궁금하다. 웹에 한 번이라도 들어왔던
+/// 사람이면 그때 이름이 남아 있다. 둘 다 없으면 `None` — 화면이 `알 수 없음` 으로 그린다.
+fn owner_display_name(state: &WebState, guild_id: u64, user_id: u64) -> Option<String> {
+    // `UserId::new(0)` 은 패닉이다. 옛 C# 데이터에 0 이 섞여 있을 수 있다.
+    if user_id == 0 {
+        return None;
+    }
+    if let Some(cache) = state.app.discord_cache.get() {
+        if let Some(guild) = cache.guild(GuildId::new(guild_id)) {
+            if let Some(member) = guild.members.get(&UserId::new(user_id)) {
+                return Some(member.display_name().to_string());
+            }
+        }
+    }
+    state.app.remote.last_known_display_name(user_id)
 }
 
 fn search_json(state: &WebState) -> Value {
@@ -6562,12 +6604,131 @@ struct PlaylistActionRequest {
     /// 자리 번호가 밀렸을 때의 대조용. 번호로 못 찾으면 이걸로 찾는다.
     #[serde(default)]
     cache_key: Option<String>,
+    /// 재생목록 링크 (§12.5). `importUrl` 에서만 쓴다.
+    #[serde(default)]
+    url: Option<String>,
+    /// `importUrl` 방식 — `"snapshot"`(지금 곡을 복사) 또는 `"link"`(연결해 두고 갱신).
+    #[serde(default)]
+    mode: Option<String>,
     /// 공유 코드 (§12.4). `import` 에서만 쓴다.
     #[serde(default)]
     code: Option<String>,
     /// `"user"` 면 **개인 재생목록**(V3 §12), 그 밖은 서버 재생목록.
     /// `create` 에서만 의미가 있고, 나머지는 대상 재생목록의 실제 범위를 따른다.
     scope: Option<String>,
+}
+
+/// 링크로 한 번에 받을 수 있는 곡 수. 공유 코드 상한과 같게 둔다.
+const PLAYLIST_LINK_MAX: usize = 500;
+
+/// 재생목록 링크를 곡 목록으로 푼다 (§12.5).
+///
+/// **주소는 우리가 다시 푼다.** 사람이 준 문자열을 그대로 yt-dlp 에 넘기면 그게 곧 임의 주소
+/// 실행이다. `/queue/collection` 과 같은 관문(`resolver::resolve`)을 지나 재생목록으로
+/// 해석되는 것만 통과시킨다.
+///
+/// 돌려주는 주소는 **정규화된 재생목록 주소**다. 링크로 연결할 때는 이걸 저장한다 — 사람이
+/// 붙여 넣은 `watch?v=…&list=…` 를 그대로 두면, 그 곡이 지워지는 날 링크 전체가 안 풀린다.
+async fn fetch_link_tracks(
+    state: &WebState,
+    url: &str,
+) -> Result<(String, Vec<TrackRef>), String> {
+    use crate::media::resolver::Resolved;
+    let (source_url, provider) = match crate::media::resolver::resolve(url.trim()) {
+        Ok(Resolved::Collection(collection)) => (collection.source_url, collection.provider),
+        /* 곡에 재생목록이 딸린 링크(`watch?v=…&list=…`)도 받는다. 재생목록을 복사하려다
+         * 보면 이 모양이 제일 흔하게 손에 잡힌다. 그 재생목록 쪽을 푼다.
+         * 자동 믹스(`RD…`)는 리졸버가 이미 걸러 `playlist_id` 가 비어 있다. */
+        Ok(Resolved::Track(track)) if track.playlist_id.is_some() => {
+            let list = track.playlist_id.unwrap_or_default();
+            let base = if matches!(track.provider, ProviderKind::YouTubeMusic) {
+                "https://music.youtube.com/playlist?list="
+            } else {
+                "https://www.youtube.com/playlist?list="
+            };
+            (format!("{base}{list}"), track.provider)
+        }
+        _ => {
+            return Err(
+                "재생목록 링크가 아니에요. `youtube.com/playlist?list=…` 같은 주소를 넣어 주세요."
+                    .into(),
+            );
+        }
+    };
+    let tracks = state
+        .app
+        .ytdlp()
+        .expand_collection(&source_url, provider)
+        .await;
+    if tracks.is_empty() {
+        return Err("재생목록에서 곡을 못 읽었어요. 비공개거나 지워졌을 수 있어요.".into());
+    }
+    // 라이브는 재생목록에 담아 둘 물건이 아니다 — 담아 두면 나중에 틀 때 이미 끝나 있다.
+    let tracks = tracks
+        .into_iter()
+        .filter(|track| !track.is_live)
+        .take(PLAYLIST_LINK_MAX)
+        .collect();
+    Ok((source_url, tracks))
+}
+
+/// 받은 곡으로 재생목록을 갈아 끼우고 받은 시각을 적는다.
+fn store_link_tracks(state: &WebState, playlist_id: i64, tracks: Vec<TrackRef>) -> bool {
+    let entries: Vec<PlaylistEntry> = tracks
+        .into_iter()
+        .map(|track| PlaylistEntry {
+            track: Some(track),
+            collection: None,
+            start_offset: None,
+            extra: serde_json::Map::new(),
+        })
+        .collect();
+    let stored = state.app.db.replace_playlist_entries(playlist_id, &entries);
+    state.app.remote.mark_playlist_link_synced(
+        playlist_id,
+        (!stored).then_some("받은 곡을 저장하지 못했어요."),
+    );
+    stored
+}
+
+/// 연결된 재생목록을 다시 받는다. 성공하면 곡 수.
+///
+/// **실패하면 옛 곡을 지우지 않는다.** 유튜브가 잠깐 막혔다는 이유로 재생목록이 텅 비면,
+/// 그 재생목록을 자동 추천 기준으로 쓰던 서버까지 같이 조용해진다. 옛 목록이 남아 있는 편이
+/// 훨씬 낫다. 실패 사유는 링크 줄에 적어 화면에 보여 준다.
+pub(crate) async fn sync_linked_playlist(
+    state: &WebState,
+    playlist_id: i64,
+    url: &str,
+) -> Result<usize, String> {
+    match fetch_link_tracks(state, url).await {
+        Ok((_, tracks)) => {
+            let count = tracks.len();
+            if store_link_tracks(state, playlist_id, tracks) {
+                Ok(count)
+            } else {
+                Err("받은 곡을 저장하지 못했어요.".into())
+            }
+        }
+        Err(reason) => {
+            state
+                .app
+                .remote
+                .mark_playlist_link_synced(playlist_id, Some(&reason));
+            Err(reason)
+        }
+    }
+}
+
+/// 연결된 재생목록에 손으로 곡을 넣고 빼는 것을 막는다. **다음 갱신이 덮어쓰기 때문이다** —
+/// 받아 주면 조용히 사라지는 편집이 된다. 끊으면 고칠 수 있다는 것까지 말해 준다.
+fn reject_if_linked(state: &WebState, playlist_id: i64) -> Option<Response> {
+    state.app.remote.playlist_link(playlist_id).map(|_| {
+        json_error(
+            StatusCode::CONFLICT,
+            "링크로 연결된 재생목록이라 다음 갱신 때 덮여요. 연결을 끊으면 직접 고칠 수 있어요.",
+        )
+    })
 }
 
 async fn api_playlist_action(
@@ -6754,12 +6915,17 @@ async fn api_playlist_action(
             if !state.app.db.delete_playlist(playlist.id) {
                 return json_error(StatusCode::CONFLICT, "재생목록을 지우지 못했어요.");
             }
+            // 링크가 남아 있으면 프리페치가 없는 재생목록을 30시간마다 받으러 간다.
+            state.app.remote.remove_playlist_link(playlist.id);
             format!("{}:{}", playlist.id, playlist.name)
         }
         "addTrack" => {
             let Some(playlist) = target else {
                 return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
             };
+            if let Some(response) = reject_if_linked(&state, playlist.id) {
+                return response;
+            }
             let Some(track) = request.track else {
                 return json_error(StatusCode::BAD_REQUEST, "추가할 곡이 없어요.");
             };
@@ -6788,6 +6954,9 @@ async fn api_playlist_action(
             let Some(playlist) = target else {
                 return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
             };
+            if let Some(response) = reject_if_linked(&state, playlist.id) {
+                return response;
+            }
             // 자리 번호(`entryIndex`/`entryId`) 우선, 못 찾으면 `cacheKey` 로 대조한다.
             // 카드가 5곡만 그리는 동안 목록이 바뀌면 번호가 밀리는데, 그때 엉뚱한 곡이
             // 지워지는 것보다 제목으로 찾는 게 낫다.
@@ -6940,6 +7109,123 @@ async fn api_playlist_action(
             extra.insert("count".into(), json!(tracks.len()));
             // 코드 자체는 감사 기록에 남기지 않는다 — 기록을 볼 수 있는 사람이 남의
             // 재생목록을 통째로 가져갈 수 있게 된다.
+            format!("{}:{}", playlist.id, playlist.name)
+        }
+        /* 재생목록 링크로 채우기 (§12.5). 두 가지 방식이 있다.
+         *
+         *   snapshot — 지금 링크에 있는 곡을 **복사해 붙인다.** 뒤에 원본이 바뀌어도 안 따라간다.
+         *              이미 담긴 곡은 건너뛴다(같은 링크를 두 번 넣어도 두 벌이 안 된다).
+         *   link     — 링크를 **걸어 두고** 차트처럼 갱신한다. 곡 목록은 링크의 것으로 갈아 끼운다.
+         *
+         * **링크를 먼저 풀어 보고, 풀린 뒤에만 건다.** 순서가 반대면 안 풀리는 주소가 걸린 채로
+         * 남아 30시간마다 헛돈다. 실패하면 아무것도 안 바뀐다. */
+        "importUrl" => {
+            let Some(playlist) = target.as_ref() else {
+                return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
+            };
+            let Some(url) = request.url.as_deref().map(str::trim).filter(|url| !url.is_empty()) else {
+                return json_error(StatusCode::BAD_REQUEST, "재생목록 링크를 넣어 주세요.");
+            };
+            let link_mode = request.mode.as_deref() == Some("link");
+            if !link_mode && state.app.remote.playlist_link(playlist.id).is_some() {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "링크로 연결된 재생목록이라 붙여 넣은 곡이 다음 갱신 때 덮여요. 연결을 끊은 뒤 담아 주세요.",
+                );
+            }
+            // yt-dlp 가 몇 초씩 도는 일이라 연타를 따로 막는다. 위의 300ms 로는 모자라다.
+            if rate_limited(&state, guild_id, session.user_id, "playlistUrl", Duration::from_secs(5)) {
+                return json_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "재생목록 링크는 5초에 한 번만 받을 수 있어요.",
+                );
+            }
+            let (normalized, tracks) = match fetch_link_tracks(&state, url).await {
+                Ok(found) => found,
+                Err(reason) => return json_error(StatusCode::BAD_GATEWAY, reason),
+            };
+            if link_mode {
+                state.app.remote.set_playlist_link(playlist.id, &normalized);
+                let count = tracks.len();
+                if !store_link_tracks(&state, playlist.id, tracks) {
+                    state.app.remote.remove_playlist_link(playlist.id);
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "곡을 저장하지 못했어요. 재생목록은 그대로예요.",
+                    );
+                }
+                extra.insert("count".into(), json!(count));
+                extra.insert("mode".into(), json!("link"));
+            } else {
+                let mut seen: HashSet<String> = playlist
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.track.as_ref())
+                    .map(|track| track.cache_key())
+                    .collect();
+                let (mut added, mut skipped) = (0usize, 0usize);
+                for track in tracks {
+                    // 손으로 담을 때(`addTrack`)와 같은 규칙이다. 경로마다 규칙이 다르면
+                    // 한쪽으로만 새는 곡이 생긴다.
+                    if track_too_long(ctx.settings.max_track_seconds, &track)
+                        || state.app.blacklist.is_blocked(guild_id, &track)
+                        || !seen.insert(track.cache_key())
+                    {
+                        skipped += 1;
+                        continue;
+                    }
+                    state.app.db.add_playlist_entry(
+                        playlist.id,
+                        &PlaylistEntry {
+                            track: Some(track),
+                            collection: None,
+                            start_offset: None,
+                            extra: serde_json::Map::new(),
+                        },
+                    );
+                    added += 1;
+                }
+                extra.insert("count".into(), json!(added));
+                extra.insert("skipped".into(), json!(skipped));
+                extra.insert("mode".into(), json!("snapshot"));
+            }
+            format!("{}:{}", playlist.id, playlist.name)
+        }
+        /* 지금 다시 받기. 30시간을 못 기다릴 때 — 차트의 `다시 가져오기` 와 같은 자리다. */
+        "refreshLink" => {
+            let Some(playlist) = target.as_ref() else {
+                return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
+            };
+            let Some(link) = state.app.remote.playlist_link(playlist.id) else {
+                return json_error(StatusCode::BAD_REQUEST, "링크로 연결된 재생목록이 아니에요.");
+            };
+            if rate_limited(&state, guild_id, session.user_id, "playlistUrl", Duration::from_secs(5)) {
+                return json_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "재생목록 링크는 5초에 한 번만 받을 수 있어요.",
+                );
+            }
+            match sync_linked_playlist(&state, playlist.id, &link.url).await {
+                Ok(count) => {
+                    extra.insert("count".into(), json!(count));
+                }
+                // 실패해도 옛 곡은 그대로 남는다(`sync_linked_playlist`). 그 말을 같이 한다.
+                Err(reason) => {
+                    return json_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("{reason} 지금 담긴 곡은 그대로 뒀어요."),
+                    );
+                }
+            }
+            format!("{}:{}", playlist.id, playlist.name)
+        }
+        /* 연결 끊기. **곡은 남긴다** — 지금 담긴 목록이 그대로 보통 재생목록이 된다.
+         * 끊자마자 비면 "끊었더니 다 날아갔다" 가 된다. */
+        "unlink" => {
+            let Some(playlist) = target.as_ref() else {
+                return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
+            };
+            state.app.remote.remove_playlist_link(playlist.id);
             format!("{}:{}", playlist.id, playlist.name)
         }
         /* 코드로 받기 (§12.4). 내 개인 재생목록으로 **복사본**이 생긴다. */
@@ -10902,6 +11188,40 @@ pub fn spawn_chart_prefetch(state: &Arc<WebState>) {
         if !state.app.coordinator.active_guild_ids().await.is_empty() {
             return;
         }
+        /* 링크로 연결된 재생목록 (§12.5). **차트보다 먼저** 본다.
+         *
+         * 아래 차트 루프는 식은 차트가 하나라도 있으면 그 서버 하나만 처리하고 `return` 한다.
+         * 뒤에 두면 차트가 어딘가 늘 식어 있는 한 링크 갱신은 **영영 안 돈다.** 링크는 몇 개
+         * 안 되므로 앞에서 한 tick 에 두 개만 받고 넘어간다. 재생이 시작되면 차트와 똑같이
+         * 즉시 물러난다.
+         *
+         * 실패한 링크도 받은 시각이 올라간다(`mark_playlist_link_synced`). 죽은 링크를 10분마다
+         * 다시 긁지 않게 하려는 것이다 — 30시간 뒤에 다시 시도한다. */
+        for link in state
+            .app
+            .remote
+            .stale_playlist_links(crate::remote::models::CHART_CACHE_TTL_HOURS, 2)
+        {
+            if !state.app.coordinator.active_guild_ids().await.is_empty() {
+                return;
+            }
+            // 재생목록이 지워졌는데 링크만 남았으면 치운다.
+            if state.app.db.find_playlist(link.playlist_id).is_none() {
+                state.app.remote.remove_playlist_link(link.playlist_id);
+                continue;
+            }
+            match sync_linked_playlist(&state, link.playlist_id, &link.url).await {
+                Ok(count) => state.app.log.info(
+                    "Playlist",
+                    &format!("연결된 재생목록 {} 을 다시 받았어요: {count}곡", link.playlist_id),
+                ),
+                Err(reason) => state.app.log.info(
+                    "Playlist",
+                    &format!("연결된 재생목록 {} 갱신 실패(옛 곡 유지): {reason}", link.playlist_id),
+                ),
+            }
+        }
+
         // **화면을 열어 둔 사람이 있다는 이유로는 미루지 않는다.**
         // 예전엔 여기서도 건너뛰었는데, 리모컨을 켜 두는 게 정상 사용이라 프리페치가 사실상
         // 영영 안 돌았다("차트가 늘 비어 있다"). 한 tick 에 한 장이고 재생 중에는 어차피

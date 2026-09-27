@@ -890,6 +890,10 @@ body[data-dragging="tab"] { user-select: none; }
 .plcard__head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-2); }
 .plcard__head strong { flex: 1; min-width: 0; color: var(--text-1); font-size: var(--fs-md); }
 .plcard__entries { padding-left: var(--sp-4); }
+/* 카드 머리 밑 한 줄 — 만든 사람·링크 상태. 머리보다 한 단계 흐리게. */
+.plcard__meta { display: flex; flex-wrap: wrap; gap: var(--sp-2); padding: 0 var(--sp-2) var(--sp-1) calc(var(--sp-2) + 1.6em); color: var(--text-3); font-size: var(--fs-xs); }
+.plcard__link--warn { color: var(--warn); }
+.plcard__all { margin: var(--sp-1) 0 0; }
 
 /* ═══════════════════════ 중앙 스테이지 ═══════════════════════ */
 
