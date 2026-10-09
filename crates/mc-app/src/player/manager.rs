@@ -467,6 +467,7 @@ impl PlayerManager {
                 state.cycle_history.clear();
                 if state.shuffle_enabled {
                     shuffle_upcoming(&mut next_cycle);
+                    spread_recent(&mut next_cycle, &state.recent_tracks);
                 }
                 state.upcoming.append(&mut next_cycle);
             }
@@ -660,6 +661,7 @@ impl PlayerManager {
                     s.cycle_history.clear();
                     if s.shuffle_enabled {
                         shuffle_upcoming(&mut next_cycle);
+                        spread_recent(&mut next_cycle, &s.recent_tracks);
                     }
                     s.upcoming.append(&mut next_cycle);
                 }
@@ -1247,8 +1249,17 @@ impl PlayerManager {
         let mut scores = self.remote.queue_scores(state.guild_id);
         if state.shuffle_enabled {
             let seed = self.shuffle_seed(state.guild_id);
+            let recent = recent_keys(&state.recent_tracks, state.upcoming.len());
+            let key_of: HashMap<&str, String> = state
+                .upcoming
+                .iter()
+                .map(|item| (item.id.as_str(), item.track.cache_key()))
+                .collect();
             for (item_id, score) in scores.iter_mut() {
-                score.original_order = shuffled_order(seed, item_id);
+                let just_played = key_of
+                    .get(item_id.as_str())
+                    .is_some_and(|key| recent.contains(key));
+                score.original_order = shuffled_order(seed, item_id, just_played);
             }
         }
 
@@ -1298,14 +1309,55 @@ fn shuffle_upcoming(items: &mut Vec<QueueItem>) {
     items.shuffle(&mut rng);
 }
 
+/// 랜덤 재생에서 "방금 튼 곡" 으로 보고 뒤로 미는 곡 수의 상한.
+///
+/// **대기열 반복 + 랜덤에서 방금 끝난 곡이 곧바로 다시 나왔다.** 한 바퀴가 끝나면 방금 끝난
+/// 곡까지 포함해 전부 다시 섞는데, 균등하게 섞으니 그 곡이 맨 앞에 올 확률이 1/N 이다.
+/// 곡이 서너 개면 네 번에 한 번꼴이라 "랜덤이 고장났다" 로 들린다. 사람이 기대하는 랜덤은
+/// 수학적 균등이 아니라 **방금 들은 건 좀 있다가** 다.
+const RECENT_SPREAD: usize = 3;
+
+/// 이번에 뒤로 밀 곡들의 키. **대기열의 절반까지만** 민다 — 곡이 두 개뿐인데 둘 다 밀면
+/// 미는 의미가 없고, 셋인데 셋을 밀면 순서가 그냥 고정된다.
+fn recent_keys(recent: &[TrackRef], queue_len: usize) -> HashSet<String> {
+    let spread = RECENT_SPREAD.min(queue_len / 2);
+    recent.iter().take(spread).map(TrackRef::cache_key).collect()
+}
+
+/// 바퀴 경계에서 새로 섞은 목록의 **맨 앞에 방금 튼 곡이 오지 않게** 뒤로 보낸다.
+/// 나머지의 섞인 순서는 그대로 둔다(안정 분할).
+///
+/// 경계에서는 정렬보다 먼저 맨 앞 곡이 곧바로 재생으로 올라간다(`promote_if_idle`).
+/// 그래서 정렬 쪽(`shuffled_order`)만 고쳐서는 이 한 곡이 안 막힌다 — 여기서 따로 막는다.
+fn spread_recent(items: &mut Vec<QueueItem>, recent: &[TrackRef]) {
+    let keys = recent_keys(recent, items.len());
+    if keys.is_empty() {
+        return;
+    }
+    let (mut fresh, mut stale): (Vec<QueueItem>, Vec<QueueItem>) = std::mem::take(items)
+        .into_iter()
+        .partition(|item| !keys.contains(&item.track.cache_key()));
+    fresh.append(&mut stale);
+    *items = fresh;
+}
+
 /// 셔플 순서를 시드 하나로 재현한다. 같은 시드면 항상 같은 순서라 5초마다 재정렬해도
 /// 큐가 요동치지 않고, 뒤늦게 신청된 곡도 무작위 위치에 자연스럽게 끼어든다.
-fn shuffled_order(seed: u64, item_id: &str) -> i64 {
+///
+/// `just_played` 면 **위쪽 절반 구간**으로 보낸다. 해시는 그 안에서만 순서를 정하므로, 방금 튼
+/// 곡은 같은 등급(투표·수동 우선순위가 같은 곡들) 안에서 항상 뒤에 선다. 우선순위 자체를
+/// 넘어서지는 않는다 — 누가 일부러 올린 곡까지 밀어내면 안 된다.
+///
+/// 대기열 반복은 바퀴마다 항목 ID 를 새로 만든다(`clone_item`). 그래서 이 해시 순서도 바퀴마다
+/// 새로 무작위가 되고, 방금 끝난 곡이 바로 다음 자리에 오는 일이 여기서도 생겼다.
+fn shuffled_order(seed: u64, item_id: &str, just_played: bool) -> i64 {
     let mut hasher = DefaultHasher::new();
     seed.hash(&mut hasher);
     item_id.hash(&mut hasher);
-    // 최상위 비트를 버려 항상 양수로 만든다(등록순 값과 같은 부호 영역에 둔다).
-    (hasher.finish() >> 1) as i64
+    // 두 비트를 버려 [0, 2^62) 에 둔다. 방금 튼 곡은 2^62 를 더해 [2^62, 2^63) — 둘 다 양수다
+    // (등록순 값과 같은 부호 영역에 둔다).
+    let base = (hasher.finish() >> 2) as i64;
+    if just_played { base + (1i64 << 62) } else { base }
 }
 
 fn advance_unsafe(state: &mut GuildPlayerState) {
@@ -1327,6 +1379,7 @@ fn advance_unsafe(state: &mut GuildPlayerState) {
         state.cycle_history.clear();
         if state.shuffle_enabled {
             shuffle_upcoming(&mut next_cycle);
+            spread_recent(&mut next_cycle, &state.recent_tracks);
         }
         state.upcoming.append(&mut next_cycle);
     }
@@ -1483,6 +1536,91 @@ mod tests {
 
     /// 셔플을 켜도 랭킹이 죽지 않는다 — 예전에는 `sort_scored_queue` 가 조기 반환해
     /// 수동 우선순위(관리자 강제 이동)까지 무시됐다.
+    /// **회귀 가드: 대기열 반복 + 랜덤에서 방금 끝난 곡이 곧바로 다시 나오면 안 된다.**
+    ///
+    /// 한 바퀴가 끝나면 방금 곡까지 포함해 다시 섞는데, 균등하게 섞으면 그 곡이 맨 앞에 올
+    /// 확률이 1/N 이다. 곡이 셋이면 세 번에 한 번이다. 그래서 바퀴 경계를 여러 번 넘기면서
+    /// 매번 확인한다 — 한 번만 보면 운으로 통과한다.
+    ///
+    /// 두 갈래를 다 본다. 곡이 자연히 끝나는 길(`advance`)과 사람이 넘기는 길(`skip`) —
+    /// 바퀴를 새로 만드는 코드가 두 곳에 따로 있어서, 한쪽만 고치면 다른 쪽에서 그대로 난다.
+    #[tokio::test]
+    async fn shuffled_queue_repeat_never_replays_the_song_that_just_ended() {
+        for (label, use_skip) in [("advance", false), ("skip", true)] {
+            let (player, remote, root) = temp_player(&format!("shuffle-repeat-{label}"));
+            let guild_id = 1;
+            for content_id in ["a", "b", "c"] {
+                player.enqueue(guild_id, user_item(content_id, 1), false).await;
+            }
+            player.set_repeat(guild_id, RepeatMode::Queue).await;
+            player.set_shuffle(guild_id, true).await;
+
+            let mut previous = player
+                .get_state(guild_id)
+                .await
+                .current_item
+                .map(|item| item.track.cache_key());
+            // 곡 셋이면 3번에 한 바퀴. 60번이면 경계를 스무 번 넘는다 — 1/3 확률이 스무 번
+            // 다 피해 갈 확률은 (2/3)^20 ≈ 0.03% 라, 고친 게 풀리면 여기서 거의 확실히 걸린다.
+            for step in 0..60 {
+                let state = if use_skip {
+                    player.skip(guild_id).await
+                } else {
+                    player.advance(guild_id).await
+                };
+                let now = state.current_item.map(|item| item.track.cache_key());
+                assert!(now.is_some(), "{label} {step}: 대기열 반복인데 재생이 끊겼다");
+                assert_ne!(
+                    now, previous,
+                    "{label} {step}: 방금 끝난 곡이 곧바로 다시 나왔다"
+                );
+                previous = now;
+            }
+            cleanup(player, remote, root);
+        }
+    }
+
+    /// **한 곡 건너 다시 나오는 것도 막는다.** 곡이 여섯이면 방금 끝난 곡은 적어도 두 곡이
+    /// 지나야 다시 나와야 한다.
+    ///
+    /// 바퀴 경계에서 막는 것(`spread_recent`)은 **맨 앞 한 자리**뿐이다. 그 다음 자리부터는
+    /// 셔플 정렬(`shuffled_order`)이 정하는데, 대기열 반복은 바퀴마다 항목 ID 를 새로 만들어서
+    /// 그 순서가 매번 새로 무작위다. 거기서 방금 곡을 뒤로 미는 것이 이 테스트가 지키는 것이다.
+    #[tokio::test]
+    async fn shuffled_queue_repeat_spaces_out_the_song_that_just_ended() {
+        let (player, remote, root) = temp_player("shuffle-spread");
+        let guild_id = 1;
+        for content_id in ["a", "b", "c", "d", "e", "f"] {
+            player.enqueue(guild_id, user_item(content_id, 1), false).await;
+        }
+        player.set_repeat(guild_id, RepeatMode::Queue).await;
+        player.set_shuffle(guild_id, true).await;
+
+        let mut history: Vec<String> = player
+            .get_state(guild_id)
+            .await
+            .current_item
+            .map(|item| item.track.cache_key())
+            .into_iter()
+            .collect();
+        // 여섯 곡 × 20바퀴. 경계에서 한 곡 건너 다시 나올 확률이 바퀴마다 있으므로 여러 번 본다.
+        for step in 0..120 {
+            let now = player
+                .advance(guild_id)
+                .await
+                .current_item
+                .map(|item| item.track.cache_key())
+                .expect("대기열 반복인데 재생이 끊겼다");
+            let window: Vec<&String> = history.iter().rev().take(2).collect();
+            assert!(
+                !window.contains(&&now),
+                "{step}: '{now}' 가 두 곡 안에 다시 나왔다 (직전 {window:?})"
+            );
+            history.push(now);
+        }
+        cleanup(player, remote, root);
+    }
+
     #[tokio::test]
     async fn shuffle_keeps_manual_priority_on_top_and_is_stable() {
         let (player, remote, root) = temp_player("shuffle");
