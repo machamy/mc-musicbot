@@ -4920,6 +4920,7 @@ function playlistMenu(playlist, mine) {
     /* 공유는 **읽기**다 — 보이는 목록의 사본을 뜨는 것이라 편집 권한이 필요 없다.
      * 서버 판정도 같은 규칙이라(`share` 를 `enqueue` 와 같은 자리에 뒀다) 화면과 안 어긋난다. */
     { icon: '🔗', label: '공유 코드 만들기', onPick: () => sharePlaylist(playlist) },
+    { icon: '⬇', label: '파일로 내보내기', onPick: () => openExportSheet(`'${playlist.name}'`, `/music/api/guilds/${ctx.guildId}/playlists/${playlist.id}/export`) },
     { icon: '🗑', label: '재생목록 삭제', danger: true, disabled: !editable, reason, onPick: () => deletePlaylist(playlist) },
   ].filter(Boolean);
 }
@@ -10116,12 +10117,110 @@ function focusLinkedMessage() {
   });
 }
 
+/** 형식을 고르게 한다. 셋의 쓰임새가 달라서 이름만 늘어놓으면 뭘 골라야 할지 모른다. */
+async function openExportSheet(label, path) {
+  const choice = await sheet({
+    title: `${label} 내보내기`,
+    desc: '어떤 형식으로 받을까요',
+    body: h('div', { class: 'hint', style: { display: 'grid', gap: 'var(--sp-1)' } },
+      h('div', null, h('strong', null, 'txt'), ' — 사람이 읽기 좋은 목록이에요. 메신저에 붙여 넣기 좋아요.'),
+      h('div', null, h('strong', null, 'csv'), ' — 엑셀·구글 시트로 열려요.'),
+      h('div', null, h('strong', null, 'json'), ' — 다른 프로그램에 넣을 때 써요.')),
+    dismissValue: null,
+    actions: [
+      { label: '취소', kind: 'ghost', value: null },
+      { label: 'txt', kind: 'ghost', value: 'txt' },
+      { label: 'csv', kind: 'ghost', value: 'csv' },
+      { label: 'json', kind: 'primary', value: 'json' },
+    ],
+  }).result;
+  if (!choice) return;
+  await downloadExport(`${path}?format=${choice}`, `export.${choice}`);
+}
+
+/** `Content-Disposition` 에서 파일 이름. 한글 이름은 `filename*` 에만 실려 온다. */
+function fileNameFrom(disposition) {
+  if (!disposition) return null;
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+  if (star) { try { return decodeURIComponent(star[1]); } catch { /* 아래로 */ } }
+  const plain = /filename="?([^";]+)"?/i.exec(disposition);
+  return plain ? plain[1] : null;
+}
+
+/* **링크를 바로 누르게 하지 않고 먼저 받아 본다.**
+ * `<a href download>` 로 곧장 가면 서버가 거절했을 때(대기열이 비었거나 권한이 없거나)
+ * 브라우저가 **그 오류 JSON 을 파일로 저장한다.** 사람은 왜 안 됐는지도 모른 채 이상한
+ * 파일 하나를 받는다. 받아서 확인하고, 실패면 알림으로 말한다. */
+async function downloadExport(path, fallbackName) {
+  let response;
+  try {
+    response = await fetch(path, { credentials: 'same-origin' });
+  } catch {
+    toast('서버에 닿지 못했어요.', 'danger');
+    return;
+  }
+  if (!response.ok) {
+    let message = '파일을 만들지 못했어요.';
+    try { message = (await response.json()).error || message; } catch { /* 본문이 JSON 이 아니면 기본 문구 */ }
+    toast(message, 'danger');
+    return;
+  }
+  const blob = await response.blob();
+  const name = fileNameFrom(response.headers.get('content-disposition')) || fallbackName;
+  const url = URL.createObjectURL(blob);
+  const link = h('a', { href: url, download: name, style: { display: 'none' } });
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  // 바로 회수하면 일부 브라우저가 저장을 시작하기도 전에 주소가 사라진다.
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  toast(`${name} 을(를) 받았어요.`, 'ok');
+}
+
+/** 지금 대기열을 통째로 재생목록으로 (§12.6). **지금 나오는 곡부터** 담긴다. */
+async function saveQueueAsPlaylist() {
+  const state = store.get();
+  const manager = can('console');
+  const today = new Date().toLocaleDateString('ko-KR', { month: 'long', day: 'numeric' });
+  const input = h('input', { class: 'field', maxlength: '60', value: `대기열 · ${today}` });
+  // 짐작 가능한 곡 수. 서버는 대기열 **전체**를 담으므로 화면이 200곡까지만 들고 있어도 다 들어간다.
+  // `queueTotal` 은 서버가 잘라 보냈을 때만 채워진다(평소엔 0). 둘 중 큰 쪽이 실제 곡 수다.
+  const count = (state.current ? 1 : 0) + Math.max(queueTotal || 0, (state.queue || []).length);
+  const choice = await sheet({
+    title: '재생목록으로 저장',
+    desc: `지금 곡부터 대기열 ${count}곡을 그대로 담아요. 담은 뒤에 대기열이 바뀌어도 이 재생목록은 그대로예요.`,
+    body: input,
+    dismissValue: null,
+    actions: [
+      { label: '취소', kind: 'ghost', value: null },
+      // 서버 재생목록은 관리자만 만들 수 있다(서버 판정과 같다). 아니면 버튼을 아예 안 준다.
+      manager ? { label: '서버 재생목록으로', kind: 'ghost', value: 'guild' } : null,
+      { label: '내 재생목록으로', kind: 'primary', value: 'user', autofocus: true },
+    ].filter(Boolean),
+  }).result;
+  if (!choice) return;
+  const name = input.value.trim();
+  if (!name) { toast('이름을 넣어 주세요.', 'warn'); return; }
+  const result = await call(() => api('/playlists/action', {
+    body: { action: 'fromQueue', name, scope: choice },
+  }));
+  if (!result) return;
+  toast(`'${name}' 에 ${result.count}곡을 담았어요.`, 'ok');
+  refetchCold();
+}
+
 function queueHeadMenu() {
   const manager = tierOf() !== 'member' && tierOf() !== 'viewer';
+  const state = store.get();
+  const empty = !state.current && !(state.queue || []).length;
   return [
     { icon: '🔀', label: '정렬 방식 보기', onPick: openModeSheet },
     // 대기열이 비면 여기서 나가는 곡을 자동 재생이 고른다. 그 설정으로 가는 길을 대기열 머리에도 둔다.
     { icon: '📻', label: '자동 재생 설정', disabled: !seedState, reason: '이 서버는 아직 자동 재생 설정을 몰라요', onPick: openAutoplaySheet },
+    /* 대기열 → 재생목록 · 파일 (§12.6). 비어 있으면 잠근다 — 눌러서 "비어 있어요" 를 듣는 것보다
+     * 처음부터 안 되는 이유가 보이는 게 낫다. */
+    { icon: '💾', label: '재생목록으로 저장', disabled: empty, reason: '대기열이 비어 있어요', onPick: saveQueueAsPlaylist },
+    { icon: '⬇', label: '파일로 내보내기', disabled: empty, reason: '대기열이 비어 있어요', onPick: () => openExportSheet('대기열', `/music/api/guilds/${ctx.guildId}/queue/export`) },
     { icon: '🧹', label: '대기열 비우기', danger: true, disabled: !manager || !can('queueEdit'), reason: lockReason('queueEdit'), onPick: clearQueue },
     { icon: '↻', label: '새로고침', onPick: () => { loadHot().catch(() => {}); toast('대기열을 다시 받아 왔어요.', 'ok'); } },
   ];

@@ -720,6 +720,12 @@ pub fn router() -> Router<Arc<WebState>> {
             "/music/api/guilds/{guild_id}/playlists/action",
             post(api_playlist_action),
         )
+        // 내보내기 (§12.6). 화면은 대기열을 앞 200곡만 들고 있어서, 파일은 서버가 전체로 만든다.
+        .route("/music/api/guilds/{guild_id}/queue/export", get(api_queue_export))
+        .route(
+            "/music/api/guilds/{guild_id}/playlists/{playlist_id}/export",
+            get(api_playlist_export),
+        )
         .route(
             "/music/api/guilds/{guild_id}/chat",
             get(api_chat_list).post(api_chat),
@@ -6618,6 +6624,256 @@ struct PlaylistActionRequest {
     scope: Option<String>,
 }
 
+// ───────────────────────── 내보내기 (§12.6) ─────────────────────────
+
+/// 내보낼 곡 한 줄.
+pub(crate) struct ExportRow {
+    pub title: String,
+    pub artist: Option<String>,
+    pub seconds: Option<u64>,
+    pub url: String,
+    /// 대기열에서만 의미가 있다. 재생목록에는 '담은 사람' 기록이 없다.
+    pub by: Option<String>,
+}
+
+impl ExportRow {
+    fn from_track(track: &TrackRef, by: Option<String>) -> Self {
+        let mut track = track.clone();
+        // 브라우저 검색으로 담긴 곡은 주소가 비어 있을 수 있다. 파일에서 주소가 빠지면
+        // 그 줄은 다시 찾아 쓸 수가 없다.
+        track.ensure_source_url();
+        ExportRow {
+            title: track.display_title().to_string(),
+            artist: track.artist.clone().filter(|artist| !artist.trim().is_empty()),
+            seconds: track.duration.map(|duration| duration.as_secs_f64().round() as u64),
+            url: track.source_url.clone(),
+            by,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+}
+
+fn export_length(seconds: u64) -> String {
+    let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
+/// CSV 한 칸.
+///
+/// **곡 제목은 남(업로더)이 정한 문자열이다.** `=`·`+`·`-`·`@` 로 시작하면 엑셀이 그걸
+/// **수식으로 실행한다**(CSV 인젝션). 받은 파일을 여는 사람은 의심할 이유가 없으니 여기서
+/// 막는다 — 앞에 `'` 를 붙여 글자로 읽히게 한다. 대가로 그런 제목 앞에 `'` 가 하나 보인다.
+pub(crate) fn csv_cell(value: &str) -> String {
+    let guarded = if value.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    if guarded.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded
+    }
+}
+
+/// 파일 내용. `(Content-Type, 확장자, 본문)`. 모르는 형식이면 `None`.
+pub(crate) fn export_body(
+    rows: &[ExportRow],
+    format: &str,
+    title: &str,
+) -> Option<(&'static str, &'static str, String)> {
+    let with_by = rows.iter().any(|row| row.by.is_some());
+    match format {
+        "csv" => {
+            // BOM 을 붙인다. 없으면 엑셀이 UTF-8 을 못 알아보고 한글 제목이 전부 깨진다.
+            let mut out = String::from("\u{feff}");
+            out.push_str(if with_by {
+                "순번,제목,아티스트,길이,길이(초),주소,담은 사람\r\n"
+            } else {
+                "순번,제목,아티스트,길이,길이(초),주소\r\n"
+            });
+            for (index, row) in rows.iter().enumerate() {
+                let mut cells = vec![
+                    (index + 1).to_string(),
+                    csv_cell(&row.title),
+                    csv_cell(row.artist.as_deref().unwrap_or("")),
+                    row.seconds.map(export_length).unwrap_or_default(),
+                    row.seconds.map(|s| s.to_string()).unwrap_or_default(),
+                    csv_cell(&row.url),
+                ];
+                if with_by {
+                    cells.push(csv_cell(row.by.as_deref().unwrap_or("")));
+                }
+                out.push_str(&cells.join(","));
+                out.push_str("\r\n");
+            }
+            Some(("text/csv; charset=utf-8", "csv", out))
+        }
+        "json" => {
+            let tracks: Vec<Value> = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    json!({
+                        "position": index + 1,
+                        "title": row.title,
+                        "artist": row.artist,
+                        "durationSeconds": row.seconds,
+                        "url": row.url,
+                        "requestedBy": row.by,
+                    })
+                })
+                .collect();
+            let body = json!({
+                "title": title,
+                "exportedUtc": chrono::Utc::now().to_rfc3339(),
+                "count": rows.len(),
+                "tracks": tracks,
+            });
+            Some((
+                "application/json; charset=utf-8",
+                "json",
+                serde_json::to_string_pretty(&body).unwrap_or_default(),
+            ))
+        }
+        "txt" => {
+            let total: u64 = rows.iter().filter_map(|row| row.seconds).sum();
+            let mut out = format!("{title}\r\n{}곡", rows.len());
+            if total > 0 {
+                out.push_str(&format!(" · 총 {}", export_length(total)));
+            }
+            out.push_str("\r\n\r\n");
+            for (index, row) in rows.iter().enumerate() {
+                out.push_str(&format!("{:>3}. {}", index + 1, row.title));
+                if let Some(artist) = &row.artist {
+                    out.push_str(&format!(" — {artist}"));
+                }
+                if let Some(seconds) = row.seconds {
+                    out.push_str(&format!("  ({})", export_length(seconds)));
+                }
+                if let Some(by) = &row.by {
+                    out.push_str(&format!("  · {by}"));
+                }
+                out.push_str(&format!("\r\n     {}\r\n", row.url));
+            }
+            // 윈도우 메모장이 옛 버전이면 BOM 없는 UTF-8 을 못 읽는다.
+            Some(("text/plain; charset=utf-8", "txt", format!("\u{feff}{out}")))
+        }
+        _ => None,
+    }
+}
+
+/// 파일 이름을 헤더에 싣는다. **한글 이름은 `filename*` 로만 실을 수 있다**(RFC 6266/5987).
+/// 옛 브라우저용으로 ASCII 이름도 같이 준다.
+fn attachment_response(stem_ascii: &str, stem: &str, ext: &str, content_type: &str, body: String) -> Response {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M");
+    let ascii = format!("{stem_ascii}-{stamp}.{ext}");
+    let utf8 = format!("{stem}-{stamp}.{ext}");
+    let encoded: String = utf8
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect();
+    let disposition = format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}");
+    let mut response = (StatusCode::OK, body).into_response();
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&disposition) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    // 대기열은 바뀐다 — 어디서도 캐시하면 안 된다.
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
+}
+
+fn export_format(query: &ExportQuery) -> String {
+    query.format.as_deref().unwrap_or("txt").trim().to_ascii_lowercase()
+}
+
+/// `GET .../queue/export?format=txt|csv|json` — **지금 곡 + 대기열 전체**.
+///
+/// 화면은 대기열을 앞 200곡만 들고 있고 나머지는 스크롤할 때 받는다. 화면에서 파일을 만들면
+/// 긴 대기열이 **조용히 잘린다.** 서버가 전체로 만든다.
+async fn api_queue_export(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path(guild_id): Path<u64>,
+    Query(query): Query<ExportQuery>,
+) -> Response {
+    if let Err(response) = authorize(&state, &cookies, guild_id, None).await {
+        return response;
+    }
+    let player = state.app.player.get_state(guild_id).await;
+    let rows: Vec<ExportRow> = player
+        .current_item
+        .iter()
+        .chain(player.upcoming.iter())
+        .map(|item| ExportRow::from_track(&item.track, Some(item.requested_by_display.clone())))
+        .collect();
+    if rows.is_empty() {
+        return json_error(StatusCode::NOT_FOUND, "대기열이 비어 있어요.");
+    }
+    let Some((content_type, ext, body)) = export_body(&rows, &export_format(&query), "마참뮤직 대기열") else {
+        return json_error(StatusCode::BAD_REQUEST, "txt · csv · json 중에서 골라 주세요.");
+    };
+    attachment_response("queue", "대기열", ext, content_type, body)
+}
+
+/// `GET .../playlists/{id}/export?format=…` — 재생목록 하나.
+///
+/// 보이는 규칙은 재생목록 화면과 같다. 남의 개인 재생목록은 **있는지조차 알려 주지 않는다**
+/// (404). 주소에 ID 만 바꿔 넣으면 남의 보관함을 받아 갈 수 있게 되면 안 된다.
+async fn api_playlist_export(
+    State(state): State<Arc<WebState>>,
+    cookies: Cookies,
+    Path((guild_id, playlist_id)): Path<(u64, i64)>,
+    Query(query): Query<ExportQuery>,
+) -> Response {
+    let ctx = match authorize(&state, &cookies, guild_id, None).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let Some(playlist) = state.app.db.find_playlist(playlist_id) else {
+        return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
+    };
+    let visible = match playlist.scope {
+        PlaylistScope::User => playlist.owner_user_id == ctx.user_id(),
+        PlaylistScope::Guild => playlist.guild_id == Some(guild_id),
+        PlaylistScope::Global => true,
+    };
+    if !visible {
+        return json_error(StatusCode::NOT_FOUND, "그 재생목록을 찾지 못했어요.");
+    }
+    let rows: Vec<ExportRow> = playlist
+        .entries
+        .iter()
+        .filter_map(|entry| entry.track.as_ref())
+        .map(|track| ExportRow::from_track(track, None))
+        .collect();
+    let Some((content_type, ext, body)) = export_body(&rows, &export_format(&query), &playlist.name) else {
+        return json_error(StatusCode::BAD_REQUEST, "txt · csv · json 중에서 골라 주세요.");
+    };
+    // 파일 이름에 쓸 수 없는 글자는 바꾼다. 윈도우가 거부하는 글자가 제목에 흔하다.
+    let stem: String = playlist
+        .name
+        .chars()
+        .map(|ch| if matches!(ch, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || ch.is_control() { '_' } else { ch })
+        .take(60)
+        .collect();
+    attachment_response("playlist", &stem, ext, content_type, body)
+}
+
 /// 링크로 한 번에 받을 수 있는 곡 수. 공유 코드 상한과 같게 둔다.
 const PLAYLIST_LINK_MAX: usize = 500;
 
@@ -7190,6 +7446,43 @@ async fn api_playlist_action(
                 extra.insert("mode".into(), json!("snapshot"));
             }
             format!("{}:{}", playlist.id, playlist.name)
+        }
+        /* 지금 대기열을 통째로 재생목록으로 (§12.6). **지금 곡까지** 넣는다 — "지금 나오는 이
+         * 흐름을 저장" 이 이 기능의 뜻이라, 지금 곡이 빠지면 첫 곡이 사라진 목록이 된다.
+         * 이미 대기열에 들어와 있는 곡이라 길이·차단 규칙은 다시 보지 않는다. */
+        "fromQueue" => {
+            if name.is_empty() || name.chars().count() > 80 {
+                return json_error(StatusCode::BAD_REQUEST, "이름은 1~80자로 입력해요.");
+            }
+            let player = state.app.player.get_state(guild_id).await;
+            let tracks: Vec<TrackRef> = player
+                .current_item
+                .iter()
+                .chain(player.upcoming.iter())
+                .map(|item| item.track.clone())
+                .filter(|track| !track.is_live)
+                .collect();
+            if tracks.is_empty() {
+                return json_error(StatusCode::BAD_REQUEST, "대기열이 비어 있어요.");
+            }
+            let id = if personal_new {
+                state.app.db.create_user_playlist(session.user_id, name)
+            } else {
+                state.app.db.create_playlist(PlaylistScope::Guild, Some(guild_id), session.user_id, name)
+            };
+            for track in &tracks {
+                state.app.db.add_playlist_entry(
+                    id,
+                    &PlaylistEntry {
+                        track: Some(track.clone()),
+                        collection: None,
+                        start_offset: None,
+                        extra: serde_json::Map::new(),
+                    },
+                );
+            }
+            extra.insert("count".into(), json!(tracks.len()));
+            format!("{id}:{name}")
         }
         /* 지금 다시 받기. 30시간을 못 기다릴 때 — 차트의 `다시 가져오기` 와 같은 자리다. */
         "refreshLink" => {
@@ -15374,5 +15667,71 @@ mod tests {
                 "{key} 에 한국어 이름이 없어요 — 거절 메시지에 기계 키가 그대로 나가요"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::{ExportRow, csv_cell, export_body};
+
+    fn row(title: &str, by: Option<&str>) -> ExportRow {
+        ExportRow {
+            title: title.to_string(),
+            artist: Some("아티스트".into()),
+            seconds: Some(225),
+            url: "https://www.youtube.com/watch?v=abc".into(),
+            by: by.map(str::to_string),
+        }
+    }
+
+    /// **곡 제목으로 엑셀 수식이 실행되면 안 된다 (CSV 인젝션).**
+    ///
+    /// 제목은 업로더가 정한 문자열이다. `=HYPERLINK(…)` 같은 제목이 대기열에 들어와 있으면,
+    /// 받은 CSV 를 엑셀로 여는 순간 그게 수식으로 돈다. 여는 사람은 의심할 이유가 없다.
+    #[test]
+    fn csv_cells_neutralise_formulas_and_quote_separators() {
+        for formula in ["=1+1", "+cmd", "-2+3", "@SUM(A1)", "=HYPERLINK(\"http://x\")"] {
+            let cell = csv_cell(formula);
+            let unquoted = cell.trim_start_matches('"');
+            assert!(unquoted.starts_with('\''), "{formula:?} 가 수식으로 남았다: {cell}");
+        }
+        // 쉼표·따옴표·줄바꿈이 있으면 칸이 갈라지지 않게 감싼다(RFC 4180).
+        assert_eq!(csv_cell("a,b"), "\"a,b\"");
+        assert_eq!(csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_cell("line\nbreak"), "\"line\nbreak\"");
+        assert_eq!(csv_cell("평범한 제목"), "평범한 제목");
+    }
+
+    /// 엑셀이 한글을 깨지 않게 BOM 으로 시작하고, 칸 수가 머리글과 맞아야 한다.
+    /// 쉼표가 든 제목이 칸을 하나 더 만들면 그 뒤 칸이 전부 한 칸씩 밀린다.
+    #[test]
+    fn csv_starts_with_a_bom_and_every_row_has_the_header_width() {
+        let rows = vec![row("쉼표, 있는 제목", Some("민수")), row("=수식", Some("영희"))];
+        let (content_type, ext, body) = export_body(&rows, "csv", "대기열").unwrap();
+        assert!(content_type.starts_with("text/csv") && ext == "csv");
+        assert!(body.starts_with('\u{feff}'), "BOM 이 없으면 엑셀에서 한글이 깨진다");
+        let lines: Vec<&str> = body.trim_start_matches('\u{feff}').split("\r\n").filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3, "머리글 + 두 줄");
+        assert!(lines[0].ends_with("담은 사람"), "대기열이면 담은 사람 칸이 있다");
+        assert!(lines[2].contains("'=수식"));
+        assert!(lines[1].contains("3:45") && lines[1].contains(",225,"));
+    }
+
+    /// 재생목록에는 '담은 사람' 기록이 없다. 빈 칸으로 늘어놓지 말고 칸 자체를 뺀다.
+    #[test]
+    fn playlists_have_no_requester_column_and_unknown_formats_are_refused() {
+        let rows = vec![row("곡", None)];
+        let (_, _, body) = export_body(&rows, "csv", "목록").unwrap();
+        assert!(!body.contains("담은 사람"));
+
+        let (_, _, json) = export_body(&rows, "json", "목록").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["tracks"][0]["durationSeconds"], 225);
+
+        let (_, _, txt) = export_body(&rows, "txt", "목록").unwrap();
+        assert!(txt.contains("1곡") && txt.contains("https://www.youtube.com/watch?v=abc"));
+
+        assert!(export_body(&rows, "xlsx", "목록").is_none());
     }
 }
