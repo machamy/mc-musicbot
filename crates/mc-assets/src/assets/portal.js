@@ -3526,6 +3526,8 @@ function openAutoplaySheet() {
   });
   autoplaySheet = { handle, body };
   renderAutoplaySheet();
+  // 닫혀 있는 동안 곡이 몇 번 바뀌었을 수 있다. 갖고 있는 것을 먼저 그리고 바로 새로 받는다.
+  loadSeeds();
   handle.result.then(() => { autoplaySheet = null; });
 }
 
@@ -7622,6 +7624,10 @@ function renderNow(state) {
       }
       if (lyricsOpen) loadLyrics();
     }
+    /* 자동 재생 시트의 "최근 튼 곡" 은 `loadSeeds()` 가 받아 온 사본이다. 서버는 곡이
+     * 바뀌어도 `autoplay` 이벤트를 쏘지 않으므로(설정이 바뀔 때만 쏜다), 여기서 안 받으면
+     * 시트를 열어 둔 내내 페이지를 연 순간의 "지금 나오는 곡" 이 그대로 남는다. */
+    if (autoplaySheet) loadSeeds();
   }
   // 웹에서 듣기는 봇을 따라간다. 곡이 바뀌면 위치까지 다시 맞춘다.
   syncWebNow(changed);

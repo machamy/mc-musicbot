@@ -101,6 +101,8 @@ struct AutoplayPlan {
     tuning: AutoplayTuning,
     /// `🎲 후보 다시 뽑기` 횟수 (`PlayerManager::reroll_salt`).
     salt: u64,
+    /// `seeds` 가 실제로 나온 방식. 폴백 사슬을 타면 설정값과 다르다.
+    mode: AutoplayMode,
 }
 
 impl AutoplayPlan {
@@ -112,6 +114,7 @@ impl AutoplayPlan {
             recent_artists: &self.recent_artists,
             tuning: self.tuning,
             salt: self.salt,
+            seed_mode: Some(self.mode),
         }
     }
 
@@ -186,6 +189,7 @@ fn build_autoplay_plan(app: &Arc<App>, guild_id: u64, state: &GuildPlayerState) 
             recent_decay_hours: settings.autoplay_recent_decay_hours,
         },
         salt: app.player.reroll_salt(guild_id),
+        mode,
     }
 }
 

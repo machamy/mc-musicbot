@@ -13,7 +13,7 @@ use crate::blacklist::Blacklist;
 use crate::logging::LogService;
 use crate::media::ytdlp::YtDlp;
 use crate::models::TrackRef;
-use crate::remote::AutoplayPolicy;
+use crate::remote::{AutoplayMode, AutoplayPolicy};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -83,6 +83,35 @@ fn pick_seed(
     }
     let index = next_seed_index(guild_id, seeds.len());
     Some((Some(index), seeds[index].clone()))
+}
+
+/// `pick_seed` 의 **커서를 안 쓰는** 판. `step` 번째 시드를 집는다.
+///
+/// `recent` 모드용이다. 그 목록은 `[지금 나오는 곡, 직전 곡, …]` 이라 곡이 바뀔 때마다
+/// 한 칸씩 밀리는데, 길드 커서도 한 번에 한 칸씩 밀므로 **같은 곡을 계속 가리킨다**.
+/// 실제로 운영에서 한 곡이 세 번 연달아 시드가 됐고, 지금 나오는 곡은 다섯 번에 한 번만
+/// 시드가 됐다. 그래서 맨 앞(지금 나오는 곡)부터 쓰고, 후보가 안 나올 때만 다음으로 넘긴다.
+fn pick_seed_at(
+    fallback_seed: Option<&TrackRef>,
+    seeds: &[TrackRef],
+    step: usize,
+) -> Option<(Option<usize>, TrackRef)> {
+    if seeds.is_empty() {
+        return fallback_seed.map(|seed| (None, seed.clone()));
+    }
+    let index = step % seeds.len();
+    Some((Some(index), seeds[index].clone()))
+}
+
+/// 로그에 찍을 시드 목록 이름. 방식과 상관없이 "등록된 기준 곡" 이라고 찍어서
+/// `recent` 모드 로그가 등록해 둔 적도 없는 곡을 "등록된 기준 곡" 이라고 불렀다.
+fn seed_list_label(mode: Option<AutoplayMode>) -> &'static str {
+    match mode {
+        Some(AutoplayMode::Seed) => "등록된 기준 곡",
+        Some(AutoplayMode::Recent) => "최근 튼 곡",
+        Some(AutoplayMode::Genre) => "차트·재생목록 곡",
+        None => "기준 곡",
+    }
 }
 
 // ───────── 결정적 PRNG (§8.5) ─────────
@@ -189,6 +218,9 @@ pub struct AutoplayContext<'a> {
     /// `🎲 후보 다시 뽑기` 를 누른 횟수. 같은 10분 안에서도 다른 답이 나오게 하는
     /// 유일한 입력이다 (`DeterministicRng::now_salted`).
     pub salt: u64,
+    /// 시드 목록이 어느 방식에서 왔는지 (폴백까지 내려간 뒤의 최종 방식).
+    /// `recent` 면 커서 없이 맨 앞부터 쓴다(`pick_seed_at`). `None` 은 옛 호출부다.
+    pub seed_mode: Option<AutoplayMode>,
 }
 
 impl<'a> AutoplayContext<'a> {
@@ -203,6 +235,7 @@ impl<'a> AutoplayContext<'a> {
             recent_artists: &[],
             tuning: AutoplayTuning::default(),
             salt: 0,
+            seed_mode: None,
         }
     }
 }
@@ -488,7 +521,13 @@ impl AutoplayEngine {
         ctx: &AutoplayContext<'_>,
         want: usize,
     ) -> Vec<TrackRef> {
-        let Some((mut picked, mut seed)) = pick_seed(guild_id, fallback_seed, seeds) else {
+        let front_first = matches!(ctx.seed_mode, Some(AutoplayMode::Recent));
+        let first = if front_first {
+            pick_seed_at(fallback_seed, seeds, 0)
+        } else {
+            pick_seed(guild_id, fallback_seed, seeds)
+        };
+        let Some((mut picked, mut seed)) = first else {
             self.log.info(
                 "Autoplay",
                 "기준 곡도 없고 참고할 최근 곡도 없어서 이번 추천은 건너뛰어요.",
@@ -499,7 +538,8 @@ impl AutoplayEngine {
             self.log.info(
                 "Autoplay",
                 &format!(
-                    "등록된 기준 곡 {}곡 중 {}번째 '{}'을 기준으로 추천을 받아요.",
+                    "{} {}곡 중 {}번째 '{}'을 기준으로 추천을 받아요.",
+                    seed_list_label(ctx.seed_mode),
                     seeds.len(),
                     index + 1,
                     seed.display_title()
@@ -544,7 +584,12 @@ impl AutoplayEngine {
             if rotations + 1 < seeds.len() {
                 rotations += 1;
                 let previous = seed.display_title().to_string();
-                let Some(rotated) = pick_seed(guild_id, fallback_seed, seeds) else {
+                let rotated = if front_first {
+                    pick_seed_at(fallback_seed, seeds, rotations)
+                } else {
+                    pick_seed(guild_id, fallback_seed, seeds)
+                };
+                let Some(rotated) = rotated else {
                     return Vec::new();
                 };
                 (picked, seed) = rotated;
@@ -788,6 +833,30 @@ mod tests {
         assert!(pick_seed(guild, None, &[]).is_none());
     }
 
+    /// `recent` 모드는 **지금 나오는 곡**을 시드로 쓴다. 커서를 쓰면 곡마다 한 칸씩 밀리는
+    /// 목록과 함께 밀려서 같은 옛 곡에 계속 머물렀다(운영: 한 곡이 세 번 연속 시드).
+    #[test]
+    fn recent_seeds_start_from_the_front_every_time() {
+        let fallback = track("현재곡");
+        // 곡이 바뀔 때마다 목록이 한 칸씩 밀린다. 매번 맨 앞(지금 곡)이어야 한다.
+        for list in [
+            vec![track("A"), track("B"), track("C")],
+            vec![track("D"), track("A"), track("B")],
+            vec![track("E"), track("D"), track("A")],
+        ] {
+            let (index, chosen) = pick_seed_at(Some(&fallback), &list, 0).unwrap();
+            assert_eq!(index, Some(0));
+            assert_eq!(chosen.content_id, list[0].content_id);
+        }
+        // 맨 앞에서 후보가 안 나오면 그다음으로 넘어간다.
+        let list = vec![track("A"), track("B")];
+        assert_eq!(pick_seed_at(None, &list, 1).unwrap().1.content_id, "B");
+        assert_eq!(pick_seed_at(None, &list, 2).unwrap().1.content_id, "A");
+        // 목록이 비면 넘겨받은 곡, 그것도 없으면 건너뛴다.
+        assert_eq!(pick_seed_at(Some(&fallback), &[], 0).unwrap().0, None);
+        assert!(pick_seed_at(None, &[], 0).is_none());
+    }
+
     /// **무작위는 재현 가능해야 한다** (§8.5). 같은 (길드·시드·후보수·시간칸)이면 같은 답이 나오고,
     /// 하나라도 다르면 달라진다. 안 그러면 왜 그 곡이 나왔는지 추적을 못 한다.
     #[test]
@@ -927,6 +996,7 @@ mod tests {
                 ..AutoplayTuning::default()
             },
             salt: 0,
+            seed_mode: None,
         };
         let survivors = |ctx: &AutoplayContext<'_>, relax| -> Vec<usize> {
             engine
